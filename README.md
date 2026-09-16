@@ -35,6 +35,9 @@ and the full source will be published once the renderer and the Forge editing
 workflow are more or less finished. Until then only these binary builds are
 distributed.
 
+## Documentation
+You can find all relevent documentation [here](https://sopitive.github.io/HaloMapStudio)
+
 ## License
 
 This software is licensed under the **PolyForm Noncommercial License 1.0.0**
