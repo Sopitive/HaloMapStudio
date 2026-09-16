@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog — Halo Map Studio</title>
+<meta name="description" content="Release history of Halo Map Studio.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html" class="cur" aria-current="page">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Changelog -->
+<!-- desc: Release history of Halo Map Studio. -->
+<h1>Changelog</h1>
+<p class="lead">Release notes are published alongside each build on <a href="https://github.com/Sopitive/halo-map-studio-rust/releases">GitHub Releases</a>. This page summarises them.</p>
+
+<h2>v0.1.0 — 2026-09 <span class="tag">current</span></h2>
+<p>First public binary release (Windows x64 and Linux x64 archives). Source code is planned to follow once the renderer and the Forge editing workflow settle.</p>
+<ul>
+  <li>Halo: Reach map viewer with engine-faithful lighting, materials, water, sky, fog and effect particles; automatic discovery of Steam and Workshop maps.</li>
+  <li>Forge variant (<code>.mvar</code>) open / edit / save, including Forge properties, labels, parents, boundaries and the 651-slot budget.</li>
+  <li>Blender-style editing (grab / rotate / duplicate, axis locks, magnet, precision, array), gizmos, box select, mass edit, undo/redo, Line and Fill placement tools.</li>
+  <li>Construction (CAD) tools: guides, circles, squares, face-to-face mate, anchor, mirror, fill edge.</li>
+  <li>Forge script language with an in-app console, headless <code>--script</code> / <code>--exec</code> runner, a local command server and the <code>hms-mcp</code> MCP bridge.</li>
+  <li>Headless PNG rendering (<code>HMS_SHOT</code>), <code>--dump-maps</code> and variant inspection flags.</li>
+  <li>Optional real-time probe GI and a path-traced lighting bake.</li>
+  <li>Experimental, view-only Halo 4 support with read-only variants.</li>
+  <li>Projects (<code>.mmsproj</code>) and a quick-save session slot; settings stored per user.</li>
+</ul>
+
+<h2>Unreleased</h2>
+<ul>
+  <li>Left panel reorganisation, searchable variant object list, placement tools moved to the Tools menu, Edit and View menus, Help ▸ Keyboard shortcuts as the shortcut reference. (Documented on this site as the target layout.)</li>
+</ul>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

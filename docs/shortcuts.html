@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Keyboard shortcuts — Halo Map Studio</title>
+<meta name="description" content="Every keyboard and mouse shortcut in Halo Map Studio, generated from the application&#x27;s input handlers.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html" class="cur" aria-current="page">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Keyboard shortcuts -->
+<!-- desc: Every keyboard and mouse shortcut in Halo Map Studio, generated from the application's input handlers. -->
+<h1>Keyboard shortcuts</h1>
+<p class="lead">Verified against the <strong>v0.1.0</strong> source (2026-09-16). In the app, <em>Help ▸ Keyboard shortcuts…</em> opens the same reference and is the source of truth for your build.</p>
+<div class="warn"><p><strong>UI is being reorganised.</strong> Menu names may differ in older builds. Where the in-app window and the code disagree, the difference is noted below.</p></div>
+
+<h2>Camera</h2>
+<p>All movement requires the <strong>right mouse button held</strong> over the viewport.</p>
+<div class="tablewrap"><table>
+<tr><th>Keys</th><th>Action</th></tr>
+<tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td><td>Move forward / left / back / right</td></tr>
+<tr><td><kbd>E</kbd> / <kbd>R</kbd></td><td>Move up</td></tr>
+<tr><td><kbd>Q</kbd> / <kbd>F</kbd></td><td>Move down</td></tr>
+<tr><td><kbd>Shift</kbd> (hold)</td><td>Fly 4× faster</td></tr>
+<tr><td>Right-drag</td><td>Look around</td></tr>
+<tr><td><kbd>Ctrl</kbd> + wheel</td><td>Fly speed up / down</td></tr>
+<tr><td><kbd>F</kbd> (right button <em>not</em> held, no modifiers)</td><td>Frame the selected object</td></tr>
+<tr><td><kbd>F12</kbd></td><td>Screenshot to <code>captures/viewer_last.png</code></td></tr>
+</table></div>
+
+<h2>Selection &amp; editing</h2>
+<div class="tablewrap"><table>
+<tr><th>Keys</th><th>Action</th></tr>
+<tr><td>Left-click</td><td>Select the object under the cursor (click empty space to clear)</td></tr>
+<tr><td><kbd>Shift</kbd> + click</td><td>Add / remove an object from the multi-selection</td></tr>
+<tr><td>Left-drag (Select mode)</td><td>Box-select; <kbd>Shift</kbd> adds to the selection</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>A</kbd></td><td>Select all objects</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>A</kbd></td><td>Context menu: select all of the same type, simulate physics</td></tr>
+<tr><td><kbd>Delete</kbd> / <kbd>Backspace</kbd></td><td>Delete the selection</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>Redo</td></tr>
+</table></div>
+
+<h2>Modal transform (Blender-style)</h2>
+<p>Cursor over the viewport, with a selection.</p>
+<div class="tablewrap"><table>
+<tr><th>Keys</th><th>Action</th></tr>
+<tr><td><kbd>G</kbd></td><td>Grab / move the selection</td></tr>
+<tr><td><kbd>R</kbd></td><td>Rotate the selection</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Duplicate the selection and grab the copies</td></tr>
+<tr><td><kbd>X</kbd> / <kbd>Y</kbd> / <kbd>Z</kbd></td><td>Lock to an axis (press again to unlock)</td></tr>
+<tr><td><kbd>E</kbd></td><td>Toggle global / local axis space</td></tr>
+<tr><td><kbd>Ctrl</kbd> (hold)</td><td>Magnet: snap flush to the nearest face or surface</td></tr>
+<tr><td><kbd>Shift</kbd> (hold)</td><td>Precision (slower mouse response)</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>Ctrl</kbd> (hold, after Shift+D with an axis lock)</td><td>Array: stamp flush copies along the axis</td></tr>
+<tr><td>Digits, <kbd>.</kbd>, <kbd>-</kbd></td><td>Type an exact distance (units) or angle (degrees)</td></tr>
+<tr><td><kbd>Enter</kbd> / left-click</td><td>Confirm</td></tr>
+<tr><td><kbd>Esc</kbd> / right-click</td><td>Cancel</td></tr>
+</table></div>
+
+<h2>Gizmos</h2>
+<div class="tablewrap"><table>
+<tr><th>Input</th><th>Action</th></tr>
+<tr><td>Press-drag an arrow (Move mode)</td><td>Move along that axis; applied on release</td></tr>
+<tr><td>Press-drag a ring (Rotate mode)</td><td>Rotate about that axis; applied on release</td></tr>
+</table></div>
+
+<h2>Tools</h2>
+<div class="tablewrap"><table>
+<tr><th>Keys</th><th>Action</th></tr>
+<tr><td><kbd>C</kbd></td><td>Construction (CAD) tool on / off</td></tr>
+<tr><td><kbd>G</kbd> (with a construction shape selected)</td><td>Move the shape; click to place, <kbd>Esc</kbd> to cancel</td></tr>
+<tr><td><kbd>Esc</kbd> (Construct tool)</td><td>Drop a half-drawn guide or a pending Coincident face A</td></tr>
+<tr><td>Drag from the palette list or preview into the viewport</td><td>Place that object on the surface under the cursor</td></tr>
+<tr><td>In the palette preview: right-drag / wheel</td><td>Orbit / zoom the preview</td></tr>
+</table></div>
+
+<h2>Menus</h2>
+<div class="tablewrap"><table>
+<tr><th>Menu item</th><th>Action</th></tr>
+<tr><td><em>File ▸ Open .mvar…</em></td><td>Open a variant</td></tr>
+<tr><td><em>File ▸ Save</em> / <em>Save As…</em></td><td>Write edits back to the variant / to a new file</td></tr>
+<tr><td><em>Edit ▸ Undo / Redo / Select all objects / Deselect / Delete selected / Remove all placed objects</em></td><td>As named</td></tr>
+<tr><td><em>View ▸ Frame selected object</em> (<kbd>F</kbd>), <em>Screenshot</em> (<kbd>F12</kbd>), <em>Construction (CAD) panel</em>, <em>Script console</em></td><td>As named</td></tr>
+<tr><td><em>Help ▸ Keyboard shortcuts…</em></td><td>The in-app version of this page</td></tr>
+</table></div>
+
+<h2>Listed in the app but not functional in this build</h2>
+<p><em>Nudge</em> keys move the selection without entering a transform: arrow keys on X/Y and <kbd>PageUp</kbd>/<kbd>PageDown</kbd> on Z step by 0.25 world units, <kbd>[</kbd> / <kbd>]</kbd> turn the yaw by 15 degrees; hold <kbd>Shift</kbd> for a larger step. They work on any selected variant object and are undoable.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

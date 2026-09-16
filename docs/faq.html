@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FAQ / troubleshooting — Halo Map Studio</title>
+<meta name="description" content="Common problems with Halo Map Studio: no maps detected, HMS_MCC_DIRS, GPU and memory requirements, unresolved variant objects, saving, Linux/Proton paths and crash logs.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html" class="cur" aria-current="page">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: FAQ / troubleshooting -->
+<!-- desc: Common problems with Halo Map Studio: no maps detected, HMS_MCC_DIRS, GPU and memory requirements, unresolved variant objects, saving, Linux/Proton paths and crash logs. -->
+<h1>FAQ / troubleshooting</h1>
+
+<h2 id="no-maps">"No maps detected (is MCC/Halo Reach installed via Steam?)"</h2>
+<p>The app could not find an MCC install. Check, in order:</p>
+<ol>
+  <li>MCC is installed through <strong>Steam</strong> and the Halo: Reach content is downloaded (Steam ▸ MCC ▸ Properties ▸ DLC). The app needs <code>…\Halo The Master Chief Collection\haloreach\maps\*.map</code>.</li>
+  <li>The Steam library is in a normal place. Libraries on other drives are found through Steam's <code>libraryfolders.vdf</code>; on Linux the Steam root must be one of <code>~/.local/share/Steam</code>, <code>~/.steam/steam</code>, <code>~/.steam/root</code>, the Flatpak location or <code>$XDG_DATA_HOME/Steam</code>.</li>
+  <li>Otherwise tell the app where the game is with <code>HMS_MCC_DIRS</code> — the MCC folder, a <code>haloreach</code> folder or a <code>maps</code> folder, several separated by <code>;</code>:
+  <pre><code>HMS_MCC_DIRS="/path/to/SteamLibrary/steamapps/common/Halo The Master Chief Collection" ./hms-app</code></pre>
+  On Windows set it in the same terminal before starting <code>hms-app.exe</code>, or create a shortcut / batch file that sets it.</li>
+  <li>Xbox / Microsoft Store installs are probed only when no Steam copy exists, and only in the default <code>XboxGames</code> / <code>ModifiableWindowsApps</code> locations; use <code>HMS_MCC_DIRS</code> for anything else.</li>
+</ol>
+<p><code>hms-app --dump-maps</code> prints exactly what was found, which is the quickest way to debug this.</p>
+
+<h2>My Workshop map shows up under Built-in (or the other way round)</h2>
+<p>The grouping is purely by folder: anything under <code>steamapps\workshop\</code> is <em>Modded</em>, anything inside the game's own <code>maps</code> folder is <em>Built-in</em> — including Anniversary maps and copies you placed there yourself. A Workshop item is only listed if its <code>ModInfo.json</code> declares a Halo: Reach or Halo 4 engine.</p>
+
+<h2>Maps are listed by file name, not by their in-game name</h2>
+<p>Correct — the picker shows the scenario stem (<code>45_aftship</code> is Zealot, <code>50_panopticon</code> is Boardwalk). See the table on <a href="maps-and-variants.html#discovery">Maps &amp; variants</a>.</p>
+
+<h2>The app does not start, or says "no wgpu adapter"</h2>
+<p>No usable GPU driver was found. You need Vulkan (Linux) or DirectX 12 / Vulkan (Windows) drivers. As a last resort the software rasteriser is used — on Linux install <code>lavapipe</code> / <code>vulkan-swrast</code> (<code>mesa-vulkan-drivers</code> on Debian/Ubuntu); on Windows WARP ships with DirectX 12. <code>HMS_SOFTWARE_GPU=1</code> forces the software path for testing. The app prints <code>adapter: &lt;name&gt; (&lt;type&gt;, &lt;backend&gt;)</code> to the terminal at start so you can see which device it picked; it prefers discrete over integrated GPUs automatically.</p>
+
+<h2>How much memory does it need?</h2>
+<p>Loading Forge World peaks at roughly 4.5 GB while textures are decoded and settles to about 1 GB afterwards. Smaller maps need less. There is no explicit RAM check, so on a machine with 4 GB or less the load may fail or swap heavily.</p>
+
+<h2>Loading Forge World is slow the first time</h2>
+<p>Expect a few seconds on a fast machine (timings are written to <code>hms_load.log</code> next to the executable). <em>Reload forge</em> rebuilds only the Forge objects and is much faster than a full <em>Reload</em>.</p>
+
+<h2>My variant opens but shows "N unresolved" or "0/N objects resolved"</h2>
+<p>Each object in a variant refers to an entry of the base map's Forge palette. If the variant was made for a different map (or a modded map with a different palette) those references cannot be matched. The app loads the base map automatically by the map id stored in the file; if that map is not installed the variant is drawn on whatever is loaded and most objects will be unresolved. Unresolved objects are kept in the file on save; they are simply not displayed. <code>hms_mvar_diag.txt</code> next to the executable and <code>hms-app --resolve-mvar &lt;map&gt; &lt;file.mvar&gt;</code> show the details.</p>
+
+<h2>Does Save make a backup?</h2>
+<p><strong>No.</strong> <em>File ▸ Save</em> overwrites the open <code>.mvar</code> in place. Use <em>Save As…</em> or copy the file first. Never save over a variant while MCC has it open. See <a href="maps-and-variants.html#save">Saving</a> for exactly what is rewritten.</p>
+
+<h2>Where does MCC keep my Forge saves?</h2>
+<p><code>%USERPROFILE%\AppData\LocalLow\MCC\LocalFiles\&lt;XUID&gt;\HaloReach\Map\</code> on Windows, and the same path inside the Proton prefix on Linux (<code>…/steamapps/compatdata/976730/pfx/drive_c/users/steamuser/AppData/LocalLow/MCC/LocalFiles/…</code>). The variant browser lists them under <em>Game</em> as <em>👤 HaloReach · &lt;profile&gt;</em>. If your <code>LocalFiles</code> is elsewhere, set <code>HMS_MCC_LOCALFILES</code>.</p>
+
+<h2>I placed objects but the count did not change / they were not saved</h2>
+<p>A variant has 651 slots and objects the app cannot display still occupy theirs. When the file is full, new objects cannot be written; the status line says how many had no free slot. New objects whose palette entry cannot be resolved on this map are also dropped from the save (again reported in the status line).</p>
+
+<h2>The arrow keys / PageUp / [ ] do not move my object</h2>
+<p>In v0.1.0 those nudge keys only drive a legacy path and do not move variant objects, even though the in-app shortcut list still mentions them. Use <kbd>G</kbd>, lock an axis with <kbd>X</kbd>/<kbd>Y</kbd>/<kbd>Z</kbd>, type the distance and press <kbd>Enter</kbd>, or edit the position fields in the Object panel.</p>
+
+<h2>Can it edit the live game / place objects while MCC is running?</h2>
+<p>Not in the released builds. Halo Map Studio works entirely on files: it reads the game's map caches and reads/writes <code>.mvar</code> variants. Load the saved variant in the game's Forge to see it in-game.</p>
+
+<h2>The image looks different from the game</h2>
+<p>See <a href="rendering.html#accuracy">How accurate is the renderer?</a> for what is reproduced and the known gaps. Lighting sliders in <em>Settings</em> are reset to the map's values with <em>Reset all</em>; make sure <em>Path-traced lighting</em> and <em>Real-time lighting (probe GI)</em> are off when you want the stock look.</p>
+
+<h2>It crashed — what should I report?</h2>
+<p>Attach <code>hms_crash.log</code> (written next to the executable on a panic), the terminal output including the <code>adapter:</code> line, your OS and GPU, and the map / variant you were using. Please do not attach the game's <code>.map</code> files.</p>
+
+<h2>Linux specifics</h2>
+<ul>
+  <li>Keep <code>libhalomapstudio.so</code> next to <code>hms-app</code>; the app loads it at start and prints a warning if it cannot.</li>
+  <li>Settings live in <code>$XDG_DATA_HOME/HaloMapStudio</code> or <code>~/.local/share/HaloMapStudio</code>.</li>
+  <li>The Proton install of MCC is an ordinary Steam library entry; no Wine tricks are needed to read the maps.</li>
+</ul>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editing — Halo Map Studio</title>
+<meta name="description" content="Selecting, placing, moving, rotating and duplicating Forge objects; gizmos, axis locks, magnet snapping, the Object panel, mass edit, undo, and the Construction (CAD) tools.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html" class="cur" aria-current="page">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Editing -->
+<!-- desc: Selecting, placing, moving, rotating and duplicating Forge objects; gizmos, axis locks, magnet snapping, the Object panel, mass edit, undo, and the Construction (CAD) tools. -->
+<h1>Editing</h1>
+<div class="warn"><p><strong>UI is being reorganised.</strong> Menu and panel labels below are the target layout; your build may still show some controls elsewhere.</p></div>
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#select">Selecting objects</a></li>
+<li><a href="#place">Placing objects</a></li>
+<li><a href="#tools">Tool modes and gizmos</a></li>
+<li><a href="#modal">Grab / rotate / duplicate (modal transforms)</a></li>
+<li><a href="#magnet">Axis lock, magnet and precision</a></li>
+<li><a href="#panel">The Object panel</a></li>
+<li><a href="#mass">Mass edit</a></li>
+<li><a href="#undo">Undo / redo</a></li>
+<li><a href="#cad">Construction (CAD) tools</a></li>
+<li><a href="#physics">Simulate physics</a></li>
+<li><a href="#extras">Model Painter, Import geometry, Light bake map</a></li>
+</ul></div>
+
+<h2 id="select">Selecting objects</h2>
+<ul>
+  <li><strong>Left-click</strong> an object in the viewport to select it. Clicking empty level geometry clears the selection (and the status line reports the surface's material, which is handy for scripting).</li>
+  <li><kbd>Shift</kbd>+click toggles an object in or out of a multi-selection.</li>
+  <li>In <em>Select</em> mode, <strong>left-drag</strong> draws a box; every object whose centre falls inside is selected (<kbd>Shift</kbd> adds to the selection).</li>
+  <li><kbd>Ctrl</kbd>+<kbd>A</kbd> (or <em>Edit ▸ Select all objects</em>) selects every object; <em>Edit ▸ Deselect</em> clears.</li>
+  <li><kbd>Shift</kbd>+<kbd>A</kbd> with a selection opens a small context menu at the cursor: <em>Select all of same object type</em> and <em>Simulate this object's physics</em> (for several objects: <em>Simulate physics for selection</em>).</li>
+  <li>The <strong>object list</strong> in the left panel selects too (click, <kbd>Ctrl</kbd>/<kbd>Shift</kbd> for multi, double-click to fly to the object). Its search box matches type, name, label or <code>#slot</code>.</li>
+  <li><kbd>Delete</kbd> / <kbd>Backspace</kbd> (or <em>Edit ▸ Delete selected</em>) deletes the selection. <em>Edit ▸ Remove all placed objects</em> clears every object from the scene, leaving the level; both are undoable.</li>
+</ul>
+
+<h2 id="place">Placing objects</h2>
+<p>Pick an item in the <em>Add Object</em> palette (use the filter box; items are grouped by Forge category) and <strong>drag it — or its 3D preview — into the viewport</strong>. The object follows the surface under the cursor (Forge objects, then level geometry, then imported geometry, then the ground plane) and drops when you release. It is placed with default Forge flags (spawns at start, both symmetries, normal physics), no team, inherited colour and no label, and is immediately editable and saveable. Placing is one undo step.</p>
+<p>Two multi-placement helpers live in <em>Tools ▸ Placement tools</em> (pick a palette item first):</p>
+<ul>
+  <li><strong>Line tool</strong> — click a start point, then an end point: <em>count</em> copies (2–64) are placed evenly along the line.</li>
+  <li><strong>Fill tool</strong> — click three or more outline points, then <strong>Close &amp; fill</strong>: the polygon is grid-filled with the item at <em>gap</em> spacing (0.5–20 world units, at most 2000 copies).</li>
+</ul>
+<p>Objects can also be placed with the <a href="scripting.html#place">script <code>place</code> command</a>, including relative to or flush against another object.</p>
+
+<h2 id="tools">Tool modes and gizmos</h2>
+<p>The floating toolbar in the viewport's top-left corner has four modes:</p>
+<div class="tablewrap"><table>
+<tr><th>Mode</th><th>Behaviour</th></tr>
+<tr><td><strong>Select</strong></td><td>Click an object or drag a box. No gizmo.</td></tr>
+<tr><td><strong>Move</strong></td><td>Draws three arrow handles (X red, Y green, Z blue) on the selection. Press-drag a handle to move along that axis; the move is applied when you release. Same as pressing <kbd>G</kbd>.</td></tr>
+<tr><td><strong>Rotate</strong></td><td>Draws three rings. Press-drag a ring to rotate about that axis; applied on release. Same as pressing <kbd>R</kbd>.</td></tr>
+<tr><td><strong>Construct</strong> (<kbd>C</kbd>)</td><td>Construction guides and CAD operations — clicks pick anchor points instead of selecting. Opens the <em>Construction (CAD)</em> window; closing that window returns to Select.</td></tr>
+</table></div>
+<p>The hovered gizmo element highlights yellow. Keyboard transforms (<kbd>G</kbd> / <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>D</kbd>) work in every mode.</p>
+
+<h2 id="modal">Grab / rotate / duplicate (modal transforms)</h2>
+<p>With the cursor over the viewport and something selected:</p>
+<div class="tablewrap"><table>
+<tr><th>Key</th><th>Action</th></tr>
+<tr><td><kbd>G</kbd></td><td>Grab: the selection follows the mouse until you confirm.</td></tr>
+<tr><td><kbd>R</kbd></td><td>Rotate about the selection's centre; mouse movement sets the angle.</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Duplicate the selection, then grab the copies. The copies become the selection.</td></tr>
+<tr><td><kbd>X</kbd> / <kbd>Y</kbd> / <kbd>Z</kbd></td><td>Lock the transform to one world axis (press again to unlock).</td></tr>
+<tr><td><kbd>E</kbd></td><td>Toggle between global and local (object) axes for the lock.</td></tr>
+<tr><td>Digits, <kbd>.</kbd>, leading <kbd>-</kbd></td><td>Type an exact value: degrees for Rotate, world units for an axis-locked Grab. <kbd>Backspace</kbd> edits it. While a number is typed the mouse is ignored.</td></tr>
+<tr><td><kbd>Enter</kbd> or left-click</td><td>Confirm.</td></tr>
+<tr><td><kbd>Esc</kbd> or right-click</td><td>Cancel — poses are restored and duplicates removed.</td></tr>
+</table></div>
+<p>Pressing <kbd>G</kbd> or <kbd>R</kbd> during an operation switches to that operation. The OS cursor is hidden and confined to the window while a transform is active. Each confirmed transform is a single undo step.</p>
+
+<h2 id="magnet">Axis lock, magnet and precision</h2>
+<ul>
+  <li><strong>Magnet:</strong> hold <kbd>Ctrl</kbd> during a grab to snap the group's leading face flush against the nearest other object's face or level surface within 3 world units — along the locked axis in either direction, or downward when no axis is locked.</li>
+  <li><strong>Precision:</strong> hold <kbd>Shift</kbd> to scale mouse movement down to about a sixth.</li>
+  <li><strong>Array duplicate:</strong> after <kbd>Shift</kbd>+<kbd>D</kbd> with an axis locked, hold <kbd>Shift</kbd>+<kbd>Ctrl</kbd>: flush copies are stamped along the axis as the cursor travels, giving a row of touching pieces in one motion.</li>
+  <li><strong>Guide snapping:</strong> when construction guides exist and <em>Snap moves</em> is on (see <a href="#cad">CAD</a>), a grab without <kbd>Ctrl</kbd> snaps to the nearest guide end, midpoint or intersection within the snap range.</li>
+</ul>
+
+<h2 id="panel">The Object panel</h2>
+<p>A floating <em>Object</em> window appears on the right whenever something is selected. Its header shows the object's datum id, position and Forge index. For a Forge object it shows the item's name and label and a grid of editable Forge properties:</p>
+<div class="tablewrap"><table>
+<tr><th>Row</th><th>Meaning</th></tr>
+<tr><td><code>quota/variant</code></td><td>The palette folder (0–255) and item (0–31) indices that identify the piece.</td></tr>
+<tr><td><code>team</code></td><td><em>none</em>, or red, blue, green, orange, purple, yellow, brown, pink, neutral.</td></tr>
+<tr><td><code>color</code></td><td><em>inherit (use team)</em> or one of eight colours.</td></tr>
+<tr><td><code>cached type</code></td><td>Engine object kind: none, weapon, grenade, teleporter 2-way / sender / receiver, location — or a raw 0–31 value.</td></tr>
+<tr><td><code>spawn seq</code></td><td>Spawn sequence (−100…100). For objects labelled <code>scale</code> the implied visual scale (× N) is shown live.</td></tr>
+<tr><td><code>respawn (s)</code></td><td>Respawn time in seconds.</td></tr>
+<tr><td><code>label</code></td><td>Pick an existing Forge label, or type a name and press <strong>＋ name</strong> to create and assign a new one.</td></tr>
+<tr><td><code>parent</code></td><td>Attach the object to another object (by slot).</td></tr>
+<tr><td><code>placement</code></td><td><em>physics</em> (normal / fixed / phased), <em>symmetry</em> (never / symmetric / asymmetric / both), and the flags <em>placed at start</em>, <em>game-type specific</em>, <em>unique spawn</em>, <em>shortcut</em>.</td></tr>
+<tr><td><code>boundary</code> / <code>boundary vals</code></td><td>Shape (none / sphere / cylinder / box) and its raw size values (0–2047).</td></tr>
+<tr><td><code>weapon clips</code>, <code>channel</code> + passability, <code>location name</code></td><td>Shown only for weapons, teleporters (Alpha…Zulu channel; Projectiles / Flying vehicles / Heavy land vehicles / Light land vehicles / Players) and named locations respectively.</td></tr>
+<tr><td><code>position</code></td><td>X, Y, Z in world units (drag or type).</td></tr>
+<tr><td><code>rotation</code></td><td>X, Y, Z in <strong>degrees</strong>: X = roll, Y = pitch (positive = nose down), Z = yaw, right-hand rule — the same convention as the script <code>rotate</code> command.</td></tr>
+<tr><td><em>raw forward / up (advanced)</em></td><td>The underlying orientation vectors and their lengths, with <em>reset to unit</em> to normalise them. Stretched/skewed vectors preview in the viewer but are not yet written to the file.</td></tr>
+</table></div>
+<p>Below the grid the panel lists the object's material (diffuse and emissive bitmap tags, blend mode) for reference. Every property edit is undoable.</p>
+
+<h2 id="mass">Mass edit</h2>
+<p>When several objects are selected the panel header turns orange: <em>Forge object — editing N objects</em>. The panel shows the first object's values; <strong>only the field you change is applied to the other selected objects</strong> — untouched fields keep each object's own value. Position is applied as a delta so the group keeps its layout, and rotation angles are applied to each object. Name, slot and parent are never copied. The same per-field behaviour is available in scripts as <code>set selection &lt;field&gt; &lt;value&gt;</code>.</p>
+
+<h2 id="undo">Undo / redo</h2>
+<p><kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes, <kbd>Ctrl</kbd>+<kbd>Y</kbd> or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redoes (also in the <em>Edit</em> menu). The stack holds 64 steps. Undoable: moves, rotations, duplicates, gizmo drags, drag-placing, deleting, every Object-panel edit, mass edits, CAD mates/anchors/mirrors, construction shapes, "simulate physics", Line/Fill placements and each script run (a whole run is one step). <strong>Not</strong> undoable: creating or deleting construction guides, variant name/description/label-table edits, lighting settings and camera moves.</p>
+
+<h2 id="cad">Construction (CAD) tools</h2>
+<p>Press <kbd>C</kbd> (or <em>Tools ▸ Construction (CAD)…</em>) to enter the Construct tool. The <em>Construction (CAD)</em> window opens with an operation picker:</p>
+<div class="tablewrap"><table>
+<tr><th>Operation</th><th>What it does</th></tr>
+<tr><td><strong>Guide</strong></td><td>Click two anchor points to draw a dotted construction guide between them. Guides have snappable ends, midpoints and mutual intersections. <em>Box diagonals</em> / <em>Face diagonals</em> add guides from the selection's bounding box in one click.</td></tr>
+<tr><td><strong>Circle</strong> / <strong>Square</strong></td><td>Press and <strong>drag</strong> in the viewport: the press sets the centre, the drag sets the radius, release commits. Choose the plane (X, Y, Z or the clicked face), circle segments (3–256) and square rotation. Press a shape's centre to move it, or select it in the <em>Shapes</em> list, press <kbd>G</kbd>, and click to place. <em>Centre on selection</em> re-centres a shape on the selected objects.</td></tr>
+<tr><td><strong>Coincident</strong></td><td>Face-to-face mating: click <strong>face A</strong> on the object you are moving, then <strong>face B</strong> on another object. The selection moves so the faces meet. <em>turn to face</em> (default on) rotates A so its face points into B; <em>centre on face</em> also aligns the two face centres (otherwise the mate is flush/coplanar and A keeps its in-plane position). Available in scripts as <code>coincident</code>.</td></tr>
+<tr><td><strong>Anchor</strong></td><td>Click a point: the selection's centre moves exactly onto it.</td></tr>
+<tr><td><strong>Mirror</strong></td><td>Click a point: the selection is mirrored through it across the chosen axis (X/Y/Z), optionally as a copy. <em>Mirror about centre</em> mirrors the selection through its own centre.</td></tr>
+</table></div>
+<p>Other controls in the window:</p>
+<ul>
+  <li><em>Snap to</em>: which anchor points clicks may land on — all points, corners, edge midpoints, face centres or object centres.</li>
+  <li><em>Snap moves</em> + <em>range</em>: pull ordinary grabs onto nearby guide points.</li>
+  <li><strong>Fill edge with an object</strong>: select the object(s) to copy, set <em>count</em> (1–256), optionally <em>turn to follow</em>, press <em>Fill edge</em> to lay the copies along the selected guide.</li>
+  <li><em>Place along guide</em> with a distance, the guide list with per-guide delete, and <em>Clear guides</em>.</li>
+  <li><em>Show</em> toggles the guide overlay; <em>done</em> returns to Select.</li>
+</ul>
+
+<h2 id="physics">Simulate physics</h2>
+<p><em>Simulate this object's physics</em> (from the <kbd>Shift</kbd>+<kbd>A</kbd> menu) drops the object straight down onto whatever is below it and tilts it flush to the slope — the equivalent of letting go of a piece with normal physics in Forge. Scripts call it <code>settle</code>.</p>
+
+<h2 id="extras">Model Painter, Import geometry, Light bake map</h2>
+<ul>
+  <li><strong>Tools ▸ Model Painter…</strong> voxelises an <code>.obj</code> from the <code>models/</code> folder next to the executable (resolution 4–48, size 2–200 world units) and places one copy of the selected palette item per surface voxel.</li>
+  <li><strong>Tools ▸ Import geometry…</strong> loads an <code>.obj</code> / <code>.glb</code> from <code>models/</code> as a persistent reference mesh you can place objects on (for example a level converted from another game). <em>Clear imported</em> removes it.</li>
+  <li><strong>Tools ▸ Light bake map…</strong> renders a top-down map of the baked light colour a Forge piece would receive at every spot on the level, enumerates the achievable shades, and for a chosen shade finds the closest-matching positions with <em>Move here</em> / <em>Camera</em> buttons. Useful for colour-matching pieces that are lit by the lightmap.</li>
+</ul>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

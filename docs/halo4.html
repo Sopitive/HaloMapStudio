@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Halo 4 (experimental) — Halo Map Studio</title>
+<meta name="description" content="Status of Halo 4 support in Halo Map Studio: view-only rendering with baked lightmaps and scenario objects, read-only map variants, and what is not supported.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html" class="cur" aria-current="page">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Halo 4 (experimental) -->
+<!-- desc: Status of Halo 4 support in Halo Map Studio: view-only rendering with baked lightmaps and scenario objects, read-only map variants, and what is not supported. -->
+<h1>Halo 4 (experimental)</h1>
+<p class="lead">Halo 4 maps from MCC can be opened as a <strong>view-only</strong> scene. Forge editing and variant saving are not available for Halo 4.</p>
+<div class="gallery">
+  <figure><img src="assets/halo4-ravine.jpg" alt="Halo 4 Ravine rendered from above: a green island with Forerunner spires in turquoise water" loading="lazy"><figcaption>Ravine (<code>ca_forge_ravine</code>).</figcaption></figure>
+  <figure><img src="assets/halo4-haven.jpg" alt="Halo 4 Haven exterior: a white Forerunner tower with cyan lights above clouds" loading="lazy"><figcaption>Haven (<code>wraparound</code>), from outside the arena.</figcaption></figure>
+</div>
+
+<h2>How to use it</h2>
+<ul>
+  <li>Halo 4 caches are detected from <code>&lt;MCC&gt;\halo4\maps</code> and from Halo 4 Workshop items, and appear in the map picker's <strong>Halo 4 (experimental)</strong> group (only shown when at least one exists). Load one like any other map.</li>
+  <li>The status line reads <em>Halo 4 (EXPERIMENTAL, view-only): &lt;map&gt; — N draws / N tris, N objects, N textures … Forge editing and variant saving are disabled for Halo 4 maps.</em></li>
+  <li><strong>File ▸ Open .mvar…</strong> accepts Halo 4 variants (the game's <code>halo4\map_variants</code> and <code>hopper_map_variants</code> folders are quick links in the browser, and your own saves are under <code>…\MCC\LocalFiles\&lt;XUID&gt;\Halo4\Map</code>). The variant's base map is loaded automatically and its objects are rendered <strong>read-only</strong>. Variant titles that the game stores as localisation keys are resolved to their display names.</li>
+  <li>Headless rendering works the same way: <code>HMS_MAP=ca_forge_ravine HMS_SHOT=ravine.png ./hms-app</code>, with <code>HMS_MVAR</code> accepting Halo 4 variants only.</li>
+</ul>
+
+<h2>What works</h2>
+<ul>
+  <li>Level geometry with diffuse textures (all common compressed formats).</li>
+  <li>Baked lightmaps and the baked sun direction and colour, atmospheric fog, the map's exposure range and bloom settings.</li>
+  <li>Material routing (opaque, alpha-tested, blended, additive), a shipped-shader lighting model, and the sky.</li>
+  <li>Scenario objects (the level's own placed objects) in their bind pose.</li>
+  <li>Reading shipped and user map variants and drawing their Forge objects (all shipped Halo 4 variants decode).</li>
+  <li>The Halo 4 parser is pure Rust, so the native library is not needed for Halo 4 maps.</li>
+</ul>
+
+<h2>Not supported yet</h2>
+<ul>
+  <li>Forge editing of any kind: no selection, moving, placing or property editing of Halo 4 objects.</li>
+  <li>Saving Halo 4 variants (<em>Save</em> is disabled; the file's integrity hash cannot yet be produced).</li>
+  <li>Normal and specular maps, skinned/animated poses, particles, decals, decorators (grass), collision, camera stand-off.</li>
+  <li>Variants of the newer version 51 format are refused.</li>
+</ul>
+
+<h2>Known issues</h2>
+<ul>
+  <li>Lighting uses the game's own baked lightmaps (two-lobe direction/intensity atlases, sun visibility and the baked sun), a Blinn/Phong material model with normal and control maps, cube reflections, fog and the filmic tone curve, all derived from the shipped shaders. Transparent surfaces (glass, water, foam), runtime lights and colour grading are not finished, so some surfaces can still look flat or off in tone.</li>
+  <li>The default camera on campaign maps frames every BSP at once and can start outside the level. Use the object list or fly manually.</li>
+  <li>Some instanced geometry may be mirrored or rotated incorrectly on asymmetric instances.</li>
+  <li>Object boundary shape sizes and a few placement flags are decoded but not yet verified against the game.</li>
+</ul>
+
+<h2>Fallback switches</h2>
+<p>If a Halo 4 map fails to render, these environment variables turn parts of the pipeline off so the rest can still be viewed: <code>HMS_H4_LIGHTMAP=0</code> (flat lighting), <code>HMS_H4_SHADING=0</code> (flat diffuse), <code>HMS_H4_NOTEX=1</code>, <code>HMS_H4_NOOBJ=1</code>, <code>HMS_H4_NOSKY=1</code>.</p>
+
+<h2>Maps tested</h2>
+<p>Ravine (<code>ca_forge_ravine</code>), Haven (<code>wraparound</code>), Erosion (<code>ca_forge_erosion</code>), Impact (<code>ca_forge_bonanza</code>), Forge Island (<code>dlc_forge_island</code>), plus several campaign and Spartan Ops caches; variants including Settler (on Ravine) and Grifball Court (on Erosion).</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

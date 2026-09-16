@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Headless / CLI — Halo Map Studio</title>
+<meta name="description" content="Rendering maps and variants to PNG without a window (HMS_SHOT, HMS_MAP, HMS_CAM, HMS_MVAR), batch rendering with scripts, and the command-line flags such as --dump-maps.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html" class="cur" aria-current="page">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Headless / CLI -->
+<!-- desc: Rendering maps and variants to PNG without a window (HMS_SHOT, HMS_MAP, HMS_CAM, HMS_MVAR), batch rendering with scripts, and the command-line flags such as --dump-maps. -->
+<h1>Headless / CLI</h1>
+<p class="lead">The same executable can render a map to a PNG with no window at all, run script files, and print information about your installation. Everything here works on Windows and Linux; on Windows the console window is hidden, so run it from a terminal to see the output.</p>
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#shot">Single screenshot: HMS_SHOT</a></li>
+<li><a href="#cam">Camera and framing</a></li>
+<li><a href="#mvar">Rendering a variant</a></li>
+<li><a href="#batch">Batch rendering with scripts</a></li>
+<li><a href="#dump-maps">--dump-maps and other flags</a></li>
+<li><a href="#env">Environment variables</a></li>
+<li><a href="#gpu">GPU notes</a></li>
+</ul></div>
+
+<h2 id="shot">Single screenshot: <code>HMS_SHOT</code></h2>
+<p>Setting <code>HMS_SHOT</code> to an output path makes the app render one frame and exit instead of opening a window:</p>
+<pre><code># Linux
+HMS_MAP=forge_halo HMS_CAM="-80,120,110,-60,-25" HMS_SHOT=forge.png HMS_SHOT_SIZE=1280x720 ./hms-app
+
+# Windows (cmd)
+set HMS_MAP=forge_halo
+set HMS_CAM=-80,120,110,-60,-25
+set HMS_SHOT=forge.png
+set HMS_SHOT_SIZE=1280x720
+hms-app.exe
+
+# Windows (PowerShell)
+$env:HMS_MAP="forge_halo"; $env:HMS_CAM="-80,120,110,-60,-25"; $env:HMS_SHOT="forge.png"; $env:HMS_SHOT_SIZE="1280x720"; .\hms-app.exe</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Variable</th><th>Meaning</th></tr>
+<tr><td><code>HMS_SHOT</code></td><td>Output PNG path (required to enter headless mode). A <code>&lt;name&gt;.png.log</code> with scene statistics is written next to it.</td></tr>
+<tr><td><code>HMS_MAP</code></td><td>Which map: the exact file stem (<code>45_aftship</code>), a substring, or a full path. Case-insensitive. Unset = the first detected map.</td></tr>
+<tr><td><code>HMS_SHOT_SIZE</code></td><td><code>WxH</code>, default <code>1600x900</code>.</td></tr>
+<tr><td><code>HMS_CAM</code></td><td><code>x,y,z,yaw,pitch</code> — position in world units, yaw and pitch in <strong>degrees</strong>. Yaw is measured around the up axis (0° looks along +X, 90° along +Y); positive pitch looks up. Exactly five numbers, otherwise it is ignored and the map is auto-framed.</td></tr>
+<tr><td><code>HMS_MVAR</code></td><td>Path to a <code>.mvar</code> whose objects are placed before rendering (see below).</td></tr>
+</table></div>
+<p>The process prints progress and finally <code>wrote forge.png (1280x720)</code>; the exit code is 0 on success, and <code>HMS_SHOT failed: …</code> with exit code 1 otherwise. Two warm-up frames are always rendered first so the auto-exposure meter settles the way it does in the GUI.</p>
+
+<h2 id="cam">Camera and framing</h2>
+<p>Without <code>HMS_CAM</code> the camera is auto-framed on the map's Forge objects (the playable area), or on the whole level if there are none. The framing can be adjusted:</p>
+<div class="tablewrap"><table>
+<tr><th>Variable</th><th>Meaning</th></tr>
+<tr><td><code>HMS_VIEW</code></td><td><code>overview</code> (default, a 3/4 view from above), <code>top</code>, or <code>front</code>.</td></tr>
+<tr><td><code>HMS_DIST</code></td><td>Multiplier on the auto-framed distance (<code>0.5</code> = twice as close).</td></tr>
+<tr><td><code>HMS_FOV</code></td><td>Vertical field of view in degrees.</td></tr>
+<tr><td><code>HMS_SPAWNCAM=1</code></td><td>Use the map's spawn-point camera (the pose the GUI uses when it opens a map) instead of framing.</td></tr>
+<tr><td><code>HMS_STANDOFF=&lt;wu&gt;</code></td><td>Push the camera out of any geometry closer than this distance.</td></tr>
+<tr><td><code>HMS_TIME=&lt;seconds&gt;</code></td><td>Animation time for the frame (water, scrolling textures, particles).</td></tr>
+</table></div>
+<p>The easiest way to find a good camera is to fly there in the GUI and copy the numbers from the camera readout (or run <code>camera get</code> in the script console); the GUI's <kbd>F12</kbd> screenshot also writes the pose to <code>captures/viewer_last.cam</code>.</p>
+
+<h2 id="mvar">Rendering a variant</h2>
+<pre><code>HMS_MAP=forge_halo \
+HMS_MVAR="&lt;MCC&gt;/haloreach/map_variants/hr_forgeWorld_asylum.mvar" \
+HMS_CAM="62,208,68,0,-10" HMS_SHOT=asylum.png HMS_SHOT_SIZE=1280x720 ./hms-app</code></pre>
+<p><code>HMS_MAP</code> must be the variant's base map (the headless renderer does not switch maps by itself). The log reports <code>HMS_MVAR: 458 variant objects, 458 placed</code> and lists any objects it could not resolve; <code>HMS_MVAR_LIST=1</code> prints every object with its slot, palette indices, position and team. For Halo 4 maps <code>HMS_MVAR</code> accepts Halo 4 variants only.</p>
+<figure><img src="assets/asylum-variant.jpg" alt="The Asylum variant rendered headless" loading="lazy"><figcaption>The command above.</figcaption></figure>
+
+<h2 id="batch">Batch rendering with scripts</h2>
+<p><code>HMS_SHOT</code> renders one frame per process. For several shots, use the script runner, which loads maps and variants synchronously and can loop:</p>
+<pre><code># shots.hscr
+foreach variants all as $v
+  loadvariant $v
+  camera frame
+  screenshot out/$stem.png 1280x720
+end</code></pre>
+<pre><code>./hms-app --script shots.hscr            # or:  hms-app.exe --exec "loadmap 45_aftship" "camera frame" "screenshot zealot.png 1920x1080"</code></pre>
+<p><code>list variants all</code> (and <code>foreach variants</code>) enumerate the <code>mvars/</code> folder next to the executable plus any folders in <code>HMS_MVAR_DIRS</code> (<code>;</code>-separated, searched recursively). <code>HMS_SHOT_SIZE</code> sets the initial render size for the headless script runner as well; individual <code>screenshot</code> commands can override it. Every command is documented in the <a href="scripting.html">Scripting reference</a>.</p>
+
+<h2 id="dump-maps">--dump-maps and other flags</h2>
+<pre><code>hms-app --dump-maps</code></pre>
+<p>Prints one line per detected map — map id, whether it is a Workshop ("modded") map, the game, the scenario stem, the file name and the full path — followed by totals and the variant folders that were found. Use it to check what the map picker will show and to get the exact stems for <code>HMS_MAP</code> / <code>loadmap</code>.</p>
+<pre><code>      3006  modded=0  game=reach  forge_halo  [forge_halo.map]  &lt;MCC&gt;/haloreach/maps/forge_halo.map
+      1040  modded=0  game=reach  45_aftship  [45_aftship.map]  &lt;MCC&gt;/haloreach/maps/45_aftship.map
+         -  modded=1  game=reach  rain_land   [rain_land.map]   &lt;library&gt;/steamapps/workshop/content/976730/&lt;id&gt;/maps/rain_land.map
+     10256  modded=0  game=halo4  ca_forge_ravine  [ca_forge_ravine.map]  &lt;MCC&gt;/halo4/maps/ca_forge_ravine.map</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Flag</th><th>Purpose</th></tr>
+<tr><td><code>--script &lt;file&gt;</code></td><td>Run a script file headless.</td></tr>
+<tr><td><code>--exec "&lt;commands&gt;"</code></td><td>Run the given commands headless.</td></tr>
+<tr><td><code>--dump-maps</code></td><td>List detected maps and variant folders.</td></tr>
+<tr><td><code>--dump-mvar &lt;file…&gt;</code></td><td>Print the header, labels and object table of one or more Reach variants (a way to inspect a file without the GUI).</td></tr>
+<tr><td><code>--dump-h4-mvar &lt;file…&gt;</code></td><td>The same for Halo 4 variants.</td></tr>
+<tr><td><code>--mvar-delete &lt;in&gt; &lt;out&gt; &lt;slot,slot,…&gt;</code></td><td>Copy a variant with the listed object slots removed. Never overwrites the input.</td></tr>
+<tr><td><code>--dump-palette &lt;map&gt; [--variants]</code></td><td>Print a map's Forge palette (folder / item indices and names), optionally with the per-item variants.</td></tr>
+<tr><td><code>--resolve-mvar &lt;map&gt; &lt;mvar&gt; [--all]</code></td><td>Show how each object in a variant resolves against a map's palette — useful when the GUI reports unresolved objects.</td></tr>
+</table></div>
+<p class="small">Further flags (<code>--bench-mvar</code>, <code>--dump-model</code>, <code>--dump-mask</code>, <code>--dump-parts</code>) exist for development and are not documented here.</p>
+
+<h2 id="env">Environment variables</h2>
+<div class="tablewrap"><table>
+<tr><th>Variable</th><th>Applies to</th><th>Meaning</th></tr>
+<tr><td><code>HMS_MCC_DIRS</code></td><td>GUI + headless</td><td>Extra MCC / game / maps folders, <code>;</code>-separated.</td></tr>
+<tr><td><code>HMS_MCC_LOCALFILES</code></td><td>GUI</td><td>Extra <code>MCC\LocalFiles</code> roots for the variant browser's quick links.</td></tr>
+<tr><td><code>HMS_MVAR_DIRS</code></td><td>Scripts</td><td>Folders for <code>list variants</code> / <code>foreach variants</code>.</td></tr>
+<tr><td><code>HMS_MAP</code></td><td>GUI + headless</td><td>Map to load at start (GUI) or render (headless).</td></tr>
+<tr><td><code>HMS_SHOT</code>, <code>HMS_SHOT_SIZE</code>, <code>HMS_CAM</code>, <code>HMS_MVAR</code>, <code>HMS_MVAR_LIST</code>, <code>HMS_VIEW</code>, <code>HMS_DIST</code>, <code>HMS_FOV</code>, <code>HMS_SPAWNCAM</code>, <code>HMS_STANDOFF</code>, <code>HMS_TIME</code></td><td>Headless</td><td>See above.</td></tr>
+<tr><td><code>HMS_AUTOSHOT=&lt;png&gt;</code></td><td>GUI</td><td>Save a screenshot automatically a few frames after the map has loaded.</td></tr>
+<tr><td><code>HMS_IMPORT=&lt;file.obj|.glb&gt;</code></td><td>GUI</td><td>Import a reference mesh at start (same as Tools ▸ Import geometry).</td></tr>
+<tr><td><code>HMS_CMD_PORT</code></td><td>GUI</td><td>Port of the script command server (default 47800; 0 disables).</td></tr>
+<tr><td><code>HMS_SOFTWARE_GPU=1</code></td><td>GUI + headless</td><td>Force the CPU software rasteriser.</td></tr>
+<tr><td><code>HMS_NOFOG=1</code>, <code>HMS_NODECALS=1</code></td><td>GUI + headless</td><td>Disable fog / decals.</td></tr>
+<tr><td><code>HMS_H4_LIGHTMAP=0</code>, <code>HMS_H4_SHADING=0</code>, <code>HMS_H4_NOTEX</code>, <code>HMS_H4_NOOBJ</code>, <code>HMS_H4_NOSKY</code></td><td>Halo 4</td><td>Halo 4 fallbacks — see <a href="halo4.html">Halo 4</a>.</td></tr>
+</table></div>
+<p class="small">Many more <code>HMS_*</code> variables exist as rendering diagnostics for development; they are print-only or change the image in ways that are not useful for normal use and are intentionally undocumented.</p>
+
+<h2 id="gpu">GPU notes</h2>
+<p>Headless rendering still needs a graphics adapter (Vulkan on Linux, DirectX 12 / Vulkan on Windows). If no hardware adapter is available the software rasteriser is used (<code>lavapipe</code> / <code>vulkan-swrast</code> must be installed on Linux; WARP is built into Windows) — expect a minute or more per frame on large maps. The native library (<code>HaloMapStudioDLL.dll</code> / <code>libhalomapstudio.so</code>) must be next to the executable for Reach maps; Halo 4 maps are parsed without it.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

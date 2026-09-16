@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Maps &amp; variants — Halo Map Studio</title>
+<meta name="description" content="How Halo Map Studio finds your maps, the Built-in / Modded / Halo 4 groups, and how Forge map variants (.mvar) are opened, edited and saved.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html" class="cur" aria-current="page">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Maps & variants -->
+<!-- desc: How Halo Map Studio finds your maps, the Built-in / Modded / Halo 4 groups, and how Forge map variants (.mvar) are opened, edited and saved. -->
+<h1>Maps &amp; variants</h1>
+<div class="warn"><p><strong>UI is being reorganised.</strong> Panel labels and positions described here are the target layout; your build may differ slightly.</p></div>
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#discovery">How maps are found</a></li>
+<li><a href="#groups">Map picker groups</a></li>
+<li><a href="#loading">Loading a map</a></li>
+<li><a href="#variants">Forge map variants (.mvar)</a></li>
+<li><a href="#where">Where MCC keeps variants</a></li>
+<li><a href="#open">Opening a variant</a></li>
+<li><a href="#info">Variant info and Forge labels</a></li>
+<li><a href="#new">New variant</a></li>
+<li><a href="#save">Saving</a></li>
+<li><a href="#budget">The 651-object budget</a></li>
+</ul></div>
+
+<h2 id="discovery">How maps are found</h2>
+<p>On start-up (and whenever you press the <strong>↻</strong> rescan button) the app looks for MCC in this order:</p>
+<ol>
+  <li><strong><code>HMS_MCC_DIRS</code></strong> — an optional environment variable with one or more paths separated by <code>;</code>. Each entry may be the MCC root, a <code>haloreach</code> / <code>halo4</code> folder, or a <code>maps</code> folder. This is added on top of the automatic search, it does not replace it.</li>
+  <li><strong>Steam libraries.</strong> The Steam install is located (Windows: registry; Linux: <code>~/.local/share/Steam</code>, <code>~/.steam/steam</code>, <code>~/.steam/root</code>, the Flatpak location, or <code>$XDG_DATA_HOME/Steam</code>) and every library in <code>steamapps/libraryfolders.vdf</code> is scanned for <code>steamapps/common/Halo The Master Chief Collection/haloreach/maps</code> and <code>…/halo4/maps</code>, plus the Workshop folder <code>steamapps/workshop/content/976730</code> (searched recursively).</li>
+  <li><strong>Xbox / Microsoft Store</strong> installs (<code>&lt;drive&gt;:\XboxGames\…\Content\haloreach\maps</code>, <code>…\Program Files\ModifiableWindowsApps\…</code>) — only when no Steam copy was found, and only on Windows.</li>
+</ol>
+<p>Resource caches that are not playable maps (<code>shared.map</code>, <code>campaign.map</code>, <code>single_player_shared.map</code>, <code>bitmaps.map</code>, <code>sounds.map</code>, <code>loc.map</code>, <code>mainmenu.map</code>) are skipped. A Workshop item is only listed if its <code>ModInfo.json</code> says it is a Halo: Reach or Halo 4 mod (items for other MCC games are ignored).</p>
+<p>Maps are shown by their <strong>scenario name</strong> (for example <code>forge_halo</code>, <code>45_aftship</code>), not by the in-game display name. Workshop maps carry a <code>[Workshop &lt;item id&gt;]</code> suffix and Halo 4 maps a <code>[Halo 4]</code> suffix. Forge canvases (<code>forge…</code>) sort first, then the rest alphabetically.</p>
+<div class="tablewrap"><table>
+<tr><th>Map</th><th>File name</th><th>Map</th><th>File name</th></tr>
+<tr><td>Forge World</td><td><code>forge_halo</code></td><td>Boardwalk</td><td><code>50_panopticon</code></td></tr>
+<tr><td>Zealot</td><td><code>45_aftship</code></td><td>Countdown</td><td><code>45_launch_station</code></td></tr>
+<tr><td>Sword Base</td><td><code>20_sword_slayer</code></td><td>Reflection</td><td><code>52_ivory_tower</code></td></tr>
+<tr><td>Powerhouse</td><td><code>30_settlement</code></td><td>Spire</td><td><code>35_island</code></td></tr>
+<tr><td>Boneyard</td><td><code>70_boneyard</code></td><td>Battle Canyon (Anniversary)</td><td><code>cex_beaver_creek</code></td></tr>
+</table></div>
+<p>Run <code>hms-app --dump-maps</code> from a terminal to print every detected map with its id, group and full path (see <a href="headless.html#dump-maps">Headless / CLI</a>).</p>
+
+<h2 id="groups">Map picker groups</h2>
+<ul>
+  <li><strong>Built-in (N)</strong> — every <code>.map</code> in the game's own <code>haloreach\maps</code> folder. This includes the Anniversary <code>cex_*</code> maps and any copies you have dropped into that folder yourself: the grouping is purely by folder.</li>
+  <li><strong>Modded (N)</strong> — maps found under the Steam Workshop folder.</li>
+  <li><strong>Halo 4 (experimental) (N)</strong> — Halo 4 caches from <code>halo4\maps</code> and Halo 4 Workshop items. Only shown when at least one exists. See <a href="halo4.html">Halo 4 (experimental)</a>.</li>
+</ul>
+
+<h2 id="loading">Loading a map</h2>
+<p>Select a map in the drop-down and press <strong>Load selected map</strong>. <strong>Reload</strong> re-opens the cache and rebuilds everything; <strong>Reload forge</strong> rebuilds only the Forge objects and keeps the level geometry. The bottom bar shows <em>Loading map… N%</em>. On Forge World the first load takes several seconds and a few gigabytes of RAM while textures are decoded.</p>
+<p>The <em>Add Object</em> palette in the left panel is filled from the loaded map's Forge palette (its "sandbox" palette), grouped by Forge category, with a filter box and a 3D preview of the selected item.</p>
+
+<h2 id="variants">Forge map variants (.mvar)</h2>
+<p>A map variant is the file Halo: Reach writes when you save a Forge map: it lists the placed objects (up to 651) with their position, rotation, team, colour, label, spawn settings, boundaries and so on, plus a title, description, author and a table of Forge labels. Halo Map Studio reads and writes the Reach format (<code>mvar</code> chunk version 31). Halo 4 variants (version 50) can be opened read-only.</p>
+
+<h2 id="where">Where MCC keeps variants</h2>
+<div class="tablewrap"><table>
+<tr><th>Location</th><th>Contents</th></tr>
+<tr><td><code>&lt;MCC&gt;\haloreach\map_variants\</code></td><td>Variants shipped with the game (for example the Forge World variants such as Asylum).</td></tr>
+<tr><td><code>&lt;MCC&gt;\haloreach\hopper_map_variants\</code></td><td>Matchmaking variants shipped with the game.</td></tr>
+<tr><td><code>%USERPROFILE%\AppData\LocalLow\MCC\LocalFiles\&lt;XUID&gt;\HaloReach\Map\</code></td><td><strong>Your own Forge saves.</strong> <code>&lt;XUID&gt;</code> is a long numeric folder per Xbox Live profile. A <code>temp\</code> subfolder holds temporary saves.</td></tr>
+<tr><td>Linux (Proton): <code>…/steamapps/compatdata/976730/pfx/drive_c/users/steamuser/AppData/LocalLow/MCC/LocalFiles/&lt;XUID&gt;/HaloReach/Map/</code></td><td>The same folder inside the Proton prefix.</td></tr>
+</table></div>
+<p>All of these appear as quick links in the variant browser's <em>Game</em> section (🎮 <code>map_variants</code>, 🏆 <code>hopper_map_variants</code>, 👤 <code>HaloReach · &lt;profile&gt;</code>). Only folders that exist and contain at least one <code>.mvar</code> are listed. If your saves live elsewhere, set <code>HMS_MCC_LOCALFILES</code> to one or more <code>MCC\LocalFiles</code> roots (separated by <code>;</code>), or just navigate there in the browser.</p>
+
+<h2 id="open">Opening a variant</h2>
+<ol>
+  <li><strong>File ▸ Open .mvar…</strong> opens the built-in file browser (it is not the OS dialog): back/forward/up/refresh buttons, an editable path box, a search field, and a sidebar with <em>Bookmarks</em> (add the current folder with ＋), <em>Game</em> quick links, <em>System</em> folders, <em>Volumes</em> and <em>Recent</em>. Columns can be sorted by name, date or size.</li>
+  <li>Single-click a file to preview its <strong>Title, Author, Editor and Description</strong> before opening. Double-click or press <strong>📂 Open</strong>.</li>
+  <li>If the variant belongs to a different map than the one loaded, the app loads that base map first (matched by the map id stored in the variant) and then places the objects. If the base map is not installed the variant is rendered best-effort on whatever map is loaded.</li>
+  <li>The camera jumps to one of the variant's initial spawn points, facing the way a player would.</li>
+</ol>
+<p>The status line then reads for example <code>asylum.mvar: 458 forge objects (0 unresolved …) in 312 ms</code>. "Unresolved" objects are entries the app could not match to the map's Forge palette; they are not displayed but still occupy their slots and are preserved on save. Details are written to <code>hms_mvar_diag.txt</code> next to the executable.</p>
+<p>The left panel shows the objects of the open variant as a searchable list (search by type, name, label or <code>#slot</code>): click to select, <kbd>Ctrl</kbd>/<kbd>Shift</kbd>-click for multi-selection, double-click to fly the camera to the object. <strong>Clear</strong> removes the rendered variant objects from the scene.</p>
+
+<h2 id="info">Variant info and Forge labels</h2>
+<p>With a variant open, the <em>Map Variant (.mvar)</em> section has two collapsible groups:</p>
+<ul>
+  <li><strong>Variant Info</strong> — <em>Name</em>, <em>Description</em>, <em>Author</em> and <em>Editor</em> (the "created by" / "modified by" gamertags, 16 characters max). Edits are written by the next Save.</li>
+  <li><strong>Forge labels</strong> — the variant's label table (the names you assign to objects for game types, such as <code>ctf_flag_return</code>). You can rename, delete (🗑) and add labels; new labels can also be created straight from the Object panel.</li>
+</ul>
+
+<h2 id="new">New variant</h2>
+<p><strong>File ▸ New variant</strong> starts an empty variant for the loaded map. Because an <code>.mvar</code> needs a valid header for that specific map, the app copies the header of the smallest existing variant it can find for the same map id (from <code>map_variants</code>, <code>hopper_map_variants</code> or the last folder you opened). Set the name and description, place objects, then <em>Save</em> — the first save asks for a file name.</p>
+
+<h2 id="save">Saving</h2>
+<div class="danger"><p><strong>File ▸ Save overwrites the open <code>.mvar</code> in place and does not create a backup.</strong> Use <em>File ▸ Save As…</em> to write a new file, or copy the original first. Never save over a file while the game has it open.</p></div>
+<p>What a save does:</p>
+<ul>
+  <li>Every part of the file that is not the object list (the BLF container chunks, the header, the title/description/author unless you edited them, the label table unless you edited it) is copied byte-for-byte from the original.</li>
+  <li>Objects are written in the editor's order into slots 0…N. Objects you did not touch round-trip bit-exactly; rotations are only re-quantised for objects you actually rotated. Deleted objects free their slots; if a deleted object was the parent of another, the child is left without a parent.</li>
+  <li>Objects the app could not display are still written back unchanged.</li>
+  <li>The per-type quota table is updated (<em>placed on map</em> recounted; <em>max</em> raised if you exceeded it).</li>
+  <li>New objects whose palette entry cannot be resolved are dropped, and the status line tells you how many.</li>
+</ul>
+<p>The status line confirms with <code>Saved N objects → file.mvar</code>. Halo 4 variants are read-only; Save is disabled for them.</p>
+<p>The <strong>Scale converter</strong> (<em>Tools ▸ Scale converter…</em>) is a related utility: it rewrites the spawn-sequence encoding of every <code>SCALE</code>-labelled object from one community scaling convention (1×, 33×, 71×, 47× or 330×) to another. Only the spawn sequence changes; save afterwards to persist it.</p>
+
+<h2 id="budget">The 651-object budget</h2>
+<p>A Reach variant has exactly 651 object slots. The bottom-right of the window shows <code>Objects: N / 651</code> (yellow at 90 %, red when full). Objects that are in the file but not displayed still count. When the variant is full, newly placed objects cannot be saved: the status line reports how many had no free slot.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>
