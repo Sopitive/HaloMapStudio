@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Halo Map Studio — Halo Map Studio</title>
+<meta name="description" content="A standalone map viewer and Forge editor for Halo: Reach (MCC, PC) with engine-faithful rendering, .mvar editing, a scripting language and headless rendering.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html" class="cur" aria-current="page">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/halo-map-studio-rust/releases">Releases</a> · <a href="https://github.com/Sopitive/halo-map-studio-rust">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Halo Map Studio -->
+<!-- desc: A standalone map viewer and Forge editor for Halo: Reach (MCC, PC) with engine-faithful rendering, .mvar editing, a scripting language and headless rendering. -->
+<h1>Halo Map Studio</h1>
+<p class="lead">A standalone map viewer and Forge editor for <strong>Halo: Reach</strong> in <em>The Master Chief Collection</em> (PC). It reads your installed game's map files directly, renders them with the engine's own lighting, materials and effects, and lets you open, edit and save Forge map variants (<code>.mvar</code>) without launching the game.</p>
+
+<p>
+  <a class="btn" href="https://github.com/Sopitive/halo-map-studio-rust/releases">Download (GitHub Releases)</a>
+  <a class="btn alt" href="getting-started.html">Getting started</a>
+  <a class="btn alt" href="scripting.html">Scripting reference</a>
+</p>
+
+<figure class="hero">
+  <img src="assets/forge-world.jpg" alt="Forge World rendered in Halo Map Studio: a grassy cliff with pine trees above the lagoon, snowy mountains behind" width="1280" height="720">
+  <figcaption>Forge World, rendered headless by Halo Map Studio (<code>HMS_MAP=forge_halo</code>).</figcaption>
+</figure>
+
+<h2>What it does</h2>
+<div class="cards">
+  <div class="card"><h3><a href="maps-and-variants.html">Browse every installed map</a></h3><p>Built-in maps, Steam Workshop maps and (experimentally) Halo 4 caches are found automatically from your Steam library.</p></div>
+  <div class="card"><h3><a href="maps-and-variants.html#variants">Open and save Forge variants</a></h3><p>Open any <code>.mvar</code> (shipped, matchmaking or your own MCC saves), edit objects and their Forge properties, and write it back.</p></div>
+  <div class="card"><h3><a href="editing.html">Blender-style editing</a></h3><p>Grab / rotate / duplicate with <kbd>G</kbd> <kbd>R</kbd> <kbd>Shift+D</kbd>, axis locks, surface magnet, gizmos, mass edit and full undo.</p></div>
+  <div class="card"><h3><a href="editing.html#cad">Construction (CAD) tools</a></h3><p>Dotted guides, circles and squares, face-to-face mating, anchors, mirroring and "fill an edge with N copies".</p></div>
+  <div class="card"><h3><a href="rendering.html">Engine-faithful rendering</a></h3><p>Baked lightmaps, auto-exposure, bloom, fog, water, particles and sky are decoded from the map's own tags. Optional real-time probe GI and a path-traced bake.</p></div>
+  <div class="card"><h3><a href="scripting.html">Scripting &amp; automation</a></h3><p>A small command language for placing and editing objects, driving the camera and taking screenshots — from the in-app console, a script file, or an MCP server for LLM agents.</p></div>
+  <div class="card"><h3><a href="headless.html">Headless rendering</a></h3><p>Render any map or variant to a PNG from the command line, with no window, for batch screenshots.</p></div>
+  <div class="card"><h3><a href="halo4.html">Halo 4 (experimental)</a></h3><p>View-only rendering of Halo 4 maps with baked lightmaps, scenario objects and read-only map variants.</p></div>
+</div>
+
+<h2>Screenshots</h2>
+<div class="gallery">
+  <figure><img src="assets/asylum-variant.jpg" alt="The Asylum Forge variant on Forge World, showing placed Forge pieces on the cliff top" loading="lazy"><figcaption>The shipped <em>Asylum</em> variant opened on Forge World — variant objects rendered and lit in place.</figcaption></figure>
+  <figure><img src="assets/zealot.jpg" alt="Zealot, a purple Covenant interior with a central column" loading="lazy"><figcaption>Zealot (<code>45_aftship</code>).</figcaption></figure>
+  <figure><img src="assets/countdown.jpg" alt="Countdown, a dark launch bay with yellow markings and white lights" loading="lazy"><figcaption>Countdown (<code>45_launch_station</code>).</figcaption></figure>
+  <figure><img src="assets/boardwalk.jpg" alt="Boardwalk, a New Alexandria tram station with city towers behind" loading="lazy"><figcaption>Boardwalk (<code>50_panopticon</code>).</figcaption></figure>
+  <figure><img src="assets/forge-world-waterfall.jpg" alt="Forge World waterfall cascading into the lagoon" loading="lazy"><figcaption>Forge World waterfall — effect particles are simulated from the map's effect tags.</figcaption></figure>
+  <figure><img src="assets/halo4-ravine.jpg" alt="Halo 4 Ravine, a Forge island with Forerunner spires seen from above" loading="lazy"><figcaption>Halo 4 Ravine (<code>ca_forge_ravine</code>), experimental view-only mode.</figcaption></figure>
+</div>
+<p class="small">All screenshots on this site were rendered by the tool itself with the <a href="headless.html">headless renderer</a>; none are captured from the game.</p>
+
+<h2>Requirements at a glance</h2>
+<ul>
+  <li><strong>Halo: The Master Chief Collection</strong> installed via Steam, with the Halo: Reach content. You must own the game — nothing from the game is included in the download.</li>
+  <li>A GPU with <strong>Vulkan</strong> (Linux) or <strong>DirectX 12 / Vulkan</strong> (Windows). A CPU software rasteriser is used as a last resort but is very slow.</li>
+  <li>Windows x64 or Linux x64. Loading Forge World peaks at roughly 4.5 GB of RAM and settles around 1 GB afterwards.</li>
+</ul>
+<p>See <a href="getting-started.html">Getting started</a> for installation and first launch.</p>
+
+<h2>Licence summary</h2>
+<p>Halo Map Studio is licensed under the <strong>PolyForm Noncommercial License 1.0.0</strong>: free for personal, hobby, educational and other noncommercial use. <strong>Any commercial use requires a separate commercial licence</strong> from the copyright holder. Details, examples of what counts as commercial use and how to obtain a licence are on the <a href="license.html">Licence &amp; commercial use</a> page.</p>
+
+<h2>Status</h2>
+<p>Halo Map Studio is under heavy development. The current release line is <strong>v0.1.0</strong>. The Reach viewer/editor is the focus; Halo 4 support is experimental and view-only. The user interface is being reorganised at the time of writing — pages that describe panels and menus say so at the top.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>
