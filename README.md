@@ -6,7 +6,7 @@
 A standalone map viewer and Forge editor for Halo: Reach (Master Chief
 Collection, PC). It reads your installed game's map files directly and renders
 them with the engine's own lighting, materials and effects, lets you open and
-edit Forge map variants (`.mvar`), and can drive the live game for placing
+edit Forge map variants (`.mvar`) for placing
 objects.
 
 ## Requirements
