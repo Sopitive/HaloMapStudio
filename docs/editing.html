@@ -45,6 +45,8 @@
 <li><a href="#modal">Grab / rotate / duplicate (modal transforms)</a></li>
 <li><a href="#magnet">Axis lock, magnet and precision</a></li>
 <li><a href="#panel">The Object panel</a></li>
+<li><a href="#flags">SCALED and SHADOW pseudo-flags</a></li>
+<li><a href="#bspwarn">Objects outside playable space</a></li>
 <li><a href="#mass">Mass edit</a></li>
 <li><a href="#undo">Undo / redo</a></li>
 <li><a href="#cad">Construction (CAD) tools</a></li>
@@ -56,15 +58,17 @@
 <ul>
   <li><strong>Left-click</strong> an object in the viewport to select it. Clicking empty level geometry clears the selection (and the status line reports the surface's material, which is handy for scripting).</li>
   <li><kbd>Shift</kbd>+click toggles an object in or out of a multi-selection.</li>
-  <li>In <em>Select</em> mode, <strong>left-drag</strong> draws a box; every object whose centre falls inside is selected (<kbd>Shift</kbd> adds to the selection).</li>
+  <li>In <em>Select</em> mode, <strong>left-drag</strong> draws a box; every object whose bounds overlap it is selected (<kbd>Shift</kbd> adds to the selection). Script: <code>select box X1 Y1 Z1 X2 Y2 Z2</code> selects by a world-space box with the same test.</li>
+  <li><strong>Hidden blocks.</strong> Some variant pieces draw nothing in-game (the invisible <em>nut_blocker</em> walls a shipped variant seals a map with): their shape is their physics hull. HMS draws that hull as an orange volume with an outline (<em>View ▸ Show hidden-block physics hulls</em>, on by default, persisted; script <code>outlines on|off</code>) and treats it as the object everywhere else too: click the hull to select the block, box-select takes every block whose hull overlaps the box, the selection wireframe is the hull, and the magnet, face mates and array duplicate use the hull's extents so copies tile edge to edge. Only pieces placed by the variant (or by you) get a hull; the map's own objects and level geometry never do.</li>
   <li><kbd>Ctrl</kbd>+<kbd>A</kbd> (or <em>Edit ▸ Select all objects</em>) selects every object; <em>Edit ▸ Deselect</em> clears.</li>
   <li><kbd>Shift</kbd>+<kbd>A</kbd> with a selection opens a small context menu at the cursor: <em>Select all of same object type</em> and <em>Simulate this object's physics</em> (for several objects: <em>Simulate physics for selection</em>).</li>
-  <li>The <strong>object list</strong> in the left panel selects too (click, <kbd>Ctrl</kbd>/<kbd>Shift</kbd> for multi, double-click to fly to the object). Its search box matches type, name, label or <code>#slot</code>.</li>
+  <li>The <strong>object list</strong> in the left panel selects too (click, <kbd>Ctrl</kbd>/<kbd>Shift</kbd> for multi, double-click to fly to the object). Each row shows the piece name, its label in quotes, its slot (<code>#12</code>, or <em>new</em> / <em>placed</em>), and the markers <code> [scaled]</code> and <code> [shadow]</code> when the object's <a href="#flags">pseudo-flags</a> are in effect. An orange <code>!</code> in front of a row means the object is <a href="#bspwarn">outside playable space</a> (hover it for the reason). The search box matches type, name, label, <code>#slot</code> and the markers (type <code>scaled</code> to list every scaled piece).</li>
   <li><kbd>Delete</kbd> / <kbd>Backspace</kbd> (or <em>Edit ▸ Delete selected</em>) deletes the selection. <em>Edit ▸ Remove all placed objects</em> clears every object from the scene, leaving the level; both are undoable.</li>
 </ul>
 
 <h2 id="place">Placing objects</h2>
-<p>Pick an item in the <em>Add Object</em> palette (use the filter box; items are grouped by Forge category) and <strong>drag it — or its 3D preview — into the viewport</strong>. The object follows the surface under the cursor (Forge objects, then level geometry, then imported geometry, then the ground plane) and drops when you release. It is placed with default Forge flags (spawns at start, both symmetries, normal physics), no team, inherited colour and no label, and is immediately editable and saveable. Placing is one undo step.</p>
+<p>Pick an item in the <em>Add Object</em> palette (use the filter box; items are grouped by Forge category) and <strong>drag it — or its 3D preview — into the viewport</strong>. The object follows the surface under the cursor (Forge objects, then level geometry, then imported geometry, then the ground plane) and drops when you release. It is placed with default Forge flags (spawns at start, both symmetries, normal physics), the <strong>neutral</strong> team (what the game gives every new Forge placement), inherited colour and no label, and is immediately editable and saveable. Placing is one undo step.</p>
+<p>The palette's 3D preview is rendered through the same object path as the viewport — the loaded map's lighting, exposure and bloom — so a piece looks in the preview the way it will look once placed. Right-drag orbits the preview, the wheel zooms it.</p>
 <p>Two multi-placement helpers live in <em>Tools ▸ Placement tools</em> (pick a palette item first):</p>
 <ul>
   <li><strong>Line tool</strong> — click a start point, then an end point: <em>count</em> copies (2–64) are placed evenly along the line.</li>
@@ -96,7 +100,7 @@
 <tr><td><kbd>Enter</kbd> or left-click</td><td>Confirm.</td></tr>
 <tr><td><kbd>Esc</kbd> or right-click</td><td>Cancel — poses are restored and duplicates removed.</td></tr>
 </table></div>
-<p>Pressing <kbd>G</kbd> or <kbd>R</kbd> during an operation switches to that operation. The OS cursor is hidden and confined to the window while a transform is active. Each confirmed transform is a single undo step.</p>
+<p>Pressing <kbd>G</kbd> or <kbd>R</kbd> during an operation switches to that operation. The OS cursor is hidden and captured while a transform is active (locked in place on Windows and Wayland, confined to the window on X11), and again while you fly with the right mouse button. Each confirmed transform is a single undo step.</p>
 
 <h2 id="magnet">Axis lock, magnet and precision</h2>
 <ul>
@@ -107,14 +111,15 @@
 </ul>
 
 <h2 id="panel">The Object panel</h2>
-<p>A floating <em>Object</em> window appears on the right whenever something is selected. Its header shows the object's datum id, position and Forge index. For a Forge object it shows the item's name and label and a grid of editable Forge properties:</p>
+<p>A floating <em>Object</em> window appears on the right whenever something is selected. Its header shows the object's datum id, position and Forge index. An orange <strong>! Outside playable space</strong> strip appears above the properties when the selected object (or any object in a multi-selection: <em>! 2 of 5 selected objects are outside playable space</em>) sits in a non-playable part of the map — see <a href="#bspwarn">below</a>; it follows the object live while you drag it. For a Forge object it shows the item's name and label, the <em>obje</em> tag behind the palette item (hover for its class and tag id) and a grid of editable Forge properties. Clicking a piece that belongs to the map itself (a scenery lamp post, a machine, a crate…) shows what it is instead of an editable record: <em>Map object (scenery): Lamp Post</em> with its full tag path, class, tag id, scenario placement index and position, all read-only; the status bar says the same on every click (<code>Selected 0xE0000012 objects\levels\multi\…\lamp_post (scenery, tag 0x1ac4, scnr #18)</code>). A small <strong>Copy tag path</strong> button puts the tag path on the clipboard, and hovering a row in the objects list shows the same identity.</p>
 <div class="tablewrap"><table>
 <tr><th>Row</th><th>Meaning</th></tr>
 <tr><td><code>quota/variant</code></td><td>The palette folder (0–255) and item (0–31) indices that identify the piece.</td></tr>
-<tr><td><code>team</code></td><td><em>none</em>, or red, blue, green, orange, purple, yellow, brown, pink, neutral.</td></tr>
+<tr><td><code>team</code></td><td>A drop-down of colour swatches: <em>neutral (no team)</em> first — the game's own team for every new placement and what "no team" means in the Forge menu — then red, blue, green, orange, purple, yellow, brown, pink, and <em>none (unset)</em> last (the file's distinct "unset" value, −1). New objects start neutral.</td></tr>
 <tr><td><code>color</code></td><td><em>inherit (use team)</em> or one of eight colours.</td></tr>
 <tr><td><code>cached type</code></td><td>Engine object kind: none, weapon, grenade, teleporter 2-way / sender / receiver, location — or a raw 0–31 value.</td></tr>
 <tr><td><code>spawn seq</code></td><td>Spawn sequence (−100…100). For objects labelled <code>scale</code> the implied visual scale (× N) is shown live.</td></tr>
+<tr><td><code>flags</code></td><td>Two checkboxes, <strong>SCALED</strong> and <strong>SHADOW</strong>, each tagged <em>(auto)</em> while it follows its rule or <em>(set)</em> once you have overridden it. Right-click a box to go back to automatic. See <a href="#flags">below</a>.</td></tr>
 <tr><td><code>respawn (s)</code></td><td>Respawn time in seconds.</td></tr>
 <tr><td><code>label</code></td><td>Pick an existing Forge label, or type a name and press <strong>＋ name</strong> to create and assign a new one.</td></tr>
 <tr><td><code>parent</code></td><td>Attach the object to another object (by slot).</td></tr>
@@ -127,11 +132,30 @@
 </table></div>
 <p>Below the grid the panel lists the object's material (diffuse and emissive bitmap tags, blend mode) for reference. Every property edit is undoable.</p>
 
+<h2 id="flags">SCALED and SHADOW pseudo-flags</h2>
+<p>Two per-object switches control how the <em>viewer</em> treats a piece. They are <strong>pseudo-flags</strong>: the <code>.mvar</code> format has no field for them, so they are never written to the variant; your overrides are stored in the project file (<code>.mmsproj</code>) instead and restored when you open the project.</p>
+<div class="tablewrap"><table>
+<tr><th>Flag</th><th>Automatic rule</th><th>Effect when on</th></tr>
+<tr><td><strong>SCALED</strong></td><td>On when the object's Forge label is <code>scale</code>.</td><td>The spawn sequence is read as an X330 size multiplier and the piece renders at that size (the objects list shows <code> [scaled]</code>).</td></tr>
+<tr><td><strong>SHADOW</strong></td><td>On for the shadow-casting gametype rule: <strong>GREEN team + <code>scale</code> label</strong>.</td><td>The piece is drawn into the sun shadow map, so it casts a shadow over the ground and other objects (<code> [shadow]</code> in the list). Vehicles, weapons and the other engine-default casters always cast regardless.</td></tr>
+</table></div>
+<p>In the Object panel each checkbox shows the <em>effective</em> state and is tagged <em>(auto)</em> or <em>(set)</em>; clicking sets an explicit override, right-clicking clears it back to automatic. With several objects selected a box whose objects disagree draws as indeterminate, and a click applies to every selected object. Scripts: <code>set &lt;datum&gt; scaled on|off|default</code>, <code>set selection shadow on</code>, <code>flags</code>.</p>
+<p>Two <strong>global switches</strong> in <em>Settings ▸ Lighting &amp; rendering… ▸ Camera, render &amp; display</em> sit above the per-object flags: <em>Scaled objects</em> (off = every object at x1) and <em>Shadow casters (Forge)</em> (off = only the engine's default casters cast). Both default to on and are remembered between runs; the line under them counts how many objects are currently scaled / casting. When either global is off the Object panel's flags row shows a <em>global: …</em> reminder. Scripts: <code>scale on|off</code>, <code>shadowcasters on|off</code>; batch renders: <code>HMS_SCALED</code>, <code>HMS_SHADOWCASTERS</code>.</p>
+
+<h2 id="bspwarn">Objects outside playable space</h2>
+<p>A map's structure BSPs carry a flag "not normally playable space in multiplayer". An object placed inside such a BSP may be pushed back inside the map by the game when the session cycles, so the editor warns about it in three places:</p>
+<ul>
+  <li>the orange <code>!</code> glyph in the objects list and the orange strip at the top of the Object panel (both follow the object's live position);</li>
+  <li>the <strong>save-time window</strong>: <em>File ▸ Save</em> and <em>Save As…</em> first check every variant and placed object. If any are outside, the save is held and an <em>Objects outside playable space</em> window lists them (piece, label, slot, BSP index and name, position). <strong>Double-click a row</strong> to select that object and fly the camera to it (the window closes and nothing is saved); <strong>Save anyway</strong> / <strong>Save As anyway</strong> proceeds with the held save; <strong>Cancel</strong> drops it. Objects you move back inside disappear from the list;</li>
+  <li>the script <code>bspwarn list</code>, which prints the map's BSP flags and the same object list; a scripted <code>save</code> never blocks but appends a warning to its output.</li>
+</ul>
+<p>Maps without any flagged BSP never warn.</p>
+
 <h2 id="mass">Mass edit</h2>
 <p>When several objects are selected the panel header turns orange: <em>Forge object — editing N objects</em>. The panel shows the first object's values; <strong>only the field you change is applied to the other selected objects</strong> — untouched fields keep each object's own value. Position is applied as a delta so the group keeps its layout, and rotation angles are applied to each object. Name, slot and parent are never copied. The same per-field behaviour is available in scripts as <code>set selection &lt;field&gt; &lt;value&gt;</code>.</p>
 
 <h2 id="undo">Undo / redo</h2>
-<p><kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes, <kbd>Ctrl</kbd>+<kbd>Y</kbd> or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redoes (also in the <em>Edit</em> menu). The stack holds 64 steps. Undoable: moves, rotations, duplicates, gizmo drags, drag-placing, deleting, every Object-panel edit, mass edits, CAD mates/anchors/mirrors, construction shapes, "simulate physics", Line/Fill placements and each script run (a whole run is one step). <strong>Not</strong> undoable: creating or deleting construction guides, variant name/description/label-table edits, lighting settings and camera moves.</p>
+<p><kbd>Ctrl</kbd>+<kbd>Z</kbd> undoes, <kbd>Ctrl</kbd>+<kbd>Y</kbd> or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> redoes (also in the <em>Edit</em> menu). The stack holds 64 steps. Undoable: moves, rotations, duplicates, gizmo drags, drag-placing, deleting, every Object-panel edit, mass edits, CAD mates/anchors/mirrors, construction shapes, "simulate physics", Line/Fill placements, nudges, pseudo-flag changes and each script run (a whole run is one step; scripts can also call <code>undo</code> / <code>redo</code> themselves). <strong>Not</strong> undoable: creating or deleting construction guides, variant name/description/label-table edits, lighting settings and camera moves.</p>
 
 <h2 id="cad">Construction (CAD) tools</h2>
 <p>Press <kbd>C</kbd> (or <em>Tools ▸ Construction (CAD)…</em>) to enter the Construct tool. The <em>Construction (CAD)</em> window opens with an operation picker:</p>
@@ -164,7 +188,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

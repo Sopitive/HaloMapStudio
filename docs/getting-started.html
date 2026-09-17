@@ -82,8 +82,8 @@
 <h2 id="layout">The main window</h2>
 <div class="warn"><p><strong>UI is being reorganised.</strong> The layout below is the target layout of the current development branch; labels and screenshots may lag the build you have.</p></div>
 <ul>
-  <li><strong>Menu bar:</strong> <em>File</em> (variants and projects), <em>Edit</em> (undo/redo, select all, deselect, delete, remove all placed objects), <em>View</em> (frame selected object, screenshot, Construction panel, Script console), <em>Tools</em> (placement Line/Fill tools, Scale converter, Light bake map, Construction (CAD), Model Painter, Import geometry, Script console), <em>Settings</em> (Lighting &amp; rendering…), <em>Help</em> (Keyboard shortcuts…). The open variant's file name is shown at the right of the bar.</li>
-  <li><strong>Left panel:</strong> the map picker, the <em>Map Variant (.mvar)</em> section (variant info, Forge labels), a searchable list of the objects in the open variant, the <em>Add Object</em> palette with a 3D preview you can drag into the scene, and the camera fly-speed slider.</li>
+  <li><strong>Menu bar:</strong> <em>File</em> (variants and projects), <em>Edit</em> (undo/redo, select all, deselect, delete, remove all placed objects), <em>View</em> (frame selected object, screenshot, Construction panel, Script console, Show map spawn points, Show physics outlines), <em>Tools</em> (placement Line/Fill tools, Scale converter, Light bake map, Construction (CAD), Model Painter, Import geometry, Script console), <em>Settings</em> (Lighting &amp; rendering…), <em>Help</em> (Keyboard shortcuts…). The open variant's file name is shown at the right of the bar.</li>
+  <li><strong>Left panel:</strong> the map picker, the <em>Map Variant (.mvar)</em> section (variant info, Forge labels), a searchable list of the objects in the open variant, and the <em>Add Object</em> palette with a 3D preview (lit like the viewport) you can drag into the scene. The fly-speed slider is in <em>Settings ▸ Lighting &amp; rendering…</em>.</li>
   <li><strong>Viewport:</strong> the 3D view with a small floating toolbar (Select / Move / Rotate / Construct) in the top-left corner.</li>
   <li><strong>Object window:</strong> a floating properties panel on the right that appears when something is selected.</li>
   <li><strong>Status bars:</strong> a one-line status message and, below it, the load progress plus the object budget (<code>Objects: N / 651</code>).</li>
@@ -101,8 +101,10 @@
 <tr><td><code>project.mmsproj</code></td><td>The single "quick-save" slot (<em>File ▸ Quick-save session</em> / <em>Restore last session</em>, also the Quick-save / Restore buttons). A project stores the map path, camera position and an informational object list; it is JSON.</td></tr>
 <tr><td><code>last_map.txt</code>, <code>last_variant.txt</code></td><td>What to reopen on the next launch.</td></tr>
 <tr><td><code>browser_bookmarks.txt</code></td><td>Bookmarked folders in the variant browser, one path per line.</td></tr>
+<tr><td><code>forge_fx.txt</code>, <code>scaled_objects.txt</code>, <code>shadow_casters.txt</code></td><td>The Settings window's <em>Forge special FX</em>, <em>Scaled objects</em> and <em>Shadow casters (Forge)</em> switches (<code>1</code> / <code>0</code>; missing = on).</td></tr>
+<tr><td><code>map_spawns.txt</code>, <code>physics_outlines.txt</code></td><td>The View menu's <em>Show map spawn points</em> and <em>Show physics outlines</em> overlays (<code>1</code> / <code>0</code>; missing = off).</td></tr>
 </table></div>
-<p>Named projects can be saved anywhere with <em>File ▸ Save Project As…</em> (<code>.mmsproj</code>) and reopened with <em>File ▸ Open Project…</em>; once a project has a name, <em>File ▸ Save Project (name)</em> re-saves it without a dialog. Opening a project restores the camera and reloads its map. Lighting and render toggles are <strong>not</strong> persisted between runs.</p>
+<p>Named projects can be saved anywhere with <em>File ▸ Save Project As…</em> (<code>.mmsproj</code>) and reopened with <em>File ▸ Open Project…</em>; once a project has a name, <em>File ▸ Save Project (name)</em> re-saves it without a dialog. Opening a project restores the camera, reloads its map and variant, and restores any per-object SCALED / SHADOW overrides (they are not part of the <code>.mvar</code>). Lighting sliders and the geometry toggles are <strong>not</strong> persisted between runs; the five switches listed above are.</p>
 
 <h2 id="files">Files written next to the executable</h2>
 <div class="tablewrap"><table>
@@ -117,7 +119,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

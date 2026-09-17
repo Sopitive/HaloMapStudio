@@ -99,7 +99,7 @@
   <li><strong>File ▸ Open .mvar…</strong> opens the built-in file browser (it is not the OS dialog): back/forward/up/refresh buttons, an editable path box, a search field, and a sidebar with <em>Bookmarks</em> (add the current folder with ＋), <em>Game</em> quick links, <em>System</em> folders, <em>Volumes</em> and <em>Recent</em>. Columns can be sorted by name, date or size.</li>
   <li>Single-click a file to preview its <strong>Title, Author, Editor and Description</strong> before opening. Double-click or press <strong>📂 Open</strong>.</li>
   <li>If the variant belongs to a different map than the one loaded, the app loads that base map first (matched by the map id stored in the variant) and then places the objects. If the base map is not installed the variant is rendered best-effort on whatever map is loaded.</li>
-  <li>The camera jumps to one of the variant's initial spawn points, facing the way a player would.</li>
+  <li>The camera jumps to one of the variant's initial spawn points, facing the way a player would. The base map's own spawn markers stay hidden unless <em>View ▸ Show map spawn points</em> is on.</li>
 </ol>
 <p>The status line then reads for example <code>asylum.mvar: 458 forge objects (0 unresolved …) in 312 ms</code>. "Unresolved" objects are entries the app could not match to the map's Forge palette; they are not displayed but still occupy their slots and are preserved on save. Details are written to <code>hms_mvar_diag.txt</code> next to the executable.</p>
 <p>The left panel shows the objects of the open variant as a searchable list (search by type, name, label or <code>#slot</code>): click to select, <kbd>Ctrl</kbd>/<kbd>Shift</kbd>-click for multi-selection, double-click to fly the camera to the object. <strong>Clear</strong> removes the rendered variant objects from the scene.</p>
@@ -124,7 +124,7 @@
   <li>The per-type quota table is updated (<em>placed on map</em> recounted; <em>max</em> raised if you exceeded it).</li>
   <li>New objects whose palette entry cannot be resolved are dropped, and the status line tells you how many.</li>
 </ul>
-<p>The status line confirms with <code>Saved N objects → file.mvar</code>. Halo 4 variants are read-only; Save is disabled for them.</p>
+<p>Before writing, the app checks whether any object sits in a part of the map flagged "not normally playable space in multiplayer"; if so the save is held and a warning window lists the objects (double-click one to fly to it, or <em>Save anyway</em>) — see <a href="editing.html#bspwarn">Objects outside playable space</a>. The status line confirms with <code>Saved N objects → file.mvar</code>. Halo 4 variants are read-only; Save is disabled for them.</p>
 <p>The <strong>Scale converter</strong> (<em>Tools ▸ Scale converter…</em>) is a related utility: it rewrites the spawn-sequence encoding of every <code>SCALE</code>-labelled object from one community scaling convention (1×, 33×, 71×, 47× or 330×) to another. Only the spawn sequence changes; save afterwards to persist it.</p>
 
 <h2 id="budget">The 651-object budget</h2>
@@ -132,7 +132,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

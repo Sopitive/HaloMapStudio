@@ -37,51 +37,61 @@
 <!-- title: Keyboard shortcuts -->
 <!-- desc: Every keyboard and mouse shortcut in Halo Map Studio, generated from the application's input handlers. -->
 <h1>Keyboard shortcuts</h1>
-<p class="lead">Verified against the <strong>v0.1.0</strong> source (2026-09-16). In the app, <em>Help ▸ Keyboard shortcuts…</em> opens the same reference and is the source of truth for your build.</p>
-<div class="warn"><p><strong>UI is being reorganised.</strong> Menu names may differ in older builds. Where the in-app window and the code disagree, the difference is noted below.</p></div>
+<p class="lead">Verified against the <strong>v0.1.0</strong> source (2026-09-17). In the app, <em>Help ▸ Keyboard shortcuts…</em> opens the same reference; the tables below mirror that window row for row, and it is the source of truth for your build.</p>
+<p>Keys are ignored while a text field has focus. File, Edit, View and Tools actions live in the menu bar.</p>
 
 <h2>Camera</h2>
-<p>All movement requires the <strong>right mouse button held</strong> over the viewport.</p>
+<p>Hold the <strong>right mouse button</strong> over the viewport to fly. While you fly (and while a grab / rotate transform is active) the OS cursor is <strong>hidden and captured</strong> — locked in place on Windows and Wayland, confined to the window on X11 — so it cannot wander onto the side panels; it is released when you let go of the button.</p>
 <div class="tablewrap"><table>
 <tr><th>Keys</th><th>Action</th></tr>
-<tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td><td>Move forward / left / back / right</td></tr>
-<tr><td><kbd>E</kbd> / <kbd>R</kbd></td><td>Move up</td></tr>
-<tr><td><kbd>Q</kbd> / <kbd>F</kbd></td><td>Move down</td></tr>
-<tr><td><kbd>Shift</kbd> (hold)</td><td>Fly 4× faster</td></tr>
 <tr><td>Right-drag</td><td>Look around</td></tr>
-<tr><td><kbd>Ctrl</kbd> + wheel</td><td>Fly speed up / down</td></tr>
-<tr><td><kbd>F</kbd> (right button <em>not</em> held, no modifiers)</td><td>Frame the selected object</td></tr>
-<tr><td><kbd>F12</kbd></td><td>Screenshot to <code>captures/viewer_last.png</code></td></tr>
+<tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td><td>Fly forward / left / back / right (RMB held)</td></tr>
+<tr><td><kbd>E</kbd> or <kbd>R</kbd></td><td>Fly up (RMB held)</td></tr>
+<tr><td><kbd>Q</kbd> or <kbd>F</kbd></td><td>Fly down (RMB held)</td></tr>
+<tr><td><kbd>Shift</kbd> (hold)</td><td>4x fly speed (RMB held)</td></tr>
+<tr><td><kbd>Ctrl</kbd> + wheel</td><td>Change fly speed (viewport hovered)</td></tr>
+<tr><td><kbd>F</kbd></td><td>Fly the camera to the selected object (not flying, no text field focused)</td></tr>
+<tr><td><kbd>F12</kbd></td><td>Screenshot to the captures folder (<code>captures/viewer_last.png</code>)</td></tr>
 </table></div>
 
-<h2>Selection &amp; editing</h2>
+<h2>Selection (Select tool)</h2>
 <div class="tablewrap"><table>
 <tr><th>Keys</th><th>Action</th></tr>
-<tr><td>Left-click</td><td>Select the object under the cursor (click empty space to clear)</td></tr>
-<tr><td><kbd>Shift</kbd> + click</td><td>Add / remove an object from the multi-selection</td></tr>
-<tr><td>Left-drag (Select mode)</td><td>Box-select; <kbd>Shift</kbd> adds to the selection</td></tr>
-<tr><td><kbd>Ctrl</kbd>+<kbd>A</kbd></td><td>Select all objects</td></tr>
-<tr><td><kbd>Shift</kbd>+<kbd>A</kbd></td><td>Context menu: select all of the same type, simulate physics</td></tr>
-<tr><td><kbd>Delete</kbd> / <kbd>Backspace</kbd></td><td>Delete the selection</td></tr>
+<tr><td>Left-click</td><td>Select the object under the cursor (empty space clears)</td></tr>
+<tr><td><kbd>Shift</kbd> + click</td><td>Add / remove the object under the cursor</td></tr>
+<tr><td>Left-drag</td><td>Box-select everything inside the rectangle (<kbd>Shift</kbd> adds to the selection)</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>A</kbd></td><td>Select every variant / placed object</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>A</kbd></td><td>Object context menu at the cursor (needs a selection)</td></tr>
+<tr><td><kbd>Delete</kbd> / <kbd>Backspace</kbd></td><td>Delete the selection (undoable)</td></tr>
+<tr><td>Objects list</td><td>Click = select, <kbd>Ctrl</kbd>+click = toggle, <kbd>Shift</kbd>+click = range, double-click = fly to</td></tr>
+</table></div>
+
+<h2>Edit</h2>
+<div class="tablewrap"><table>
+<tr><th>Keys</th><th>Action</th></tr>
 <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo</td></tr>
-<tr><td><kbd>Ctrl</kbd>+<kbd>Y</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>Redo</td></tr>
+<tr><td><kbd>Ctrl</kbd>+<kbd>Y</kbd> or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></td><td>Redo</td></tr>
+<tr><td>Arrow keys</td><td>Nudge the selection on X / Y by 0.25 wu (<kbd>Shift</kbd> = 1 wu)</td></tr>
+<tr><td><kbd>PageUp</kbd> / <kbd>PageDown</kbd></td><td>Nudge the selection on Z by 0.25 wu (<kbd>Shift</kbd> = 1 wu)</td></tr>
+<tr><td><kbd>[</kbd> / <kbd>]</kbd></td><td>Yaw the selection by 15 deg (<kbd>Shift</kbd> = 45 deg)</td></tr>
 </table></div>
+<p>Nudges move the selection without entering a transform; they work on any selected variant or placed object and are undoable.</p>
 
-<h2>Modal transform (Blender-style)</h2>
-<p>Cursor over the viewport, with a selection.</p>
+<h2>Transform (Blender-style)</h2>
+<p>Viewport hovered, selection non-empty.</p>
 <div class="tablewrap"><table>
 <tr><th>Keys</th><th>Action</th></tr>
-<tr><td><kbd>G</kbd></td><td>Grab / move the selection</td></tr>
-<tr><td><kbd>R</kbd></td><td>Rotate the selection</td></tr>
-<tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Duplicate the selection and grab the copies</td></tr>
-<tr><td><kbd>X</kbd> / <kbd>Y</kbd> / <kbd>Z</kbd></td><td>Lock to an axis (press again to unlock)</td></tr>
-<tr><td><kbd>E</kbd></td><td>Toggle global / local axis space</td></tr>
-<tr><td><kbd>Ctrl</kbd> (hold)</td><td>Magnet: snap flush to the nearest face or surface</td></tr>
-<tr><td><kbd>Shift</kbd> (hold)</td><td>Precision (slower mouse response)</td></tr>
-<tr><td><kbd>Shift</kbd>+<kbd>Ctrl</kbd> (hold, after Shift+D with an axis lock)</td><td>Array: stamp flush copies along the axis</td></tr>
-<tr><td>Digits, <kbd>.</kbd>, <kbd>-</kbd></td><td>Type an exact distance (units) or angle (degrees)</td></tr>
-<tr><td><kbd>Enter</kbd> / left-click</td><td>Confirm</td></tr>
-<tr><td><kbd>Esc</kbd> / right-click</td><td>Cancel</td></tr>
+<tr><td><kbd>G</kbd></td><td>Grab / move the selection (or drag the move gizmo)</td></tr>
+<tr><td><kbd>R</kbd></td><td>Rotate the selection (or drag the rotate gizmo)</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Duplicate the selection and start moving the copies</td></tr>
+<tr><td><kbd>X</kbd> / <kbd>Y</kbd> / <kbd>Z</kbd></td><td>During G/R: lock to that axis (press again to unlock)</td></tr>
+<tr><td><kbd>E</kbd></td><td>During G/R: toggle world / local axes</td></tr>
+<tr><td><kbd>Ctrl</kbd> (hold)</td><td>During G: magnet — snap the leading face flush to the nearest face</td></tr>
+<tr><td><kbd>Shift</kbd> (hold)</td><td>During G/R: precision (slow) movement</td></tr>
+<tr><td><kbd>Shift</kbd>+<kbd>Ctrl</kbd> + axis</td><td>During a Shift+D grab: array copies along the locked axis</td></tr>
+<tr><td>Digits, <kbd>-</kbd> <kbd>.</kbd></td><td>During G/R: type an exact distance (wu) / angle (deg); <kbd>Backspace</kbd> edits</td></tr>
+<tr><td>Click or <kbd>Enter</kbd></td><td>Confirm the transform</td></tr>
+<tr><td><kbd>Esc</kbd> or right-click</td><td>Cancel the transform (gizmo drags: <kbd>Esc</kbd> only)</td></tr>
 </table></div>
 
 <h2>Gizmos</h2>
@@ -94,9 +104,9 @@
 <h2>Tools</h2>
 <div class="tablewrap"><table>
 <tr><th>Keys</th><th>Action</th></tr>
-<tr><td><kbd>C</kbd></td><td>Construction (CAD) tool on / off</td></tr>
-<tr><td><kbd>G</kbd> (with a construction shape selected)</td><td>Move the shape; click to place, <kbd>Esc</kbd> to cancel</td></tr>
-<tr><td><kbd>Esc</kbd> (Construct tool)</td><td>Drop a half-drawn guide or a pending Coincident face A</td></tr>
+<tr><td><kbd>C</kbd></td><td>Construct tool on / off (construction guides &amp; CAD panel)</td></tr>
+<tr><td><kbd>G</kbd> (Construct)</td><td>Move the selected construction shape; click or <kbd>Enter</kbd> places, <kbd>Esc</kbd> cancels</td></tr>
+<tr><td><kbd>Esc</kbd> (Construct)</td><td>Drop a half-drawn guide / face pick</td></tr>
 <tr><td>Drag from the palette list or preview into the viewport</td><td>Place that object on the surface under the cursor</td></tr>
 <tr><td>In the palette preview: right-drag / wheel</td><td>Orbit / zoom the preview</td></tr>
 </table></div>
@@ -104,19 +114,20 @@
 <h2>Menus</h2>
 <div class="tablewrap"><table>
 <tr><th>Menu item</th><th>Action</th></tr>
-<tr><td><em>File ▸ Open .mvar…</em></td><td>Open a variant</td></tr>
-<tr><td><em>File ▸ Save</em> / <em>Save As…</em></td><td>Write edits back to the variant / to a new file</td></tr>
-<tr><td><em>Edit ▸ Undo / Redo / Select all objects / Deselect / Delete selected / Remove all placed objects</em></td><td>As named</td></tr>
+<tr><td><em>File ▸ New variant</em>, <em>Open .mvar…</em>, <em>Save</em>, <em>Save As…</em></td><td>Variants. A save first checks for objects outside playable space (see <a href="editing.html#bspwarn">Editing</a>).</td></tr>
+<tr><td><em>File ▸ Open Project…</em>, <em>Save Project As…</em>, <em>Save Project (name)</em>, <em>Quick-save session</em>, <em>Restore last session</em></td><td>Projects (<code>.mmsproj</code>).</td></tr>
+<tr><td><em>Edit ▸ Undo</em> (<kbd>Ctrl</kbd>+<kbd>Z</kbd>), <em>Redo</em> (<kbd>Ctrl</kbd>+<kbd>Y</kbd>), <em>Select all objects</em> (<kbd>Ctrl</kbd>+<kbd>A</kbd>), <em>Deselect</em>, <em>Delete selected</em> (<kbd>Del</kbd>), <em>Remove all placed objects</em></td><td>As named</td></tr>
 <tr><td><em>View ▸ Frame selected object</em> (<kbd>F</kbd>), <em>Screenshot</em> (<kbd>F12</kbd>), <em>Construction (CAD) panel</em>, <em>Script console</em></td><td>As named</td></tr>
+<tr><td><em>View ▸ Show map spawn points</em></td><td>Draw the base map's own built-in spawn markers (off by default; persisted). Script: <code>mapspawns on|off</code>.</td></tr>
+<tr><td><em>View ▸ Show hidden-block physics hulls</em></td><td>Draw the physics hulls of the variant's hidden (invisible) blocks (on by default; persisted). Script: <code>outlines on|off</code>.</td></tr>
+<tr><td><em>Tools ▸ Line tool</em> / <em>Fill tool</em>, <em>Scale converter…</em>, <em>Light bake map…</em>, <em>Construction (CAD)…</em> (<kbd>C</kbd>), <em>Model Painter…</em>, <em>Import geometry…</em>, <em>Script console…</em></td><td>As named</td></tr>
+<tr><td><em>Settings ▸ Lighting &amp; rendering…</em></td><td>The Settings window: <em>Lighting</em>, <em>Camera, render &amp; display</em> (including <em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em>) and <em>Advanced (diagnostics)</em> — see <a href="rendering.html">Rendering &amp; settings</a>.</td></tr>
 <tr><td><em>Help ▸ Keyboard shortcuts…</em></td><td>The in-app version of this page</td></tr>
 </table></div>
 
-<h2>Listed in the app but not functional in this build</h2>
-<p><em>Nudge</em> keys move the selection without entering a transform: arrow keys on X/Y and <kbd>PageUp</kbd>/<kbd>PageDown</kbd> on Z step by 0.25 world units, <kbd>[</kbd> / <kbd>]</kbd> turn the yaw by 15 degrees; hold <kbd>Shift</kbd> for a larger step. They work on any selected variant object and are undoable.</p>
-
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

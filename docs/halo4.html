@@ -47,7 +47,7 @@
 <ul>
   <li>Halo 4 caches are detected from <code>&lt;MCC&gt;\halo4\maps</code> and from Halo 4 Workshop items, and appear in the map picker's <strong>Halo 4 (experimental)</strong> group (only shown when at least one exists). Load one like any other map.</li>
   <li>The status line reads <em>Halo 4 (EXPERIMENTAL, view-only): &lt;map&gt; — N draws / N tris, N objects, N textures … Forge editing and variant saving are disabled for Halo 4 maps.</em></li>
-  <li><strong>File ▸ Open .mvar…</strong> accepts Halo 4 variants (the game's <code>halo4\map_variants</code> and <code>hopper_map_variants</code> folders are quick links in the browser, and your own saves are under <code>…\MCC\LocalFiles\&lt;XUID&gt;\Halo4\Map</code>). The variant's base map is loaded automatically and its objects are rendered <strong>read-only</strong>. Variant titles that the game stores as localisation keys are resolved to their display names.</li>
+  <li><strong>File ▸ Open .mvar…</strong> accepts Halo 4 variants (the game's <code>halo4\map_variants</code> and <code>hopper_map_variants</code> folders are quick links in the browser, and your own saves are under <code>…\MCC\LocalFiles\&lt;XUID&gt;\Halo4\Map</code>). The variant's base map is loaded automatically and its objects are rendered <strong>read-only</strong>; the status line counts them as <em>map-variant objects (read-only)</em>. Variant titles and descriptions that the game stores as localisation keys (<code>$h4_mvar_…</code>) are resolved to their English display names from MCC's localisation tables, so the browser shows "Settler" rather than the key.</li>
   <li>Headless rendering works the same way: <code>HMS_MAP=ca_forge_ravine HMS_SHOT=ravine.png ./hms-app</code>, with <code>HMS_MVAR</code> accepting Halo 4 variants only.</li>
 </ul>
 
@@ -63,7 +63,7 @@
 
 <h2>Not supported yet</h2>
 <ul>
-  <li>Forge editing of any kind: no selection, moving, placing or property editing of Halo 4 objects.</li>
+  <li>Forge editing of any kind: no selection, moving, placing or property editing of Halo 4 objects. The script verbs, the Object panel, the SCALED / SHADOW flags and the playable-space warning apply to Reach variants only.</li>
   <li>Saving Halo 4 variants (<em>Save</em> is disabled; the file's integrity hash cannot yet be produced).</li>
   <li>Normal and specular maps, skinned/animated poses, particles, decals, decorators (grass), collision, camera stand-off.</li>
   <li>Variants of the newer version 51 format are refused.</li>
@@ -85,7 +85,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

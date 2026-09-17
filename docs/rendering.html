@@ -40,11 +40,13 @@
 <div class="warn"><p><strong>UI is being reorganised.</strong> Every setting below is in <em>Settings ▸ Lighting &amp; rendering…</em> on the current branch; older builds spread some of them over the left panel.</p></div>
 <div class="toc"><strong>On this page</strong><ul>
 <li><a href="#lighting">Lighting</a></li>
-<li><a href="#display">Render &amp; display</a></li>
+<li><a href="#display">Camera, render &amp; display</a></li>
+<li><a href="#forge">Forge objects: special FX, scaled objects, shadow casters</a></li>
+<li><a href="#advanced">Advanced (diagnostics)</a></li>
 <li><a href="#gi">Real-time probe GI and the path-traced bake</a></li>
 <li><a href="#accuracy">How accurate is the renderer?</a></li>
 </ul></div>
-<p>The settings window has two collapsible sections, <em>Lighting</em> and <em>Render &amp; display</em>, plus an <em>Advanced (diagnostics)</em> section of read-only readouts (camera pose, map, a "rebuild forge objects" button) that you do not need for forging. Settings are not saved between runs.</p>
+<p>The settings window has two collapsible sections, <em>Lighting</em> and <em>Camera, render &amp; display</em>, plus an <em>Advanced (diagnostics)</em> section of read-only readouts that you do not need for forging. Lighting sliders and the geometry toggles are not saved between runs; the three Forge-object switches (<em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em>) and the two <em>View</em> menu overlays (<em>Show map spawn points</em>, <em>Show hidden-block physics hulls</em>) are remembered in the <a href="getting-started.html#settings">settings folder</a>.</p>
 
 <h2 id="lighting">Lighting</h2>
 <p>By default the app reproduces the game's own exposure: the map's camera-effects tag provides the auto-exposure key and the range of EV it may adapt over, and the luminance meter converges the way the engine's does. The sliders let you deviate from that for inspection.</p>
@@ -61,12 +63,13 @@
 <tr><td><em>Reset all</em></td><td></td><td>Back to the map's values.</td></tr>
 </table></div>
 
-<h2 id="display">Render &amp; display</h2>
+<h2 id="display">Camera, render &amp; display</h2>
 <div class="tablewrap"><table>
 <tr><th>Control</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><em>fly speed</em></td><td>12</td><td>Camera speed in world units per second (also <kbd>Ctrl</kbd> + wheel).</td></tr>
 <tr><td><em>Camera stand-off</em> + distance, <em>Push camera out</em>, <em>Measure</em></td><td>off, 2.0 wu</td><td>Keep the camera out of geometry — see <a href="camera.html">Camera &amp; navigation</a>.</td></tr>
 <tr><td><em>BSP</em>, <em>Terrain</em>, <em>Forge objects</em>, <em>Water</em>, <em>Sky</em></td><td>on</td><td>Show / hide each geometry pass.</td></tr>
+<tr><td><em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em></td><td>on (persisted)</td><td>See <a href="#forge">below</a>.</td></tr>
 <tr><td><em>Grid</em></td><td>off</td><td>A reference grid.</td></tr>
 <tr><td><em>Trigger volumes</em></td><td>off</td><td>Draw the map's trigger volumes.</td></tr>
 <tr><td><em>Lights</em></td><td>off</td><td>Draw the map's light sources (and enable the light-moving controls under probe GI).</td></tr>
@@ -75,6 +78,19 @@
 <tr><td><em>Path-traced lighting</em> + <em>bake quality</em></td><td>off, medium</td><td>See below.</td></tr>
 <tr><td><em>Real-time lighting (probe GI)</em></td><td>off</td><td>See below.</td></tr>
 </table></div>
+
+<h2 id="forge">Forge objects: special FX, scaled objects, shadow casters</h2>
+<div class="tablewrap"><table>
+<tr><th>Control</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><em>Forge special FX</em></td><td>on</td><td>Apply the screen effects of placed Forge special-FX objects (Colorblind, Gloomy, Juicy, Nova, Olde Timey, Pen and Ink, Dusk, Eerie, Golden Hour) the way the game composes them: identical effects do not stack, and the map's own default effect is always included. Untick to view or screenshot the map without them. Script <code>screenfx on|off</code>; headless <code>HMS_FORGE_FX=0</code>. Stored in <code>forge_fx.txt</code>.</td></tr>
+<tr><td><em>Scaled objects</em></td><td>on</td><td>Objects whose SCALED pseudo-flag is on (by default: the Forge <code>scale</code> label) render at the size their spawn sequence encodes. Off = every object at x1. Script <code>scale on|off</code>; headless <code>HMS_SCALED</code>. Stored in <code>scaled_objects.txt</code>.</td></tr>
+<tr><td><em>Shadow casters (Forge)</em></td><td>on</td><td>Objects whose SHADOW pseudo-flag is on (by default: GREEN team + <code>scale</code> label) are drawn into the sun shadow map. Off = only the engine's default casters (vehicles, weapons and so on). Script <code>shadowcasters on|off</code>; headless <code>HMS_SHADOWCASTERS</code>. Stored in <code>shadow_casters.txt</code>.</td></tr>
+</table></div>
+<p>The line under the two object switches counts how many objects are currently scaled and casting. The per-object flags themselves are set in the Object panel — see <a href="editing.html#flags">SCALED and SHADOW pseudo-flags</a>.</p>
+<p>Two related overlays live in the <em>View</em> menu rather than here, both remembered: <em>Show map spawn points</em> (the base map's built-in spawn markers, off by default; <code>map_spawns.txt</code>, script <code>mapspawns</code>, headless <code>HMS_MAP_SPAWNS=1</code>) and <em>Show hidden-block physics hulls</em> (orange physics hulls of the variant's invisible blocks, on by default; <code>physics_outlines.txt</code>, script <code>outlines</code>, headless <code>HMS_PHYSICS_OUTLINES=0</code> to hide).</p>
+
+<h2 id="advanced">Advanced (diagnostics)</h2>
+<p>Closed by default. Read-only readouts for troubleshooting: the camera pose (angles in radians), the map and variant load status, object counts (variant / placed / unresolved slots / palette entries), and for the selected object its datum, Forge index, position, mode and object tags, record (name, folder, item, slot) and first material (diffuse and emissive bitmaps, blend mode). The <em>Rebuild forge objects</em> button rebuilds the object meshes without reloading the map.</p>
 
 <h2 id="gi">Real-time probe GI and the path-traced bake</h2>
 <p>Both are optional alternatives to the map's baked lightmaps, mainly useful to preview lighting for objects or to see a map under a different sun.</p>
@@ -89,8 +105,8 @@
   <li><strong>Lightmaps</strong> — the per-map baked lighting (both the texture atlas and the per-vertex lighting used by terrain and instances) is decoded with the engine's own formulas, including the map's absolute intensity scale, so different maps are correctly bright or dark relative to each other.</li>
   <li><strong>Exposure and tone-mapping</strong> — auto-exposure uses each map's authored key and adaptation range, and the final tone curve matches the PC engine (no filmic curve). Per-map bloom and colour filters are read from the map's camera-effects tag.</li>
   <li><strong>Materials</strong> — terrain (multi-layer detail blending), opaque/detail shaders, glass, self-illumination, water (wave animation, reflections, foam and murk), the sky, foliage and decals follow the engine's shader templates, with textures decoded from the map's bitmaps (all common DXT / BC formats, including the DXN normal maps).</li>
-  <li><strong>Effects</strong> — effect particle systems (grav lifts, waterfalls, sparks, mist) are simulated on the CPU from the map's effect tags; shield doors, holograms and light volumes use the same parameters as the game.</li>
-  <li><strong>Objects</strong> — Forge pieces and scenario objects are lit the way the engine lights objects (sampling the lightmap under the object plus an air-probe term and a bounce term) so a crate in a shaded corner is darker than one in the sun.</li>
+  <li><strong>Effects</strong> — effect particle systems (grav lifts, waterfalls, sparks, mist) are simulated on the CPU from the map's effect tags; shield doors, holograms and light volumes use the same parameters as the game. The screen effects spawned by Forge special-FX objects are decoded from their tags and composed with the map's default effect using the engine's own rules and colour matrix.</li>
+  <li><strong>Objects</strong> — Forge pieces and scenario objects are lit the way the engine lights objects (sampling the lightmap under the object plus an air-probe term and a bounce term) so a crate in a shaded corner is darker than one in the sun. Forge lights and their animated colour and radius, power-ups, armor-ability pickups with their holographic icons, vehicles including their attached parts, the Tree of Life and other foliage (with the engine's cutout and translucency), decals, and the map's water categories follow the game's own tag data and shaders.</li>
   <li><strong>Sun and shadows</strong> — the sun direction comes from the map; the sun shadow map covers objects only, since the level's own sun shadowing is already baked into the lightmap, exactly as in the game.</li>
   <li><strong>Fog</strong> — atmospheric fog uses the engine's scattering model and the map's fog parameters.</li>
 </ul>
@@ -98,7 +114,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-16). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>
