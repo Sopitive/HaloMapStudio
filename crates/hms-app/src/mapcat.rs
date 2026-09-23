@@ -479,8 +479,14 @@ fn steam_install_path() -> Option<String> {
 
 #[cfg(windows)]
 fn reg_query(key: &str, value: &str) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    // The GUI is windows_subsystem="windows" (no console of its own), so spawning the console
+    // app `reg.exe` without this flag makes Windows create - and flash on screen - a console
+    // window for it. CREATE_NO_WINDOW (0x08000000) runs it with no window.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let out = std::process::Command::new("reg")
         .args(["query", key, "/v", value])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .ok()?;
     if !out.status.success() {
