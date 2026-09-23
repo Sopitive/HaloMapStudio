@@ -1,0 +1,146 @@
+/* Halo Map Studio docs — plain CSS, no framework, no external fonts. */
+:root {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --text: #1c2430;
+  --muted: #5b6675;
+  --line: #dfe4ea;
+  --accent: #1f6f8b;
+  --accent-2: #e8f2f6;
+  --code-bg: #eef1f4;
+  --warn-bg: #fff6e0;
+  --warn-line: #e6b94d;
+  --note-bg: #e9f3f7;
+  --note-line: #7fb6c8;
+  --danger-bg: #fdecec;
+  --danger-line: #d97b7b;
+  --side-w: 250px;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14181d;
+    --panel: #1b2027;
+    --text: #e6eaee;
+    --muted: #9aa5b1;
+    --line: #2c333c;
+    --accent: #6fbad3;
+    --accent-2: #1f2c34;
+    --code-bg: #232a32;
+    --warn-bg: #3a3320;
+    --warn-line: #b3903a;
+    --note-bg: #1e2c33;
+    --note-line: #4d8aa0;
+    --danger-bg: #3a2222;
+    --danger-line: #a05252;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, Ubuntu, "Helvetica Neue", Arial, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+a { color: var(--accent); }
+a:hover { text-decoration-thickness: 2px; }
+.skip { position: absolute; left: -999px; top: 0; background: var(--panel); padding: .5rem; }
+.skip:focus { left: .5rem; z-index: 10; }
+
+header.top {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: .6rem 1.2rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 5;
+}
+.brand { color: var(--text); text-decoration: none; font-weight: 700; font-size: 1.1rem; display: flex; align-items: center; gap: .55rem; }
+.logo { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 6px; background: var(--accent); color: #fff; font-weight: 800; }
+.ver { color: var(--muted); font-weight: 400; font-size: .85rem; margin-left: .3rem; }
+.navtoggle { display: none; font: inherit; padding: .3rem .8rem; border: 1px solid var(--line); background: var(--panel); color: var(--text); border-radius: 6px; }
+
+.wrap { display: flex; max-width: 1240px; margin: 0 auto; }
+nav.side {
+  flex: 0 0 var(--side-w);
+  padding: 1.2rem 1rem;
+  border-right: 1px solid var(--line);
+  position: sticky; top: 52px; align-self: flex-start; height: calc(100vh - 52px); overflow: auto;
+}
+nav.side ul { list-style: none; margin: 0; padding: 0; }
+nav.side li a { display: block; padding: .35rem .6rem; border-radius: 6px; color: var(--text); text-decoration: none; }
+nav.side li a:hover { background: var(--accent-2); }
+nav.side li a.cur { background: var(--accent); color: #fff; font-weight: 600; }
+.sidefoot { font-size: .85rem; color: var(--muted); margin-top: 1.2rem; }
+
+main { flex: 1 1 auto; min-width: 0; padding: 1.4rem 2.2rem 3rem; }
+main h1 { font-size: 2rem; line-height: 1.2; margin: .2rem 0 1rem; }
+main h2 { font-size: 1.45rem; margin: 2.2rem 0 .7rem; padding-bottom: .25rem; border-bottom: 1px solid var(--line); }
+main h3 { font-size: 1.12rem; margin: 1.6rem 0 .5rem; }
+main h4 { font-size: 1rem; margin: 1.2rem 0 .4rem; }
+p, ul, ol { margin: 0 0 1rem; }
+li { margin: .2rem 0; }
+.lead { font-size: 1.15rem; color: var(--muted); }
+
+code, kbd, pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: .92em;
+}
+code { background: var(--code-bg); padding: .1em .35em; border-radius: 4px; }
+pre {
+  background: var(--code-bg); padding: .8rem 1rem; border-radius: 8px;
+  overflow-x: auto; line-height: 1.45; margin: 0 0 1.1rem;
+}
+pre code { background: none; padding: 0; }
+kbd {
+  background: var(--panel); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 4px; padding: .05em .4em; white-space: nowrap;
+}
+
+table { border-collapse: collapse; width: 100%; margin: 0 0 1.2rem; font-size: .95rem; }
+th, td { text-align: left; vertical-align: top; padding: .45rem .6rem; border-bottom: 1px solid var(--line); }
+th { background: var(--accent-2); font-weight: 600; }
+.tablewrap { overflow-x: auto; margin-bottom: 1.2rem; }
+.tablewrap table { margin-bottom: 0; }
+td:first-child code, td:first-child kbd { white-space: nowrap; }
+
+.note, .warn, .danger {
+  padding: .7rem 1rem; border-left: 4px solid; border-radius: 6px; margin: 0 0 1.2rem;
+}
+.note { background: var(--note-bg); border-color: var(--note-line); }
+.warn { background: var(--warn-bg); border-color: var(--warn-line); }
+.danger { background: var(--danger-bg); border-color: var(--danger-line); }
+.note p:last-child, .warn p:last-child, .danger p:last-child { margin-bottom: 0; }
+
+figure { margin: 0 0 1.4rem; }
+figure img { width: 100%; height: auto; border-radius: 8px; border: 1px solid var(--line); display: block; }
+figcaption { font-size: .88rem; color: var(--muted); margin-top: .4rem; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 1rem; margin-bottom: 1.4rem; }
+.gallery figure { margin: 0; }
+.hero img { border-radius: 10px; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: .9rem; margin: 0 0 1.4rem; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: .9rem 1rem; }
+.card h3 { margin: 0 0 .3rem; font-size: 1.02rem; }
+.card p { margin: 0; color: var(--muted); font-size: .93rem; }
+.card a { text-decoration: none; }
+.btn {
+  display: inline-block; padding: .55rem 1.1rem; border-radius: 8px; background: var(--accent); color: #fff !important;
+  text-decoration: none; font-weight: 600; margin: 0 .5rem .6rem 0;
+}
+.btn.alt { background: var(--accent-2); color: var(--accent) !important; border: 1px solid var(--line); }
+.toc { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .7rem 1rem; margin-bottom: 1.4rem; font-size: .93rem; }
+.toc ul { margin: 0; padding-left: 1.2rem; columns: 2; }
+.small { font-size: .85rem; color: var(--muted); }
+.tag { display: inline-block; font-size: .75rem; padding: .05em .5em; border-radius: 999px; background: var(--accent-2); color: var(--accent); vertical-align: middle; margin-left: .3rem; }
+dl.defs dt { font-weight: 600; margin-top: .6rem; }
+dl.defs dd { margin: 0 0 .3rem 1.2rem; }
+footer.foot { margin-top: 3rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: .88rem; }
+
+@media (max-width: 860px) {
+  .navtoggle { display: inline-block; }
+  .wrap { display: block; }
+  nav.side { display: none; position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+  body.nav-open nav.side { display: block; }
+  main { padding: 1rem 1rem 2rem; }
+  .toc ul { columns: 1; }
+}

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rendering &amp; settings — Halo Map Studio</title>
+<meta name="description" content="The Lighting &amp; rendering settings window (exposure, bloom, fog, sun, probe GI, path-traced bake, display toggles) and how faithful the renderer is to the game.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html" class="cur" aria-current="page">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Rendering & settings -->
+<!-- desc: The Lighting & rendering settings window (exposure, bloom, fog, sun, probe GI, path-traced bake, display toggles) and how faithful the renderer is to the game. -->
+<h1>Rendering &amp; settings</h1>
+<div class="warn"><p><strong>UI is being reorganised.</strong> Every setting below is in <em>Settings ▸ Lighting &amp; rendering…</em> on the current branch; older builds spread some of them over the left panel.</p></div>
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#lighting">Lighting</a></li>
+<li><a href="#display">Camera &amp; rendering</a></li>
+<li><a href="#forge">Forge objects: special FX, scaled objects, shadow casters</a></li>
+<li><a href="#advanced">Advanced (diagnostics)</a></li>
+<li><a href="#gi">Real-time probe GI and the path-traced bake</a></li>
+<li><a href="#accuracy">How accurate is the renderer?</a></li>
+</ul></div>
+<p>The settings window has two collapsible sections, <em>Lighting</em> and <em>Camera &amp; rendering</em>, plus an <em>Advanced (diagnostics)</em> section of read-only readouts that you do not need for forging. Everything that switches part of the scene on or off lives in the <strong>View</strong> menu instead — see <a href="#view">what the View menu draws</a>; what stays in Settings changes how the scene is rendered (path-traced and real-time lighting) or how the camera moves. Lighting sliders and the geometry toggles are not saved between runs; the three Forge-object switches (<em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em>) and the persisted <em>View</em> menu overlays (<em>Show map spawn points</em>, <em>Show hidden-block physics hulls</em>, <em>Selection wireframe through objects</em>, <em>Soft ceilings</em>, <em>Hard floor</em>, <em>Playable BSP bounds</em>) are remembered in the <a href="getting-started.html#settings">settings folder</a>.</p>
+
+<h2 id="lighting">Lighting</h2>
+<p>By default the app reproduces the game's own exposure: the map's camera-effects tag provides the auto-exposure key and the range of EV it may adapt over, and the luminance meter converges the way the engine's does. The sliders let you deviate from that for inspection.</p>
+<div class="tablewrap"><table>
+<tr><th>Control</th><th>Range (default)</th><th>Meaning</th></tr>
+<tr><td><em>manual (auto-exposure OFF)</em></td><td>off</td><td>Freeze exposure at the <em>exposure</em> slider value instead of adapting to the scene.</td></tr>
+<tr><td><em>exposure</em></td><td>0.02 – 4 (0.669)</td><td>Fixed exposure gain (manual mode only).</td></tr>
+<tr><td><em>base gain</em></td><td>0.05 – 3 (seeded from the map)</td><td>Overall gain applied before auto-exposure.</td></tr>
+<tr><td><em>auto key</em>, <em>auto min EV</em>, <em>auto max EV</em></td><td>0.01–0.5 (0.1), −4–2 (0), 0–5 (2)</td><td>The auto-exposure target and its adaptation band, seeded from the map's camera-effects tag.</td></tr>
+<tr><td><em>meter cal</em></td><td>0.1 – 4 (1.0)</td><td>Calibration multiplier on the luminance meter.</td></tr>
+<tr><td><em>sun</em>, <em>ambient</em>, <em>lightmap</em></td><td>0 – 4 (1.0 each)</td><td>Multipliers on the three lighting terms. 1.0 = as authored.</td></tr>
+<tr><td><em>bloom</em></td><td>0 – 2 (1.0)</td><td>Multiplier on the map's authored bloom.</td></tr>
+<tr><td><em>fog density</em></td><td>0 – 0.03 (0.0025)</td><td>Atmospheric fog scale.</td></tr>
+<tr><td><em>Reset all</em></td><td></td><td>Back to the map's values.</td></tr>
+</table></div>
+
+<h2 id="display">Camera &amp; rendering</h2>
+<div class="tablewrap"><table>
+<tr><th>Control</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><em>fly speed</em></td><td>12</td><td>Camera speed in world units per second (also <kbd>Ctrl</kbd> + wheel).</td></tr>
+<tr><td><em>Camera stand-off</em> + distance, <em>Push camera out</em>, <em>Measure</em></td><td>off, 2.0 wu</td><td>Keep the camera out of geometry — see <a href="camera.html">Camera &amp; navigation</a>.</td></tr>
+<tr><td><em>Path-traced lighting</em> + <em>bake quality</em></td><td>off, medium</td><td>See below.</td></tr>
+<tr><td><em>Real-time lighting (probe GI)</em></td><td>off</td><td>See below.</td></tr>
+</table></div>
+
+<h2 id="forge">Forge objects: special FX, scaled objects, shadow casters</h2>
+<p>These three live in the <strong>View</strong> menu, under <em>Forge extras</em>.</p>
+<div class="tablewrap"><table>
+<tr><th>Control</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><em>Forge special FX</em></td><td>on</td><td>Apply the screen effects of placed Forge special-FX objects (Colorblind, Gloomy, Juicy, Nova, Olde Timey, Pen and Ink, Dusk, Eerie, Golden Hour) the way the game composes them: identical effects do not stack, and the map's own default effect is always included. Untick to view or screenshot the map without them. Script <code>screenfx on|off</code>; headless <code>HMS_FORGE_FX=0</code>. Stored in <code>forge_fx.txt</code>.</td></tr>
+<tr><td><em>Scaled objects</em></td><td>on</td><td>Objects whose SCALED pseudo-flag is on (by default: the Forge <code>scale</code> label) render at the size their spawn sequence encodes. Off = every object at x1. Script <code>scale on|off</code>; headless <code>HMS_SCALED</code>. Stored in <code>scaled_objects.txt</code>.</td></tr>
+<tr><td><em>Shadow casters (Forge)</em></td><td>on</td><td>Objects whose SHADOW pseudo-flag is on (by default: GREEN team + <code>scale</code> label) are drawn into the sun shadow map. Off = only the engine's default casters (vehicles, weapons and so on). Script <code>shadowcasters on|off</code>; headless <code>HMS_SHADOWCASTERS</code>. Stored in <code>shadow_casters.txt</code>.</td></tr>
+</table></div>
+<p>The line under the two object switches counts how many objects are currently scaled and casting. The per-object flags themselves are set in the Object panel — see <a href="editing.html#flags">SCALED and SHADOW pseudo-flags</a>.</p>
+<p>The map overlays live in the <em>View</em> menu too:</p>
+<div class="tablewrap" id="view"><table>
+<tr><th>View menu</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><em>Geometry: BSP</em>, <em>Terrain</em>, <em>Forge objects</em>, <em>Water</em>, <em>Sky</em></td><td>on</td><td>Show / hide each geometry pass: the map's structure geometry, its terrain instances, the variant's placed Forge objects, the water surfaces and the sky.</td></tr>
+<tr><td><em>Forge extras: Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em></td><td>on (persisted)</td><td>See <a href="#forge">above</a>.</td></tr>
+<tr><td><em>Grid</em></td><td>off</td><td>A reference grid through the origin.</td></tr>
+<tr><td><em>Lights</em></td><td>off</td><td>Draw the map's light sources as markers — a star per light, a spot's aim line and its range ring. Marker only: it does not change how the scene is lit, but it is what reveals the light-moving controls under probe GI.</td></tr>
+<tr><td><em>Boundary shapes</em></td><td>on</td><td>Sphere / cylinder / box zones of teleporters and objectives.</td></tr>
+<tr><td><em>Collision (selected)</em>, <em>Physics (selected)</em></td><td>off</td><td>Overlay the selected object's collision model (cyan) and physics model (orange) as a wireframe hull. Works on <strong>Reach, Halo 4 and Halo 2 Anniversary</strong>; a piece that ships no such model draws nothing (Halo 4's Forge blockers, for instance, carry only a physics model). Script: <code>collision on|off</code>, <code>physics on|off</code>.</td></tr>
+<tr><td><em>Show map spawn points</em></td><td>off (persisted)</td><td>The base map's built-in spawn markers. <code>map_spawns.txt</code>, script <code>mapspawns</code>, headless <code>HMS_MAP_SPAWNS=1</code>.</td></tr>
+<tr><td><em>Show hidden-block physics hulls</em></td><td>on (persisted)</td><td>Orange physics hulls of the variant's invisible blocks. <code>physics_outlines.txt</code>, script <code>outlines</code>, headless <code>HMS_PHYSICS_OUTLINES=0</code> to hide.</td></tr>
+<tr><td><em>Selection wireframe through objects</em></td><td>off (persisted)</td><td>Draw the selected object's wireframe THROUGH anything in front of it (the depth test is switched off for that lane), so a piece buried in the terrain or behind a wall still shows its whole outline. Off = the wireframe is hidden where geometry covers it. Independent of this switch, every selection wireframe is drawn as a near-black outline under a bright gold core, and the core is held at a fixed brightness whatever the scene exposure is doing &mdash; so it reads on a white Halo 4 Forge piece under a blown-out sky as well as in a dark interior. <code>wire_xray.txt</code>, script <code>wirexray on|off|get</code>, script-host <code>HMS_WIRE_XRAY=1</code>.</td></tr>
+<tr><td><em>Trigger volumes</em></td><td>off</td><td>The scenario's trigger volumes as wireframe boxes: red = kill, green = safe, amber = plain. Script <code>triggers on|off|get</code>.</td></tr>
+<tr><td><em>Soft ceilings (map floor)</em></td><td>off (persisted)</td><td>The invisible planes that bound the playable space — the "map floor" under Forge World, the outer walls and the sky ceiling. Each is drawn as a translucent fill plus its edges; the edges are drawn through the terrain and the water, so the floor is readable from above. Red = soft kill, orange = acceleration (pushes you back; the shipped maps checked — Forge World, Sword Base, Boneyard, Prisoner — use this kind for their floor and walls), yellow = slip surface. Hover the menu item for the per-map count. <code>soft_ceilings.txt</code>, script <code>softceilings on|off|get</code> (<code>get</code> lists every ceiling with its kind, triangle count and height range), headless <code>HMS_SOFT_CEILINGS=1</code>.</td></tr>
+<tr><td><em>Hard floor (world bounds)</em></td><td>off (persisted)</td><td>The total volume you can occupy on the map before the engine's invisible wall: the physics <em>broadphase</em> box the game builds at load from the physics bounds of <strong>every</strong> structure BSP — the sky and hidden BSPs included, which is why it reaches far past the playable area — padded by 64 world units on every side. Drawn as a magenta box with its floor gridded at the box's lowest height; the box edges show through terrain and water. That floor is where you stop when the soft ceiling is off (Forge World: -75, above the soft-ceiling floor at -147); nothing can pass the box, a loose object that leaves it is deleted, and a player who keeps falling inside it dies at terminal velocity. Hover the menu item for the box and floor height. <code>hard_floor.txt</code>, script <code>hardfloor on|off|get</code> (<code>get</code> lists every structure BSP with its bounds), headless <code>HMS_HARD_FLOOR=1</code>.</td></tr>
+<tr><td><em>Playable BSP bounds</em></td><td>off (persisted)</td><td>The smaller box: each playable structure BSP's own <em>world bounds</em> (violet box + floor), the volume the game clamps object positions to; below its floor nothing solid exists (Forge World: -25, the sea floor). <code>playable_bounds.txt</code>, script <code>playablebounds on|off|get</code>, headless <code>HMS_PLAYABLE_BOUNDS=1</code>.</td></tr>
+</table></div>
+
+<h2 id="advanced">Advanced (diagnostics)</h2>
+<p>Closed by default. Read-only readouts for troubleshooting: the camera pose (angles in radians), the map and variant load status, object counts (variant / placed / unresolved slots / palette entries), and for the selected object its datum, Forge index, position, mode and object tags, record (name, folder, item, slot) and first material (diffuse and emissive bitmaps, blend mode). The <em>Rebuild forge objects</em> button rebuilds the object meshes without reloading the map.</p>
+
+<h2 id="gi">Real-time probe GI and the path-traced bake</h2>
+<p>Both are optional alternatives to the map's baked lightmaps, mainly useful to preview lighting for objects or to see a map under a different sun.</p>
+<ul>
+  <li><strong>Real-time lighting (probe GI)</strong> keeps a grid of light probes updated on the GPU every frame (a DDGI-style probe grid with visibility). When on you get a <em>GI gain</em> slider (0.25–4, default 1.3), <em>sun yaw / pitch / intensity</em> sliders seeded from the map with <em>reset sun to map</em>, and — if <em>Lights</em> is shown — a <em>move light</em> picker that lets you drag any of the 24 nearest map lights (or move one to the camera). The info line reports the probe count, spacing and update rate. Outdoors it matches the shipped bake closely; interiors are darker than the bake.</li>
+  <li><strong>Path-traced lighting</strong> ignores the map's lightmaps and bakes a GPU path-traced global illumination of the level (a few seconds, progress bar shown). <em>bake quality</em> offers <code>direct_only</code>, <code>draft</code>, <code>low</code>, <code>medium</code>, <code>high</code> and <code>super_slow</code> (increasing samples and bounces). Untick to return to the stock lighting.</li>
+</ul>
+
+<h2 id="accuracy">How accurate is the renderer?</h2>
+<p>The renderer's goal is to show a map the way the game shows it, by decoding the same data the engine uses rather than approximating the look:</p>
+<ul>
+  <li><strong>Lightmaps</strong> — the per-map baked lighting (both the texture atlas and the per-vertex lighting used by terrain and instances) is decoded with the engine's own formulas, including the map's absolute intensity scale, so different maps are correctly bright or dark relative to each other.</li>
+  <li><strong>Exposure and tone-mapping</strong> — auto-exposure uses each map's authored key and adaptation range, and the final tone curve matches the PC engine (no filmic curve). Per-map bloom and colour filters are read from the map's camera-effects tag.</li>
+  <li><strong>Materials</strong> — terrain (multi-layer detail blending), opaque/detail shaders, glass, self-illumination, water (wave animation, reflections, foam and murk), the sky, foliage and decals follow the engine's shader templates, with textures decoded from the map's bitmaps (all common DXT / BC formats, including the DXN normal maps).</li>
+  <li><strong>Effects</strong> — effect particle systems (grav lifts, waterfalls, sparks, mist) are simulated on the CPU from the map's effect tags; shield doors, holograms and light volumes use the same parameters as the game. The screen effects spawned by Forge special-FX objects are decoded from their tags and composed with the map's default effect using the engine's own rules and colour matrix.</li>
+  <li><strong>Objects</strong> — Forge pieces and scenario objects are lit the way the engine lights objects (sampling the lightmap under the object plus an air-probe term and a bounce term) so a crate in a shaded corner is darker than one in the sun. Forge lights and their animated colour and radius, power-ups, armor-ability pickups with their holographic icons, vehicles including their attached parts, the Tree of Life and other foliage (with the engine's cutout and translucency), decals, and the map's water categories follow the game's own tag data and shaders.</li>
+  <li><strong>Sun and shadows</strong> — the sun direction comes from the map; the sun shadow map covers objects only, since the level's own sun shadowing is already baked into the lightmap, exactly as in the game.</li>
+  <li><strong>Fog</strong> — atmospheric fog uses the engine's scattering model and the map's fog parameters.</li>
+</ul>
+<p>Much of this has been checked pixel-for-pixel against frames captured from the game with the same camera. Known remaining differences (v0.1.0): some indoor mid-tones render darker than the game (the engine's wide bloom "pedestal" is only partially reproduced), instanced geometry lit by per-vertex lighting can read too dark on some maps, a few water hues and the Forge World tide pools are slightly off, and a handful of exotic shader templates fall back to a neutral material. None of this affects what is written to a variant — rendering is for viewing only.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>
