@@ -26,7 +26,7 @@
 <li><a href="rendering.html" class="cur" aria-current="page">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
-<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
@@ -40,13 +40,13 @@
 <div class="warn"><p><strong>UI is being reorganised.</strong> Every setting below is in <em>Settings ▸ Lighting &amp; rendering…</em> on the current branch; older builds spread some of them over the left panel.</p></div>
 <div class="toc"><strong>On this page</strong><ul>
 <li><a href="#lighting">Lighting</a></li>
-<li><a href="#display">Camera, render &amp; display</a></li>
+<li><a href="#display">Camera &amp; rendering</a></li>
 <li><a href="#forge">Forge objects: special FX, scaled objects, shadow casters</a></li>
 <li><a href="#advanced">Advanced (diagnostics)</a></li>
 <li><a href="#gi">Real-time probe GI and the path-traced bake</a></li>
 <li><a href="#accuracy">How accurate is the renderer?</a></li>
 </ul></div>
-<p>The settings window has two collapsible sections, <em>Lighting</em> and <em>Camera, render &amp; display</em>, plus an <em>Advanced (diagnostics)</em> section of read-only readouts that you do not need for forging. Lighting sliders and the geometry toggles are not saved between runs; the three Forge-object switches (<em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em>) and the two <em>View</em> menu overlays (<em>Show map spawn points</em>, <em>Show hidden-block physics hulls</em>) are remembered in the <a href="getting-started.html#settings">settings folder</a>.</p>
+<p>The settings window has two collapsible sections, <em>Lighting</em> and <em>Camera &amp; rendering</em>, plus an <em>Advanced (diagnostics)</em> section of read-only readouts that you do not need for forging. Everything that switches part of the scene on or off lives in the <strong>View</strong> menu instead — see <a href="#view">what the View menu draws</a>; what stays in Settings changes how the scene is rendered (path-traced and real-time lighting) or how the camera moves. Lighting sliders and the geometry toggles are not saved between runs; the three Forge-object switches (<em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em>) and the persisted <em>View</em> menu overlays (<em>Show map spawn points</em>, <em>Show hidden-block physics hulls</em>, <em>Selection wireframe through objects</em>, <em>Soft ceilings</em>, <em>Hard floor</em>, <em>Playable BSP bounds</em>) are remembered in the <a href="getting-started.html#settings">settings folder</a>.</p>
 
 <h2 id="lighting">Lighting</h2>
 <p>By default the app reproduces the game's own exposure: the map's camera-effects tag provides the auto-exposure key and the range of EV it may adapt over, and the luminance meter converges the way the engine's does. The sliders let you deviate from that for inspection.</p>
@@ -63,23 +63,17 @@
 <tr><td><em>Reset all</em></td><td></td><td>Back to the map's values.</td></tr>
 </table></div>
 
-<h2 id="display">Camera, render &amp; display</h2>
+<h2 id="display">Camera &amp; rendering</h2>
 <div class="tablewrap"><table>
 <tr><th>Control</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><em>fly speed</em></td><td>12</td><td>Camera speed in world units per second (also <kbd>Ctrl</kbd> + wheel).</td></tr>
 <tr><td><em>Camera stand-off</em> + distance, <em>Push camera out</em>, <em>Measure</em></td><td>off, 2.0 wu</td><td>Keep the camera out of geometry — see <a href="camera.html">Camera &amp; navigation</a>.</td></tr>
-<tr><td><em>BSP</em>, <em>Terrain</em>, <em>Forge objects</em>, <em>Water</em>, <em>Sky</em></td><td>on</td><td>Show / hide each geometry pass.</td></tr>
-<tr><td><em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em></td><td>on (persisted)</td><td>See <a href="#forge">below</a>.</td></tr>
-<tr><td><em>Grid</em></td><td>off</td><td>A reference grid.</td></tr>
-<tr><td><em>Trigger volumes</em></td><td>off</td><td>Draw the map's trigger volumes.</td></tr>
-<tr><td><em>Lights</em></td><td>off</td><td>Draw the map's light sources (and enable the light-moving controls under probe GI).</td></tr>
-<tr><td><em>Boundary shapes</em></td><td>on</td><td>Sphere / cylinder / box zones of teleporters and objectives.</td></tr>
-<tr><td><em>Collision (selected)</em>, <em>Physics (selected)</em></td><td>off</td><td>Overlay the collision / physics hulls of the selected objects.</td></tr>
 <tr><td><em>Path-traced lighting</em> + <em>bake quality</em></td><td>off, medium</td><td>See below.</td></tr>
 <tr><td><em>Real-time lighting (probe GI)</em></td><td>off</td><td>See below.</td></tr>
 </table></div>
 
 <h2 id="forge">Forge objects: special FX, scaled objects, shadow casters</h2>
+<p>These three live in the <strong>View</strong> menu, under <em>Forge extras</em>.</p>
 <div class="tablewrap"><table>
 <tr><th>Control</th><th>Default</th><th>Meaning</th></tr>
 <tr><td><em>Forge special FX</em></td><td>on</td><td>Apply the screen effects of placed Forge special-FX objects (Colorblind, Gloomy, Juicy, Nova, Olde Timey, Pen and Ink, Dusk, Eerie, Golden Hour) the way the game composes them: identical effects do not stack, and the map's own default effect is always included. Untick to view or screenshot the map without them. Script <code>screenfx on|off</code>; headless <code>HMS_FORGE_FX=0</code>. Stored in <code>forge_fx.txt</code>.</td></tr>
@@ -87,7 +81,23 @@
 <tr><td><em>Shadow casters (Forge)</em></td><td>on</td><td>Objects whose SHADOW pseudo-flag is on (by default: GREEN team + <code>scale</code> label) are drawn into the sun shadow map. Off = only the engine's default casters (vehicles, weapons and so on). Script <code>shadowcasters on|off</code>; headless <code>HMS_SHADOWCASTERS</code>. Stored in <code>shadow_casters.txt</code>.</td></tr>
 </table></div>
 <p>The line under the two object switches counts how many objects are currently scaled and casting. The per-object flags themselves are set in the Object panel — see <a href="editing.html#flags">SCALED and SHADOW pseudo-flags</a>.</p>
-<p>Two related overlays live in the <em>View</em> menu rather than here, both remembered: <em>Show map spawn points</em> (the base map's built-in spawn markers, off by default; <code>map_spawns.txt</code>, script <code>mapspawns</code>, headless <code>HMS_MAP_SPAWNS=1</code>) and <em>Show hidden-block physics hulls</em> (orange physics hulls of the variant's invisible blocks, on by default; <code>physics_outlines.txt</code>, script <code>outlines</code>, headless <code>HMS_PHYSICS_OUTLINES=0</code> to hide).</p>
+<p>The map overlays live in the <em>View</em> menu too:</p>
+<div class="tablewrap" id="view"><table>
+<tr><th>View menu</th><th>Default</th><th>Meaning</th></tr>
+<tr><td><em>Geometry: BSP</em>, <em>Terrain</em>, <em>Forge objects</em>, <em>Water</em>, <em>Sky</em></td><td>on</td><td>Show / hide each geometry pass: the map's structure geometry, its terrain instances, the variant's placed Forge objects, the water surfaces and the sky.</td></tr>
+<tr><td><em>Forge extras: Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em></td><td>on (persisted)</td><td>See <a href="#forge">above</a>.</td></tr>
+<tr><td><em>Grid</em></td><td>off</td><td>A reference grid through the origin.</td></tr>
+<tr><td><em>Lights</em></td><td>off</td><td>Draw the map's light sources as markers — a star per light, a spot's aim line and its range ring. Marker only: it does not change how the scene is lit, but it is what reveals the light-moving controls under probe GI.</td></tr>
+<tr><td><em>Boundary shapes</em></td><td>on</td><td>Sphere / cylinder / box zones of teleporters and objectives.</td></tr>
+<tr><td><em>Collision (selected)</em>, <em>Physics (selected)</em></td><td>off</td><td>Overlay the selected object's collision model (cyan) and physics model (orange) as a wireframe hull. Works on <strong>Reach, Halo 4 and Halo 2 Anniversary</strong>; a piece that ships no such model draws nothing (Halo 4's Forge blockers, for instance, carry only a physics model). Script: <code>collision on|off</code>, <code>physics on|off</code>.</td></tr>
+<tr><td><em>Show map spawn points</em></td><td>off (persisted)</td><td>The base map's built-in spawn markers. <code>map_spawns.txt</code>, script <code>mapspawns</code>, headless <code>HMS_MAP_SPAWNS=1</code>.</td></tr>
+<tr><td><em>Show hidden-block physics hulls</em></td><td>on (persisted)</td><td>Orange physics hulls of the variant's invisible blocks. <code>physics_outlines.txt</code>, script <code>outlines</code>, headless <code>HMS_PHYSICS_OUTLINES=0</code> to hide.</td></tr>
+<tr><td><em>Selection wireframe through objects</em></td><td>off (persisted)</td><td>Draw the selected object's wireframe THROUGH anything in front of it (the depth test is switched off for that lane), so a piece buried in the terrain or behind a wall still shows its whole outline. Off = the wireframe is hidden where geometry covers it. Independent of this switch, every selection wireframe is drawn as a near-black outline under a bright gold core, and the core is held at a fixed brightness whatever the scene exposure is doing &mdash; so it reads on a white Halo 4 Forge piece under a blown-out sky as well as in a dark interior. <code>wire_xray.txt</code>, script <code>wirexray on|off|get</code>, script-host <code>HMS_WIRE_XRAY=1</code>.</td></tr>
+<tr><td><em>Trigger volumes</em></td><td>off</td><td>The scenario's trigger volumes as wireframe boxes: red = kill, green = safe, amber = plain. Script <code>triggers on|off|get</code>.</td></tr>
+<tr><td><em>Soft ceilings (map floor)</em></td><td>off (persisted)</td><td>The invisible planes that bound the playable space — the "map floor" under Forge World, the outer walls and the sky ceiling. Each is drawn as a translucent fill plus its edges; the edges are drawn through the terrain and the water, so the floor is readable from above. Red = soft kill, orange = acceleration (pushes you back; the shipped maps checked — Forge World, Sword Base, Boneyard, Prisoner — use this kind for their floor and walls), yellow = slip surface. Hover the menu item for the per-map count. <code>soft_ceilings.txt</code>, script <code>softceilings on|off|get</code> (<code>get</code> lists every ceiling with its kind, triangle count and height range), headless <code>HMS_SOFT_CEILINGS=1</code>.</td></tr>
+<tr><td><em>Hard floor (world bounds)</em></td><td>off (persisted)</td><td>The total volume you can occupy on the map before the engine's invisible wall: the physics <em>broadphase</em> box the game builds at load from the physics bounds of <strong>every</strong> structure BSP — the sky and hidden BSPs included, which is why it reaches far past the playable area — padded by 64 world units on every side. Drawn as a magenta box with its floor gridded at the box's lowest height; the box edges show through terrain and water. That floor is where you stop when the soft ceiling is off (Forge World: -75, above the soft-ceiling floor at -147); nothing can pass the box, a loose object that leaves it is deleted, and a player who keeps falling inside it dies at terminal velocity. Hover the menu item for the box and floor height. <code>hard_floor.txt</code>, script <code>hardfloor on|off|get</code> (<code>get</code> lists every structure BSP with its bounds), headless <code>HMS_HARD_FLOOR=1</code>.</td></tr>
+<tr><td><em>Playable BSP bounds</em></td><td>off (persisted)</td><td>The smaller box: each playable structure BSP's own <em>world bounds</em> (violet box + floor), the volume the game clamps object positions to; below its floor nothing solid exists (Forge World: -25, the sea floor). <code>playable_bounds.txt</code>, script <code>playablebounds on|off|get</code>, headless <code>HMS_PLAYABLE_BOUNDS=1</code>.</td></tr>
+</table></div>
 
 <h2 id="advanced">Advanced (diagnostics)</h2>
 <p>Closed by default. Read-only readouts for troubleshooting: the camera pose (angles in radians), the map and variant load status, object counts (variant / placed / unresolved slots / palette entries), and for the selected object its datum, Forge index, position, mode and object tags, record (name, folder, item, slot) and first material (diffuse and emissive bitmaps, blend mode). The <em>Rebuild forge objects</em> button rebuilds the object meshes without reloading the map.</p>

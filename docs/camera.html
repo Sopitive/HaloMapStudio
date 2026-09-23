@@ -26,7 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
-<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
@@ -49,7 +49,7 @@
 <tr><td><kbd>Q</kbd> or <kbd>F</kbd></td><td>Down</td></tr>
 <tr><td><kbd>Shift</kbd> (hold)</td><td>4× speed boost</td></tr>
 <tr><td><kbd>Ctrl</kbd> + mouse wheel</td><td>Change fly speed (0.5 – 500 world units per second; the status line shows the new value). The plain wheel does nothing in the viewport on purpose.</td></tr>
-<tr><td><em>fly speed</em> slider (<em>Settings ▸ Lighting &amp; rendering… ▸ Camera, render &amp; display</em>)</td><td>The same setting, 0.5 – 200, default 12.</td></tr>
+<tr><td><em>fly speed</em> slider (<em>Settings ▸ Lighting &amp; rendering… ▸ Camera &amp; rendering</em>)</td><td>The same setting, 0.5 – 200, default 12.</td></tr>
 </table></div>
 <p>To copy a view into a script or a headless render, run <code>camera get</code> in the script console: it prints the position plus yaw and pitch in <strong>degrees</strong>, the units <code>camera to</code> / <code>camera lookat</code> and the headless <code>HMS_CAM</code> use. (The <em>Advanced (diagnostics)</em> section of the Settings window also shows the pose, but with the angles in radians.)</p>
 
@@ -63,7 +63,7 @@
 </ul>
 
 <h2>Camera stand-off (collision)</h2>
-<p>In <em>Settings ▸ Lighting &amp; rendering… ▸ Camera, render &amp; display</em>, tick <strong>Camera stand-off</strong> and set a distance in world units (default 2.0). The camera then keeps at least that distance from level geometry and objects while you fly, so you cannot end up inside a wall. <em>Push camera out</em> applies it once to the current position; <em>Measure</em> reports the nearest surface. Scripts expose the same solver as <code>camera standoff</code> and <code>camera clearance</code>.</p>
+<p>In <em>Settings ▸ Lighting &amp; rendering… ▸ Camera &amp; rendering</em>, tick <strong>Camera stand-off</strong> and set a distance in world units (default 2.0). The camera then keeps at least that distance from level geometry and objects while you fly, so you cannot end up inside a wall. <em>Push camera out</em> applies it once to the current position; <em>Measure</em> reports the nearest surface. Scripts expose the same solver as <code>camera standoff</code> and <code>camera clearance</code>.</p>
 
 <h2>Screenshots</h2>
 <p><kbd>F12</kbd>, the <em>📷 F12</em> button or <em>View ▸ Screenshot</em> saves the viewport to <code>captures/viewer_last.png</code> next to the executable (each shot overwrites the previous one; the camera pose is written alongside as <code>viewer_last.cam</code>). For fixed-size or batch screenshots use the <a href="headless.html">headless renderer</a> or the script <code>screenshot</code> command.</p>

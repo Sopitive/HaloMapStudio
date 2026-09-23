@@ -26,7 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
-<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
@@ -72,7 +72,7 @@
 
 <h2 id="first-launch">First launch</h2>
 <ol>
-  <li>The app scans your Steam libraries for MCC and lists every playable map in the <strong>Map</strong> section of the left panel, grouped into <em>Built-in</em>, <em>Modded</em> and (if present) <em>Halo 4 (experimental)</em>. If nothing is listed, see <a href="faq.html#no-maps">No maps detected</a>.</li>
+  <li>The app scans your Steam libraries for MCC and lists every playable map in the <strong>Map</strong> section of the left panel: first pick the <em>game</em> (<em>Reach</em>, <em>Halo 4</em>, <em>Halo 2 Anniversary</em> — only the ones you have), then <em>Built-in</em> or <em>Modded</em> within it. If nothing is listed, see <a href="faq.html#no-maps">No maps detected</a>.</li>
   <li>Pick a map from the drop-down and press <strong>Load selected map</strong>. Forge World takes a few seconds; a progress bar runs along the bottom.</li>
   <li>Hold the <strong>right mouse button</strong> in the viewport and use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> to fly (see <a href="camera.html">Camera &amp; navigation</a>).</li>
   <li>To edit a Forge map: <strong>File ▸ Open .mvar…</strong>, pick a variant, and the base map is loaded automatically if it is not already open. See <a href="maps-and-variants.html">Maps &amp; variants</a>.</li>
@@ -82,7 +82,7 @@
 <h2 id="layout">The main window</h2>
 <div class="warn"><p><strong>UI is being reorganised.</strong> The layout below is the target layout of the current development branch; labels and screenshots may lag the build you have.</p></div>
 <ul>
-  <li><strong>Menu bar:</strong> <em>File</em> (variants and projects), <em>Edit</em> (undo/redo, select all, deselect, delete, remove all placed objects), <em>View</em> (frame selected object, screenshot, Construction panel, Script console, Show map spawn points, Show physics outlines), <em>Tools</em> (placement Line/Fill tools, Scale converter, Light bake map, Construction (CAD), Model Painter, Import geometry, Script console), <em>Settings</em> (Lighting &amp; rendering…), <em>Help</em> (Keyboard shortcuts…). The open variant's file name is shown at the right of the bar.</li>
+  <li><strong>Menu bar:</strong> <em>File</em> (variants and projects), <em>Edit</em> (undo/redo, select all, deselect, delete, remove all placed objects), <em>View</em> (frame selected object, screenshot, Construction panel, Script console, then everything that is DRAWN: geometry — BSP, Terrain, Forge objects, Water, Sky; Forge extras — Forge special FX, Scaled objects, Shadow casters; overlays — Grid, Lights, Boundary shapes, Collision and Physics of the selection, Show map spawn points, hidden-block physics hulls, Selection wireframe through objects, Trigger volumes, Soft ceilings, Hard floor, Playable BSP bounds), <em>Tools</em> (placement Line/Fill tools, Scale converter, Light bake map, Construction (CAD), Model Painter, Import geometry, Script console), <em>Settings</em> (Lighting &amp; rendering…), <em>Help</em> (Keyboard shortcuts…). The open variant's file name is shown at the right of the bar.</li>
   <li><strong>Left panel:</strong> the map picker, the <em>Map Variant (.mvar)</em> section (variant info, Forge labels), a searchable list of the objects in the open variant, and the <em>Add Object</em> palette with a 3D preview (lit like the viewport) you can drag into the scene. The fly-speed slider is in <em>Settings ▸ Lighting &amp; rendering…</em>.</li>
   <li><strong>Viewport:</strong> the 3D view with a small floating toolbar (Select / Move / Rotate / Construct) in the top-left corner.</li>
   <li><strong>Object window:</strong> a floating properties panel on the right that appears when something is selected.</li>
@@ -102,7 +102,7 @@
 <tr><td><code>last_map.txt</code>, <code>last_variant.txt</code></td><td>What to reopen on the next launch.</td></tr>
 <tr><td><code>browser_bookmarks.txt</code></td><td>Bookmarked folders in the variant browser, one path per line.</td></tr>
 <tr><td><code>forge_fx.txt</code>, <code>scaled_objects.txt</code>, <code>shadow_casters.txt</code></td><td>The Settings window's <em>Forge special FX</em>, <em>Scaled objects</em> and <em>Shadow casters (Forge)</em> switches (<code>1</code> / <code>0</code>; missing = on).</td></tr>
-<tr><td><code>map_spawns.txt</code>, <code>physics_outlines.txt</code></td><td>The View menu's <em>Show map spawn points</em> and <em>Show physics outlines</em> overlays (<code>1</code> / <code>0</code>; missing = off).</td></tr>
+<tr><td><code>map_spawns.txt</code>, <code>physics_outlines.txt</code>, <code>wire_xray.txt</code>, <code>soft_ceilings.txt</code>, <code>hard_floor.txt</code>, <code>playable_bounds.txt</code></td><td>The View menu's <em>Show map spawn points</em>, <em>Show physics outlines</em>, <em>Selection wireframe through objects</em>, <em>Soft ceilings</em>, <em>Hard floor</em> and <em>Playable BSP bounds</em> overlays (<code>1</code> / <code>0</code>; missing = the default).</td></tr>
 </table></div>
 <p>Named projects can be saved anywhere with <em>File ▸ Save Project As…</em> (<code>.mmsproj</code>) and reopened with <em>File ▸ Open Project…</em>; once a project has a name, <em>File ▸ Save Project (name)</em> re-saves it without a dialog. Opening a project restores the camera, reloads its map and variant, and restores any per-object SCALED / SHADOW overrides (they are not part of the <code>.mvar</code>). Lighting sliders and the geometry toggles are <strong>not</strong> persisted between runs; the five switches listed above are.</p>
 

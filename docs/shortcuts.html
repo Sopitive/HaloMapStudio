@@ -26,7 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
-<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
@@ -86,10 +86,13 @@
 <tr><td><kbd>Shift</kbd>+<kbd>D</kbd></td><td>Duplicate the selection and start moving the copies</td></tr>
 <tr><td><kbd>X</kbd> / <kbd>Y</kbd> / <kbd>Z</kbd></td><td>During G/R: lock to that axis (press again to unlock)</td></tr>
 <tr><td><kbd>E</kbd></td><td>During G/R: toggle world / local axes</td></tr>
-<tr><td><kbd>Ctrl</kbd> (hold)</td><td>During G: magnet — snap the leading face flush to the nearest face</td></tr>
+<tr><td><kbd>Ctrl</kbd> (hold)</td><td>During G: magnet — push the selection's nearest real face flush against the nearest other face / map surface, then line the edges up (<a href="editing.html#magnet">details</a>)</td></tr>
+<tr><td><kbd>Ctrl</kbd> + <kbd>X</kbd>/<kbd>Y</kbd>/<kbd>Z</kbd></td><td>During G: the magnet may only travel on that axis (both directions)</td></tr>
 <tr><td><kbd>Shift</kbd> (hold)</td><td>During G/R: precision (slow) movement</td></tr>
 <tr><td><kbd>Shift</kbd>+<kbd>Ctrl</kbd> + axis</td><td>During a Shift+D grab: array copies along the locked axis</td></tr>
-<tr><td>Digits, <kbd>-</kbd> <kbd>.</kbd></td><td>During G/R: type an exact distance (wu) / angle (deg); <kbd>Backspace</kbd> edits</td></tr>
+<tr><td>Wheel (while arraying)</td><td>Change the array step: up = spread out, down = overlap (0.25 wu per notch)</td></tr>
+<tr><td><kbd>Alt</kbd> + wheel (while arraying)</td><td>Fine array step (0.05 wu per notch)</td></tr>
+<tr><td>Digits, <kbd>-</kbd> <kbd>.</kbd></td><td>During G/R: type an exact distance (wu) / angle (deg); <kbd>Backspace</kbd> edits. A <kbd>-</kbd> typed <strong>anywhere</strong> flips the sign, so <code>90-</code> is the same as <code>-90</code></td></tr>
 <tr><td>Click or <kbd>Enter</kbd></td><td>Confirm the transform</td></tr>
 <tr><td><kbd>Esc</kbd> or right-click</td><td>Cancel the transform (gizmo drags: <kbd>Esc</kbd> only)</td></tr>
 </table></div>
@@ -106,7 +109,8 @@
 <tr><th>Keys</th><th>Action</th></tr>
 <tr><td><kbd>C</kbd></td><td>Construct tool on / off (construction guides &amp; CAD panel)</td></tr>
 <tr><td><kbd>G</kbd> (Construct)</td><td>Move the selected construction shape; click or <kbd>Enter</kbd> places, <kbd>Esc</kbd> cancels</td></tr>
-<tr><td><kbd>Esc</kbd> (Construct)</td><td>Drop a half-drawn guide / face pick</td></tr>
+<tr><td><kbd>Esc</kbd> (Construct)</td><td>Drop a half-drawn guide / face pick / line array</td></tr>
+<tr><td>Line array (Construct)</td><td>Click the line's START then its END; the selection fills it by count or by step (a step below the piece's size makes the copies overlap). <a href="editing.html#cad">Details</a></td></tr>
 <tr><td>Drag from the palette list or preview into the viewport</td><td>Place that object on the surface under the cursor</td></tr>
 <tr><td>In the palette preview: right-drag / wheel</td><td>Orbit / zoom the preview</td></tr>
 </table></div>
@@ -118,10 +122,18 @@
 <tr><td><em>File ▸ Open Project…</em>, <em>Save Project As…</em>, <em>Save Project (name)</em>, <em>Quick-save session</em>, <em>Restore last session</em></td><td>Projects (<code>.mmsproj</code>).</td></tr>
 <tr><td><em>Edit ▸ Undo</em> (<kbd>Ctrl</kbd>+<kbd>Z</kbd>), <em>Redo</em> (<kbd>Ctrl</kbd>+<kbd>Y</kbd>), <em>Select all objects</em> (<kbd>Ctrl</kbd>+<kbd>A</kbd>), <em>Deselect</em>, <em>Delete selected</em> (<kbd>Del</kbd>), <em>Remove all placed objects</em></td><td>As named</td></tr>
 <tr><td><em>View ▸ Frame selected object</em> (<kbd>F</kbd>), <em>Screenshot</em> (<kbd>F12</kbd>), <em>Construction (CAD) panel</em>, <em>Script console</em></td><td>As named</td></tr>
-<tr><td><em>View ▸ Show map spawn points</em></td><td>Draw the base map's own built-in spawn markers (off by default; persisted). Script: <code>mapspawns on|off</code>.</td></tr>
+<tr><td><em>View ▸ Geometry: BSP</em>, <em>Terrain</em>, <em>Forge objects</em>, <em>Water</em>, <em>Sky</em></td><td>Show / hide each geometry pass (all on by default).</td></tr>
+<tr><td><em>View ▸ Forge extras: Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em></td><td>The three Forge-object switches (on by default; persisted). Scripts: <code>screenfx</code>, <code>scale</code>, <code>shadowcasters</code> — see <a href="rendering.html#forge">Rendering</a>.</td></tr>
+<tr><td><em>View ▸ Overlays: Grid</em>, <em>Lights</em>, <em>Boundary shapes</em>, <em>Collision (selected)</em>, <em>Physics (selected)</em></td><td>The reference grid, the light markers (marker only — it does not change the lighting), teleporter / objective zones and the selected object's collision and physics hulls.</td></tr>
+<tr><td><em>View ▸ Overlays: Show map spawn points</em></td><td>Draw the base map's own built-in spawn markers (off by default; persisted). Script: <code>mapspawns on|off</code>.</td></tr>
 <tr><td><em>View ▸ Show hidden-block physics hulls</em></td><td>Draw the physics hulls of the variant's hidden (invisible) blocks (on by default; persisted). Script: <code>outlines on|off</code>.</td></tr>
+<tr><td><em>View ▸ Selection wireframe through objects</em></td><td>Draw the selected object's wireframe through anything in front of it, so a buried or hidden piece still shows its whole outline (off by default; persisted). The wireframe itself always has a dark outline under a bright core, so it stays readable on white Forge pieces and in dark interiors alike. Script: <code>wirexray on|off</code>.</td></tr>
+<tr><td><em>View ▸ Trigger volumes</em></td><td>Draw the scenario's trigger volumes as wireframe boxes (off by default). Script: <code>triggers on|off</code>.</td></tr>
+<tr><td><em>View ▸ Soft ceilings (map floor)</em></td><td>Draw the invisible planes that bound the playable space — the map floor, walls and sky ceiling (off by default; persisted). Script: <code>softceilings on|off</code>.</td></tr>
+<tr><td><em>View ▸ Hard floor (world bounds)</em></td><td>Draw the map's world box — the physics broadphase from every BSP's bounds plus 64 units, the invisible wall — and its floor (off by default; persisted). Script: <code>hardfloor on|off</code>.</td></tr>
+<tr><td><em>View ▸ Playable BSP bounds</em></td><td>Draw each playable BSP's own bounds box and floor (off by default; persisted). Script: <code>playablebounds on|off</code>.</td></tr>
 <tr><td><em>Tools ▸ Line tool</em> / <em>Fill tool</em>, <em>Scale converter…</em>, <em>Light bake map…</em>, <em>Construction (CAD)…</em> (<kbd>C</kbd>), <em>Model Painter…</em>, <em>Import geometry…</em>, <em>Script console…</em></td><td>As named</td></tr>
-<tr><td><em>Settings ▸ Lighting &amp; rendering…</em></td><td>The Settings window: <em>Lighting</em>, <em>Camera, render &amp; display</em> (including <em>Forge special FX</em>, <em>Scaled objects</em>, <em>Shadow casters (Forge)</em>) and <em>Advanced (diagnostics)</em> — see <a href="rendering.html">Rendering &amp; settings</a>.</td></tr>
+<tr><td><em>Settings ▸ Lighting &amp; rendering…</em></td><td>The Settings window: <em>Lighting</em>, <em>Camera &amp; rendering</em> (fly speed, camera stand-off, path-traced and real-time lighting) and <em>Advanced (diagnostics)</em> — see <a href="rendering.html">Rendering &amp; settings</a>. What is DRAWN is in the <em>View</em> menu.</td></tr>
 <tr><td><em>Help ▸ Keyboard shortcuts…</em></td><td>The in-app version of this page</td></tr>
 </table></div>
 

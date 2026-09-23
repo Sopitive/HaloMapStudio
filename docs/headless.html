@@ -26,7 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html" class="cur" aria-current="page">Headless / CLI</a></li>
-<li><a href="halo4.html">Halo 4 (experimental)</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
@@ -103,6 +103,9 @@ HMS_CAM="62,208,68,0,-10" HMS_SHOT=asylum.png HMS_SHOT_SIZE=1280x720 ./hms-app</
 <tr><td><code>HMS_SHADOWCASTERS=0|1</code></td><td>setting (on)</td><td>The <em>Shadow casters (Forge)</em> global: whether flagged Forge pieces cast sun shadows. Per-object overrides from a project are not available headless; the automatic rules (<code>scale</code> label; GREEN + <code>scale</code>) apply.</td></tr>
 <tr><td><code>HMS_MAP_SPAWNS=1</code></td><td>off</td><td>Draw the base map's own spawn markers (<em>View ▸ Show map spawn points</em>).</td></tr>
 <tr><td><code>HMS_PHYSICS_OUTLINES=0</code></td><td>on</td><td>Hide the physics hulls of the variant's hidden blocks (<em>View ▸ Show hidden-block physics hulls</em>) for a game-look render.</td></tr>
+<tr><td><code>HMS_SOFT_CEILINGS=1</code></td><td>off</td><td>Draw the map's soft ceilings — the floor, walls and sky ceiling of the playable space (<em>View ▸ Soft ceilings</em>). The log always lists every ceiling with its kind, triangle count and height range.</td></tr>
+<tr><td><code>HMS_HARD_FLOOR=1</code></td><td>off</td><td>Draw the map's world box — the physics broadphase from every structure BSP's bounds plus 64 units — and its floor (<em>View ▸ Hard floor</em>). The log always lists every structure BSP with its world and physics bounds and the box.</td></tr>
+<tr><td><code>HMS_PLAYABLE_BOUNDS=1</code></td><td>off</td><td>Draw each playable BSP's own world-bounds box and floor (<em>View ▸ Playable BSP bounds</em>).</td></tr>
 </table></div>
 <p>The script runner has the same switches as commands (<code>screenfx</code>, <code>scale</code>, <code>shadowcasters</code>, <code>mapspawns</code>, <code>outlines</code>); set there they apply to that run only and are not written back to the settings folder.</p>
 
@@ -146,7 +149,7 @@ end</code></pre>
 <tr><td><code>HMS_MAP</code></td><td>GUI + headless</td><td>Map to load at start (GUI) or render (headless).</td></tr>
 <tr><td><code>HMS_SHOT</code>, <code>HMS_SHOT_SIZE</code>, <code>HMS_CAM</code>, <code>HMS_MVAR</code>, <code>HMS_MVAR_LIST</code>, <code>HMS_PLACE</code>, <code>HMS_PLACE_COLOR</code>, <code>HMS_VIEW</code>, <code>HMS_DIST</code>, <code>HMS_FOV</code>, <code>HMS_SPAWNCAM</code>, <code>HMS_STANDOFF</code>, <code>HMS_TIME</code></td><td>Headless</td><td>See above.</td></tr>
 <tr><td><code>HMS_FORGE_FX</code>, <code>HMS_SCALED</code>, <code>HMS_SHADOWCASTERS</code>, <code>HMS_MAP_SPAWNS</code>, <code>HMS_PHYSICS_OUTLINES</code></td><td>Headless</td><td>One-run overrides of the persisted Forge / overlay switches — see <a href="#switches">above</a>.</td></tr>
-<tr><td><code>HMS_PREVIEW_SHOT=&lt;object tag hex&gt;[:&lt;variant hex&gt;]:&lt;png&gt;</code></td><td>Headless</td><td>After the main shot, also render the palette-panel <em>preview</em> of that object (as the GUI's Add Object panel draws it) to a square PNG; <code>HMS_PREVIEW_SIZE=&lt;px&gt;</code> (default 280) and <code>HMS_PREVIEW_ORBIT=yaw,pitch,zoom</code> adjust it. Several specs may be joined with <code>;</code>.</td></tr>
+<tr><td><code>HMS_PREVIEW_SHOT=&lt;object tag hex&gt;[:&lt;variant hex&gt;]:&lt;png&gt;</code></td><td>Headless</td><td>After the main shot, also render the palette-panel <em>preview</em> of that object (as the GUI's Add Object panel draws it) to a square PNG; <code>HMS_PREVIEW_SIZE=&lt;px&gt;</code> (default 280) and <code>HMS_PREVIEW_ORBIT=yaw,pitch,zoom</code> adjust it. Several specs may be joined with <code>;</code>. On a <strong>Halo 4</strong> map the item is a Forge palette row instead: <code>q&lt;quota&gt;[.&lt;variant&gt;]</code> (the palette numbering <code>HMS_H4_PALETTE_DUMP=1</code> prints), <code>n&lt;raw name substring&gt;</code> (e.g. <code>nbb_2x2</code>) or a raw obje tag in hex - so <code>HMS_PREVIEW_SHOT=q98.0:grid.png</code> previews Ravine's Grid.</td></tr>
 <tr><td><code>HMS_AUTOSHOT=&lt;png&gt;</code></td><td>GUI</td><td>Save a screenshot automatically a few frames after the map has loaded.</td></tr>
 <tr><td><code>HMS_IMPORT=&lt;file.obj|.glb&gt;</code></td><td>GUI</td><td>Import a reference mesh at start (same as Tools ▸ Import geometry).</td></tr>
 <tr><td><code>HMS_CMD_PORT</code></td><td>GUI</td><td>Port of the script command server (default 47800; 0 disables).</td></tr>
