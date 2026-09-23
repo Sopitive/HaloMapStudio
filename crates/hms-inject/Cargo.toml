@@ -1,0 +1,16 @@
+[package]
+name = "hms-inject"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+
+# Injection is inherently a Windows capability (MCC is a Windows process), so the
+# windows crate is pulled in ONLY for windows targets. On Linux this crate still
+# builds -- as an empty crate (see the #![cfg(windows)] in src/lib.rs) -- so that
+# a plain `cargo check` over the whole workspace succeeds on both platforms.
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

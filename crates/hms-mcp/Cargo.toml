@@ -1,0 +1,15 @@
+[package]
+name = "hms-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# MCP (Model Context Protocol) stdio server that lets LLM agents drive the HMS forge editor.
+# It is a thin bridge: JSON-RPC over stdio in, framed script text out to the running hms-app's
+# TCP command server (crate hms-app::cmd_server). Keeps the editor process free of stdio conflicts.
+[[bin]]
+name = "hms-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"

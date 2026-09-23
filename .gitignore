@@ -1,0 +1,48 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+*.pdb
+
+# Native C++ parser / DLL build output (sources under native/ are tracked)
+/native/build-linux/
+/native/build-windows/
+/native/staging/
+/native/x64/
+/native/**/x64/
+/native/**/Debug/
+/native/**/Release/
+/native/**/*.obj
+/native/**/*.ilk
+/native/**/*.exp
+/native/**/*.lib
+/native/**/*.iobj
+/native/**/*.ipdb
+/native/**/*.tlog
+/native/.vs/
+/runtime/
+/staging/
+
+# Binary release staging (dist/README.md is tracked)
+/dist/*.zip
+/dist/linux-x64/
+/dist/windows-x64/
+/dist/github-root/
+/dist/repaired/
+
+# Local session artefacts: logs, screenshots, RE scratch, raw captures
+*.log
+*.f32
+/*.png
+/*.txt
+/*.hms
+/HANDOFF_*.md
+/scratch/
+/scratchpad/
+/knowledge/
+
+
+# reverse-engineering notes / internal docs (not published)
+/docs/
+# editor/backup files
+*.bak

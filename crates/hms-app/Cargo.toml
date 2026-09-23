@@ -1,0 +1,55 @@
+[package]
+name = "hms-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hms-app"
+path = "src/main.rs"
+
+# `injection` compiles in the in-process DLL-injection features (inject the payload into MCC +
+# read its live MMFs). It is OFF BY DEFAULT so a plain `cargo build`/release is the fully-offline
+# .mvar/map viewer + editor — it never injects `HaloMapStudioDLL.dll` into MCC and so never locks
+# that DLL/exe for iteration (the payload DLL and the offline map-parser DLL are the SAME file, so
+# an injecting build holds a lock on it while MCC runs). For live-dev with the injected features,
+# build with `--features injection`.
+[features]
+default = []
+injection = ["dep:hms-inject"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+glam.workspace = true
+eframe = { version = "0.31", default-features = false, features = ["wgpu", "default_fonts"] }
+hms-inject = { path = "../hms-inject", optional = true }
+hms-ipc = { path = "../hms-ipc" }
+hms-native = { path = "../hms-native" }
+hms-render = { path = "../hms-render" }
+bytemuck = { version = "1", features = ["derive"] }
+png = "0.17"
+# #fresh50-1: f32→f16 packing for the HDR (Rgba16Float) opaque self-illum emissive texture.
+half = "2"
+pollster = "0.3"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+rfd = "0.14"
+serde_json = "1"
+# Forge-label string tables in .mvar are zlib-compressed about half the time.
+# Pure-Rust inflate (no C toolchain, builds identically on Windows and Linux).
+miniz_oxide = "0.8"
+# #h4: the pure-Rust Halo 4 cache reader maps the .map (and shared.map) read-only.
+memmap2.workspace = true
+
+# Win32 bits (working-set trimming / memory stats) are Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Foundation"] }
+
+# eframe's default features are off (above), but on Linux/BSD winit selects its
+# windowing backend *via features* -- with none enabled it hits
+# `compile_error!("The platform you're compiling for is not supported by winit")`.
+# Cargo unions features, so this just adds the backends on Unix.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["x11", "wayland"] }

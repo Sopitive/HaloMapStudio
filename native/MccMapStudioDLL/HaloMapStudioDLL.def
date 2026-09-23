@@ -1,0 +1,156 @@
+LIBRARY "HaloMapStudioDLL"
+EXPORTS
+    ; Offline map-parsing API loaded by crates/hms-native (libloading). Every
+    ; entry point is also declared __declspec(dllexport) in its source file;
+    ; this list is the authoritative, grouped view of the FFI surface.
+
+    ; ---- Cache + bitmap decode (MapCacheCommon / MapBitmapParser) ----
+    ZH_MBP_ClearPageCache
+    ZH_MBP_CloseCache
+    ZH_MBP_DecodeBitmap
+    ZH_MBP_DecodeBitmapFace
+    ZH_MBP_DecodeBitmapKeepAlpha
+    ZH_MBP_DecodeBitmapSlice
+    ZH_MBP_DropMapPages
+    ZH_MBP_FindBitmapTag
+    ZH_MBP_FreeBuffer
+    ZH_MBP_FreeRawDDS
+    ZH_MBP_GetPageCacheBytes
+    ZH_MBP_GetPageStats
+    ZH_MBP_GetRawDDS
+    ZH_MBP_OpenCache
+    ZH_TrimHeaps
+
+    ; ---- Generic tag access ----
+    ZH_TAG_EnumerateByGroup
+    ZH_TAG_GetClass
+    ZH_TAG_GetName
+    ZH_TAG_GetShaderOverlayAt
+    ZH_TAG_GetShaderOverlayCount
+    ZH_TAG_ReadMeta
+    ZH_TAG_ReadPtr
+    ZH_TAG_ResolveArmorIconBitmap
+    ZH_TAG_ResolveCollTagId
+    ZH_TAG_ResolveModeTagId
+    ZH_TAG_ResolvePhmoTagId
+
+    ; ---- render_model decode (MapModelParser / OverlayWalker) ----
+    ZH_MMP_CloseModel
+    ZH_MMP_DecodeSectionColors
+    ZH_MMP_DecodeSectionGeometry
+    ZH_MMP_DecodeSectionUVs
+    ZH_MMP_EnumerateAttachments
+    ZH_MMP_FreeBuffer
+    ZH_MMP_GetDefaultVariantSectionMask
+    ZH_MMP_GetSection
+    ZH_MMP_GetSectionCount
+    ZH_MMP_GetShaderAlphaTestBitmapTagId
+    ZH_MMP_GetShaderBitmapByUsage
+    ZH_MMP_GetShaderBlendMode
+    ZH_MMP_GetShaderClass
+    ZH_MMP_GetShaderConstants
+    ZH_MMP_GetShaderDiffuseBitmapTagId
+    ZH_MMP_GetShaderEmissiveBitmapTagId
+    ZH_MMP_GetShaderMaterialModel
+    ZH_MMP_GetShaderOverlayAt
+    ZH_MMP_GetShaderOverlayCount
+    ZH_MMP_GetShaderSamplerByUsage
+    ZH_MMP_GetShaderSelfIllumMode
+    ZH_MMP_GetShaderSkyClass
+    ZH_MMP_GetShaderTagId
+    ZH_MMP_GetShaderTemplateTagId
+    ZH_MMP_GetSubmesh
+    ZH_MMP_GetSubmeshCount
+    ZH_MMP_GetVariantSectionMask
+    ZH_MMP_IsSectionAllowed
+    ZH_MMP_OpenModel
+    ZH_MMP_PrepareUnload
+    ZH_MMP_ResolveDefaultVariantMask
+
+    ; ---- scenario_structure_bsp decode (MapBspParser) ----
+    ZH_BSP_CloseBsp
+    ZH_BSP_DecodeMeshBinormals
+    ZH_BSP_DecodeMeshGeometry
+    ZH_BSP_DecodeMeshNormals
+    ZH_BSP_DecodeMeshTangents
+    ZH_BSP_DecodeMeshUV2
+    ZH_BSP_DecodeMeshUVs
+    ZH_BSP_EnumerateSbspsInScenario
+    ZH_BSP_FreeBuffer
+    ZH_BSP_FreeRuntimeDecoratorMeshes
+    ZH_BSP_GetInstancePvlVb
+    ZH_BSP_GetMaterialAlbedoOption
+    ZH_BSP_GetMaterialBitmapByUsage
+    ZH_BSP_GetMaterialBlendMode
+    ZH_BSP_GetMaterialDiffuseBitmapTagId
+    ZH_BSP_GetMaterialDiffuseTiling
+    ZH_BSP_GetMaterialModel
+    ZH_BSP_GetMaterialOverlays
+    ZH_BSP_GetMaterialSamplerByUsage
+    ZH_BSP_GetMaterialShaderConstants
+    ZH_BSP_GetMaterialShaderKind
+    ZH_BSP_GetMaterialShaderTagId
+    ZH_BSP_GetMaterialTerrainLayers
+    ZH_BSP_GetMesh
+    ZH_BSP_GetMeshCount
+    ZH_BSP_GetRawGeometry
+    ZH_BSP_GetRuntimeDecoratorGeometry
+    ZH_BSP_GetSelfIllumMode
+    ZH_BSP_GetShaderClass
+    ZH_BSP_GetUnderwaterFog
+    ZH_BSP_OpenBsp
+    ZH_BSP_UnderwaterProbe
+
+    ; ---- Lightmap / lightprobe data (LightmapParser) ----
+    ZH_LBSP_FreeAirprobeGrid
+    ZH_LBSP_FreeLightprobeBuffer
+    ZH_LBSP_GetActiveLbspTagId
+    ZH_LBSP_GetAirprobeGrid
+    ZH_LBSP_GetBrightness
+    ZH_LBSP_GetClusterEntry
+    ZH_LBSP_GetClusterPvlVb
+    ZH_LBSP_GetInstanceAtlasSubmap
+    ZH_LBSP_GetInstanceProbe
+    ZH_LBSP_GetInstancePvl
+    ZH_LBSP_GetLightprobeAtlas
+
+    ; ---- Decals (DecalWalker / PreplacedDecalsWalker / MapBspParser) ----
+    HaloMapStudio_BSP_DecodePreplacedGeometry
+    HaloMapStudio_BSP_EnumeratePreplacedDecals
+    HaloMapStudio_BSP_FreePreplacedDecals
+    HaloMapStudio_BSP_FreePreplacedGeometry
+    HaloMapStudio_BSP_GetPreplacedDecalCount
+    ZH_BSP_EnumerateDecals
+    ZH_BSP_FreeDecalBuffer
+
+    ; ---- Collision + physics model hulls ----
+    ZH_COLL_DecodeGeometry
+    ZH_COLL_FreeBuffer
+    ZH_PHMO_DecodeGeometry
+    ZH_PHMO_FreeBuffer
+
+    ; ---- Scenario walkers (sky, lights, fog, exposure, objects, palettes, volumes) ----
+    ZH_FOG_GetParams
+    ZH_GLOBALS_GetChangeColors
+    ZH_LENS_GetElements
+    ZH_PFOG_Enumerate
+    ZH_PFOG_FreeBuffer
+    ZH_SCNR_EnumerateForgePalette
+    ZH_SCNR_EnumerateObjects
+    ZH_SCNR_EnumerateSimpleLights
+    ZH_SCNR_EnumerateTriggerVolumes
+    ZH_SCNR_FreeObjectBuffer
+    ZH_SCNR_GetExposure
+    ZH_SCNR_GetSkyLight
+    ZH_SCNR_GetSunLight
+    ZH_SDDT_EnumerateSoftCeilingTriangles
+    ZH_SDDT_EnumerateSoftCeilings
+    ZH_SKY_GetRenderModelTagId
+    ZH_SKY_GetSkyCount
+    ZH_SKY_GetSkyTagId
+
+    ; ---- Injection-side (Windows only; the DLL hosts these when injected into MCC) ----
+    ; Kill-volume / soft-ceiling bypass toggle, driven in-process via GetProcAddress.
+    HaloMapStudio_ForgeBarrier_SetEnabled
+    HaloMapStudio_ForgeBarrier_IsDisabled
+    HaloMapStudio_ForgeBarrier_Tick

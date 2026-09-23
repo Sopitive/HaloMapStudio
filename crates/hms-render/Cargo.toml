@@ -1,0 +1,28 @@
+[package]
+name = "hms-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+half = "2"
+# Depend on eframe purely for its re-exported, version-aligned wgpu/egui so the
+# whole workspace shares ONE egui+wgpu version set (avoids the classic
+# egui/eframe duplicate-crate type mismatch).
+eframe = { version = "0.31", default-features = false, features = ["wgpu"] }
+
+[dev-dependencies]
+# Same naga the resolved wgpu uses — validates our WGSL offline (cargo build
+# does NOT parse shaders; naga runs only at pipeline creation on a live device).
+naga = { version = "24", features = ["wgsl-in"] }
+
+# eframe's default features are off (above), but on Linux/BSD winit selects its
+# windowing backend *via features* -- with none enabled it hits
+# `compile_error!("The platform you're compiling for is not supported by winit")`.
+# Cargo unions features, so this just adds the backends on Unix.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+eframe = { version = "0.31", default-features = false, features = ["x11", "wayland"] }

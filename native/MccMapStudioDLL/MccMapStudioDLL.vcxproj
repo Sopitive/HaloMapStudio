@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{F2118387-6C79-4651-8396-9090C8C04316}</ProjectGuid>
+    <RootNamespace>HaloMapStudioDLL</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <TargetName>HaloMapStudioDLL</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+    <TargetName>HaloMapStudioDLL</TargetName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <PropertyGroup Label="UserMacros" />
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;MCCMAPSTUDIODLL_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)packages\minhook.1.3.3\lib\native\include;$(SolutionDir)packages\minhook.1.3.3\lib\native\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <RandomizedBaseAddress>true</RandomizedBaseAddress>
+      <DataExecutionPrevention>true</DataExecutionPrevention>
+      <HighEntropyVA>true</HighEntropyVA>
+      <ModuleDefinitionFile>HaloMapStudioDLL.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;MCCMAPSTUDIODLL_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+      <ControlFlowGuard>Guard</ControlFlowGuard>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)packages\minhook.1.3.3\lib\native\include;$(SolutionDir)packages\minhook.1.3.3\lib\native\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <RandomizedBaseAddress>true</RandomizedBaseAddress>
+      <DataExecutionPrevention>true</DataExecutionPrevention>
+      <HighEntropyVA>true</HighEntropyVA>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <ModuleDefinitionFile>HaloMapStudioDLL.def</ModuleDefinitionFile>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="framework.h" />
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="EngineThreadResolver.h" />
+    <ClInclude Include="HaloReachTagHelpers.h" />
+    <ClInclude Include="MapBitmapParser.h" />
+    <ClInclude Include="MapBspParser.h" />
+    <ClInclude Include="MapCacheCommon.h" />
+    <ClInclude Include="MapModelParser.h" />
+    <ClInclude Include="miniz.h" />
+    <ClInclude Include="$(SolutionDir)packages\minhook.1.3.3\lib\native\include\MinHook.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Create</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="Logging.cpp" />
+    <ClCompile Include="HostByteHelper.cpp" />
+    <ClCompile Include="FramePumpHook.cpp" />
+    <ClCompile Include="MapCacheCommon.cpp" />
+    <ClCompile Include="MapCacheUnload.cpp" />
+    <ClCompile Include="MapBitmapParser.cpp" />
+    <ClCompile Include="MapModelParser.cpp" />
+    <ClCompile Include="MapBspParser.cpp" />
+    <ClCompile Include="SkyWalker.cpp" />
+    <ClCompile Include="CollisionModelWalker.cpp" />
+    <ClCompile Include="PhysicsModelWalker.cpp" />
+    <ClCompile Include="DecalWalker.cpp" />
+    <ClCompile Include="PreplacedDecalsWalker.cpp" />
+    <ClCompile Include="FogParser.cpp" />
+    <ClCompile Include="PlanarFogWalker.cpp" />
+    <ClCompile Include="LightWalker.cpp" />
+    <ClCompile Include="SimpleLightsWalker.cpp" />
+    <ClCompile Include="OverlayWalker.cpp" />
+    <ClCompile Include="ScenarioExposureWalker.cpp" />
+    <ClCompile Include="LightmapParser.cpp" />
+    <ClCompile Include="MapInfoSnapshot.cpp" />
+    <ClCompile Include="ForgePaletteSnapshot.cpp" />
+    <ClCompile Include="ObjectTableSnapshot.cpp" />
+    <ClCompile Include="PlayerModeSnapshot.cpp" />
+    <ClCompile Include="PoseSnapshot.cpp" />
+    <ClCompile Include="TransformQueueSnapshot.cpp" />
+    <ClCompile Include="WorldSpawnSnapshot.cpp" />
+    <ClCompile Include="ForgeSpawnAndPose.cpp" />
+    <ClCompile Include="SpawnDefinitionLive.cpp" />
+    <ClCompile Include="ForgeObjectTableSnapshot.cpp" />
+    <ClCompile Include="MegaloObjectSnapshot.cpp" />
+    <ClCompile Include="ForgeGtLabelsMmf.cpp" />
+    <ClCompile Include="ForgeObjectEdit.cpp" />
+    <ClCompile Include="ForgeBudgetBypass.cpp" />
+    <ClCompile Include="ForgeBarrierBypass.cpp" />
+    <ClCompile Include="ForgePhysics.cpp" />
+    <ClCompile Include="ScenarioForgePaletteWalker.cpp" />
+    <ClCompile Include="ScenarioObjectWalker.cpp" />
+    <ClCompile Include="ScenarioTriggerVolumeWalker.cpp" />
+    <ClCompile Include="SoftCeilingWalker.cpp" />
+    <ClCompile Include="ChangeColorWalker.cpp" />
+    <!-- MinHook source files (precompiled header excluded — they're C). -->
+    <ClCompile Include="$(SolutionDir)packages\minhook.1.3.3\lib\native\src\buffer.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(SolutionDir)packages\minhook.1.3.3\lib\native\src\hook.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(SolutionDir)packages\minhook.1.3.3\lib\native\src\trampoline.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="$(SolutionDir)packages\minhook.1.3.3\lib\native\src\HDE\hde64.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
+    <!-- miniz: vendored single-header (richgel999/miniz 3.1.x, public domain).
+         miniz.c is the ONE TU that defines MINIZ_IMPLEMENTATION. Compiled as C
+         (no PCH, no SDLCheck — miniz uses some patterns SDL's stricter checks
+         don't like and they're not security-relevant in our usage). -->
+    <ClCompile Include="miniz.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">CompileAsC</CompileAs>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CompileAsC</CompileAs>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</SDLCheck>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ConformanceMode>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ConformanceMode>
+      <DisableSpecificWarnings>4244;4267;4456;4457;4244;4310;4334;4146;%(DisableSpecificWarnings)</DisableSpecificWarnings>
+    </ClCompile>
+    <!-- libdeflate (ebiggers/libdeflate v1.19, MIT). Decompressor-only TUs: ~3x faster raw
+         DEFLATE than miniz for the map resource pages (the dominant load cost). Compiled as C,
+         no PCH/SDLCheck (relative #includes resolve within the vendored tree). -->
+    <ClCompile Include="libdeflate\lib\deflate_decompress.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">CompileAsC</CompileAs>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CompileAsC</CompileAs>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</SDLCheck>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ConformanceMode>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ConformanceMode>
+    </ClCompile>
+    <ClCompile Include="libdeflate\lib\utils.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">CompileAsC</CompileAs>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CompileAsC</CompileAs>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</SDLCheck>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ConformanceMode>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ConformanceMode>
+    </ClCompile>
+    <ClCompile Include="libdeflate\lib\x86\cpu_features.c">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">CompileAsC</CompileAs>
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CompileAsC</CompileAs>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</SDLCheck>
+      <SDLCheck Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</SDLCheck>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</ConformanceMode>
+      <ConformanceMode Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</ConformanceMode>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="HaloMapStudioDLL.def" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+
+  <!--
+    Hot-reload staging copy. Writes a fresh copy of HaloMapStudioDLL.dll to
+    $(SolutionDir)staging\ alongside a plain-text timestamp so the running
+    HaloMapStudio.exe can pull the latest build without holding a file lock
+    on the build output. The viewer's Hot Reload button:
+      1. invokes MSBuild on this vcxproj (produces fresh bin output + staging copy)
+      2. calls native ZH_MMP_PrepareUnload + FreeLibrary
+      3. copies staging\HaloMapStudioDLL.dll over its own bundle copy
+      4. LoadLibraryW the bundle copy again
+    Staging is never locked because nothing loads from there directly.
+  -->
+  <Target Name="CopyToStaging" AfterTargets="Build">
+    <MakeDir Directories="$(SolutionDir)staging" Condition="!Exists('$(SolutionDir)staging')" />
+    <Copy
+      SourceFiles="$(TargetPath)"
+      DestinationFolder="$(SolutionDir)staging"
+      SkipUnchangedFiles="false"
+      Condition="Exists('$(TargetPath)')" />
+    <WriteLinesToFile
+      File="$(SolutionDir)staging\HaloMapStudioDLL.dll.timestamp.txt"
+      Lines="$([System.DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))"
+      Overwrite="true"
+      Condition="Exists('$(TargetPath)')" />
+    <Message Importance="high" Text="Staged HaloMapStudioDLL.dll to $(SolutionDir)staging\" Condition="Exists('$(TargetPath)')" />
+  </Target>
+</Project>
