@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Scripting reference — Halo Map Studio</title>
+<meta name="description" content="Complete reference for the Halo Map Studio Forge script language: how to run scripts, grammar, every command with syntax and examples, loops, and the MCP server for LLM agents.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html" class="cur" aria-current="page">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Scripting reference -->
+<!-- desc: Complete reference for the Halo Map Studio Forge script language: how to run scripts, grammar, every command with syntax and examples, loops, and the MCP server for LLM agents. -->
+<h1>Scripting reference</h1>
+<p class="lead">Halo Map Studio has a small line-oriented command language ("Forge script") for placing and editing objects, driving the camera, loading maps and variants, and taking screenshots. The same grammar is used by the in-app console, script files run from the command line, and the MCP server.</p>
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#run">Ways to run a script</a></li>
+<li><a href="#grammar">Grammar</a></li>
+<li><a href="#place">Placing objects</a></li>
+<li><a href="#edit">Editing objects</a></li>
+<li><a href="#set">set — fields and values</a></li>
+<li><a href="#coincident">coincident (face mate)</a></li>
+<li><a href="#snaparray">snapto and array (face snap, line arrays)</a></li>
+<li><a href="#switches">Display and global switches</a></li>
+<li><a href="#camera">Camera</a></li>
+<li><a href="#query">Queries</a></li>
+<li><a href="#maps">Maps, variants, screenshots, saving</a></li>
+<li><a href="#variant">variant — the file's global fields</a></li>
+<li><a href="#loops">Loops</a></li>
+<li><a href="#output">Output format</a></li>
+<li><a href="#examples">Examples</a></li>
+<li><a href="#mcp">MCP server (hms-mcp)</a></li>
+</ul></div>
+
+<h2 id="run">Ways to run a script</h2>
+<div class="tablewrap"><table>
+<tr><th>Entry point</th><th>How</th><th>Notes</th></tr>
+<tr><td><strong>Script console</strong> (GUI)</td><td><em>View ▸ Script console</em> (or <em>Tools ▸ Script console…</em>, or the ⌨ Script toggle in the toolbar). Type or paste commands into the editor and press <strong>▶ Run</strong>.</td><td>The editor starts pre-filled with a commented quick reference. The output log appears below. One run = one undo step. There is no "run file" button — paste the file's contents.</td></tr>
+<tr><td><strong>Script file</strong> (headless)</td><td><code>hms-app --script build.hscr</code></td><td>No window is opened. The log is printed to <em>stderr</em>. Any file extension works (<code>.hscr</code>, <code>.txt</code>, <code>.hms</code>). Exit code 0 on completion.</td></tr>
+<tr><td><strong>One-liner</strong> (headless)</td><td><code>hms-app --exec "loadmap forge_halo" "camera frame" "screenshot out.png 1280x720"</code></td><td>Everything after <code>--exec</code> is joined with spaces into one script; use newlines inside the quoted string for several commands.</td></tr>
+<tr><td><strong>TCP command server</strong></td><td>The GUI listens on <code>127.0.0.1:47800</code> (change with <code>HMS_CMD_PORT=&lt;port&gt;</code>, disable with <code>HMS_CMD_PORT=0</code>).</td><td>Length-framed text: send <code>&lt;byte count&gt;\n&lt;script&gt;</code>, receive <code>&lt;byte count&gt;\n&lt;log&gt;</code>. Each request is one undo step. Used by the MCP server below; you can also talk to it from any language.</td></tr>
+<tr><td><strong>MCP server</strong></td><td><code>hms-mcp</code> bridges an MCP client (an LLM agent) to the command server.</td><td>See <a href="#mcp">below</a>.</td></tr>
+</table></div>
+<p>The GUI executor and the headless executor share one grammar, but a few commands need the interactive app (they are marked <span class="tag">GUI only</span>) and headless loads are synchronous while GUI loads stream over frames (marked where it matters).</p>
+
+<h2 id="grammar">Grammar</h2>
+<ul>
+  <li><strong>One command per line.</strong> Lines are split on whitespace; there is no quoting. Where a value may contain spaces (labels, paths, <code>echo</code> text) the command takes the rest of the line.</li>
+  <li><strong>Comments:</strong> a line starting with <code>#</code> or <code>//</code> is skipped. Blank lines are skipped. No trailing comments.</li>
+  <li><strong>Case:</strong> command words and keywords are case-insensitive. Name filters are case-insensitive substring matches.</li>
+  <li><strong>Numbers</strong> are decimal floats (<code>1</code>, <code>-2.5</code>, <code>1e3</code>). <strong>Vectors are three separate numbers</strong>: <code>X Y Z</code>, not <code>x,y,z</code>.</li>
+  <li><strong>Units:</strong> positions and distances are world units — the same numbers the Object panel and the camera readout show; angles are degrees.</li>
+  <li><strong>Datums</strong> identify objects: hexadecimal <code>0xD8000001</code> or decimal. Variant objects are <code>0xD0xxxxxx</code>, objects placed by scripts <code>0xD8xxxxxx</code>. Get them from <code>list objects</code>.</li>
+  <li><strong>Palette references</strong> for <code>place</code>: <code>#&lt;index&gt;</code> (from <code>list palette</code>) or a case-insensitive substring of the item name (first match wins). Palette names use underscores (<code>block_2x2_flat</code>, <code>wall_double</code>); a name with a space is read as two words, so <code>place block 1x1</code> fails with <code>unknown place target '1x1'</code>.</li>
+  <li><strong>Directions:</strong> <code>+x</code> <code>-x</code> <code>+y</code> <code>-y</code> <code>+z</code> <code>-z</code>, with aliases <code>east west north south up down</code>. <strong>Faces</strong> (for <code>coincident</code>) additionally accept <code>left right front back bottom top</code> or the numbers 0–5.</li>
+  <li><strong>Filters</strong> (for <code>list objects</code>, <code>count</code>, <code>foreach objects</code>): any of <code>type &lt;t&gt;</code>, <code>name &lt;s&gt;</code>, <code>label &lt;s&gt;</code> in any order.</li>
+  <li>A bad line prints an error and the script continues with the next line.</li>
+  <li><strong>Undo:</strong> in the GUI a whole run is one undo step, except a run that itself contains <code>undo</code> or <code>redo</code> — that run takes no snapshot of its own, so its <code>undo</code> acts on the previous real edit, exactly like <kbd>Ctrl</kbd>+<kbd>Z</kbd>.</li>
+</ul>
+
+<h2 id="place">Placing objects</h2>
+<pre><code>place &lt;name|#idx&gt;                         # on the surface under the camera crosshair (12 units ahead if nothing)
+place &lt;name|#idx&gt; at X Y Z
+place &lt;name|#idx&gt; rel &lt;datum&gt; DX DY DZ     # at another object's position plus an offset
+place &lt;name|#idx&gt; onface &lt;datum&gt; &lt;dir&gt;     # flush against that object's face in direction dir
+place &lt;name|#idx&gt; camera</code></pre>
+<p>The new object gets identity orientation, the <em>neutral</em> team (8, what the game gives every new Forge placement), inherited colour and the default Forge flags, becomes the selection, and is fully editable and saveable. Output: <code>placed 'block_1x1_flat' → 0xD8000000 at (10.0,20.0,60.0)</code> — always read the datum back from this line rather than assuming it. Errors: <code>no palette object matching '…'</code>, <code>palette index N out of range</code>, <code>no object 0x…</code>, <code>unknown place target '…'</code>.</p>
+
+<h2 id="edit">Editing objects</h2>
+<div class="tablewrap"><table>
+<tr><th>Command</th><th>Effect</th></tr>
+<tr><td><code>select &lt;datum&gt;</code> · <code>select all</code> · <code>select none</code> · <code>deselect</code></td><td>Set the selection. Prints <code>selected 0x…</code> / <code>selected N objects</code>.</td></tr>
+<tr><td><code>select box X1 Y1 Z1 X2 Y2 Z2 [add]</code></td><td>Box-select in world space: every variant / placed object whose bounds (a hidden block's physics hull) overlap the axis-aligned box between the two corners — the same test the viewport's rubber band uses. <code>add</code> keeps the current selection.</td></tr>
+<tr><td><code>delete [datum]</code></td><td>Delete the object, or the whole selection when no datum is given. <code>del</code> is an alias.</td></tr>
+<tr><td><code>move &lt;datum&gt; DX DY DZ</code></td><td>Move by a delta.</td></tr>
+<tr><td><code>moveto &lt;datum&gt; X Y Z</code></td><td>Move to an absolute position.</td></tr>
+<tr><td><code>rotate &lt;datum&gt; &lt;x|y|z&gt; &lt;deg&gt;</code></td><td>Rotate about the given <em>world</em> axis through the object's own position, in degrees (right-hand rule; the Object panel's X/Y/Z fields use the same convention). <code>rot</code> is an alias.</td></tr>
+<tr><td><code>dup [datum] [DX DY DZ]</code> <span class="tag">GUI only</span></td><td>Duplicate the object (or the selection) with an optional offset; the copies become the selection. <code>duplicate</code> is an alias.</td></tr>
+<tr><td><code>settle [datum | all | selection]</code></td><td>Drop the object(s) onto the surface below and tilt to the slope ("simulate physics"). <code>drop</code> is an alias.</td></tr>
+<tr><td><code>snapto [datum] [to &lt;datum&gt;] [axis &lt;dir&gt;]</code></td><td>The <kbd>Ctrl</kbd> face magnet, scripted — see <a href="#snaparray">below</a>.</td></tr>
+<tr><td><code>array line …</code> · <code>array axis …</code> <span class="tag">GUI only</span></td><td>Fill a line or a world axis with copies of the selection — see <a href="#snaparray">below</a>.</td></tr>
+<tr><td><code>construct [get] | on|off | op &lt;op&gt; | snap &lt;mode&gt; | anchors &lt;datum&gt; | clear</code> <span class="tag">GUI only</span></td><td>The Construct (CAD) tool: arm it (the same switch as <kbd>C</kbd>), choose the operation (<code>guide circle square coincident anchor mirror line</code>) and the snap mode (<code>all corners edges faces centres</code>), or list every anchor point an object offers a click. <code>construct clear</code> drops the guides and shapes. <code>cad</code> is an alias. The viewport clicks themselves are <code>preview click X Y</code>.</td></tr>
+<tr><td><code>pick [delete] [radius &lt;wu&gt;]</code></td><td>Select (or delete) whatever is under the camera crosshair, plus everything within <em>radius</em> of it. <code>aim</code> is an alias. The reply names the hit: <code>under crosshair: 0xE0000005 objects\props\…\health_cabinet (scenery, tag 0x00fc, scnr #5) — 1 object(s) selected</code>.</td></tr>
+<tr><td><code>count [filters]</code></td><td>Count matching objects; in the GUI also reports the slot budget: <code>N object(s) match — variant holds T/651 (F free)</code>. (Headless: prints <code>N object(s)</code> and the name/label filters are not applied.)</td></tr>
+<tr><td><code>undo</code> · <code>redo</code> <span class="tag">GUI only</span></td><td>Step the editor's edit history, the same stack as <kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd>. Prints <code>undo</code> / <code>redo</code>, or <code>undo: nothing to undo</code>. Headless answers <code>ERROR undo/redo: the headless batch host keeps no edit history</code>.</td></tr>
+</table></div>
+
+<h2 id="set">set — fields and values</h2>
+<pre><code>set &lt;datum&gt; &lt;field&gt; &lt;value&gt;
+set selection &lt;field&gt; &lt;value&gt;      # every selected object (aliases: sel, all)</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Field</th><th>Value</th><th>Notes</th></tr>
+<tr><td><code>team</code></td><td>−1 … 8, or a name</td><td>−1 = none; 0 red, 1 blue, 2 green, 3 orange, 4 purple, 5 yellow, 6 brown, 7 pink, 8 neutral. Names: <code>red blue green orange purple yellow</code> (or <code>gold</code>) <code>brown pink neutral none</code>. <em>neutral</em> is what the game gives new placements; <em>none</em> is the file's distinct "unset" value.</td></tr>
+<tr><td><code>color</code></td><td>−1 … 7</td><td>−1 = inherit from team</td></tr>
+<tr><td><code>label</code></td><td>text</td><td>Forge label (rest of the line)</td></tr>
+<tr><td><code>spawnseq</code> (<code>spawn_seq</code>)</td><td>integer</td><td>Spawn sequence</td></tr>
+<tr><td><code>scale</code></td><td>number</td><td>Sets label <code>scale</code> and encodes the multiplier into the spawn sequence (X330 convention)</td></tr>
+<tr><td><code>cached_type</code> (<code>cachedtype</code>)</td><td>0 … 31</td><td>Engine object kind</td></tr>
+<tr><td><code>respawn</code></td><td>integer</td><td>Respawn seconds</td></tr>
+<tr><td><code>shape</code> (<code>boundary</code>)</td><td><code>none</code> <code>sphere</code> <code>cylinder</code> <code>box</code></td><td>Boundary shape</td></tr>
+<tr><td><code>radius</code> / <code>width</code>, <code>length</code>, <code>top</code>, <code>bottom</code></td><td>world units</td><td>Boundary size (sphere: radius; cylinder: radius, top, bottom; box: width, length, top, bottom). Converted to the file's 0–2047 encoding.</td></tr>
+<tr><td><code>b0</code> <code>b1</code> <code>b2</code> <code>b3</code></td><td>0 … 2047</td><td>Raw boundary values</td></tr>
+<tr><td><code>scaled</code></td><td><code>on</code> <code>off</code> <code>default</code></td><td>Per-object <strong>SCALED</strong> pseudo-flag: read the spawn sequence as an X330 size. <code>default</code> (also <code>auto</code>, <code>reset</code>) returns to the rule: on when the label is <code>scale</code>. Not written to the <code>.mvar</code>; kept in the project file.</td></tr>
+<tr><td><code>shadow</code> (<code>castshadow</code>, <code>shadowcaster</code>)</td><td><code>on</code> <code>off</code> <code>default</code></td><td>Per-object <strong>SHADOW</strong> pseudo-flag: draw the object into the sun shadow map. <code>default</code> returns to the rule: on for GREEN team + <code>scale</code> label. Not written to the <code>.mvar</code>. Both flags only take effect while the matching global switch (<a href="#switches">below</a>) is on.</td></tr>
+</table></div>
+<p>Output: <code>set 0x… team=1</code> or <code>set team on N object(s)</code>. Errors: <code>unknown field '…'</code>, <code>team must be -1..8</code>, <code>bad team '…'</code>, <code>expected on|off|default, got '…'</code>, <code>no editable object 0x…</code>, <code>set selection: nothing editable selected</code>.</p>
+
+<h3 id="set-h4">Halo 4 objects</h3>
+<p>When a <a href="halo4.html">Halo 4</a> variant is open the shared names (<code>team</code>, <code>color</code>, <code>label</code>, <code>shape</code>, <code>radius</code> …) keep working with Halo 4 meanings, and these fields come in addition. Field names follow the game's own Forge menu ("spawn sequence", "spawn time", "user data", "Game type label"). <code>cached_type</code> and <code>scaled</code> are refused (the type is dictated by the palette entry; Halo 4 has no scale label — the record has a real scale field instead, see <code>scale</code>).</p>
+<div class="tablewrap"><table>
+<tr><th>Field</th><th>Value</th><th>Notes</th></tr>
+<tr><td><code>spawnseq</code> (<code>spawn_seq</code>, <code>spawnorder</code>, <code>spawn_order</code>)</td><td>−128 … 127 (−100 … 100 in the game's menu; 0 … 255 wraps)</td><td>The Forge menu's "spawn sequence" (Megalo <code>object.user_data</code>): hill order, extraction site number, gametype-script input. With the <code>scale</code> label a scaling Forge gametype reads it as the object's size, exactly like Reach (the SCALED flag / convention picker apply; it replaces the record scale).</td></tr>
+<tr><td><code>spawntime</code> (<code>spawn_time</code>, <code>respawn</code>)</td><td>0 … 255</td><td>Respawn seconds</td></tr>
+<tr><td><code>label</code>, <code>label2</code>, <code>label3</code>, <code>label4</code></td><td>label name, index, or <code>none</code></td><td>The object's four gametype labels, from the variant's label table (add names in the Forge labels panel first)</td></tr>
+<tr><td><code>traitzone</code></td><td>0 … 3</td><td>Trait-set index (type 31 objects)</td></tr>
+<tr><td><code>clips</code>, <code>channel</code>, <code>passability</code></td><td>0 … 255 / 0 … 31 / 0 … 31</td><td>Weapon spare clips (type 1) / pad byte (12); teleporter channel and passability (13–15), raw</td></tr>
+<tr><td><code>shape</code>, <code>radius</code> / <code>width</code>, <code>length</code>, <code>top</code>, <code>bottom</code></td><td>as Reach, world units</td><td>Stored in 1/256 world units (16-bit); <code>b0</code>…<code>b3</code> take the raw 0 … 65535 values</td></tr>
+<tr><td><code>placement_hi</code></td><td>0 … 3</td><td>Placement bits 8–9 (new in Halo 4; the engine copies them into the object's multiplayer flags, meaning unverified)</td></tr>
+<tr><td><code>userdata</code></td><td>−128 … 127 (−100 … 100 in the menu)</td><td>The Forge menu's "user data" (Megalo <code>object.user_data2</code>): a second signed byte for gametype scripts (Ricochet's ball-spawn offset)</td></tr>
+<tr><td><code>locked</code></td><td><code>on</code> <code>off</code></td><td>The Forge object lock (a locked object cannot be grabbed in Forge)</td></tr>
+<tr><td><code>scale</code> (<code>variant_object_scale</code>)</td><td>0 … 10</td><td><strong>The record's own <code>variant-object-scale</code> field, written to the <code>.mvar</code></strong> — the engine's name for it (Halo 4 Editing Kit debug strings). The game decodes it and copies it into the spawned object but <strong>does not draw it</strong> (see the <a href="halo4.html">Halo 4 page</a>), so this only round-trips the file. Stored in 64 steps over 0 … 10 (about 0.16 apart), so the value snaps to the grid; <code>1</code> is the shipped default. <code>scale_q</code> sets the raw 0 … 63 quantum; <code>get</code> reports it as <code>variant_object_scale</code>. To scale a Halo 4 object use the gametype rule (scale label + spawn sequence, SCALED on); <code>scaled on|off|default</code> works on Halo 4 objects too. (<code>real6</code> / <code>real6q</code> are old aliases.)</td></tr>
+</table></div>
+<p><code>get</code> prints an extra <code>h4:</code> block for a Halo 4 object (quota / variant with the palette name, type, spawn sequence / time, all four labels, placement + bits 8–9, parent, slot, shape values in raw and world units, the type tail, <code>record_scale</code> with its quantum, user data, the lock, and <code>gametype_scale</code> — the size the scale-label rule gives — with the effective value).</p>
+
+<h2 id="coincident">coincident (face mate)</h2>
+<pre><code>coincident &lt;datumA&gt; &lt;faceA&gt; &lt;datumB&gt; &lt;faceB&gt; [centered] [noturn]</code></pre>
+<div class="note"><p>Needs the objects' mesh bounds, which the interactive app has after the scene is built. In a headless <code>--script</code> run, objects placed in the same run currently answer <code>coincident: no bounds for 0x…</code>; use it from the GUI console or the MCP server.</p></div>
+<p>Moves object A (only A moves) so that its face <em>faceA</em> becomes coincident with face <em>faceB</em> of object B — the CAD "mate" from the Construction window. By default the mate is <strong>flush</strong> (coplanar; A keeps its position within the plane) and A is <strong>turned</strong> so the faces oppose each other. <code>centered</code> (also <code>centred</code>, <code>center</code>, <code>centre</code>) additionally aligns the face centres; <code>noturn</code> (also <code>norotate</code>, <code>slide</code>) keeps A's rotation. Faces: <code>-x +x -y +y -z +z</code>, the words <code>left right front back bottom top</code>, or 0–5. <code>mate</code> is an alias.</p>
+<pre><code># stack the second block on top of the first, centred
+coincident 0xD8000001 -z 0xD8000000 +z centered</code></pre>
+<p>Errors: <code>coincident: no bounds for 0x…</code>, <code>coincident: 0x… face N has no normal (zero-extent axis)</code>.</p>
+
+<h2 id="snaparray">snapto and array (face snap, line arrays)</h2>
+<pre><code>snapto [&lt;datum&gt; | selection] [to &lt;datum&gt;] [axis &lt;+x|-x|+y|-y|+z|-z&gt;]
+array line [&lt;datum&gt;] from X Y Z to X Y Z (count N | step WU) [align]
+array axis [&lt;datum&gt;] &lt;+x|-x|+y|-y|+z|-z&gt; count N [step WU] [align]</code></pre>
+
+<p><code>snapto</code> is the scripted form of the <kbd>Ctrl</kbd> magnet described under
+<a href="editing.html#magnet">Axis lock, magnet and precision</a>: the same oriented face-pair snap
+followed by the same edge alignment, applied to the selection as a pure <strong>translation</strong>
+(it never turns an object — use <a href="#coincident"><code>coincident</code></a> for that). With
+<code>to &lt;datum&gt;</code> only that object's faces are candidates; without it every other object
+<em>and</em> the level geometry are. <code>axis</code> restricts the face contact to one world axis,
+exactly as locking an axis during a grab does. Aliases: <code>facesnap</code>, <code>snapface</code>
+(plain <code>snap</code> is an alias of <code>screenshot</code> and is left alone). The reply is
+measured:</p>
+<pre><code>snapto 0xD8000001 to 0xD8000000
+snapped 1 object(s) by (0.400, 0.000, 0.080) — face +X to 0xD8000000 -X (gap +0.400 wu), edge aligned Z by 0.080 wu</code></pre>
+<p>Errors: <code>snapto: no face within 3.00 wu of the selection</code>, <code>snapto needs a datum or a selection</code>.</p>
+
+<p><code>array line</code> fills a straight line with the selection: the original moves to the start
+point and copies fill the rest. <code>count N</code> spreads exactly N copies from the start point to
+the end point; <code>step WU</code> puts one copy every WU world units until the end is passed — and a
+step <strong>smaller than the piece's own extent makes the copies overlap</strong>, which is the point
+of having it. Giving both means "N copies, WU apart, in the direction of the end point". The points are
+where the selection's <em>bounding-box centre</em> lands. <code>align</code> yaws every copy (and the
+original) to face along the line — yaw only, so a wall stays vertical and a ramp keeps its rise.</p>
+<p><code>array axis</code> is the same fill laid out along a world axis from where the selection already
+is; its <code>step</code> defaults to the selection's own extent along that axis, i.e. exact
+face-to-face. Both cap at 512 copies, are a <strong>single undo step</strong>, and stamp a
+multi-object selection as a unit (the group's internal layout is kept). Both need the interactive app,
+because they duplicate objects.</p>
+<pre><code># a wall of touching blocks
+array axis 0xD8000000 +x count 12
+
+# 20 world units of deliberately overlapping cover
+array line 0xD8000000 from -60 130 63 to -40 130 63 step 0.7
+
+# five evenly spaced pieces turned to follow the line
+array line from 0 0 200 to 0 40 200 count 5 align</code></pre>
+<pre><code>array line: 10 copies + the original, step 2.000 wu (overlap 1.00 wu) along (1.00, 0.00, 0.00)
+array axis: 3 copies + the original, step 3.000 wu (flush)</code></pre>
+
+<h2 id="switches">Display and global switches</h2>
+<p>These verbs mirror checkboxes in the <em>View</em> menu and the Settings window. Each takes <code>on</code> / <code>off</code> (also <code>1</code>/<code>0</code>, <code>true</code>/<code>false</code>) or <code>get</code> (or nothing) to report the current state. In the GUI a change is <strong>persisted</strong> like the checkbox (see <a href="getting-started.html#settings">where settings live</a>); in a headless run it applies to that run only.</p>
+<div class="tablewrap"><table>
+<tr><th>Command</th><th>Mirrors</th><th>Effect</th></tr>
+<tr><td><code>screenfx on|off|get</code> (<code>forgefx</code>, <code>fx</code>)</td><td>Settings ▸ <em>Forge special FX</em> (default on)</td><td>Apply the screen effects of placed Forge special-FX objects (Colorblind, Gloomy, Juicy, Nova, Olde Timey, Pen and Ink, Dusk, Eerie, Golden Hour). Off = the map's own default effect only. Reports <code>Forge FX: dusk + juicy</code> or <code>Forge FX: none placed (on)</code>.</td></tr>
+<tr><td><code>scale on|off|get</code> (<code>scaled</code>, <code>scaling</code>)</td><td>Settings ▸ <em>Scaled objects</em> (default on)</td><td>Global switch: objects whose SCALED flag is on render at the size their spawn sequence encodes. Off = every object at x1. (Different from <code>set &lt;datum&gt; scale N</code>, which writes the size.)</td></tr>
+<tr><td><code>shadowcasters on|off|get</code> (<code>shadowcaster</code>, <code>casters</code>, <code>shadows</code>)</td><td>Settings ▸ <em>Shadow casters (Forge)</em> (default on)</td><td>Global switch: objects whose SHADOW flag is on are drawn into the sun shadow map. Off = only the engine's default casters (vehicles, weapons and so on) cast.</td></tr>
+<tr><td><code>mapspawns on|off|get</code> (<code>map_spawns</code>, <code>scnrspawns</code>)</td><td>View ▸ <em>Show map spawn points</em> (default off)</td><td>Draw the base map's own built-in spawn markers (respawn points, respawn zones, spawning cameras). They are not part of your variant and cannot be edited or saved; your placed spawn points always show. Reports how many markers are hidden or drawn.</td></tr>
+<tr><td><code>wirexray on|off|get</code> (<code>wire_xray</code>, <code>wirethrough</code>, <code>xraywire</code>)</td><td>View ▸ <em>Selection wireframe through objects</em> (default off)</td><td>Draw the selection wireframe THROUGH other objects instead of only where it is unoccluded &mdash; the way to see a piece buried in the terrain or behind a wall. <code>get</code> reports the mode and how many wireframe edges the selection currently holds. In the interactive app the switch is persisted like the View checkbox; in a <code>--script</code> / <code>--exec</code> run it is run-local and seeded by <code>HMS_WIRE_XRAY=1</code>.</td></tr>
+<tr><td><code>softceilings on|off|get</code> (<code>ceilings</code>, <code>mapfloor</code>, <code>floor</code>)</td><td>View ▸ <em>Soft ceilings (map floor)</em> (default off)</td><td>Draw the map's soft ceilings — the invisible planes that bound the playable space (the floor under Forge World, the outer walls, the sky ceiling): red = soft kill, orange = acceleration, yellow = slip surface; the edges show through terrain and water. <code>get</code> reports the count per kind and lists every ceiling with its name, kind, triangle count and height range.</td></tr>
+<tr><td><code>hardfloor on|off|get</code> (<code>mapbounds</code>, <code>worldbounds</code>, <code>bounds</code>)</td><td>View ▸ <em>Hard floor (world bounds)</em> (default off)</td><td>Draw the map's world box (magenta): the physics broadphase built from every structure BSP's bounds plus 64 units — the invisible wall nothing can pass — with its floor gridded at the lowest height. <code>get</code> reports the box, the floor height and the source, and lists every structure BSP with its world and physics bounds.</td></tr>
+<tr><td><code>playablebounds on|off|get</code> (<code>playable</code>, <code>bspbounds</code>)</td><td>View ▸ <em>Playable BSP bounds</em> (default off)</td><td>Draw each playable structure BSP's own world-bounds box (violet) and floor. <code>get</code> reports the count and the lowest floor.</td></tr>
+<tr><td><code>triggers on|off|get</code> (<code>trigger</code>, <code>triggervolumes</code>)</td><td>View ▸ <em>Trigger volumes</em> (default off)</td><td>Draw the scenario's trigger volumes as wireframe boxes (red = kill, green = safe, amber = plain). Reports the volume count.</td></tr>
+<tr><td><code>outlines on|off|get</code> (<code>outline</code>, <code>physoutlines</code>, <code>physics_outlines</code>, <code>blockers</code>)</td><td>View ▸ <em>Show hidden-block physics hulls</em> (default on)</td><td>Draw the physics hull (orange volume plus outline) of every hidden block the variant placed — the invisible walls a shipped variant seals the map with. On by default so the blocks can be found and edited; <code>off</code> gives the game's look. Only variant/user-placed pieces ever get a hull. Reports the hull triangle count.</td></tr>
+<tr><td><code>collision on|off|get</code> (<code>coll</code>, <code>collisionhull</code>)</td><td>View ▸ Overlays ▸ <em>Collision (selected)</em> (default off)</td><td>Overlay the SELECTED object's collision model (<code>coll</code>) as a cyan wireframe hull. Works on Reach, Halo 4 and Halo 2 Anniversary. Reports the state, how many hull edges the selection contributes (0 = the object ships no collision model), and <em>selection geometry: N pick entr(ies), M attachment(s)</em> &mdash; M &gt; 0 means the selected object's turret or other child object is inside its selection box and outline.</td></tr>
+<tr><td><code>physics on|off|get</code> (<code>phmo</code>, <code>physicshull</code>)</td><td>View ▸ Overlays ▸ <em>Physics (selected)</em> (default off)</td><td>The same for the physics model (<code>phmo</code> rigid-body shapes: boxes, capsules, spheres, convex polyhedra, lists), drawn orange.</td></tr>
+<tr><td><code>flags [get]</code> (<code>flag</code>)</td><td>—</td><td>Report both globals (<code>scale on | shadowcasters off | N scaled, M casting | shadow pass: …</code>) followed by one line per selected object with its effective SCALED / SHADOW state and whether each is automatic or set.</td></tr>
+<tr><td><code>bspwarn [list]</code> (<code>bsp_warn</code>, <code>bspflags</code>)</td><td>The save-time warning window</td><td>Print the map's structure BSPs with their playable-space flags, then every variant / placed object whose position is inside a BSP marked "not normally playable space in multiplayer" — the same list the GUI shows before a save (see <a href="editing.html#bspwarn">Objects outside playable space</a>). Error <code>no map loaded</code>.</td></tr>
+</table></div>
+<p>Batch renders can set the same switches from the environment (<code>HMS_FORGE_FX</code>, <code>HMS_SCALED</code>, <code>HMS_SHADOWCASTERS</code>, <code>HMS_MAP_SPAWNS</code>, <code>HMS_PHYSICS_OUTLINES</code>) — see <a href="headless.html#env">Headless / CLI</a>.</p>
+
+<h2 id="camera">Camera</h2>
+<div class="tablewrap"><table>
+<tr><th>Command</th><th>Effect</th></tr>
+<tr><td><code>camera to X Y Z</code></td><td>Set the position.</td></tr>
+<tr><td><code>camera lookat X Y Z</code> (<code>look</code>)</td><td>Aim at a point.</td></tr>
+<tr><td><code>camera nudge DX DY DZ</code> (<code>by</code>)</td><td>Move by a delta.</td></tr>
+<tr><td><code>camera spawn</code></td><td>The variant's spawn camera (its spawning camera if it has one, else an initial spawn point).</td></tr>
+<tr><td><code>camera frame</code></td><td>Frame the placed objects (or the whole scene).</td></tr>
+<tr><td><code>camera get</code> (<code>pos</code>)</td><td>Print <code>camera pos x y z  yaw d°  pitch d°  fly N</code>.</td></tr>
+<tr><td><code>camera orbit &lt;datum | selection | X Y Z&gt; [dist=12] [yaw=45] [pitch=−25]</code></td><td>Put the camera <em>dist</em> units from the target at the given yaw/pitch (degrees), looking at it. (Headless: no <code>selection</code> target.)</td></tr>
+<tr><td><code>camera standoff [N]</code> (<code>unstick</code>, <code>push</code>) <span class="tag">GUI only</span></td><td>Push the camera until nothing solid is within <em>N</em> units (default: the Camera stand-off setting, 2.0).</td></tr>
+<tr><td><code>camera clearance</code> (<code>clear</code>) <span class="tag">GUI only</span></td><td>Report the nearest surface in any direction.</td></tr>
+</table></div>
+<p><code>cam</code> is an alias for <code>camera</code>. There is no command to change fly speed.</p>
+
+<h2 id="query">Queries</h2>
+<div class="tablewrap"><table>
+<tr><th>Command</th><th>Output</th></tr>
+<tr><td><code>list palette [filter]</code> (<code>pal</code>)</td><td><code>N palette objects:</code> then <code>  #idx  name</code> lines (truncated after 200 in the GUI, 400 headless).</td></tr>
+<tr><td><code>list objects [type t] [name s] [label s]</code> (also plain <code>list</code>, <code>objects</code>)</td><td><code>N objects:</code> then <code>  0xDATUM  (x,y,z)  type=N  name  [label]</code>. The map's own scenery appears as <code>0xE0xxxxxx</code> entries headless. (Headless: name/label filters are not applied.)</td></tr>
+<tr><td><code>list types</code></td><td>Distinct object types with counts.</td></tr>
+<tr><td><code>list maps [filter]</code></td><td><code>  [stk|mod] id=0x…  label</code> for each detected map.</td></tr>
+<tr><td><code>list variants [current | &lt;map id&gt; | map &lt;name&gt; | all] [filter]</code></td><td>Variants in the catalogue: the <code>mvars/</code> folder next to the executable plus every folder in <code>HMS_MVAR_DIRS</code> (searched recursively; <code>;</code>-separated). Filter matches the file stem.</td></tr>
+<tr><td><code>get &lt;datum&gt;</code> (<code>info</code>)</td><td>Everything about one object: position, forward/up, tags, name, team, colour, type, spawn sequence, respawn, label, boundary, scale, placement flags, weapon clips, teleporter channel, location name. It also names what the object <em>is</em>: <code>tag_path=</code>, <code>class=</code> (scenery / machine / crate / vehicle…), <code>tag_id=</code> and a <code>source=</code> line (<code>variant palette='wall_double' slot=1</code>, or <code>scenario placement #5</code> for a map-owned <code>0xE…</code> object — those dump too, read-only). An <code>aabb=(min)..(max) size=(…)</code> line gives the object's placed world bounds, so a script can <em>measure</em> a snap or an array's spacing (two pieces are flush when one's max equals the other's min on the shared axis) instead of eyeballing it.</td></tr>
+<tr><td><code>mapid</code> · <code>mapid current</code> · <code>mapid &lt;mapname&gt;</code> · <code>mapid variant &lt;path&gt;</code></td><td>The numeric map id (<code>0x00000BBE (3006)</code>) of the loaded map, a named map, or the base map a variant file targets.</td></tr>
+<tr><td><code>echo &lt;text&gt;</code></td><td>Prints the text (useful as a marker in batch logs).</td></tr>
+</table></div>
+
+<h2 id="maps">Maps, variants, screenshots, saving</h2>
+<div class="tablewrap"><table>
+<tr><th>Command</th><th>Effect</th></tr>
+<tr><td><code>loadmap &lt;name | stem | substring | path&gt;</code> (<code>openmap</code>)</td><td>Load a map. Headless: synchronous. GUI: the load streams over the following frames.</td></tr>
+<tr><td><code>loadvariant &lt;path&gt;</code> (<code>openvariant</code>, <code>loadmvar</code>)</td><td>Open a variant; its base map is loaded automatically from the map id. Headless output includes the object count and which camera pose was chosen.</td></tr>
+<tr><td><code>wait</code></td><td>Headless: no-op (loads are synchronous). GUI: prints a reminder that loads stream over frames — a GUI script cannot block on a load, so run load-then-screenshot batches headless.</td></tr>
+<tr><td><code>screenshot &lt;path | dir&gt; [WxH | W H]</code> (<code>shot</code>, <code>snap</code>)</td><td>Write a PNG. If <em>path</em> is a directory (or ends in <code>/</code>) the file is named after the last loaded variant/map stem. Parent folders are created. Headless honours the size; the GUI captures the live viewport at its own size.</td></tr>
+<tr><td><code>save</code> · <code>save as &lt;path&gt;</code> · <code>saveas &lt;path&gt;</code> <span class="tag">GUI only</span></td><td>Write the open variant in place, or to a new file (which becomes the open variant). Output <code>saved N objects → path</code>, with <code>— WARNING: N object(s) outside playable space (see `bspwarn list`)</code> appended when the save-time check would have warned (a scripted save never blocks). Error: <code>no variant is open — use `save as &lt;path&gt;`</code>.</td></tr>
+</table></div>
+<div class="danger"><p><code>save</code> overwrites the open <code>.mvar</code> without a backup, exactly like <em>File ▸ Save</em>.</p></div>
+
+<h3 id="variant">variant — the file's global fields</h3>
+<p>Every field of a map variant that is not per-object (the content header and the variant body) is readable, and the useful ones are editable, for Reach and Halo 4 alike. Field names are the engine's own. See <a href="maps-and-variants.html#properties">Variant properties</a> for what each field does in the game.</p>
+<div class="tablewrap"><table>
+<tr><th>Command</th><th>Effect</th></tr>
+<tr><td><code>variant get</code> (<code>variant</code>, <code>variant info</code>, <code>mvar get</code>)</td><td>Print every global field: <code>game</code>, <code>name</code>, <code>description</code>, <code>CreatedBy</code> / <code>ModifiedBy</code> (gamertag, timestamp with date, author-xuid, online flag), <code>type</code>, <code>file-size</code>, <code>uid</code> / <code>parent-uid</code> / <code>root-uid</code> / <code>game-id</code>, <code>activity</code>, <code>game-mode</code>, <code>game-engine-type</code>, <code>map-id</code>, <code>megalo-category-index</code>, <code>hopper-id</code>, <code>map-variant-version</code>, <code>map-variant-checksum</code>, <code>m_scenario_palette_crc</code>, <code>number_of_placeable_object_quotas</code>, <code>built_in</code>, <code>m_built_from_xml</code>, <code>world-bounds</code>, <code>maximum_budget</code>, <code>spent_budget</code>, <code>mcc-map-id</code>, <code>labels</code>, the <code>mvar chunk</code> facts (length, SHA-1 ok/stale, <code>_fsm</code> present) and the quota table (index, min, max, placed, palette entry name). A pending edit is marked <em>(edited, pending save)</em>.</td></tr>
+<tr><td><code>variant get &lt;field&gt;</code></td><td>One field: <code>name</code>, <code>description</code>, <code>author</code>/<code>created</code>, <code>editor</code>/<code>modified</code>, <code>type</code>, <code>file-size</code>, <code>uid</code>, <code>parent-uid</code>, <code>root-uid</code>, <code>game-id</code>, <code>activity</code>, <code>game-mode</code>, <code>engine</code>, <code>map-id</code>, <code>category</code>, <code>hopper-id</code>, <code>version</code>, <code>checksum</code>, <code>palette-crc</code>, <code>quotas</code> (the count), <code>built-in</code>, <code>built-from-xml</code>, <code>bounds</code>, <code>budget</code>, <code>mcc-map-id</code>, <code>labels</code>, <code>chunk</code>, <code>quota</code> (the table). Error <code>variant get: unknown field</code>.</td></tr>
+<tr><td><code>variant set name &lt;text&gt;</code> · <code>description</code> · <code>author</code> · <code>editor</code></td><td>The four header strings (same as the Variant Info panel; gamertags are cut to 16 characters).</td></tr>
+<tr><td><code>variant set category &lt;-128..127&gt;</code></td><td><code>megalo-category-index</code> (-1 = none on every shipped file). Written into the bitstream and the <code>chdr</code> mirror.</td></tr>
+<tr><td><code>variant set budget &lt;n&gt;</code> (<code>budget-max</code>, <code>maximum_budget</code>)</td><td><code>maximum_budget</code>. The game restores the map's own sandbox budget when it loads the variant on its map, so this reaches the file and other tools only. Halo 4: a save raises it to at least what the placed pieces cost, so the file's maximum always covers its spend.</td></tr>
+<tr><td><code>variant set bounds &lt;xmin xmax ymin ymax zmin zmax&gt;</code> · <code>variant set bounds default</code></td><td><code>world-bounds</code>, the box every object position is quantised against. Every object is re-quantised against the new box on save (positions move by at most one quantisation step); an inverted box is refused; objects outside the box are reported (they are clamped to its edge on save). Read the warning under <a href="maps-and-variants.html#properties">Variant properties</a> before widening it. <code>default</code> restores the file's box.</td></tr>
+<tr><td><code>variant set quotamin &lt;i&gt; &lt;n&gt;</code> · <code>quotamax &lt;i&gt; &lt;n&gt;</code> · <code>quota &lt;i&gt; &lt;min&gt; &lt;max&gt;</code></td><td>The quota table entry <em>i</em> (the index in <code>variant get quota</code>) - <code>minimum_count</code> / <code>maximum_count</code>, 0..255. <em>placed_on_map</em> is always recounted on save, and a maximum below it is raised to it.</td></tr>
+</table></div>
+<p>Edits are written by the next <code>save</code> / <code>save as</code> (the GUI marks the panel with <code>*</code> until then). Headless: <code>variant get</code> works for both games; <code>variant set</code> applies to a Halo 4 variant (whose save runs headless) - a Reach variant's globals are written by the interactive app, like its objects.</p>
+
+<h2 id="loops">Loops</h2>
+<pre><code>foreach &lt;source&gt; as $v
+  …
+end</code></pre>
+<p>Sources: <code>variants [current | all | &lt;map id&gt; | map &lt;name&gt;] [filter]</code>, <code>maps [filter]</code>, <code>objects [type t] [name s] [label s]</code>. Inside the body <code>$v</code> is the item (a path for variants and maps, <code>0xDATUM</code> for objects), <code>$stem</code> is the file stem (or object name) and <code>$idx</code> the 0-based index. Loops nest up to 16 deep. A missing <code>end</code> aborts the block with <code>ERROR foreach without matching 'end'</code>.</p>
+
+<h2 id="output">Output format</h2>
+<p>Every line produces at most one result line. Successful commands print their message with no prefix; execution errors are prefixed <code>ERROR </code>; unparseable lines are prefixed <code>PARSE </code> (for example <code>PARSE unknown command 'foo'</code>). If a run prints nothing at all the log is <code>ok</code>. In the GUI the log appears in the console's Output box; over TCP it is the response body; headless it goes to stderr.</p>
+
+<h2 id="examples">Examples</h2>
+<h3>Build a small platform</h3>
+<pre><code>list palette block                      # find the exact names / indices
+place block_2x2_flat at 10 20 60        # → placed 'block_2x2_flat' → 0xD8000000 at (10.0,20.0,60.0)
+place block_2x2_flat onface 0xD8000000 +x
+place block_2x2_flat onface 0xD8000000 -x
+place block_1x1 rel 0xD8000000 0 0 5    # 5 units above the first block
+rotate 0xD8000003 z 45
+select all
+set selection team 1
+set selection color -1
+count</code></pre>
+<h3>Recolour every object with a label</h3>
+<pre><code>foreach objects label ctf_flag_return as $o
+  set $o team 0
+end</code></pre>
+<h3>Mark a pair of pieces as scaled shadow casters</h3>
+<pre><code>select 0xD0000012
+set selection shadow on            # SHADOW (set) on every selected object
+set 0xD0000012 scaled default      # back to automatic (follows the "scale" label)
+flags                              # globals + the selection's effective flags
+shadowcasters off                  # global switch: no Forge piece casts (persisted in the GUI)
+undo                               # GUI only: steps the real edit history</code></pre>
+<h3>Batch screenshots of every variant (headless)</h3>
+<pre><code># shots.hscr — run with: hms-app --script shots.hscr
+foreach variants all as $v
+  loadvariant $v
+  camera frame
+  screenshot out/$stem.png 1280x720
+end</code></pre>
+<h3>A fixed camera on Forge World</h3>
+<pre><code>loadmap forge_halo
+wait
+camera to 40 -70 104.5
+camera lookat 40 -260 101.5
+screenshot forge_ground.png 1280x720</code></pre>
+
+<h2 id="mcp">MCP server (hms-mcp)</h2>
+<p><code>hms-mcp</code> is a small <a href="https://modelcontextprotocol.io">Model Context Protocol</a> server (JSON-RPC over stdio) that lets an LLM agent such as Claude drive the running editor. It is a thin bridge: every tool call is turned into a script and sent to the GUI's TCP command server, and the editor's log comes back as the tool result. It is built from the same repository (<code>cargo build --release -p hms-mcp</code>); a prebuilt binary is not part of the v0.1.0 archives, so treat it as a power-user feature.</p>
+<ol>
+  <li>Start the editor (<code>hms-app</code>). The command server listens on <code>127.0.0.1:47800</code> (or <code>HMS_CMD_PORT</code>).</li>
+  <li>Register <code>hms-mcp</code> with your MCP client. Example <code>mcpServers</code> entry for Claude Desktop / Claude Code:</li>
+</ol>
+<pre><code>{
+  "mcpServers": {
+    "hms-forge": {
+      "command": "C:\\path\\to\\hms-mcp.exe",
+      "env": { "HMS_CMD_PORT": "47800" }
+    }
+  }
+}</code></pre>
+<p><code>HMS_MCP_TARGET=host:port</code> overrides the whole address if the editor runs elsewhere. Tools exposed:</p>
+<div class="tablewrap"><table>
+<tr><th>Tool</th><th>Parameters</th><th>Purpose</th></tr>
+<tr><td><code>forge_script</code></td><td><code>script</code> (string, newline-separated commands)</td><td>Run any commands from this page. Returns the per-line log. One undo step per call.</td></tr>
+<tr><td><code>list_palette</code></td><td><code>filter</code> (optional)</td><td>Placeable palette objects with their indices.</td></tr>
+<tr><td><code>list_objects</code></td><td>—</td><td>Scene objects with datum and position.</td></tr>
+<tr><td><code>place_object</code></td><td><code>name</code>, <code>x</code>, <code>y</code>, <code>z</code></td><td>Place a palette object (name substring or <code>#index</code>) at a world position; returns its datum.</td></tr>
+</table></div>
+<p>Because it drives the live window, a <code>loadmap</code> followed immediately by <code>screenshot</code> may capture mid-load; use <code>hms-app --script</code> for deterministic batches.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>
