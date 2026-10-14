@@ -395,12 +395,26 @@ fn angle_to_axes_internal(up: [f64; 3], angle: f64) -> [f64; 3] {
 /// Decode world (forward, up) in engine/HMS space (Z-up) from the captured raw fields.
 /// Dequantized components are already engine (x,y,z); no frame remap.
 pub fn decode_orientation(up_is_global: bool, up_quant: u32, forward_angle_q: u32) -> ([f32; 3], [f32; 3]) {
+    decode_orientation_bits(up_is_global, up_quant, 20, forward_angle_q, 14)
+}
+
+/// The same decode with the quantisation WIDTHS as parameters. A `.mvar` stores the up vector in
+/// 20 bits and the forward angle in 14; a saved film's replication stream
+/// (`film_decode`, `sub_1803D9330`) uses 19 and 8 for the same pair of quantities, so both share
+/// this one implementation rather than each carrying its own copy of the Rodrigues convention.
+pub fn decode_orientation_bits(
+    up_is_global: bool,
+    up_quant: u32,
+    up_bits: u32,
+    angle_q: u32,
+    angle_bits: u32,
+) -> ([f32; 3], [f32; 3]) {
     let up = if up_is_global {
         GLOBAL_UP
     } else {
-        dequantize_unit_vector3d(up_quant as i64, 20)
+        dequantize_unit_vector3d(up_quant as i64, up_bits)
     };
-    let angle = dequantize_real_f(forward_angle_q as i64, -K_PI, K_PI, 1i64 << 14, false, false);
+    let angle = dequantize_real_f(angle_q as i64, -K_PI, K_PI, 1i64 << angle_bits, false, false);
     let fwd = angle_to_axes_internal(up, angle);
     let f32v = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32];
     (f32v(fwd), f32v(up))
@@ -518,7 +532,7 @@ fn highest_bit_set(v: i32) -> i32 {
     31 - (v as u32).leading_zeros() as i32
 }
 
-fn compute_axis_bits(bitcount: i32, ext: [f32; 3]) -> [u32; 3] {
+pub fn compute_axis_bits(bitcount: i32, ext: [f32; 3]) -> [u32; 3] {
     const MIN_UNIT: f32 = 0.00833333333;
     let mut min_step = if bitcount > 16 {
         MIN_UNIT / (1i32 << (bitcount - 16)) as f32
@@ -755,6 +769,10 @@ pub struct Variant {
     /// authored on. Must match the loaded map before its objects make sense; otherwise
     /// the correct base map has to be loaded first.
     pub map_id: u32,
+    /// MCC map GUID (version >= 32 files), the key that routes a variant saved on a Workshop
+    /// (modded) map to its base map: those maps have no numeric id and the .mvar stores
+    /// `map_id` 0xFFFFFFFE. Same bytes as `globals.mcc_map_id`; see `mapcat::parse_guid_le`.
+    pub mcc_map_id: Option<[u8; 16]>,
     /// `m_number_of_placeable_object_quotas` — the count of distinct object types the
     /// variant's quota array holds (1:1 with the base map's sandbox palette). Should equal
     /// the number of distinct sandbox-palette object types; a mismatch means the offline
@@ -1041,6 +1059,13 @@ pub fn reach_chunk_hash(payload: &[u8], length: u32) -> [u8; 20] {
     crate::h4::mvar::mvar_chunk_hash(payload, length)
 }
 
+/// True for the `map_id` a variant saved on a Workshop (modded) map carries: those maps have no
+/// numeric id, the game writes -2 (0xFFFFFFFE); -1 is the "none" sentinel. Such a variant can only
+/// be routed to its base map through its MCC map GUID.
+pub fn is_unassigned_map_id(map_id: u32) -> bool {
+    map_id == 0xFFFF_FFFE || map_id == 0xFFFF_FFFF || map_id == 0
+}
+
 /// Parse a .mvar file → base map id + placed forge objects.
 pub fn parse_variant(path: &std::path::Path) -> Option<Variant> {
     let data = read_expanded(path).ok()?;
@@ -1092,6 +1117,7 @@ pub fn parse_variant(path: &std::path::Path) -> Option<Variant> {
     };
     Some(Variant {
         map_id,
+        mcc_map_id: hi.mcc_map_id,
         num_quotas,
         objects,
         labels: hi.labels,
@@ -1424,7 +1450,16 @@ impl HeaderEdits {
     /// (30+ of one player's files share `567b3fca0707e5ad`, Forge World's), so that is what a
     /// game-made file carries and the listing does not key on it.
     pub fn stamp_new(&mut self, xuid: u64) {
-        self.created = Some((crate::h4::mvar::unix_now(), xuid));
+        self.stamp_new_at(xuid, crate::h4::mvar::unix_now());
+    }
+    /// The same, with the timestamp SUPPLIED rather than read from the clock.
+    ///
+    /// The clock is the only thing in a rebuilt variant that is not a pure function of its input,
+    /// and the stamp is mirrored in several places (the bitstream and both `chdr` copies), so two
+    /// builds of the same variant a second apart differ in a scatter of bytes. Anything that has
+    /// to compare two builds byte for byte passes the same instant to both.
+    pub fn stamp_new_at(&mut self, xuid: u64, now: u64) {
+        self.created = Some((now, xuid));
         self.modified = Some((0, 0));
     }
     /// A re-save of an existing variant the way MCC stamps one: created kept, modified = (now, xuid).
@@ -2280,6 +2315,10 @@ mod tests {
             "/mnt/games/SteamLibrary/steamapps/common/Halo The Master Chief Collection/haloreach/map_variants",
             "/mnt/games/SteamLibrary/steamapps/common/Halo The Master Chief Collection/haloreach/hopper_map_variants",
             "/mnt/games/XboxGames/Halo- The Master Chief Collection/Content/haloreach/map_variants",
+            // The install THIS box actually has (/mnt/games is not always mounted); without it
+            // the whole round-trip gate goes vacuous and `samples_are_found` fails.
+            "/mnt/990pro/SteamLibrary/steamapps/common/Halo The Master Chief Collection/haloreach/map_variants",
+            "/mnt/990pro/SteamLibrary/steamapps/common/Halo The Master Chief Collection/haloreach/hopper_map_variants",
         ]);
         for d in dirs {
             let Ok(rd) = std::fs::read_dir(d) else { continue };

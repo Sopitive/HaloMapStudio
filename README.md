@@ -3,9 +3,12 @@
 
 # Halo Map Studio
 
-A standalone map viewer and Forge editor for **Halo: Reach** and **Halo 4**
-(with early, view-only **Halo 2 Anniversary** support) from *Halo: The Master
-Chief Collection* on PC. It reads the game's own `.map` cache files, renders
+**Current release: v1.4.0** — [downloads](https://github.com/Sopitive/HaloMapStudio/releases/latest) · [changelog](https://sopitive.github.io/HaloMapStudio/changelog.html). The app can check for new releases itself (Help ▸ Software update…; opt-in, see the [user guide](https://sopitive.github.io/HaloMapStudio/getting-started.html#updating)). Release archives are named `HaloMapStudio-<version>-linux-x64.zip` / `HaloMapStudio-<version>-windows-x64.zip` (see `RELEASING.md`).
+
+A standalone map viewer and Forge editor for **Halo: Reach**, **Halo 3**,
+**Halo 4** and **Halo 2 Anniversary** from *Halo: The Master Chief Collection*
+on PC. It also plays back **Reach saved films** —
+see [Theater](https://sopitive.github.io/HaloMapStudio/theater.html). It reads the game's own `.map` cache files, renders
 them with the engine's lighting, materials and effects reverse-engineered from
 the shipped shaders, and opens, edits and saves Forge map variants (`.mvar`) —
 no running game required.

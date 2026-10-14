@@ -76,6 +76,10 @@ fn format_desc(format: i16) -> Option<(u32 /*dxgi*/, usize /*block bytes*/, bool
         38 => Some((84, 16, true)),  // DXN  -> BC5_SNORM (the shaders read .xy signed)
         36 => Some((80, 8, true)),   // DXT5a mono -> BC4 (PROVISIONAL)
         11 => Some((87, 4, false)),  // A8R8G8B8 -> B8G8R8A8
+        // H2A (groundhog) normal maps: resource DXGI 51 = R8G8_SNORM (signed .xy, like DXN) #h2a
+        22 => Some((51, 2, false)),
+        // `light_volume_glow` (the lens-flare sun dot): resource DXGI 11 = R16G16B16A16_FLOAT #h2a
+        30 => Some((11, 8, false)),
         _ => None,
     }
 }
@@ -90,6 +94,9 @@ pub enum Texel {
     Dds { bytes: Vec<u8>, w: u32, h: u32, mips: u32 },
     /// One uncompressed BGRA8 level.
     Bgra { bytes: Vec<u8>, w: u32, h: u32 },
+    /// One uncompressed R8G8_SNORM level (format 22: the H2A normal maps; the shaders read .xy
+    /// SIGNED exactly like the BC5_SNORM DXN maps - no *2-1).
+    Rg8Snorm { bytes: Vec<u8>, w: u32, h: u32 },
 }
 
 /// A colour-grading volume (`bitm` type 1 = 3D, A8R8G8B8, n x n x n; the cfxs
@@ -185,7 +192,17 @@ pub fn load_base_texture(c: &H4Cache, tag: usize) -> Result<Texel> {
         // one level is enough for the base-colour path (the renderer builds its own mips)
         let first = &chunks[0].1;
         let n = level_size(tw, th, block, false);
-        return Ok(Texel::Bgra { bytes: first[..n.min(first.len())].to_vec(), w: tw, h: th });
+        let lvl = &first[..n.min(first.len())];
+        return Ok(match info.format {
+            22 => Texel::Rg8Snorm { bytes: lvl.to_vec(), w: tw, h: th },
+            // R16G16B16A16_FLOAT (the lens-flare glow sprite): CPU-clamped to BGRA8 (PROVISIONAL:
+            // an LDR stand-in of the HDR sprite, its >1 peak is lost)
+            30 => Texel::Bgra { bytes: lvl.chunks_exact(8).flat_map(|px| {
+                let f = |o: usize| (half::f16::from_le_bytes([px[o], px[o + 1]]).to_f32().clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                [f(4), f(2), f(0), f(6)]
+            }).collect(), w: tw, h: th },
+            _ => Texel::Bgra { bytes: lvl.to_vec(), w: tw, h: th },
+        });
     }
     let mut bytes = dds_header_dxt10(tw, th, mips, dxgi);
     for (_, ch) in chunks { bytes.extend_from_slice(&ch); }

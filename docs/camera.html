@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -48,9 +49,16 @@
 <tr><td><kbd>E</kbd> or <kbd>R</kbd></td><td>Up</td></tr>
 <tr><td><kbd>Q</kbd> or <kbd>F</kbd></td><td>Down</td></tr>
 <tr><td><kbd>Shift</kbd> (hold)</td><td>4× speed boost</td></tr>
+<tr><td><kbd>Alt</kbd> (hold)</td><td>Quarter speed, for easing up to a close shot</td></tr>
 <tr><td><kbd>Ctrl</kbd> + mouse wheel</td><td>Change fly speed (0.5 – 500 world units per second; the status line shows the new value). The plain wheel does nothing in the viewport on purpose.</td></tr>
 <tr><td><em>fly speed</em> slider (<em>Settings ▸ Lighting &amp; rendering… ▸ Camera &amp; rendering</em>)</td><td>The same setting, 0.5 – 200, default 12.</td></tr>
 </table></div>
+<p><strong>These keys are the defaults, and all of them can be changed.</strong> <em>Settings ▸ Controls &amp; keyboard…</em>
+rebinds any of them — including which mouse button flies the camera — and ships a left-handed preset that moves the
+camera onto the arrow keys (or onto <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd>) for people who hold the mouse
+in their left hand. The fly keys are matched by the key's <em>position</em>, so an AZERTY keyboard flies with
+<kbd>Z</kbd> <kbd>Q</kbd> <kbd>S</kbd> <kbd>D</kbd> with nothing to set up. See
+<a href="shortcuts.html#rebind">Keyboard shortcuts</a>.</p>
 <p>To copy a view into a script or a headless render, run <code>camera get</code> in the script console: it prints the position plus yaw and pitch in <strong>degrees</strong>, the units <code>camera to</code> / <code>camera lookat</code> and the headless <code>HMS_CAM</code> use. (The <em>Advanced (diagnostics)</em> section of the Settings window also shows the pose, but with the angles in radians.)</p>
 
 <h2>Framing and jumping</h2>
@@ -82,7 +90,7 @@ camera clearance              # report nearest surface</code></pre>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

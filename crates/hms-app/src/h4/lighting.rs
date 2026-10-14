@@ -1,45 +1,88 @@
 //! Halo 4 scene lighting tags: atmosphere fog (`fogg`) -> the renderer's fog uniform, and the
 //! camera fx (`cfxs`) -> exposure meter, bloom, filmic curve and colour-grading LUT.
 //!
-//! Fog law (halo4.dll `sub_18035B330` fog blend state, `sub_18039E6F4` fogg accumulate,
-//! `sub_1803A3C90` density = thickness * 0.01, `sub_1803A3CC8` fog light; explicit shader
-//! `explicit_shaders\postprocess\screen_atmospheric_fog` entries 0 (table) / 4 (apply), scratch
-//! listings h4light/fog/dis): Halo 4's atmospheric fog is a deferred screen-space pass over the
-//! HDR buffer, `final = scene * T + inscatter`, per height layer
-//!   dh   = min(hi - base, H) - (lo - base)          (ray extent inside the layer, lo/hi = min/max z)
-//!   d    = min(max(0, sat(dh / (hi - lo)) * (dist + dist_bias)), falloff_end)
-//!   k    = sat((H - (lo - base)) / H)^2
-//!   T    = exp2(-d * thickness * 0.01 * k),  inscatter = colour * (1 - T)
-//! plus the optional fog light (flags bit 3): `f = sat((dot(view, L) - cos r) / (1.001 - cos r))
-//! ^ ang_falloff * sat(1 + T / (nearby_cutoff - 1)) ^ dist_falloff`, colour = tint * tint_int,
-//! or with flags bit 7 = tint_int * the BSP sun colour along -sun_dir. The scnr Fog block
-//! (+0x56C, 16-B elements, `fogg` ref @0) selects the tag (weighted by atmosphere blend
-//! volumes on campaign maps - the MP maps have exactly one). Haven's `fogg` has both
-//! thicknesses 0 = no atmospheric fog; Ravine: ground layer base 5 / height 2000 / thickness
-//! 0.05 / falloff 2000, colour (0.571, 0.730, 0.956), fog light 0.1 x sun.
+//! Fog law - the engine's `screen_atmospheric_fog` TABLE pass, read from the shipped DXBC
+//! (entries 0/2 = 2-layer table generation, 4/5 = apply; byte-identical asm in ca_zanzibar.map and
+//! Halo 4's m10_crash.map) and the H4EK source `include/atmosphere/atmosphere_calculate.fxh`
+//! (`compute_scattering_mixed`), plus the halo4.dll CPU side (groundhog.dll is byte-identical at
+//! every step): `sub_18039E6F4` fogg accumulate (weighted by the atmosphere blend volumes; MP maps
+//! = one fogg at weight 1), `sub_18039EE1C` normalise, `sub_1803A3C90` density = (t < 2e-4 ?
+//! max(0, 2(t - 1e-4)) : t) * 0.01 per world unit (groundhog `sub_1803A4858`, same bytes),
+//! `sub_18039FA28` the per-layer 256-entry CPU tables, `sub_18039F7BC` constant packing.
+//!   per layer: table T(x), x in 0..1 = (weighted travel distance) / max_distance, with
+//!     T(x) = exp(-x * max_distance * density)        no function (natural exp: ps00 `mul 1.4427; exp`)
+//!     T(x) = 1 - f(x)                                 the layer's authored mapping function
+//!     (`fogg` +0x28 / +0x54 count == 1: the engine evaluates it with `sub_180234E08` and the
+//!     thickness field is NOT read for that layer - every shipped H2A map fogs this way, which is
+//!     why their thickness fields hold junk like 4.982892 = log2(31.6))
+//!   ray: top/bot = max/min(scene z, camera z), ratio = sat(dh / (top - bot)) of the ray inside
+//!   the layer, k = sat((H - (bot - base)) / H)^2, d = clamp((dist + dist_bias) * ratio, 0, max)
+//!   sky (solo, above the ground layer top): T_a = table_a(k_a d_a / max_a)
+//!   ground (mixed): T_m = table_b(k_b d_b / max_b) * table_a(min(d, max_a - d_a) / max_a)
+//!   inscatter = the two layers' colours (weighted by density x travel) composed in either
+//!   order by `low_rate`; final = scene * T_a * T_m + inscatter (+ fog light).
+//! Layer base heights are camera-relative with flags bit 5 (sky) / bit 6 (ground). Fog light
+//! (`sub_1803A3CC8`; on when intensity > 0 and flags bit 8 clear): colour = the TINT alone for an
+//! authored light (intensity is not packed), sun colour x intensity with flags bit 7;
+//! `f = sat((dot(view, L) - cos r) / (1.001 - cos r))^ang_falloff * sat(1 + T / (nearby_cutoff -
+//! 1))^dist_falloff`. The scnr Fog block (+0x56C, 16-B elements, `fogg` ref @0) selects the tag.
+//! Ravine: ground layer base 5 / height 2000 / thickness 0.05 / max 2000, no function.
 //!
 //! `fogg` layout (== the X360 Assembly fogg.xml, matching the DLL reader): flags u16 @0,
-//! dist bias f32 @4; sky layer @0x8 {base, height, thickness, falloff end, rgb @0x18}; ground
-//! layer @0x34 {same, rgb @0x44}; ceiling @0x60; fog light @0x8C {pitch, yaw, angular radius,
-//! tint rgb @0x98, tint intensity @0xA4, angular falloff @0xA8, distance falloff @0xAC, nearby
-//! cutoff @0xB0}.
+//! dist bias f32 @4; sky layer @0x8 {base, height, thickness, max distance, rgb @0x18, 1.0 @0x24
+//! (unread), function block @0x28 {count, address} of one tag_data {size @0, ptr @12} = a Guerilla
+//! mapping function}; ground layer @0x34 {same, rgb @0x44, function @0x54}; ceiling @0x60; fog
+//! light @0x8C {pitch, yaw, angular radius, tint rgb @0x98, tint intensity @0xA4, angular falloff
+//! @0xA8, distance falloff @0xAC, nearby cutoff @0xB0}.
 
 use eframe::wgpu;
 use super::cache::{ByteRead, H4Cache};
+use crate::scene::MapFn;
+use hms_render::{FOG_UNIFORM_LEN, H4_FOG_TABLE_LEN};
 
 pub const OFF_SCNR_FOG: usize = 0x56C;
 pub const FOGG_FLAG_SKY: u16 = 1 << 0;
 pub const FOGG_FLAG_GROUND: u16 = 1 << 1;
 pub const FOGG_FLAG_LIGHT: u16 = 1 << 3;
+/// Sky / ground layer base height is relative to the camera height (accumulate `v10 & 0x20/0x40`).
+pub const FOGG_FLAG_SKY_BASE_CAMERA: u16 = 1 << 5;
+pub const FOGG_FLAG_GROUND_BASE_CAMERA: u16 = 1 << 6;
 pub const FOGG_FLAG_LIGHT_IS_SUN: u16 = 1 << 7;
+/// Fog light disabled (accumulate `v10 & 0x100` zeroes the light weight).
+pub const FOGG_FLAG_LIGHT_OFF: u16 = 1 << 8;
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FogLayer {
     pub base: f32,
     pub height: f32,
     pub thickness: f32,
     pub falloff_end: f32,
     pub color: [f32; 3],
+    /// The authored extinction curve (function block @+0x20 of the layer): T = 1 - f(d / max);
+    /// the engine ignores `thickness` for the extinction of such a layer (density still weights
+    /// the layer's colour share).
+    pub function: Option<MapFn>,
+}
+
+impl FogLayer {
+    /// The engine's per-world-unit density of the layer (`sub_1803A3C90`).
+    pub fn density(&self) -> f32 {
+        let t = self.thickness;
+        (if t < 2e-4 { (2.0 * (t - 1e-4)).max(0.0) } else { t }) * 0.01
+    }
+    /// The layer's extinction table T(x), x = weighted travel distance / max distance in 0..1
+    /// (`sub_18039FA28` builds 256 entries; the shader interpolates linearly).
+    pub fn table(&self) -> [f32; H4_FOG_TABLE_LEN] {
+        let mut t = [1.0f32; H4_FOG_TABLE_LEN];
+        for (i, v) in t.iter_mut().enumerate() {
+            let x = i as f32 / (H4_FOG_TABLE_LEN - 1) as f32;
+            *v = match &self.function {
+                Some(f) => (1.0 - f.eval(x)).clamp(0.0, 1.0),
+                None => (-x * self.falloff_end * self.density()).exp().min(1.0),
+            };
+        }
+        t
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,7 +104,16 @@ pub struct H4Fog {
 
 fn layer(c: &H4Cache, o: usize) -> FogLayer {
     let d = c.data();
-    FogLayer { base: d.f32_at(o), height: d.f32_at(o + 4), thickness: d.f32_at(o + 8), falloff_end: d.f32_at(o + 12), color: [d.f32_at(o + 16), d.f32_at(o + 20), d.f32_at(o + 24)] }
+    // function block @+0x20: {count, address}; the runtime takes the block when count == 1 and
+    // evaluates the element's tag_data (size @0, cache ptr @12)
+    let function = c.block(o + 0x20).filter(|(n, _)| *n == 1).and_then(|(_, fo)| {
+        let size = d.i32_at(fo);
+        let ptr = d.u32_at(fo + 12);
+        if size <= 0 { return None; }
+        let bo = c.meta_off(ptr)?;
+        MapFn::decode(&d[bo..(bo + size as usize).min(d.len())])
+    });
+    FogLayer { base: d.f32_at(o), height: d.f32_at(o + 4), thickness: d.f32_at(o + 8), falloff_end: d.f32_at(o + 12), color: [d.f32_at(o + 16), d.f32_at(o + 20), d.f32_at(o + 24)], function }
 }
 
 /// The scenario's first `fogg` (None when the scnr Fog block is empty or the ref is null).
@@ -72,6 +124,19 @@ pub fn load_fog(c: &H4Cache) -> Option<H4Fog> {
     let tag = c.tag_ref_of(fo, b"fogg")?;
     let m = c.tag_meta(tag)?;
     let d = c.data();
+    if std::env::var("HMS_H4_FOGDIAG").is_ok() { // print-only: raw tag floats (fmt/i16 when not float-like)
+        let fl: Vec<String> = (0..0x30).map(|q| { let v = d.f32_at(m + q * 4); if v.is_finite() && v.abs() < 1e6 && (v == 0.0 || v.abs() > 1e-6) { format!("{q:#x}={v:.4}") } else { format!("{q:#x}=i{}", d.i32_at(m + q * 4)) } }).collect();
+        eprintln!("  H4FOG raw {}", fl.join(" "));
+        // the per-layer function blocks (sky @0x28, ground @0x54: tag_data {size @0, ptr @12})
+        for (label, bo) in [("sky", 0x28usize), ("ground", 0x54usize)] {
+            if let Some((n, fo)) = c.block(m + bo) {
+                let size = d.i32_at(fo);
+                let ptr = d.u32_at(fo + 12);
+                let bytes = c.meta_off(ptr).filter(|_| size > 0).map(|o| d[o..(o + size as usize).min(d.len())].iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")).unwrap_or_default();
+                eprintln!("  H4FOG {label} function block n={n} size={size} ptr={ptr:#x}: {bytes}");
+            }
+        }
+    }
     Some(H4Fog {
         name: c.tag_name(tag).to_string(),
         flags: d.u16_at(m),
@@ -90,47 +155,66 @@ pub fn load_fog(c: &H4Cache) -> Option<H4Fog> {
 }
 
 impl H4Fog {
-    /// True when a layer would fog anything (the engine skips the pass at thickness 0).
+    /// True when the engine runs the fog pass: `sub_18039F7BC` enables it when either layer's
+    /// accumulated thickness is > 0 (the flag bits 0/1 are not consulted at runtime; a function
+    /// layer still needs a non-zero thickness to count, which is why the H2A tags carry one).
     pub fn active(&self) -> bool {
-        (self.flags & FOGG_FLAG_GROUND != 0 && self.ground.thickness > 2e-4) || (self.flags & FOGG_FLAG_SKY != 0 && self.sky.thickness > 2e-4)
+        self.ground.thickness > 0.0 || self.sky.thickness > 0.0
     }
 
-    /// The renderer's 28-float fog uniform packed for the Halo 4 lane (mesh.rs `h4_fog`):
-    /// atm0 = 0 (the Reach sky-tint lane), atm1 = ground colour, atm2 = fog light colour,
-    /// atm3 = 0 (keeps the Reach `apply_fog` off), atm4 = (density, base, height, falloff_end) of
-    /// the ground layer, atm5 = (dist bias, light on, cos radius, angular falloff), atm6 = (light
-    /// dir xyz, 4.0 = the Halo 4 marker); the sky layer density rides in atm1.w, its (base,
-    /// height, falloff) in atm2.w / atm5.w is NOT carried (Ravine + Haven: sky thickness 0).
+    /// The renderer's fog uniform packed for the Halo 4 lane (mesh.rs `h4_fog`, lib.rs
+    /// FOG_UNIFORM_LEN): atm0 = 0 (the Reach sky-tint lane), atm1 = ground colour (.w = sky
+    /// density, informational), atm2 = fog light colour (.w = distance falloff), atm3 = (1 /
+    /// (nearby_cutoff - 1), 0, 0, 0) (keeps the Reach `apply_fog` off), atm4 = (density, base, height,
+    /// max distance) of the ground layer, atm5 = (dist bias, light on, cos radius, angular falloff),
+    /// atm6 = (light dir xyz, 4.0 = the Halo 4 marker); ext[0] = (sky base, height, max distance,
+    /// density), ext[1] = (sky colour, mode bits: 1 sky base camera-relative, 2 ground base
+    /// camera-relative, 4 active), ext[2..18] / ext[18..34] = the sky / ground extinction tables.
     /// `sun_dir` = unit vector TO the sun, `sun_rgb` = the BSP sun colour (fog light flag 7).
-    pub fn uniform(&self, sun_dir: [f32; 3], sun_rgb: [f32; 3]) -> [f32; 28] {
-        let mut f = [0.0f32; 28];
+    pub fn uniform(&self, sun_dir: [f32; 3], sun_rgb: [f32; 3]) -> [f32; FOG_UNIFORM_LEN] {
+        let mut f = [0.0f32; FOG_UNIFORM_LEN];
         let g = &self.ground;
+        let sk = &self.sky;
         // atm0 stays zero: the renderer reads fog[0..3] as the Reach sky-gradient tint and a
         // Halo 4 sky is a scenery object, so the procedural gradient keeps its neutral default
         f[4..7].copy_from_slice(&g.color);
-        f[7] = if self.flags & FOGG_FLAG_SKY != 0 { self.sky.thickness * 0.01 } else { 0.0 };
-        let light_on = self.flags & FOGG_FLAG_LIGHT != 0 && self.light_intensity > 0.0;
+        f[7] = sk.density();
+        // fog light: on when the authored intensity is > 0 and bit 8 is clear (accumulate v18 / v13);
+        // the colour is the tint alone (`sub_1803A3CC8` never packs the intensity for a tint light),
+        // or intensity x the BSP sun colour along the sun with flags bit 7
+        let light_on = self.light_intensity > 0.0 && self.flags & FOGG_FLAG_LIGHT_OFF == 0;
         let (lc, ld) = if self.flags & FOGG_FLAG_LIGHT_IS_SUN != 0 {
             ([sun_rgb[0] * self.light_intensity, sun_rgb[1] * self.light_intensity, sun_rgb[2] * self.light_intensity], sun_dir)
         } else {
             let (p, y) = (self.light_pitch.to_radians(), self.light_yaw.to_radians());
-            ([self.light_tint[0] * self.light_intensity, self.light_tint[1] * self.light_intensity, self.light_tint[2] * self.light_intensity],
-             [p.cos() * y.cos(), p.cos() * y.sin(), p.sin()])
+            (self.light_tint, [p.cos() * y.cos(), p.cos() * y.sin(), p.sin()])
         };
         f[8..11].copy_from_slice(&lc);
         f[11] = self.light_dist_falloff;
-        f[16] = if self.flags & FOGG_FLAG_GROUND != 0 { g.thickness * 0.01 } else { 0.0 };
+        f[12] = 1.0 / (self.light_nearby_cutoff - 1.0).min(-1e-3);
+        f[16] = g.density();
         f[17] = g.base;
         f[18] = g.height;
-        f[19] = g.falloff_end.max(100.0);
+        f[19] = g.falloff_end;
         f[20] = self.dist_bias;
         f[21] = if light_on { 1.0 } else { 0.0 };
-        f[22] = self.light_radius_deg.to_radians().cos();
+        f[22] = self.light_radius_deg.clamp(0.0, 180.0).to_radians().cos();
         f[23] = self.light_ang_falloff;
         f[24..27].copy_from_slice(&ld);
         f[27] = 4.0;
-        // nearby cutoff rides in atm1.w's neighbour slot? no free lane: fold 1/(cutoff-1) into atm3.x
-        f[12] = 1.0 / (self.light_nearby_cutoff - 1.0).min(-1e-3);
+        // extension: sky layer, mode, tables
+        f[28] = sk.base;
+        f[29] = sk.height;
+        f[30] = sk.falloff_end;
+        f[31] = sk.density();
+        f[32..35].copy_from_slice(&sk.color);
+        let mut mode = 0u32;
+        if self.flags & FOGG_FLAG_SKY_BASE_CAMERA != 0 { mode |= 1; }
+        if self.flags & FOGG_FLAG_GROUND_BASE_CAMERA != 0 { mode |= 2; }
+        if self.active() { mode |= 4; }
+        f[35] = mode as f32;
+        f[36..36 + H4_FOG_TABLE_LEN].copy_from_slice(&sk.table());
+        f[36 + H4_FOG_TABLE_LEN..36 + 2 * H4_FOG_TABLE_LEN].copy_from_slice(&g.table());
         f
     }
 }
@@ -573,6 +657,21 @@ mod tests {
         if let Some(c) = open("wraparound.map") {
             let f = load_fog(&c).expect("haven fogg");
             assert!(!f.active(), "{f:?}");
+        }
+        // H2A Zanzibar (#h2a-fog): the ground layer carries an authored extinction curve, the
+        // cubic 0.0587x^3 - 0.734x^2 + 1.675x over d / 200 wu, so T(0) = 1, T(1) = 0 and the
+        // 4.982892 thickness never becomes a density; sky layer thickness 0 -> table of ones; the
+        // fog light colour is the tint alone (165, 142, 100), not tint x intensity 200.
+        if let Some(c) = crate::h4::cache::h2a_maps_dir().and_then(|d| H4Cache::open(&d.join("ca_zanzibar.map")).ok()) {
+            let f = load_fog(&c).expect("zanzibar fogg");
+            assert!(f.ground.function.is_some() && f.sky.function.is_none());
+            let t = f.ground.table();
+            let x = 31.0 / 63.0;
+            let expect = 1.0 - (0.0587 * x * x * x - 0.734 * x * x + 1.675 * x);
+            assert!((t[0] - 1.0).abs() < 1e-4 && t[63].abs() < 2e-3 && (t[31] - expect).abs() < 5e-3, "{:?}", &t[..]);
+            assert!(f.sky.table().iter().all(|v| (v - 1.0).abs() < 1e-6));
+            let u = f.uniform([0.0, 0.0, 1.0], [1.0; 3]);
+            assert!((u[8] - 164.98825).abs() < 1e-3 && u[21] == 1.0 && (u[35] - 6.0).abs() < 1e-6, "light {:?} mode {}", &u[8..11], u[35]);
         }
     }
 

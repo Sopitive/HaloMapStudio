@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Result};
 use eframe::wgpu;
 use glam::{Mat4, Vec3};
-use hms_render::{GpuMesh, LightmapInputs, MeshRenderer, MeshVertex};
+use hms_render::{GpuMesh, LightmapInputs, MeshRenderer, MeshVertex, WaterParams};
 
 use super::bitmaps::{bitmap_dxgi, bitmap_info, dxgi_is_srgb, load_base_texture, load_cube_faces, Texel};
 use super::cache::H4Cache;
@@ -43,6 +43,8 @@ pub enum Lane {
     AlphaTest,
     Blend,
     Additive,
+    /// `shader_water` surfaces, drawn through the renderer's water pass. #h2a-water
+    Water,
     /// The scenario sky object's parts (renderer sky lane; `GpuMesh::blend_mode` carries
     /// the Reach sky blend enum, `centroid().x` the draw order).
     Sky,
@@ -96,6 +98,7 @@ fn lane_for(kind: H4MatKind) -> Option<Lane> {
         H4MatKind::AlphaTest => Some(Lane::AlphaTest),
         H4MatKind::AlphaBlend | H4MatKind::Multiply => Some(Lane::Blend),
         H4MatKind::Additive => Some(Lane::Additive),
+        H4MatKind::Water => Some(Lane::Water),
         H4MatKind::Invisible => None,
     }
 }
@@ -234,6 +237,8 @@ pub(crate) struct TexCtx {
     shading_cache: HashMap<usize, H4Shading>,
     /// Linear-format sky bitmaps uploaded gamma-encoded (`fetch_tex_sky`).
     sky_cache: HashMap<usize, Option<wgpu::TextureView>>,
+    /// #h2a-vista: the n x 1 RGBA16F user-constant row of a `srf_ca_skybox_terrain` / `_water` material (per mat tag).
+    const_cache: HashMap<usize, wgpu::TextureView>,
     shade_diag: bool,
     white_tex: wgpu::TextureView,
 }
@@ -244,7 +249,7 @@ impl TexCtx {
         TexCtx {
             cache, device: device.clone(), queue: queue.clone(),
             notex: std::env::var("HMS_H4_NOTEX").is_ok(),
-            tex_cache: HashMap::new(), cube_cache: HashMap::new(), shading_cache: HashMap::new(), sky_cache: HashMap::new(),
+            tex_cache: HashMap::new(), cube_cache: HashMap::new(), shading_cache: HashMap::new(), sky_cache: HashMap::new(), const_cache: HashMap::new(),
             shade_diag: std::env::var("HMS_H4_MATDIAG").is_ok(),
             white_tex: hms_render::upload_texture_bgra(device, queue, &[255, 255, 255, 255], 1, 1).0,
         }
@@ -252,6 +257,10 @@ impl TexCtx {
     /// A 2D bitmap as a GPU view + its sRGB flag (the DXGI format at def +0x4C).
     pub(crate) fn fetch_tex(&mut self, tag: usize, stats: &mut H4Stats) -> (Option<wgpu::TextureView>, bool) {
         if self.notex { return (None, false); }
+        if std::env::var("HMS_H4_TEXDIAG").is_ok() { // print-only: name + bitmap format/dxgi of every fetched texture
+            let (fmt, dxgi) = (bitmap_info(&self.cache, tag).map(|i| i.format), bitmap_dxgi(&self.cache, tag));
+            eprintln!("  HMS_H4_TEXDIAG {} fmt={fmt:?} dxgi={dxgi:?}", self.cache.tag_name(tag).rsplit('\\').next().unwrap_or(""));
+        }
         if let Some(v) = self.tex_cache.get(&tag) { return v.clone(); }
         let (cache, device, queue) = (&*self.cache, &self.device, &self.queue);
         let srgb = bitmap_dxgi(cache, tag).map_or(true, dxgi_is_srgb);
@@ -261,6 +270,8 @@ impl TexCtx {
                 None => { stats.tex_fail.push(format!("{} ({w}x{h} mips {mips}): GPU BC upload refused", cache.tag_name(tag))); None }
             },
             Ok(Texel::Bgra { bytes, w, h }) => { stats.tex_ok += 1; Some(hms_render::upload_texture_bgra(device, queue, &bytes, w, h).0) }
+            // format 22 = R8G8_SNORM normal maps (H2A): signed .xy like the BC5_SNORM DXN maps
+            Ok(Texel::Rg8Snorm { bytes, w, h }) => { stats.tex_ok += 1; Some(hms_render::upload_texture_rg8_snorm(device, queue, &bytes, w, h).0) }
             Err(e) => { stats.tex_fail.push(format!("{}: {e}", cache.tag_name(tag))); None }
         };
         self.tex_cache.insert(tag, (view.clone(), srgb));
@@ -328,6 +339,43 @@ impl TexCtx {
         self.shading_cache[&m.mat_tag].clone()
     }
 
+    /// #h2a-vista: a material's user-constant block as an n x 1 RGBA16F row (cached per `mat `
+    /// tag) for the shader lanes whose constants outgrow the instance attributes (mesh.rs
+    /// `h4_sky_p`: cb13[k] = texel k).
+    fn const_row(&mut self, tag: usize, params: &[[f32; 4]]) -> wgpu::TextureView {
+        if !self.const_cache.contains_key(&tag) {
+            let mut bytes = Vec::with_capacity(params.len() * 8);
+            for row in params { for v in row { bytes.extend_from_slice(&half::f16::from_f32(*v).to_le_bytes()); } }
+            let view = hms_render::upload_texture_rgba16f_nomip(&self.device, &self.queue, &bytes, params.len() as u32, 1).0;
+            self.const_cache.insert(tag, view);
+        }
+        self.const_cache[&tag].clone()
+    }
+
+    /// The mean LINEAR rgb + mean alpha of a 2D colour bitmap's top shipped level (sRGB-decoded
+    /// when its DXGI format is an sRGB one; DXT1 / DXT5 / A8R8G8B8 only). #h2a-vista
+    fn bitmap_mean_linear(&self, tag: usize) -> Option<[f32; 4]> {
+        let c = &*self.cache;
+        let srgb = bitmap_dxgi(c, tag).map_or(true, dxgi_is_srgb);
+        let (bgra, n) = match (load_base_texture(c, tag).ok()?, bitmap_info(c, tag)?) {
+            (Texel::Dds { bytes, w, h, .. }, i) => {
+                let lvl = &bytes[148..];
+                (match i.format {
+                    14 => super::bitmaps::decode_bc1_bgra(lvl, w, h),
+                    16 => super::lightmaps::decode_bc3_bgra(lvl, w, h),
+                    _ => return None,
+                }, (w * h) as usize)
+            }
+            (Texel::Bgra { bytes, w, h }, _) => (bytes, (w * h) as usize),
+            _ => return None,
+        };
+        if n == 0 || bgra.len() < n * 4 { return None; }
+        let lin = |v: u8| { let f = v as f32 / 255.0; if srgb { if f <= 0.04045 { f / 12.92 } else { ((f + 0.055) / 1.055).powf(2.4) } } else { f } };
+        let mut acc = [0.0f64; 4];
+        for px in bgra[..n * 4].chunks_exact(4) { acc[0] += lin(px[2]) as f64; acc[1] += lin(px[1]) as f64; acc[2] += lin(px[0]) as f64; acc[3] += px[3] as f64 / 255.0; }
+        Some([(acc[0] / n as f64) as f32, (acc[1] / n as f64) as f32, (acc[2] / n as f64) as f32, (acc[3] / n as f64) as f32])
+    }
+
     /// The material's shading constants + every texture its family samples.
     pub(crate) fn resolve_h4(&mut self, m: &H4Material, stats: &mut H4Stats) -> (H4Shading, H4PartTex) {
         if !self.shading_cache.contains_key(&m.mat_tag) {
@@ -338,13 +386,34 @@ impl TexCtx {
         let sh = self.shading_cache[&m.mat_tag].clone();
         let mut t = H4PartTex::default();
         let (b, bs) = self.get(sh.tex.color, stats);
+        if std::env::var("HMS_H4_BASEDIAG").is_ok() { // print-only: which albedo slot resolved, or every slot when none did
+            let slots: Vec<String> = m.textures.iter().map(|t| format!("{}={}", t.name, t.bitm.map(|b| self.cache.tag_name(b).rsplit('\\').next().unwrap_or("").to_string()).unwrap_or_default())).collect();
+            eprintln!("  H4BASE {} [{}] base={} | {}", m.name.rsplit('\\').next().unwrap_or(""), m.mats_name.rsplit('\\').next().unwrap_or(""), if b.is_some() { "ok" } else { "WHITE" }, slots.join(" "));
+        }
         t.base = b.or_else(|| Some(self.white_tex.clone()));
         t.base_srgb = bs;
         t.normal = self.get(sh.tex.normal, stats).0;
         t.normal_detail = self.get(sh.tex.normal_detail, stats).0;
         let (cd, cds) = self.get(sh.tex.color_detail, stats);
         t.color_detail = cd; t.color_detail_srgb = cds;
-        if let Some(l) = sh.layered.clone() {
+        if let Some(st) = sh.skybox_terrain.clone() {
+            // #h2a-vista srf_ca_skybox_terrain: mat = mix_map, emis = modulate_map (color_detail /
+            // normal_detail = the tree maps, base / normal = combo / macro, resolved above); the
+            // 17 user constants ride the bump_detail3 slot as a 17x1 RGBA16F row (mesh.rs lane 4).
+            let (mx, mxs) = self.get(st.mix, stats); t.spec = mx; t.spec_srgb = mxs;
+            let (md, mds) = self.get(st.modulate, stats); t.emis = md; t.emis_srgb = mds;
+            t.bd3 = Some(self.const_row(m.mat_tag, &st.params));
+        } else if let Some(sw) = sh.skybox_water.clone() {
+            // #h2a-vista srf_ca_skybox_water: cube = reflection_map, the 9 user constants as a
+            // 10x1 row (mesh.rs lane 5) whose row 9 is the MEAN of the colour map: the engine
+            // samples it on the second uv set, which the 36-B object vertex does not carry
+            // (at uv1 the map smears into streaks), so the mean stands in (PROVISIONAL).
+            t.cube = sh.tex.reflection_cube.and_then(|c| self.fetch_cube(c, stats));
+            let mean = sh.tex.color.and_then(|b| self.bitmap_mean_linear(b)).unwrap_or([1.0; 4]);
+            let mut rows: Vec<[f32; 4]> = sw.params.to_vec();
+            rows.push(mean);   // row 9 = mean rgb + mean alpha (the reflection / spec mask)
+            t.bd3 = Some(self.const_row(m.mat_tag, &rows));
+        } else if let Some(l) = sh.layered.clone() {
             t.spec = self.get(l.blend, stats).0;
             let (e, es) = self.get(l.layer_co[1], stats); t.emis = e; t.emis_srgb = es;
             let (a, as_) = self.get(l.layer_co[2], stats); t.at = a; t.at_srgb = as_;
@@ -392,7 +461,8 @@ pub(crate) fn upload_part_h4(mr: &MeshRenderer, device: &wgpu::Device, queue: &w
     let colors = if matches!(kind, H4MatKind::AlphaBlend | H4MatKind::Multiply) { Some(tints.as_slice()) } else { None };
     // #h4-veh layout 3 = srf_char_cov* (the Covenant body ramp), which repurposes the free
     // std-layout lanes (probe1 / fres_rgb / xbump / aux.x) for its three ramp colours.
-    let layout: f32 = if sh.snow.is_some() { 1.0 } else if sh.layered.is_some() { 2.0 } else if sh.char_cov.is_some() { 3.0 } else { 0.0 };
+    // #h2a-vista layout 4 = srf_ca_skybox_terrain (the H2A vista ring: own constant lights).
+    let layout: f32 = if sh.snow.is_some() { 1.0 } else if sh.layered.is_some() { 2.0 } else if sh.char_cov.is_some() { 3.0 } else if sh.skybox_terrain.is_some() { 4.0 } else if sh.skybox_water.is_some() { 5.0 } else { 0.0 };
     let mut srgb = 0u32;
     if tex.base_srgb { srgb |= 1; }
     if tex.color_detail_srgb { srgb |= 2; }
@@ -409,6 +479,7 @@ pub(crate) fn upload_part_h4(mr: &MeshRenderer, device: &wgpu::Device, queue: &w
     if tex.emis.is_some() && layout == 0.0 { flags |= 32; }
     if layout == 1.0 && tex.emis.is_some() && tex.at.is_some() { flags |= 64; }
     if layout == 2.0 && tex.spec.is_some() { flags |= 64; }
+    if (layout == 4.0 || layout == 5.0) && tex.bd3.is_some() { flags |= 64; }   // the user-constant row is bound
     // `at` slot bound: pcc_amount_map (layout 0) or spec_detail_map (layout 3, #h4-veh)
     if (layout == 0.0 || layout == 3.0) && tex.at.is_some() { flags |= 128; }
     let xf = |x: [f32; 4]| x;
@@ -427,6 +498,32 @@ pub(crate) fn upload_part_h4(mr: &MeshRenderer, device: &wgpu::Device, queue: &w
         probe1 = [sn.spec1_color[0], sn.spec1_color[1], sn.spec1_color[2], sn.spec1_intensity];
         fine_xform = xf(t.normal1_xform);
         mattex_xform = xf(t.color1_xform);
+        bump_detail_xform = xf(t.normal_detail_xform);
+        si_mode = 0.0;
+    } else if sh.skybox_water.is_some() {
+        // #h2a-vista lane 5: base + cube + the constant row; every lighting lane is ignored.
+        env_ctl = [1.0, 1.0, 1.0, 0.0];
+        mattex = [0.0, 0.0, 1.0, 0.0];
+        si_ctl = [0.0; 4];
+        xbump = [0.0; 4];
+        probe0 = [1.0, 1.0, 1.0, 0.0];
+        probe1 = [0.0; 4];
+        fine_xform = [1.0, 1.0, 0.0, 0.0];
+        mattex_xform = [1.0, 1.0, 0.0, 0.0];
+        bump_detail_xform = [1.0, 1.0, 0.0, 0.0];
+        si_mode = 0.0;
+    } else if let Some(st) = &sh.skybox_terrain {
+        // #h2a-vista: only the texture xforms matter (fine = mix_map, mattex = modulate_map,
+        // bump_detail = tree normal, detail = tree colour below); every constant comes from the
+        // RGBA16F row in the bump_detail3 slot, the lighting lanes are ignored by lane 4.
+        env_ctl = [1.0, 1.0, 1.0, 0.0];
+        mattex = [0.0, 0.0, 1.0, 0.0];
+        si_ctl = [0.0; 4];
+        xbump = [0.0; 4];
+        probe0 = [1.0, 1.0, 1.0, 0.0];
+        probe1 = [0.0; 4];
+        fine_xform = xf(st.mix_xform);
+        mattex_xform = xf(st.modulate_xform);
         bump_detail_xform = xf(t.normal_detail_xform);
         si_mode = 0.0;
     } else if let Some(l) = &sh.layered {
@@ -683,7 +780,11 @@ pub struct H4Stats {
     pub lm_probe_instances: usize,
     /// The scenario's atmosphere fog packed for the renderer (lighting.rs), None when
     /// the map has no active fog layer (Haven).
-    pub fog: Option<[f32; 28]>,
+    pub fog: Option<[f32; hms_render::FOG_UNIFORM_LEN]>,
+    /// The fogg's sky-inscatter and ground-fog colours (for the fallback sky gradient's horizon /
+    /// below-horizon haze on this path: the fog uniform's first floats are NOT a sky colour).
+    pub fog_sky_color: Option<[f32; 3]>,
+    pub fog_ground_color: Option<[f32; 3]>,
     /// The scenario's default camera fx (exposure band / bloom / filmic), lighting.rs.
     pub camera_fx: Option<super::lighting::H4CameraFx>,
     /// The cfxs colour-grading volume (BGRA8 texels, n) decoded for the post pass.
@@ -994,7 +1095,42 @@ pub fn build_meshes(
                 // `srf_ca_boundary*` (the boundary walls): its own ADDITIVE self-illum shader,
                 // drawn through the renderer's halogram lane (`upload_part_boundary`).
                 let bnd = match (classified, shading_on) { (Some(m), true) => tc.shading_of(m).boundary, _ => None };
-                let gm = if let Some(b) = bnd {
+                let gm = if kind == H4MatKind::Water {
+                    // #h2a-water: draw through the renderer's water pass (transparent + sky
+                    // reflection) with the water material's own colour map and default surface
+                    // params. Identity instance: structure-BSP water is at world origin. The atlas
+                    // lightmap rides along so the water surface takes the baked light.
+                    let wverts: Vec<MeshVertex> = if mats.len() == 1 && mats[0] != Mat4::IDENTITY {
+                        let m = mats[0]; let n = glam::Mat3::from_mat4(m);
+                        part_verts.iter().map(|v| MeshVertex { pos: m.transform_point3(Vec3::from(v.pos)).into(), normal: (n * Vec3::from(v.normal)).normalize_or_zero().into(), ..*v }).collect()
+                    } else { part_verts.to_vec() };
+                    // #h2a-water: the H2A `water_io*` families carry no colour map - their body colour
+                    // is p0.rgb (relic 0.016/0.029/0.041 = deep blue-green). Through the default
+                    // params with NO base texture the river/pools drew MAGENTA. Feed p0 into the
+                    // deep / diffuse colours and bind a 1x1 of it as the base when nothing else is.
+                    let mut wp = WaterParams::default();
+                    let water_p0 = classified.and_then(|m| m.floats.first().map(|f| f.1)).filter(|p| p[0].is_finite() && p[0] >= 0.0 && p[0] <= 1.0 && p[1] <= 1.0 && p[2] <= 1.0);
+                    let one_by_one;
+                    // no colour map at all -> pure-colour water (cat.x = 0): with a texture water
+                    // colour AND dynamic refraction the shader's texture branch has no real map to
+                    // read and H2A's `water_io` pools came out MAGENTA; reflection/refraction stay on.
+                    // ... and for every H2A `water_io*` family even WITH a colour map: the texture +
+                    // refraction combination is the broken one (relic puddles stayed magenta).
+                    // A "colour" slot that is really a flow-direction / normal / noise map (relic's
+                    // `puddles_diff_direction`) is not a water colour either -> pure colour as well;
+                    // a REAL colour map (zanzibar's turquoise sea) keeps the texture path.
+                    let fake_color = classified.and_then(|m| m.diffuse()).map_or(false, |t| { let n = tc.cache.tag_name(t).to_ascii_lowercase(); n.contains("direction") || n.contains("_flow") || n.contains("normal") || n.contains("noise") });
+                    if std::env::var("HMS_H4_MATDIAG").is_ok() { if let Some(m) = classified { eprintln!("  H4WATER {} [{}] tex {:?} fake_color {fake_color} | {}", m.name.rsplit('\\').next().unwrap_or(""), m.mats_name.rsplit('\\').next().unwrap_or(""), m.diffuse().map(|t| tc.cache.tag_name(t).rsplit('\\').next().unwrap_or("").to_string()), m.textures.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(" ")); } }
+                    if tex.is_none() || fake_color { wp.cat[0] = 0.0; }
+                    let wtex = if tex.is_some() { tex.clone() } else if let Some(p) = water_p0 {
+                        wp.deep = [p[0], p[1], p[2], 0.0]; wp.diff = [p[0] * 0.5, p[1] * 0.5, p[2] * 0.5, wp.diff[3]];
+                        let c = |v: f32| (v.max(0.0).powf(1.0 / 2.2) * 255.0).round().clamp(0.0, 255.0) as u8;
+                        one_by_one = hms_render::upload_texture_bgra(device, queue, &[c(p[2]), c(p[1]), c(p[0]), 255], 1, 1).0; Some(one_by_one)
+                    } else { None };
+                    let wlm = if std::env::var("HMS_H4_WATER_NOLM").is_ok() { None } else { lm.map(|ag| ag.inputs()) }; // probe
+                    if let Ok(c) = std::env::var("HMS_H4_WATER_CAT") { let v: Vec<f32> = c.split(',').filter_map(|x| x.trim().parse().ok()).collect(); if v.len() == 4 { wp.cat = [v[0], v[1], v[2], v[3]]; } } // probe
+                    mr.upload_water_mesh(device, queue, &wverts, indices, wtex.as_ref(), None, &wp, None, None, None, wlm)
+                } else if let Some(b) = bnd {
                     upload_part_boundary(&mut tc, mr, part_verts, indices, mats, &b, &mut stats)
                 } else if h4_lane {
                     let (sh, ht) = tc.resolve_h4(classified.unwrap(), &mut stats);
@@ -1217,10 +1353,19 @@ pub fn build_meshes(
     if let Some(f) = super::lighting::load_fog(cache) {
         let sun_dir = stats.sun_dir().to_array();
         let sun_rgb = stats.sun.map(|(_, rgb)| rgb).unwrap_or([0.0; 3]);
-        log(format!("h4 fog '{}': flags {:#x} ground base {} height {} thickness {} falloff {} colour {:?}{} -> {}", f.name.rsplit('\\').next().unwrap_or(&f.name), f.flags, f.ground.base, f.ground.height, f.ground.thickness, f.ground.falloff_end, f.ground.color,
+        log(format!("h4 fog '{}': flags {:#x} SKY[base {} height {} thickness {} falloff {} colour {:?}] ground base {} height {} thickness {} falloff {} colour {:?}{} -> {}", f.name.rsplit('\\').next().unwrap_or(&f.name), f.flags, f.sky.base, f.sky.height, f.sky.thickness, f.sky.falloff_end, f.sky.color, f.ground.base, f.ground.height, f.ground.thickness, f.ground.falloff_end, f.ground.color,
             if f.flags & super::lighting::FOGG_FLAG_LIGHT != 0 { format!(", fog light {}x{} (tint {:?}, pitch {} yaw {} radius {} ang falloff {} dist falloff {} nearby cutoff {}), dist bias {}", f.light_intensity, if f.flags & super::lighting::FOGG_FLAG_LIGHT_IS_SUN != 0 { "sun" } else { "tint" }, f.light_tint, f.light_pitch, f.light_yaw, f.light_radius_deg, f.light_ang_falloff, f.light_dist_falloff, f.light_nearby_cutoff, f.dist_bias) } else { String::new() },
             if f.active() { "active" } else { "inactive (thickness 0)" }));
-        if f.active() { stats.fog = Some(f.uniform(sun_dir, sun_rgb)); }
+        if f.active() {
+            stats.fog = Some(f.uniform(sun_dir, sun_rgb));
+            // The fogg's sky colour is the fallback sky's horizon UNLESS it is the tag's untouched
+            // default (0.5, 0.1, 0.8) - Coagulation and Warlock ship exactly that purple with their
+            // sky band unused, and painting it gave a magenta sky; then the ground-fog colour (the
+            // band that IS active) is the haze the map dissolves into.
+            let is_default = |c: [f32; 3]| (c[0] - 0.5).abs() < 1e-3 && (c[1] - 0.1).abs() < 1e-3 && (c[2] - 0.8).abs() < 1e-3;
+            stats.fog_sky_color = Some(if is_default(f.sky.color) { f.ground.color } else { f.sky.color });
+            stats.fog_ground_color = Some(f.ground.color);
+        }
     }
     if let Some(x) = super::lighting::load_camera_fx(cache) {
         log(format!("h4 camera fx '{}': exposure range [{}, {}] stops, screen brightness {:.3} sensitivity {} (meter key {:.3}), self-illum stops pref {} change {}, bloom highlight {} inherent {} self-illum {} intensity {} colours {:?}, filmic {:?}",
@@ -1236,7 +1381,7 @@ pub fn build_meshes(
     stats.seconds = t0.elapsed().as_secs_f32();
     log(format!("h4 uploaded {} draws, {} tris, {} verts (instanced), decode failures {}, textures ok {} failed {} ({:.2}s)",
         stats.draws, stats.tris, stats.verts, stats.decode_fail, stats.tex_ok, stats.tex_fail.len(), stats.seconds));
-    for f in stats.tex_fail.iter().take(8) { log(format!("  tex: {f}")); }
+    for f in stats.tex_fail.iter().take(if std::env::var("HMS_H4_TEXDIAG").is_ok() { usize::MAX } else { 8 }) { log(format!("  tex: {f}")); }
     log(format!("h4 world bounds min {:?} max {:?}", stats.bmin, stats.bmax));
     Ok(stats)
 }
@@ -1244,7 +1389,15 @@ pub fn build_meshes(
 /// Grow the object caster AABB by one placed model instance (`transform_aabb`).
 pub fn grow_caster_bounds(b: &mut Option<(Vec3, Vec3)>, min: Vec3, max: Vec3, m: &Mat4) {
     let (mn, mx) = crate::scene::transform_aabb(min, max, m);
-    if !(mn.is_finite() && mx.is_finite()) { return; }
+    // Reject a garbage instance: NaN/inf, OR a finite-but-absurd coordinate. A misread placement
+    // transform (H2A's scnr placement layout differs from Halo 4's) can put a corner at ~1e31 wu;
+    // one such instance would blow the shadow-caster AABB out to nonsense, fitting the object sun
+    // shadow to a degenerate volume so every object samples full shadow and renders BLACK. No real
+    // map extends past ~1e6 wu. #h2a-shadow
+    const LIMIT: f32 = 1.0e6;
+    if !(mn.is_finite() && mx.is_finite()) || mn.abs().max_element() > LIMIT || mx.abs().max_element() > LIMIT {
+        return;
+    }
     *b = Some(match *b { Some((a, c)) => (a.min(mn), c.max(mx)), None => (mn, mx) });
 }
 
@@ -1502,7 +1655,7 @@ pub fn split_marker_meshes(v: Vec<(Lane, GpuMesh)>) -> (Vec<GpuMesh>, Vec<GpuMes
     let (mut o, mut a, mut b) = (Vec::new(), Vec::new(), Vec::new());
     for (lane, m) in v {
         match lane {
-            Lane::Opaque | Lane::AlphaTest | Lane::Sky => o.push(m),
+            Lane::Opaque | Lane::AlphaTest | Lane::Sky | Lane::Water => o.push(m),
             Lane::Additive => a.push(m),
             Lane::Blend => b.push(m),
         }
@@ -1575,8 +1728,15 @@ pub fn decode_model_geom(cache: &H4Cache, mode: usize) -> Result<H4ModelGeom> {
 /// `variant` (objects.rs `variant_meshes`: the variant's permutation per region, hidden regions
 /// dropped; lod0 when the model has no variants). `mode` must be the object's render model.
 pub fn decode_object_geom(cache: &H4Cache, obje: usize, mode: usize, variant: Option<usize>) -> Result<H4ModelGeom> {
+    decode_object_state_geom(cache, obje, mode, variant, 0)
+}
+
+/// #damage `decode_object_geom` displayed in damage `state` (objects.rs `variant_state_meshes`:
+/// the variant's runtime state permutation per region when authored, else its base pick).
+/// State 0 is `decode_object_geom` exactly.
+pub fn decode_object_state_geom(cache: &H4Cache, obje: usize, mode: usize, variant: Option<usize>, state: u8) -> Result<H4ModelGeom> {
     let model = load_model(cache, mode)?;
-    let meshes = super::objects::variant_meshes(cache, obje, &model, variant);
+    let meshes = super::objects::variant_state_meshes(cache, obje, &model, variant, state);
     decode_model_geom_meshes(cache, &model, &meshes)
 }
 
@@ -1620,6 +1780,36 @@ pub(crate) fn upload_model_parts(
     let cache = tc.cache.clone();
     let (device, queue) = (tc.device.clone(), tc.queue.clone());
     let mut any = false;
+    // HMS_H4_ONLYOBJ=<substr>: draw only the models whose name contains it (diagnostic)
+    if let Ok(want) = std::env::var("HMS_H4_ONLYOBJ") { if !geom.name.to_ascii_lowercase().contains(&want.to_ascii_lowercase()) { return false; } }
+    if std::env::var("HMS_H4_OBJDIAG").is_ok() { // print-only: model bounds + per-mesh vertex extents
+        eprintln!("  H4OBJ model '{}': bounds min {:?} max {:?} meshes {}", geom.name.rsplit('\\').next().unwrap_or(""), geom.min, geom.max, geom.meshes.len());
+        for (mi, mesh) in geom.meshes.iter().enumerate() {
+            let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for v in &mesh.verts { for a in 0..3 { mn[a] = mn[a].min(v.pos[a]); mx[a] = mx[a].max(v.pos[a]); } }
+            eprintln!("  H4OBJ   mesh {mi:2}: verts {:6} parts {:2} x [{:.0}..{:.0}] y [{:.0}..{:.0}] z [{:.0}..{:.0}]", mesh.verts.len(), mesh.parts.len(), mn[0], mx[0], mn[1], mx[1], mn[2], mx[2]);
+            for (pi, part) in mesh.parts.iter().enumerate() {
+                let s0 = part.index_start as usize; let e0 = (s0 + part.index_count as usize).min(mesh.indices.len());
+                let (mut pn, mut px) = ([f32::MAX; 3], [f32::MIN; 3]); let (mut nn, mut nx) = ([f32::MAX; 3], [f32::MIN; 3]); // all, and near the map (|x|,|y| < 150)
+                for &ix in &mesh.indices[s0..e0] { let v = &mesh.verts[ix as usize]; for a in 0..3 { pn[a] = pn[a].min(v.pos[a]); px[a] = px[a].max(v.pos[a]); }
+                    if v.pos[0].abs() < 150.0 && v.pos[1].abs() < 150.0 { for a in 0..3 { nn[a] = nn[a].min(v.pos[a]); nx[a] = nx[a].max(v.pos[a]); } } }
+                let mname = geom.materials.get(part.material.max(0) as usize).copied().flatten().map(|t| tc.cache.tag_name(t).rsplit('\\').next().unwrap_or("").to_string()).unwrap_or_default();
+                // z range by distance band from the origin (the map sits at the origin)
+                let mut bands = [(150f32, 400f32, f32::MAX, f32::MIN), (400.0, 1000.0, f32::MAX, f32::MIN), (1000.0, 3000.0, f32::MAX, f32::MIN), (3000.0, 8000.0, f32::MAX, f32::MIN)];
+                for &ix in &mesh.indices[s0..e0] { let v = &mesh.verts[ix as usize]; let r = (v.pos[0] * v.pos[0] + v.pos[1] * v.pos[1]).sqrt();
+                    for b in bands.iter_mut() { if r >= b.0 && r < b.1 { b.2 = b.2.min(v.pos[2]); b.3 = b.3.max(v.pos[2]); } } }
+                // triangle sanity: longest edge and how many edges exceed 1000 wu (a real ocean /
+                // terrain sheet has none; hole-spanning giants mean the index ranges are wrong)
+                let (mut emax, mut ebig, mut tris) = (0f32, 0usize, 0usize);
+                for t in mesh.indices[s0..e0].chunks(3) { if t.len() < 3 { break } tris += 1;
+                    for (a, b) in [(0, 1), (1, 2), (2, 0)] { let (p, q) = (mesh.verts[t[a] as usize].pos, mesh.verts[t[b] as usize].pos);
+                        let l = ((p[0]-q[0]).powi(2) + (p[1]-q[1]).powi(2) + (p[2]-q[2]).powi(2)).sqrt(); emax = emax.max(l); if l > 1000.0 { ebig += 1; } } }
+                eprintln!("  H4OBJ       part {pi:2} tris {tris} longest edge {emax:.0} edges>1000: {ebig}");
+                let bs: Vec<String> = bands.iter().map(|b| if b.2 == f32::MAX { format!("r{}-{}: -", b.0, b.1) } else { format!("r{}-{}: z {:.0}..{:.0}", b.0, b.1, b.2, b.3) }).collect();
+                eprintln!("  H4OBJ     part {pi:2} '{mname}': z [{:.0}..{:.0}] | near (<150): [{}..{}] | {}", pn[2], px[2], if nn[2] == f32::MAX { "-".into() } else { format!("{:.0}", nn[2]) }, if nx[2] == f32::MIN { "-".into() } else { format!("{:.0}", nx[2]) }, bs.join(" | "));
+            }
+        }
+    }
     for mesh in &geom.meshes {
         let verts = &mesh.verts;
         for part in &mesh.parts {
@@ -1641,9 +1831,28 @@ pub(crate) fn upload_model_parts(
                     eprintln!("  HMS_H4_MATDIAG obj '{}' part idx {} NO MATERIAL", geom.name.rsplit('\\').next().unwrap_or(&geom.name), e - s);
                 }
             }
-            let Some(lane) = lane_for(kind) else { stats.skipped_invisible += 1; continue };
+            let Some(mut lane) = lane_for(kind) else { stats.skipped_invisible += 1; continue };
+            // HMS_H4_SKIPKIND=<Opaque|AlphaTest|AlphaBlend|Additive|Multiply|Water>: drop object parts of that kind (diagnostic)
+            if let Ok(sk) = std::env::var("HMS_H4_SKIPKIND") { if format!("{kind:?}") == sk { continue; } }
+            // #h2a-vista: the vista ocean (`srf_ca_skybox_water`) is an opaque, self-lit surface
+            // in the engine (SkyboxWater doc); through the tinted water stand-in it drew BLACK.
+            let vista_water = kind == H4MatKind::Water && shading_on && m.as_ref().map_or(false, |mm| tc.shading_of(mm).skybox_water.is_some());
+            let kind = if vista_water { lane = Lane::Opaque; H4MatKind::Opaque } else { kind };
             let base_alpha = m.as_ref().map(|m| m.base_alpha).unwrap_or(1.0);
             let tex = m.as_ref().and_then(|m| m.diffuse()).and_then(|t| tc.fetch_tex(t, stats).0);
+            // `srf_ca_skybox_cloudlayer*` (H2A vista cloud sheets over the ring) is NOT ported: its
+            // constants are not an emissive tint (p1 = (0.5, 0, 0.45) is mask/scroll data), so the
+            // generic unlit law paints a MAGENTA sheet over the ocean. Skip it until its pixel
+            // shader is transcribed (listing in scratchpad/asc_ps/ is the starting point).
+            if m.as_ref().map_or(false, |mm| mm.mats_name.rsplit('\\').next().unwrap_or("").to_ascii_lowercase().starts_with("srf_ca_skybox_cloudlayer")) {
+                stats.skipped_invisible += 1; continue;
+            }
+            // An UNLIT emissive family (sky / colour-warp / constant) drawn additive or blended
+            // with NO resolvable diffuse would be a flat tinted sheet (the white fallback x its
+            // tint) over everything behind it - never the intent. Skip it, like build_sky does.
+            if tex.is_none() && matches!(kind, H4MatKind::Additive | H4MatKind::AlphaBlend) && m.as_ref().and_then(emissive_tint).is_some() {
+                stats.skipped_invisible += 1; continue;
+            }
             // objects take the same material lane; their lighting rides the per-instance colour
             // and lobe lanes (`object_light_lanes`) instead of a lightmap binding
             // `srf_ca_boundary*` (the Forge grid / boundary walls) is a shipped ADDITIVE
@@ -1685,7 +1894,8 @@ pub(crate) fn upload_model_parts(
 /// p1.w (the same bitmap on every shipped part, so the two tints are summed into the vertex colour);
 /// alpha-blended parts use the diffuse alpha (x the per-vertex mask on `*_vertmask`;
 /// `srf_constant_vertalpha` = lerp(vertex.a, vertex.a * color.a, p2.z), blend 9 = add x src alpha,
-/// `srf_constant` uv scroll p2.xy * time). The uv warp / fresnel terms are not ported
+/// `srf_constant*` uv scroll p2.xy * ps_time.z = frac(seconds / 600), i.e. p2 is uv per 600 s; the
+/// other sky families are static). The uv warp / fresnel terms are not ported
 /// (PROVISIONAL). Reach sky blend enum: 0 opaque, 1 additive, 4 alpha, 9 add x src alpha (H4 only).
 pub const OFF_SCNR_SKIES: usize = 0xDC;
 pub const SCNR_SKY_ELEM: usize = 0x34;
@@ -1740,8 +1950,41 @@ fn build_sky(loaded: &H4Loaded, device: &wgpu::Device, queue: &wgpu::Queue, mr: 
                 // * p1 * p1.w))). The per-part factor f = sat(luma(p1 * p1.w)) (the texel luma <= 1
                 // bound) splits the tint: (1 - f) rides the vertex colour (scene E), f the sky
                 // shader's self-illum lane (x illum_scale_now() = E_si / E), same bitmap as the base.
-                let si_f = if gradient { 0.0 } else { (0.3086 * p1[0] * p1[3] + 0.6094 * p1[1] * p1[3] + 0.082 * p1[2] * p1[3]).clamp(0.0, 1.0) };
-                let tint = [p0[0] * p0[3] + p1[0] * p1[3], p0[1] * p0[3] + p1[1] * p1[3], p0[2] * p0[3] + p1[2] * p1[3]];
+                let (diff, diff_xf) = m.textures.iter().find(|t| matches!(t.name.as_str(), "diffuseMap" | "color_map" | "color_texture")).map(|t| (t.bitm, t.xform)).unwrap_or((None, [1.0, 1.0, 0.0, 0.0]));
+                // A sky part with no real diffuse can only be drawn as a flat WHITE dome
+                // (fetch returns the 1x1 white fallback, or the tag is the `default_diff`
+                // placeholder). Opaque, that white sphere saturates the whole sky; additive,
+                // it adds 1.0 everywhere - either way it hides every real sky layer behind a
+                // flat grey wash (ca_ascension: an `invalid`/srf_lambert shell + the
+                // 6texcombine starfield/stripes, whose real maps live in texture_NN_map, a
+                // slot this builder does not read). GRADIENT parts legitimately carry no
+                // diffuse - their colour is computed from p1/p2 - so they are kept. Every
+                // other diffuse-less part is skipped: a missing sky layer is far better than
+                // a white-out that erases the ones that DID load.
+                let placeholder_diff = diff.map_or(true, |t| {
+                    let n = cache.tag_name(t); n.ends_with("default_diff") || n.ends_with("default_detail")
+                }) || fam == "srf_lambert" || m.name.to_ascii_lowercase().contains("invalid");
+                // A WATER-kind sky part (H2A Relic's `ca_relic_closewater_01`, water_io_relic: the
+                // sea around the island) has no colour map; the sky lane cannot run the water
+                // shader, so it draws as a flat sea in the material's p0 body colour x p0.w
+                // instead of leaving a black void under the horizon (APPROXIMATION).
+                let flat_sea = m.kind == H4MatKind::Water && placeholder_diff;
+                if std::env::var("HMS_SKYTEXDBG").is_ok() { // print-only: the skip decision + every texture slot
+                    let slots: Vec<String> = m.textures.iter().map(|t| format!("{}={}", t.name, t.bitm.map(|b| cache.tag_name(b).rsplit('\\').next().unwrap_or("").to_string()).unwrap_or_default())).collect();
+                    eprintln!("  SKYTEXDBG {} [{}] {:?} -> {} | {}", m.name.rsplit('\\').next().unwrap_or(""), fam, m.kind, if !gradient && placeholder_diff { "SKIP" } else { "keep" }, slots.join(" "));
+                }
+                if !gradient && placeholder_diff && !flat_sea && std::env::var("HMS_SKY_SOLID").is_err() { continue; }
+                // srf_ca_skybox_relic / _si_saturate: p1 is NOT a self-illum colour (si_saturate's
+                // p1 = (5, 2.5, 0, 0.3) is its saturation/power block), so only p0 x p0.w tints the
+                // texture and the self-illum lane stays off (APPROXIMATION - shader not transcribed).
+                let p0_only = fam.starts_with("srf_ca_skybox_relic") || fam.starts_with("srf_ca_skybox_si_saturate");
+                // srf_special_sky_ocean_calm (H2A Relic / Zanzibar distant ocean): p0 = (tile, tile,
+                // 2500, 50) are its wave-tiling / distance constants, not a colour - the generic
+                // p0 x p0.w tint made a x50..x125000 sheet that blinded the auto-exposure meter and
+                // washed out the whole map. Texture only (APPROXIMATION: shader not transcribed).
+                let tex_only = fam.starts_with("srf_special_sky_ocean");
+                let si_f = if gradient || p0_only || tex_only || flat_sea { 0.0 } else { (0.3086 * p1[0] * p1[3] + 0.6094 * p1[1] * p1[3] + 0.082 * p1[2] * p1[3]).clamp(0.0, 1.0) };
+                let tint = if flat_sea { [p0[0] * p0[3], p0[1] * p0[3], p0[2] * p0[3]] } else if tex_only { [1.0, 1.0, 1.0] } else if p0_only { [p0[0] * p0[3], p0[1] * p0[3], p0[2] * p0[3]] } else { [p0[0] * p0[3] + p1[0] * p1[3], p0[1] * p0[3] + p1[1] * p1[3], p0[2] * p0[3] + p1[2] * p1[3]] };
                 // vertex colour = the summed emissive tints (or the gradient by uv.y)
                 let verts: Vec<MeshVertex> = dm.verts.iter().map(|v| {
                     let mut c = [tint[0] * (1.0 - si_f), tint[1] * (1.0 - si_f), tint[2] * (1.0 - si_f), if vertmask { v.blend.clamp(0.0, 1.0) } else { 1.0 }];
@@ -1751,19 +1994,46 @@ fn build_sky(loaded: &H4Loaded, device: &wgpu::Device, queue: &wgpu::Queue, mr: 
                     }
                     MeshVertex { pos: v.pos, normal: v.normal, uv: v.uv, color: c, ..Default::default() }
                 }).collect();
-                let (diff, diff_xf) = m.textures.iter().find(|t| matches!(t.name.as_str(), "diffuseMap" | "color_map")).map(|t| (t.bitm, t.xform)).unwrap_or((None, [1.0, 1.0, 0.0, 0.0]));
+                // `color_texture`: the srf_ca_skybox_relic / srf_ca_skybox_si_saturate backdrop and
+                // card families (H2A Relic) keep their albedo under that name; unknown, the whole
+                // backdrop was skipped and the sky showed as bare gradient bands.
                 let base = diff.and_then(|t| tc.fetch_tex_sky(t, stats)).unwrap_or_else(|| white.clone());
                 // Reach sky blend enum: 0 opaque, 1 additive, 2 multiply, 3 double multiply, 4 alpha,
                 // 9 = add_src_times_srcalpha (H4 blend 9; the sky lane premultiplies).
-                let blend: u8 = match m.blend_mode_raw { 1 | 6 | 7 | 24 => 1, 2 => 2, 4 => 3, 3 | 5 | 10 | 22 | 23 => 4, 8 | 9 => 9, _ => 0 };
+                let blend: u8 = if flat_sea { 0 } else { match m.blend_mode_raw { 1 | 6 | 7 | 24 => 1, 2 => 2, 4 => 3, 3 | 5 | 10 | 22 | 23 => 4, 8 | 9 => 9, _ => 0 } };
                 let opt = if gradient { 2.0 } else { 0.0 };
                 // instance colour = the sky shader's self-illum gain (x base texel x illum_scale_now);
                 // .w = the colour-alpha weight of the H4 alpha lane (ctl.w = 1).
                 let si_gain = [tint[0] * si_f, tint[1] * si_f, tint[2] * si_f, tex_alpha_w];
                 let si_mode = if si_f > 0.0 { 1.0 } else { 0.0 };
-                // srf_constant* uv scroll: uv += p2.xy * time before the xform (PS asm
-                // `mad r0.xy, cb13[2].xyxx, cb0[0].z, v1.xyxx`); the lane animates xf.zw, so scale.
-                let scroll = if gradient { [0.0, 0.0] } else { [p2[0] * diff_xf[0], p2[1] * diff_xf[1]] };
+                // srf_constant* uv scroll (H4EK srf_constant_core.fxh `uv += scroll_rate * ps_time.z`,
+                // PS asm `mad r0.xy, cb13[2].xyxx, cb0[0].z, v1.xyxx`): cb0 = EngineFramePS.ps_time
+                // and halo4.dll `sub_1803764AC` (groundhog `sub_180375B20`) fills it as
+                // (seconds, ., frac(seconds / 600), .) - the scroll rate is uv per 600 s, not per
+                // second (the engine's own 10-minute wrap is not reproduced). The lane animates
+                // xf.zw (uv * xf.xy + xf.zw), so the rate is scaled by the tiling.
+                // Only the srf_constant* families read p2.xy as a scroll rate: the CA skybox
+                // families (srf_ca_skybox_*, incl. halo / cloudlayer / 6texcombine / gradient) and
+                // srf_special_sky_ocean_calm bind no EngineFramePS at all (static in the PS; RDEF
+                // of every shipped entry), and srf_ca_color_warp* use p2 as (warp strength,
+                // speed, phase) of a cosine uv WARP `offset_map * p2.x * cos(p2.y * t + p2.z)` -
+                // not ported (APPROXIMATION: drawn unwarped; the shipped H2A parts have speed 0
+                // = a static offset anyway). Scrolling Ascension's srf_ca_skybox_halo part by its
+                // p2 = (8000, -1500) per second was the "sky animates way too fast" report.
+                let scroll = if fam.starts_with("srf_constant") { [p2[0] * diff_xf[0] / 600.0, p2[1] * diff_xf[1] / 600.0] } else { [0.0, 0.0] };
+                // HMS_SKY_SOLID: geometry probe. Draw every sky part as flat opaque RED,
+                // bypassing texture/blend/gradient, to see whether the dome geometry lands
+                // on screen at all (red = present, grey/black = the mesh is off-frustum).
+                if std::env::var("HMS_SKYVERTDBG").is_ok() && parts < 2 {
+                    let n = dm.verts.len();
+                    let sample: Vec<[f32;3]> = dm.verts.iter().take(4).map(|v| v.pos).collect();
+                    let nan = dm.verts.iter().any(|v| v.pos.iter().any(|c| !c.is_finite()));
+                    eprintln!("SKYVERTDBG part {} nverts={n} nan={nan} first4={:?}", m.name.rsplit('\\').next().unwrap_or(""), sample);
+                }
+                let (verts, blend, base, si_f) = if std::env::var("HMS_SKY_SOLID").is_ok() {
+                    let vred: Vec<MeshVertex> = dm.verts.iter().map(|v| MeshVertex { pos: v.pos, normal: v.normal, uv: v.uv, color: [1.0, 0.0, 0.0, 1.0], ..Default::default() }).collect();
+                    (vred, 0u8, white.clone(), 0.0f32)
+                } else { (verts, blend, base, si_f) };
                 let mut gm = mr.upload_mesh(device, queue, &verts, &dm.indices[s0..e0], &[Mat4::IDENTITY], Some(&[si_gain]),
                     Some(&base), if si_f > 0.0 { Some(&base) } else { None }, None, None, None, scroll, [1.0, 1.0], diff_xf, 0.0, 0.0, [0.0, 0.0],
                     [1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 0.0, 0.0], diff_xf /* sky si_xf */, [1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0],

@@ -59,6 +59,7 @@ mod tests {
             match load(&c, b) {
                 Ok(Texel::Dds { w, h, mips, bytes }) => { assert!(w > 0 && h > 0 && mips >= 1 && !bytes.is_empty()); ok += 1; }
                 Ok(Texel::Bgra { w, h, bytes }) => { assert_eq!(bytes.len(), (w * h * 4) as usize); ok += 1; }
+                Ok(Texel::Rg8Snorm { w, h, bytes }) => { assert_eq!(bytes.len(), (w * h * 2) as usize); ok += 1; }
                 Err(_) => fail += 1,
             }
         }

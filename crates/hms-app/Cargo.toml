@@ -27,9 +27,15 @@ eframe = { version = "0.31", default-features = false, features = ["wgpu", "defa
 hms-inject = { path = "../hms-inject", optional = true }
 hms-ipc = { path = "../hms-ipc" }
 hms-native = { path = "../hms-native" }
+# #reach-sound  FMOD bank reader, Vorbis decoder and the lazily-opened output device.
+hms-sound = { path = "../hms-sound" }
 hms-render = { path = "../hms-render" }
 bytemuck = { version = "1", features = ["derive"] }
 png = "0.17"
+# #model-import: pure-Rust baseline+progressive JPEG decode for glTF/OBJ base-colour maps
+# (PNG is handled by `png` above). No C toolchain, so the cargo-xwin Windows cross build is
+# unaffected; it is the same decoder the `image` crate uses.
+zune-jpeg = "0.5"
 # #fresh50-1: f32→f16 packing for the HDR (Rgba16Float) opaque self-illum emissive texture.
 half = "2"
 pollster = "0.3"
@@ -42,10 +48,20 @@ serde_json = "1"
 miniz_oxide = "0.8"
 # #h4: the pure-Rust Halo 4 cache reader maps the .map (and shared.map) read-only.
 memmap2.workspace = true
+# Auto-update: SHA-256 of a downloaded release archive (updater.rs).
+sha2 = "0.10"
+
+# Auto-update HTTP client. Linux: rustls (pure Rust, bundled webpki roots). Windows: the
+# platform TLS (schannel via native-tls) — rustls' `ring` needs nasm for the msvc cross build,
+# and schannel is what Wine / Proton implement; no OpenSSL anywhere.
+[target.'cfg(not(windows))'.dependencies]
+ureq = { version = "2", default-features = false, features = ["tls"] }
 
 # Win32 bits (working-set trimming / memory stats) are Windows-only.
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Foundation"] }
+windows = { workspace = true, features = ["Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_Foundation", "Win32_System_LibraryLoader"] }
+ureq = { version = "2", default-features = false, features = ["native-tls"] }
+native-tls = "0.2"
 
 # eframe's default features are off (above), but on Linux/BSD winit selects its
 # windowing backend *via features* -- with none enabled it hits

@@ -23,33 +23,90 @@ mod bake_compare;
 mod cmd_server;
 mod construct;
 mod euler;
+mod film; // Reach (MCC) Theater saved films -- BLF reader (re-notes/reach_saved_film_layout.md)
+mod film_export; // extract the map variant / game variant embedded in a saved film
+mod film_ui; // the saved-film metadata card (pure content + a thin egui card)
+mod film_decode; // #film  the per-tick record bitstream decoder + its measured throughput
+mod film_play; // #film  the playback clock, scrub and per-frame placement
+mod film_anim; // #film-anim  locomotion, armour abilities, vehicles and combat actions
+mod film_action; // #film-action  the synchronised-action channel + per-entity object definition
+mod film_camera; // #film-camera  the engine's CAMERA MODES, decoded, and Theater driven into them
+mod film_stats; // #film-stats  player statistics pulled out of a saved film (GPU-free)
+mod film_variant; // #gamevariant  the GAME VARIANT a film was recorded under (loadouts, traits, species)
+mod film_vehicle; // #vehicle-rot #vehicle-damage  a film's VEHICLES: recorded basis, damage state, the wreck
+mod film_objective; // #film-objects  a film's OBJECTIVE objects (the flag) + loose weapons + debris
+mod film_projectile; // #projectile  a film's PROJECTILES, weapon firing effects and explosions
+mod extimport; // externally imported OBJ/GLB models + their user-driven transform (#4)
 mod decal_projector;
 mod forge_scale;
+mod gfxbench; // the in-app graphics benchmark (frame period / update() CPU / per-pass GPU)
+mod film_perf; // #film-perf the Theater frame profiler (`film perf`)
+mod gfxsettings; // Settings ▸ Graphics & performance — the quality ladder and its knobs
 mod h2a; // Halo 2 Anniversary (MCC "groundhog") support -- the Halo 4 reader with one constant changed
+mod h3; // Halo 3 (MCC) support -- a Reach-family container (own reader, classic Gen3 resource paging)
 mod h4; // Halo 4 (MCC) support
 mod h4_app; // Halo 4 Forge editing in the GUI (palette / objects / save / Object window rows)
 mod headless;
+mod keybinds; // Settings ▸ Controls & keyboard — the rebindable action table every input site reads
 mod lightbake;
 mod lightprobe;
 mod map_spawns; // View > Show map spawn points
 mod mapcat;
+mod mccimport; // #mcc-import  Settings ▸ Controls & keyboard ▸ Import from MCC (read-only)
 mod physics_outlines; // View > Show physics outlines (hidden-blocker hulls)
+mod play_phys; // #play  the player movement constants, read out of the bipd + matg tags
+mod play_ctl; // #play  the character controller: one biped's capsule vs the BSP + Forge objects
+mod load_status; // #loadstatus  not-started / in-flight / done / failed, as four answers
+mod play_damage; // #play  the DAMAGE SEAM test mode calls into (the damage law itself is not here)
+mod play_mode; // #play  test mode: spawn as a Spartan / Elite and walk around the map
+mod play_pickup; // #pickup  test mode: pick a weapon up off the map
+mod play_hud; // #play-hud  test mode's own HUD values: the weap magazines layout, player vitality, grenades
+mod play_vehicle; // #seat-entry  test mode's vehicles: the prompt, getting in, riding, driving
+mod physics_settle; // "Simulate physics": the phmo rigid-body settle (#settle)
+mod phmo_shapes; // phmo rigid bodies -> settle shapes, both games (#settle)
+mod ragdoll; // the articulated phmo solver: Theater ragdolls + the editor settle (#ragdoll)
 mod soft_ceilings; // View > Soft ceilings (the map floor / kill planes)
+mod spawn_camera; // the load / teleport camera rule shared by every game (spawn > starting location > soft ceiling > bounds)
 mod hard_floor; // View > Hard floor (playable BSP world bounds)
 mod wire_xray; // View > Selection wireframe through objects (#wire-visible)
 mod color_hover; // team/colour dropdown hover preview (pure predicate)
 mod mvar;
 mod numfield; // signed numeric text entry (a '-' anywhere = sign flip)
+mod quant_error; // #quant-error  predict the pose a .mvar will actually hold (save-precision ghost + numbers)
+mod quant_error_ui; // #quant-error  the ghost overlay, the Object-panel numbers, snap-to-representable, `precision`
+mod prefab; // #prefab  saved object groups (GitHub issue #5): the file format, the geometry and the resolver
+mod prefab_app; // #prefab  the per-game adapter, the Tools > Prefabs panel and the `prefab` verb
 mod project;
+mod recent; // File ▸ Open recent — the one history of opened variants / maps / films / models
+mod reach_skel; // Reach render_model skeleton + skinning metadata (#reach-skin)
+mod reach_sound; // #reach-sound  the TAG side of audio: $#!+ / ugh! / lsnd / the acoustics palette
+mod sound; // #reach-sound  the audio engine: banks + decoder + output, driven from the Theater clock
+mod reach_actor; // Reach posed skinned bipeds + held weapons (#reach-skin)
+mod reach_font; // #reach-font  Reach's own fonts (font_package / .font), decoded + painted
+mod reach_widget; // #reach-widget  Reach's own UI widgets (cui_screen 'cusc'), decoded + painted
+mod reach_chud; // #reach-chud  Reach's HUD authoring (chud_globals 'chgd'): the navpoint palette + anchor
+mod reach_hud; // #reach-hud  the first-person HUD from the chud tags: ammo/grenades/vitals, the name-tag mode, the respawn countdown
+mod reach_jmad; // Reach model_animation_graph decode: codecs + sampling (#reach-skin)
+mod reach_projectile; // #projectile  Reach `weap` BARRELS + `proj` tag fields (what a shot launches and plays)
+mod reach_damage; // #damage  Reach `jpt!` + an object model's vitality / damage sections / responses
+mod reach_physics; // #gravity  Reach's ONE gravity constant + the biped physics law
+mod reach_collision; // #collision  Reach's COLLISION GROUPS: which physics collides with which
+mod reach_seats; // #seats  Reach `unit_seat_block`: a vehicle's seats + the authored ENTRY rule
+mod reach_strings; // #reach-strings  Reach localized text: the MCC `.bin` key for a `unic` string id
+mod reach_vehicle; // #vehicle-phys  Reach `vehi` vehicle physics blocks (engine/gears/velocity/differential)
+mod reach_vehicle_anim; // #vehicle-anim  a DRIVEN vehicle's own overlays: wheels (a wrapping phase) + steering (a saturating range)
 mod scene;
 mod screenfx; // Forge special-FX screen effects
 mod obj_identity; // what a clicked object IS (tag path / class / tag id)
+mod modelimport; // #model-import: OBJ/MTL + glTF/GLB readers (materials + textures)
 mod objscene; // the game-agnostic object-scene trait (Reach SceneController / Halo 4 H4ObjectScene)
 mod script;
 mod script_host;
 // #snap-array: pure geometry for the oriented face snap, edge alignment and line arrays.
 mod snap;
+mod updater; // opt-in auto-update (GitHub Releases) + recovery snapshots
 mod voxel;
+mod xgame; // #xgame cross-game map-variant conversion (object catalog + equivalence table + converter)
 use scene::SceneController;
 use objscene::objscene_parts_mut;
 
@@ -87,10 +144,47 @@ fn cli_scene_controller() -> Option<SceneController> {
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
+    // Resumed after an update: wait for the old process to exit before anything else opens.
+    updater::handle_wait_pid_arg(&std::env::args().collect::<Vec<_>>(), std::time::Duration::from_secs(60));
     // Diagnostic: `hms-app --dump-mvar <file.mvar> [more.mvar ...]` prints each variant's
     // base map id + object count, then exits. Used to catalog Reach map ids offline.
     {
         let args: Vec<String> = std::env::args().collect();
+        // #model-import: `hms-app --model-info <model.glb|.gltf|.obj> [more ...]` — print-only
+        // report of what the model-import readers get out of a file (parts, materials, decoded
+        // textures, UV coverage, and every note about something clamped or unsupported). This is
+        // the offline half of the import browser's probe line.
+        if let Some(pos) = args.iter().position(|a| a == "--model-info") {
+            for p in &args[pos + 1..] {
+                let path = std::path::Path::new(p);
+                match modelimport::load(path) {
+                    Ok(m) => {
+                        println!(
+                            "{}: {} — {} part(s), {} verts, {} tris, {}",
+                            path.display(), m.format, m.parts.len(), m.vert_count(), m.tri_count(), m.material_summary()
+                        );
+                        for (i, mt) in m.materials.iter().enumerate() {
+                            println!(
+                                "  mat[{i}] '{}' base=({:.3},{:.3},{:.3},{:.3}) image={:?} uv_scale={:?} uv_off={:?} wrap={:?} alpha={:?}/{:.2}{}",
+                                mt.name, mt.base_color[0], mt.base_color[1], mt.base_color[2], mt.base_color[3],
+                                mt.image, mt.uv_scale, mt.uv_offset, mt.wrap, mt.alpha_mode, mt.alpha_cutoff,
+                                if mt.double_sided { " double-sided" } else { "" }
+                            );
+                        }
+                        for (i, im) in m.images.iter().enumerate() {
+                            println!("  img[{i}] '{}' {}x{} ({} KiB RGBA)", im.name, im.w, im.h, im.rgba.len() / 1024);
+                        }
+                        for (i, pt) in m.parts.iter().enumerate().take(8) {
+                            println!("  part[{i}] '{}' {} verts {} tris mat={:?}", pt.name, pt.verts.len(), pt.indices.len() / 3, pt.material);
+                        }
+                        if m.parts.len() > 8 { println!("  ... {} more parts", m.parts.len() - 8); }
+                        for n in &m.notes { println!("  note: {n}"); }
+                    }
+                    Err(e) => println!("{}: {e}", path.display()),
+                }
+            }
+            std::process::exit(0);
+        }
         // `hms-app --dump-h4-palette <map or map name> [more ...]`: print-only listing
         // of a Halo 4 map's Forge palette (categories, entries, variants, localized names, MP
         // defaults). A bare name (`ca_forge_ravine`) is looked up among the detected Halo 4 maps.
@@ -147,6 +241,26 @@ fn main() -> eframe::Result<()> {
                 },
                 None => { println!("usage: hms-app --h4-mvar-roundtrip <file.mvar> [out.mvar]"); std::process::exit(1); }
             }
+        }
+        // `hms-app --mvar-roundtrip <file.mvar> [more ...]`: THE encoder gate, for any number of
+        // files of any title. Each file is decoded, re-encoded with no edits and compared with the
+        // original bytes; the verb exits non-zero if a single one is not reproduced byte-for-byte.
+        // Dispatch is by the file's own `mvar` chunk version, so Halo 3 (v12/13), Halo 4 (v50) and
+        // Halo 2 Anniversary (v52) all gate through one command. #h2a-mvar
+        if let Some(pos) = args.iter().position(|a| a == "--mvar-roundtrip") {
+            let files = &args[pos + 1..];
+            if files.is_empty() { println!("usage: hms-app --mvar-roundtrip <file.mvar> [more ...]"); std::process::exit(1); }
+            let (mut same, mut differ, mut failed) = (0usize, 0usize, 0usize);
+            for f in files {
+                let path = std::path::Path::new(f);
+                let r = if h3::mvar::is_h3_variant(path) { h3::mvar::roundtrip_report(path, None) } else { h4::mvar::roundtrip_report(path, None) };
+                match r {
+                    Ok(r) => { println!("{r}"); if r.contains("BYTE-IDENTICAL") { same += 1 } else { differ += 1 } }
+                    Err(e) => { println!("{f}: {e}"); failed += 1; }
+                }
+            }
+            println!("--mvar-roundtrip: {same} byte-identical, {differ} differ, {failed} unreadable (of {} files)", files.len());
+            std::process::exit(if differ + failed == 0 { 0 } else { 2 });
         }
         if let Some(pos) = args.iter().position(|a| a == "--dump-mvar") {
             for p in &args[pos + 1..] {
@@ -252,8 +366,117 @@ fn main() -> eframe::Result<()> {
             // #h2a: groundhog caches share the Halo 4 header, so `h4_type` reads the same field
             let h2a: Vec<&mapcat::MapCandidate> = all.iter().filter(|c| c.game == mapcat::Game::H2A).collect();
             println!("h2a: {} total (mp={})", h2a.len(), h2a.iter().filter(|c| c.h4_type == Some(1)).count());
+            let h3: Vec<&mapcat::MapCandidate> = all.iter().filter(|c| c.game == mapcat::Game::Halo3).collect(); // #h3
+            println!("halo3: {} total", h3.len());
             for d in mapcat::variant_dirs() {
                 println!("  variants dir: {}", d.display());
+            }
+            for d in mapcat::h3_variant_dirs() { // #h3
+                println!("  halo3 variants dir: {}", d.display());
+            }
+            std::process::exit(0);
+        }
+        // #film  `--model-regions <map.map> <tag name substring>`: print the render-model regions
+        // and per-region permutation counts of every object tag whose name matches. Needed to pin
+        // the recorded armour indices to real regions, and deliberately GPU-FREE -- the headless
+        // renderer cannot start while something else holds the display adapter.
+        if let Some(pos) = args.iter().position(|a| a == "--model-regions") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let needle = args.get(pos + 2).cloned().unwrap_or_default();
+            let Some(mut scene) = cli_scene_controller() else { std::process::exit(1) };
+            if let Err(e) = scene.open_cache(&map) {
+                eprintln!("open_cache({map}) failed: {e:#}");
+                std::process::exit(1);
+            }
+            // `--model-regions <map> #armour` prints Reach's armour customisation table.
+            if needle.eq_ignore_ascii_case("#armour") || needle.eq_ignore_ascii_case("#armor") {
+                scene.dump_player_customization();
+                std::process::exit(0);
+            }
+            // `--model-regions <map> #fp` prints the FIRST-PERSON arm models (matg "@player
+            // representation", or the scenario's override of it) and the armoury colour table.
+            if needle.eq_ignore_ascii_case("#fp") {
+                for (n, h, b) in scene.first_person_models() {
+                    println!("player representation: first-person hands = {h:#x} [{}] '{n}', body = {b:#x} [{}] '{}'",
+                        scene.raw_tag_class(h).unwrap_or_default(),
+                        scene.raw_tag_class(b).unwrap_or_default(),
+                        scene.tag_name_of(b));
+                    println!("    resolve_object_mode(hands) = {:#x}, resolve_object_mode(body) = {:#x}",
+                        scene.resolve_object_mode(h), scene.resolve_object_mode(b));
+                }
+                // #fp-arms  Trace the WHOLE first-person chain, because "the arms stick straight
+                // out" is a bind pose and a bind pose means one of its links failed: the arms
+                // model's own node list, a weapon's `first person animations` graph, and the
+                // name-match between the two that decides whether a graph channel reaches a bone.
+                if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                    reach_actor::dump_fp_chain(n, c, &scene.first_person_models());
+                }
+                let t = scene.profile_colors();
+                println!("profile colors (matg +0x498): {} entries", t.len());
+                for (i, c) in t.iter().enumerate() {
+                    println!("  [{i:2}] {:.3} {:.3} {:.3}", c[0], c[1], c[2]);
+                }
+                std::process::exit(0);
+            }
+            // `--model-regions <map> @<tag hex>[:<len>]` dumps a tag's raw meta bytes, and
+            // `!<tag hex>:<count>:<stride>` walks a block pointer at a given offset -- enough to
+            // read `globals\\player_model_customization` without a GPU.
+            if let Some(q) = needle.strip_prefix('@') {
+                let mut it = q.split(':');
+                let tag = u32::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                let len: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(0x200);
+                println!("TAG {tag:#06x} '{}'", scene.tag_name_of(tag));
+                match scene.tag_meta_bytes(tag, 0, len) {
+                    Some(b) => {
+                        for (i, row) in b.chunks(16).enumerate() {
+                            println!(
+                                "  {:04x}  {}",
+                                i * 16,
+                                row.iter().map(|v| format!("{v:02x}")).collect::<Vec<_>>().join(" ")
+                            );
+                        }
+                    }
+                    None => println!("  (meta unreadable)"),
+                }
+                std::process::exit(0);
+            }
+            // `--model-regions <map> !<ptr hex>:<len>[:<elem>]` dumps raw bytes at a tag block
+            // pointer, so a block found in a meta dump can be walked.
+            if let Some(q) = needle.strip_prefix('!') {
+                let mut it = q.split(':');
+                let ptr = u32::from_str_radix(it.next().unwrap_or("0").trim_start_matches("0x"), 16).unwrap_or(0);
+                let len: u32 = it.next().and_then(|v| v.parse().ok()).unwrap_or(256);
+                let elem: usize = it.next().and_then(|v| v.parse().ok()).unwrap_or(16);
+                for line in scene.tag_ptr_dump(ptr, len, elem) {
+                    println!("{line}");
+                }
+                std::process::exit(0);
+            }
+            // `--model-regions <map> ?<substring>` just LISTS matching tag names, which is how
+            // you find the tag to dump in the first place.
+            if let Some(q) = needle.strip_prefix('?') {
+                for t in 0..0x10000u32 {
+                    let n = scene.tag_name_of(t);
+                    if !n.is_empty() && n.to_ascii_lowercase().contains(&q.to_ascii_lowercase()) {
+                        println!("TAG {t:#06x} '{n}'");
+                    }
+                }
+                std::process::exit(0);
+            }
+            let mut found = 0usize;
+            for t in 0..0x10000u32 {
+                let n = scene.tag_name_of(t);
+                if n.is_empty() || !n.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()) {
+                    continue;
+                }
+                found += 1;
+                scene.dump_model_regions(t);
+                if found >= 8 {
+                    break;
+                }
+            }
+            if found == 0 {
+                eprintln!("no object tag name contains {needle:?}");
             }
             std::process::exit(0);
         }
@@ -362,6 +585,372 @@ fn main() -> eframe::Result<()> {
             }
             std::process::exit(0);
         }
+        // `hms-app --dump-biped <map> [name-substring]` / `--dump-markers <map> <group> [name]`:
+        // print-only Reach actor diagnostics (#reach-skin). See reach_actor::dump_bipeds.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-biped") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_bipeds(n, c, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #play  The movement constants test mode reads, out of a real map: the `matg` player
+        // information rows and each species' own `bipd` fields, with the derived step-up and
+        // ground probe beside them. Print-only, and the one way to CHECK the values without the
+        // window.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-play-phys") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        println!("{}", play_phys::PlayerPhysics::describe_rows(n, c));
+                        let bipeds = reach_actor::ActorScene::list_bipeds(n, c);
+                        println!("{} bipd tag(s) in this map", bipeds.len());
+                        for (t, path) in bipeds.iter().take(40) {
+                            println!("  {t:#x}  {path}");
+                        }
+                        for sp in [play_mode::Species::Spartan, play_mode::Species::Elite] {
+                            println!("\n=== {} ===", sp.label());
+                            match play_mode::player_physics_for(n, c, &bipeds, sp) {
+                                Ok((path, pp)) => {
+                                    println!("{path}\n{}", pp.describe());
+                                    println!(
+                                        "step-up {:.4} wu (emergent; no authored step field) | ground probe {:.4} wu",
+                                        play_ctl::max_step_height(&pp),
+                                        play_ctl::ground_probe_depth(&pp)
+                                    );
+                                }
+                                Err(e) => println!("{e}"),
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("could not open '{map}'");
+                }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--dump-anim") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let biped = args.get(pos + 2).cloned().unwrap_or_default();
+            let anim = args.get(pos + 3).cloned().unwrap_or_default();
+            let frames = args.get(pos + 4).and_then(|s| s.parse().ok()).unwrap_or(5usize);
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_anim(n, c, &biped, &anim, frames);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #ragdoll  `--dump-ragdoll <map.map> [bipd-name-substring]`: the biped's `phmo` rigid
+        // bodies, every authored constraint with its limits in degrees, and the PIVOT RESIDUAL at
+        // the bind pose that proves the constraint offsets are read correctly. Print-only, and
+        // deliberately a CLI verb rather than only a script verb so it needs no GPU.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-ragdoll") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let biped = args.get(pos + 2).cloned().unwrap_or_else(|| "spartans".into());
+            if let Some(mut scene) = cli_scene_controller() {
+                match scene.open_cache(&map) {
+                    Ok(()) => {
+                        if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                            match reach_actor::run_actor_command(&format!("ragdoll {biped}"), &mut Default::default(), n, Some(c)) {
+                                Ok(s) => println!("{s}"),
+                                Err(e) => println!("ERROR {e}"),
+                            }
+                        }
+                    }
+                    Err(e) => println!("ERROR could not open {map}: {e}"),
+                }
+            }
+            std::process::exit(0);
+        }
+        // #reach-widget  `--dump-scoreboard <map.map> [cusc-name-substring]`: print every
+        // component, property and authored value of Reach's own scoreboard `cui_screen` tags, in
+        // tag order, with the referenced bitmap names. Print-only.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-scoreboard") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                match scene.open_cache(&map) {
+                    Ok(()) => {
+                        if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                            reach_widget::dump_scoreboard(n, c, &filter);
+                            reach_widget::dump_static_data(n, c, "colors");
+                            reach_widget::dump_ui_globals(n, c);
+                            reach_widget::dump_emblem_library(n, c);
+                        }
+                        // The UI bitmaps the widgets reference, as HMS decodes them: size and
+                        // the actual pixel statistics, because "the plate is dark" is a claim
+                        // about the ART and not about the tag. Writes a PNG per bitmap into
+                        // $HMS_UI_BITMAP_DUMP when that is set, so they can be looked at.
+                        for name in [
+                            "ui\\cui\\common\\white_pix",
+                            "ui\\cui\\lobbies\\player_base_bitmap",
+                            "ui\\cui\\lobbies\\player_base_servicetag_bitmap",
+                            "ui\\cui\\lobbies\\roster_gradient_bitmap",
+                            "ui\\cui\\in_game\\scoreboard\\bitmaps\\scoreboard_gray",
+                        ] {
+                            let Some(t) = (0..0x10000u32).find(|&t| scene.tag_name_of(t).eq_ignore_ascii_case(name)) else {
+                                println!("bitmap '{name}': NOT IN THIS CACHE");
+                                continue;
+                            };
+                            match scene.decode_bitmap_keep_alpha_public(t) {
+                                Some((bgra, w, h)) => {
+                                    let n = (w as usize * h as usize).min(bgra.len() / 4);
+                                    let mut sum = [0u64; 4];
+                                    let mut mn = [255u8; 4];
+                                    let mut mx = [0u8; 4];
+                                    for px in bgra.chunks_exact(4).take(n) {
+                                        for k in 0..4 {
+                                            sum[k] += px[k] as u64;
+                                            mn[k] = mn[k].min(px[k]);
+                                            mx[k] = mx[k].max(px[k]);
+                                        }
+                                    }
+                                    let m = |k: usize| sum[k] as f64 / n.max(1) as f64;
+                                    println!(
+                                        "bitmap {t:#06x} '{name}' {w}x{h}: mean B {:.1} G {:.1} R {:.1} A {:.1}; \
+                                         min(bgra) {mn:?} max(bgra) {mx:?}",
+                                        m(0), m(1), m(2), m(3)
+                                    );
+                                    // first row and middle row, as RGBA hex, a few samples across
+                                    for (label, y) in [("row 0", 0u32), ("row h/2", h / 2)] {
+                                        let mut cells = Vec::new();
+                                        for i in 0..8u32 {
+                                            let x = (w.saturating_sub(1)) * i / 7;
+                                            let o = ((y as usize * w as usize) + x as usize) * 4;
+                                            if o + 4 <= bgra.len() {
+                                                cells.push(format!("x{x}:{:02x}{:02x}{:02x}/a{:02x}", bgra[o + 2], bgra[o + 1], bgra[o], bgra[o + 3]));
+                                            }
+                                        }
+                                        println!("    {label}: {}", cells.join(" "));
+                                    }
+                                    if let Ok(dir) = std::env::var("HMS_UI_BITMAP_DUMP") {
+                                        let _ = std::fs::create_dir_all(&dir);
+                                        let file = std::path::Path::new(&dir)
+                                            .join(format!("{}.png", name.rsplit('\\').next().unwrap_or("bm")));
+                                        if let Ok(f) = std::fs::File::create(&file) {
+                                            let mut enc = png::Encoder::new(std::io::BufWriter::new(f), w, h);
+                                            enc.set_color(png::ColorType::Rgba);
+                                            enc.set_depth(png::BitDepth::Eight);
+                                            if let Ok(mut wr) = enc.write_header() {
+                                                let mut rgba = vec![0u8; n * 4];
+                                                for (i, px) in bgra.chunks_exact(4).take(n).enumerate() {
+                                                    rgba[i * 4] = px[2];
+                                                    rgba[i * 4 + 1] = px[1];
+                                                    rgba[i * 4 + 2] = px[0];
+                                                    rgba[i * 4 + 3] = px[3];
+                                                }
+                                                let _ = wr.write_image_data(&rgba);
+                                                println!("    wrote {}", file.display());
+                                            }
+                                        }
+                                    }
+                                }
+                                None => println!("bitmap {t:#06x} '{name}': DECODE FAILED"),
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("open_cache({map}) failed: {e:#}"),
+                }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--probe-jmad") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::probe_jmad(n, c, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--dump-jmad") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).cloned().unwrap_or_default();
+            let limit = args.get(pos + 3).and_then(|s| s.parse().ok()).unwrap_or(12usize);
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_jmad(n, c, &filter, limit);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #aim  `--dump-aim <map> <graph substring> <clip>`: one overlay clip's per-frame
+        // rotations, which is how the aim frame convention was measured.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-aim") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).cloned().unwrap_or_default();
+            let clip = args.get(pos + 3).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_aim_clip(n, c, &filter, &clip);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #reach-hud  `--dump-hud <map> [chdt substring]`: every chud widget WITH its Active and
+        // Hidden state conditions (which `--dump-chdt` does not print), plus the two `weap`
+        // numbers a first-person HUD needs -- the aim-assist block with both readings of every
+        // angle, and the raw `magazines` block.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-hud") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_hud::dump_hud(n, c, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #reach-chud  `--dump-chud <map>`: the authored floating-player-name rules -- the chgd
+        // skin palette, the engine's colour-index map, and the anchor marker on every biped.
+        // #crosshair  `--dump-crosshair <map> [weapon substring]`: every weapon's reticule.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-crosshair") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_chud::dump_crosshair(n, c, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #spectate  `--dump-spectate <map>`: Theater's spectated-player card, as authored.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-spectate") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_chud::dump_spectate(n, c);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #reach-chud  `--list-ui <map> [substring]`: every UI tag path, by group.
+        if let Some(pos) = args.iter().position(|a| a == "--list-ui") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_chud::list_ui(n, c, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #reach-chud  `--dump-chdt <map> [substring]`: every chud_definition's widget tree.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-chdt") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let filter = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_chud::dump_chdt(n, c, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--dump-chud") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let film = args.get(pos + 2).filter(|a| !a.starts_with("--")).cloned();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_chud::dump(n, c);
+                        if let Some(d) = args.iter().position(|a| a == "--icon-png").and_then(|i| args.get(i + 1)) {
+                            let g = reach_chud::read_globals(n, c);
+                            if let Some(skin) = g.as_ref().and_then(|g| g.default_skin()) {
+                                reach_chud::dump_navpoint_sheet(n, c, skin, d);
+                            }
+                        }
+                        if let Some(f) = &film {
+                            let g = reach_chud::read_globals(n, c);
+                            reach_chud::dump_film(std::path::Path::new(f), g.as_ref().and_then(|g| g.default_skin()));
+                        }
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--dump-markers") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let group = args.get(pos + 2).cloned().unwrap_or_else(|| "weap".into());
+            let filter = args.get(pos + 3).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_markers(n, c, &group, &filter);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // Print-only: every `weap` tag's ANIMATION CLASS (the middle component of a `jmad`
+        // `mode:class:action` name), plus `--weapon-class <map> [filter] sweep` for the
+        // (offset, width) sweep that pinned the field against the graph's own vocabulary.
+        // Print-only: a RENDER MODEL read with no object wrapper (the first-person arm models).
+        if let Some(pos) = args.iter().position(|a| a == "--dump-rmodel") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let tag = args.get(pos + 2).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_render_model(n, c, tag);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        // #wscale Print-only: which marker pair the held-weapon attach resolves, and what the
+        // attach matrix does to the weapon's size and position.
+        if let Some(pos) = args.iter().position(|a| a == "--held-weapon") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let biped = args.get(pos + 2).cloned().unwrap_or_else(|| "spartans\\spartans".into());
+            let weapon = args.get(pos + 3).cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_held_weapon(n, c, &biped, &weapon);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--weapon-class") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let sweep = args.iter().any(|a| a == "sweep");
+            let filter = args.get(pos + 2).filter(|a| *a != "sweep").cloned().unwrap_or_default();
+            if let Some(mut scene) = cli_scene_controller() {
+                if scene.open_cache(&map).is_ok() {
+                    if let (Some(c), n) = (scene.cache_handle(), scene.native_dll()) {
+                        reach_actor::dump_weapon_classes(n, c, &filter, sweep);
+                    }
+                }
+            }
+            std::process::exit(0);
+        }
         if let Some(pos) = args.iter().position(|a| a == "--dump-model") {
             let map = args.get(pos + 1).cloned().unwrap_or_default();
             let mode = args.get(pos + 2).and_then(|s| u32::from_str_radix(s.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
@@ -414,6 +1003,217 @@ fn main() -> eframe::Result<()> {
                 }
             }
             std::process::exit(0);
+        }
+        // #xgame CROSS-GAME CONVERSION, print-only / file-writing diagnostics:
+        //   --xgame-build-catalog [out.json]   walk every installed canvas's Forge palette and
+        //                                     write the object catalog (sizes in world units)
+        //   --xgame-catalog [filter]           list the catalog HMS is using
+        //   --xgame-build-table [out.tsv]      auto-propose the equivalence table from the catalog
+        //   --xgame-table [filter]             list the equivalence table HMS is using
+        //   --xgame-convert <src.mvar> <game> <canvas> [out.mvar] [offset x,y,z] [yaw d] [report]
+        if let Some(pos) = args.iter().position(|a| a == "--xgame-build-catalog") {
+            let out = args.get(pos + 1).filter(|a| !a.starts_with("--")).cloned()
+                .unwrap_or_else(|| "crates/hms-app/src/xgame/catalog.json".to_string());
+            let t0 = std::time::Instant::now();
+            let cat = xgame::catalog::build(&mut |l| println!("  {l}"));
+            match std::fs::write(&out, cat.to_json()) {
+                Ok(()) => println!("wrote {out}: {} objects in {:.1} s", cat.objects.len(), t0.elapsed().as_secs_f32()),
+                Err(e) => { eprintln!("{out}: {e}"); std::process::exit(1); }
+            }
+            for g in xgame::GAMES {
+                let n = cat.of_game(g).count();
+                if n == 0 { continue; }
+                let boxed = cat.of_game(g).filter(|o| o.has_box()).count();
+                println!("  {:<22} {n:>4} objects, {boxed:>4} with a render box, {} canvases", g.display_name(), cat.canvases(g).len());
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--xgame-catalog") {
+            let cat = xgame::catalog::Catalog::load();
+            print!("{}", xgame::catalog::describe(&cat, args.get(pos + 1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"))));
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--xgame-build-table") {
+            let out = args.get(pos + 1).filter(|a| !a.starts_with("--")).cloned()
+                .unwrap_or_else(|| "crates/hms-app/src/xgame/equivalence.tsv".to_string());
+            let cat = xgame::catalog::Catalog::load();
+            if cat.objects.is_empty() { eprintln!("the catalog is empty - run --xgame-build-catalog first"); std::process::exit(1); }
+            // KEEP every hand-curated row: the auto pass only fills in what a human has not
+            // decided, so regenerating never silently undoes a correction.
+            let curated: Vec<xgame::table::EqRow> = xgame::table::Table::load().rows.into_iter().filter(|r| r.curated).collect();
+            let mut t = xgame::table::propose(&cat);
+            t.rows.retain(|r| !curated.iter().any(|c| c.src_game == r.src_game && c.src_key == r.src_key && c.dst_game == r.dst_game));
+            let kept = curated.len();
+            t.rows.extend(curated);
+            match std::fs::write(&out, t.to_tsv()) {
+                Ok(()) => println!("wrote {out}: {} rows ({kept} curated rows kept)", t.rows.len()),
+                Err(e) => { eprintln!("{out}: {e}"); std::process::exit(1); }
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--xgame-table") {
+            let cat = xgame::catalog::Catalog::load();
+            let t = xgame::table::Table::load();
+            print!("{}", xgame::table::describe(&t, &cat, args.get(pos + 1).map(|s| s.as_str()).filter(|s| !s.starts_with("--"))));
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--xgame-verify") {
+            let mut bad = 0usize;
+            for f in args[pos + 1..].iter().take_while(|a| !a.starts_with("--")) {
+                match xgame::verify_variant(std::path::Path::new(f)) {
+                    Ok(m) => println!("OK   {m}"),
+                    Err(e) => { println!("FAIL {e}"); bad += 1; }
+                }
+            }
+            std::process::exit(if bad > 0 { 1 } else { 0 });
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--xgame-convert") {
+            let rest: Vec<String> = args[pos + 1..].to_vec();
+            match xgame::convert_cli(&rest) {
+                Ok(msg) => { println!("{msg}"); std::process::exit(0); }
+                Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+            }
+        }
+        // #film-stats  `hms-app --film-stats <film|folder>... [--json] [--map <cache.map>]`
+        // Player statistics straight out of a saved film, with NO window and NO wgpu device —
+        // the whole point is that someone who only wants the numbers (or a CI job, or an SSH
+        // session) never needs a GPU. `--map` is optional and only resolves vehicle and weapon
+        // TAG NAMES; every other statistic comes from the film bytes alone.
+        // #scoreboard-color  `--dump-scoreboard-rows <map.map> <film.mov>`: for every row the
+        // Theater scoreboard would paint, print what HMS resolved for it -- the team, whether
+        // the clip reads as a free-for-all, the player's own armour colour INDEX, and the two
+        // candidate colours that index can produce (`wigl`'s `bitmap player` UI bar colour and
+        // `matg`'s raw `profile colors` entry, which is what the body on screen is tinted
+        // with). Print-only, GPU-free, and it reads the same `scoreboard_rows` the panel paints.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-scoreboard-rows") {
+            let map = args.get(pos + 1).cloned().unwrap_or_default();
+            let path = args.get(pos + 2).cloned().unwrap_or_default();
+            let Some(mut scene) = cli_scene_controller() else { std::process::exit(1) };
+            if let Err(e) = scene.open_cache(&map) {
+                eprintln!("open_cache({map}) failed: {e:#}");
+                std::process::exit(1);
+            }
+            let f = match film::open(std::path::Path::new(&path)) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("--dump-scoreboard-rows: {path}: {e:#}");
+                    std::process::exit(1);
+                }
+            };
+            let idx = film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+            let pb = film_play::Playback::new(idx);
+            let roster = film_ui::roster_lines(&f, &pb, &std::collections::HashMap::new());
+            let rows = film_ui::scoreboard_rows(&roster, None);
+            let g = match (scene.cache_handle(), scene.native_dll()) {
+                (Some(c), n) => reach_widget::read_ui_globals(n, c),
+                _ => None,
+            };
+            let prof = scene.profile_colors();
+            println!(
+                "{}: {} scoreboard row(s); wigl bitmap player list {} entr(ies), bitmap team {}; matg profile colors {}",
+                std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy(),
+                rows.len(),
+                g.as_ref().map_or(0, |g| g.tint_bitmap_player.len()),
+                g.as_ref().map_or(0, |g| g.tint_bitmap_team.len()),
+                prof.len()
+            );
+            let hex = |c: [f32; 3]| {
+                format!("#{:02x}{:02x}{:02x}",
+                    (c[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (c[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u8,
+                    (c[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u8)
+            };
+            for r in &rows {
+                let bar = g.as_ref().and_then(|g| film_ui::bitmap_tint(g, r));
+                // What the row is actually painted with across its player-coloured run.
+                let chip = film_ui::player_primary_color(&prof, r);
+                println!(
+                    "  pos {:>2} {:<20} named={} team={:<4} show_team={} armour_color={:<5} | engine's own (wigl bitmap_player) {} | PAINTED across the row (matg profile_colors, sRGB) {}",
+                    r.position,
+                    r.name,
+                    r.named,
+                    r.team,
+                    r.show_team,
+                    r.armour_color.map(|v| v.to_string()).unwrap_or_else(|| "-".into()),
+                    bar.map(|c| hex([c[1], c[2], c[3]]))
+                        .unwrap_or_else(|| format!("{} (the engine would leave it transparent)", hex([film_ui::NO_PLAYER_COLOUR[1], film_ui::NO_PLAYER_COLOUR[2], film_ui::NO_PLAYER_COLOUR[3]]))),
+                    chip.map(hex).unwrap_or_else(|| {
+                        format!("{} (nothing recorded)", hex([film_ui::NO_PLAYER_COLOUR[1], film_ui::NO_PLAYER_COLOUR[2], film_ui::NO_PLAYER_COLOUR[3]]))
+                    }),
+                );
+            }
+            std::process::exit(0);
+        }
+        // #emblem  `--dump-film-players <film.mov>`: print each recorded player's whole 160-byte
+        // `s_player_configuration` slot with the fields this reader has solved -- the emblem
+        // among them -- and say how many DISTINCT emblems one recording holds. Print-only.
+        if let Some(pos) = args.iter().position(|a| a == "--dump-film-players") {
+            let path = args.get(pos + 1).cloned().unwrap_or_default();
+            match film::open_header(std::path::Path::new(&path)) {
+                Ok(f) => {
+                    let present: Vec<&film::FilmPlayer> = f.header.players.iter().filter(|p| p.present()).collect();
+                    println!("{}: {} present player slot(s)", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy(), present.len());
+                    let mut distinct: std::collections::HashSet<[u8; 8]> = Default::default();
+                    for p in &present {
+                        let mut k = [0u8; 8];
+                        if p.raw.len() >= film::EMBLEM_AT + 8 {
+                            k.copy_from_slice(&p.raw[film::EMBLEM_AT..film::EMBLEM_AT + 8]);
+                        }
+                        distinct.insert(k);
+                        println!(
+                            "  slot {:>2} team {:>3} [{}] {:<18} emblem bytes {} -> {}",
+                            p.index,
+                            p.team,
+                            p.service_tag,
+                            p.gamertag,
+                            k.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" "),
+                            match p.emblem() {
+                                Some(e) => format!("{}{}", e.summary(), if e.in_range() { "" } else { "  [OUT OF RANGE for the shipped art]" }),
+                                None => "NO VALID EMBLEM (the engine's own checks fail)".to_string(),
+                            }
+                        );
+                        if let Some(a) = p.appearance() {
+                            println!("           appearance: {} | model {} | tertiary colour {} | flags {:#04b}",
+                                a.summary(), if a.model_choice == 1 { "elite" } else { "spartan" }, a.f4b, a.f48);
+                        }
+                    }
+                    println!("  DISTINCT emblem records across those {} slots: {}", present.len(), distinct.len());
+                }
+                Err(e) => eprintln!("--dump-film-players: {path}: {e:#}"),
+            }
+            std::process::exit(0);
+        }
+        if let Some(pos) = args.iter().position(|a| a == "--film-stats") {
+            let json = args.iter().any(|a| a == "--json");
+            let targets: Vec<String> =
+                args[pos + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect();
+            // The cache is opened through `cli_scene_controller` — native library only.
+            let map = args.iter().position(|a| a == "--map").and_then(|i| args.get(i + 1)).cloned();
+            let mut scene = None;
+            let mut names: Option<film_stats::MapNames> = None;
+            if let Some(m) = &map {
+                match cli_scene_controller() {
+                    Some(mut sc) => match sc.open_cache(m) {
+                        Ok(()) => {
+                            if let (Some(c), n) = (sc.cache_handle(), sc.native_dll()) {
+                                // #film-action  the map PATH too: the network tag-reference
+                                // table is sorted by the cache's per-tag datum salts, which live
+                                // in the .map file and in no native export.
+                                names = Some(film_stats::MapNames::build_with_map(n, c, Some(std::path::Path::new(m))));
+                            }
+                            scene = Some(sc);
+                        }
+                        Err(e) => eprintln!("--film-stats: --map {m} did not open ({e:#}); vehicle and weapon names will not be resolved"),
+                    },
+                    None => eprintln!("--film-stats: no native library; vehicle and weapon names will not be resolved"),
+                }
+            }
+            let code = match &names {
+                Some(n) => film_stats::cli(&targets, json, n),
+                None => film_stats::cli(&targets, json, &film_stats::NoNames),
+            };
+            drop(scene);
+            std::process::exit(code);
         }
         if let Some(pos) = args.iter().position(|a| a == "--dump-palette") {
             let map = args.get(pos + 1).cloned().unwrap_or_default();
@@ -540,7 +1340,8 @@ fn main() -> eframe::Result<()> {
         })
         .unwrap_or_else(|| "built@?".into());
     let title = format!(
-        "Halo Map Studio (Rust) — {build_stamp} [{}]",
+        "Halo Map Studio v{} — {build_stamp} [{}]",
+        env!("CARGO_PKG_VERSION"),
         if cfg!(debug_assertions) { "DEBUG" } else { "RELEASE" }
     );
     // Also write the running build's stamp + exe path to the settings dir on every launch, so a
@@ -553,9 +1354,24 @@ fn main() -> eframe::Result<()> {
     // Window/taskbar icon. Decoded from the PNG in assets/ (the same art is compiled into
     // the .exe as a resource by build.rs on Windows, which is what Explorer shows).
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).ok();
+    // Settings ▸ Graphics: two of the knobs are fixed at the moment the GPU objects are created
+    // and cannot be changed afterwards — the swapchain present mode (vsync) and the one material
+    // sampler every bind group bakes in (anisotropy) — so the persisted graphics settings have to
+    // be read HERE, before eframe builds either. The texture cap is global for the same reason
+    // (the upload helpers are free functions called from ~40 sites).
+    let startup_gfx = gfxsettings::GfxSettings::load();
+    hms_render::quality::set_anisotropy(startup_gfx.anisotropy as u16);
+    hms_render::quality::set_texture_max_dim(startup_gfx.texture_max_dim);
+    // A benchmark run must not be pinned to the display refresh, or every frame period measures
+    // the monitor instead of the renderer.
+    let bench_run = std::env::var("HMS_BENCH").is_ok();
     let native_options = eframe::NativeOptions {
         viewport: {
-            let vb = egui::ViewportBuilder::default();
+            // `with_app_id` sets the Wayland app_id / X11 WM_CLASS. The Wayland compositor
+            // shows NO window-set icon (there is no such protocol) - it matches this id to a
+            // `<app_id>.desktop` file to find the icon, so it must equal the installed desktop
+            // entry's basename (see dist/linux/halo-map-studio.desktop + install-desktop-linux.sh).
+            let vb = egui::ViewportBuilder::default().with_app_id("halo-map-studio");
             let vb = match icon {
                 Some(i) => vb.with_icon(std::sync::Arc::new(i)),
                 None => vb,
@@ -563,7 +1379,9 @@ fn main() -> eframe::Result<()> {
             vb
         }
             .with_title(&title)
-            .with_inner_size([1400.0, 900.0])
+            // HMS_WIN=WxH (dev): open at a given size, so a viewport-shaped defect (aspect /
+            // resize) can be captured with HMS_AUTOSHOT at the user's own window geometry.
+            .with_inner_size(std::env::var("HMS_WIN").ok().and_then(|v| { let (w, h) = v.split_once('x')?; Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?]) }).unwrap_or([1400.0, 900.0]))
             // Force the window on-screen, visible, and focused. eframe's default persists
             // the window rect across runs; a stale off-screen/other-monitor position makes
             // the window open where it can't be seen. Pin a known top-left position each
@@ -578,7 +1396,14 @@ fn main() -> eframe::Result<()> {
         // present mode on some NVIDIA drivers (seen on 610.88), after which the UI
         // thread blocks on present.
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            present_mode: eframe::wgpu::PresentMode::Fifo,
+            // Settings ▸ Graphics ▸ Vertical sync. Fifo (standard vsync) stays the default: the
+            // comment below records why AutoVsync is not used, and AutoNoVsync is the explicit
+            // opt-out rather than a mode the driver picks.
+            present_mode: if startup_gfx.vsync && !bench_run {
+                eframe::wgpu::PresentMode::Fifo
+            } else {
+                eframe::wgpu::PresentMode::AutoNoVsync
+            },
             // Request TEXTURE_COMPRESSION_BC so the map's BC blocks upload directly (no CPU
             // decode/mip). Masked by adapter.features() so only supported features are
             // requested — can't break device creation. Everything else is the default.
@@ -586,7 +1411,11 @@ fn main() -> eframe::Result<()> {
                 device_descriptor: std::sync::Arc::new(|adapter: &eframe::wgpu::Adapter| {
                     eframe::wgpu::DeviceDescriptor {
                         label: Some("hms-device"),
-                        required_features: adapter.features() & eframe::wgpu::Features::TEXTURE_COMPRESSION_BC,
+                        // TIMESTAMP_QUERY is requested (masked, so an adapter without it is
+                        // unaffected) purely so the in-app graphics benchmark can attribute GPU
+                        // milliseconds to named passes. Nothing in the normal frame uses it.
+                        required_features: adapter.features()
+                            & (eframe::wgpu::Features::TEXTURE_COMPRESSION_BC | eframe::wgpu::Features::TIMESTAMP_QUERY),
                         required_limits: adapter.limits(),
                         // Smaller allocator blocks (16-128 MB instead of 128-512 MB) so one
                         // live allocation cannot pin a half-gigabyte host-visible chunk after the load.
@@ -600,8 +1429,33 @@ fn main() -> eframe::Result<()> {
                 native_adapter_selector: Some(std::sync::Arc::new(|adapters: &[eframe::wgpu::Adapter], surface: Option<&eframe::wgpu::Surface<'_>>| {
                     use eframe::wgpu::DeviceType;
                     let want_soft = std::env::var("HMS_SOFTWARE_GPU").is_ok();
+                    use eframe::wgpu::Backend;
+                    // #cross-platform-parity: PREFER VULKAN on every platform. The renderer + WGSL
+                    // are shared, so the only thing that diverges Windows from Linux is the wgpu
+                    // backend: Linux runs Vulkan (naga -> SPIR-V), but on Windows Backends::all()
+                    // ranks a DX12 adapter first (naga -> HLSL/DXBC, and under Proton a second hop
+                    // through vkd3d-proton) - and DX12 vs Vulkan genuinely disagree on line
+                    // rasterization (grids / hull edges) and some shader codegen. Choosing the
+                    // Vulkan adapter makes the Windows build take the identical SPIR-V path (and
+                    // under Proton the SAME Linux Vulkan driver), so it renders exactly like ours.
+                    // HMS_BACKEND=vulkan|dx12|gl|metal forces one (fallback / broken-driver escape).
+                    let forced = std::env::var("HMS_BACKEND").ok().map(|s| s.to_ascii_lowercase());
+                    let backend_pref = |b: Backend| -> i32 {
+                        match b { Backend::Vulkan | Backend::Metal => 0, Backend::Dx12 => 1, Backend::Gl => 2, _ => 3 }
+                    };
+                    let backend_matches = |b: Backend, name: &str| -> bool {
+                        match name {
+                            "vulkan" | "vk" => b == Backend::Vulkan,
+                            "dx12" | "d3d12" | "directx" => b == Backend::Dx12,
+                            "gl" | "opengl" | "gles" => b == Backend::Gl,
+                            "metal" => b == Backend::Metal,
+                            _ => true,
+                        }
+                    };
+                    // device type is the primary key (x10); Vulkan is the tiebreaker within a type.
                     let rank = |a: &eframe::wgpu::Adapter| -> i32 {
-                        let t = a.get_info().device_type;
+                        let info = a.get_info();
+                        let t = info.device_type;
                         let base = match t {
                             DeviceType::DiscreteGpu => 0,
                             DeviceType::IntegratedGpu => 1,
@@ -609,11 +1463,13 @@ fn main() -> eframe::Result<()> {
                             DeviceType::Other => 3,
                             DeviceType::Cpu => 4,
                         };
-                        if want_soft { if t == DeviceType::Cpu { -1 } else { base + 10 } } else { base }
+                        let bp = backend_pref(info.backend);
+                        if want_soft { if t == DeviceType::Cpu { -1 } else { base * 10 + bp + 100 } } else { base * 10 + bp }
                     };
                     let mut best: Option<(i32, usize)> = None;
                     for (i, a) in adapters.iter().enumerate() {
                         if let Some(s) = surface { if !a.is_surface_supported(s) { continue; } }
+                        if let Some(f) = forced.as_deref() { if !backend_matches(a.get_info().backend, f) { continue; } }
                         let r = rank(a);
                         if best.map_or(true, |(br, _)| r < br) { best = Some((r, i)); }
                     }
@@ -786,8 +1642,10 @@ pub(crate) fn boundary_geometry(
             let l = dq(boundary[1]).max(0.05);
             let tp = dq(boundary[2]);
             let bt = dq(boundary[3]);
+            // Box extents run WIDTH along the object's forward axis and LENGTH along its right axis
+            // (matches how the game orients the boundary; the reverse read inverted on screen).
             let corner = |sx: f32, sy: f32, upper: bool| {
-                pos + right * (sx * w) + fwd * (sy * l) + up * (if upper { tp } else { -bt })
+                pos + fwd * (sx * w) + right * (sy * l) + up * (if upper { tp } else { -bt })
             };
             let cs = [
                 corner(-1.0, -1.0, false), corner(1.0, -1.0, false),
@@ -984,7 +1842,10 @@ fn obj_flags_line(datum: u32, m: &ObjMeta, g: &forge_scale::GlobalFlags, conv: f
         if !g.scaled && fs != m.scaled_on() { ", global OFF" } else { "" },
         if m.shadow_on() { "ON" } else { "off" }, how(m.flags.shadow),
         if !g.shadowcasters && fc != m.shadow_on() { ", global OFF" } else { "" },
-    )
+    ) + &match m.flags.damage {
+        Some(d) => format!(" | damage {} (set)", forge_scale::damage_state_name(d)),
+        None => String::new(),
+    }
 }
 
 /// Human name for a forge team index (-1 none, 8 neutral, 0..7 the change-colour names).
@@ -997,43 +1858,256 @@ fn forge_team_name(idx: i32) -> String {
     }
 }
 
-/// Import external geometry (OBJ/GLB — converted from another game's BSP by the user)
-/// as a renderable BASE mesh to forge over. Computes per-vertex normals and converts
-/// the source Y-up convention to the viewer's Halo Z-up. Returns a lit static mesh
-/// (untextured → default white × lighting). This is the core of the "import geometry
-/// and forge on top" feature; the UI/file-picker + a scan folder wrap this.
-fn import_geometry_mesh(
+/// #model-import: the GPU side of one imported model file — ONE sub-mesh per material (so a
+/// multi-material model keeps every one of its looks), split into the opaque pass and the
+/// alpha-test cutout pass, plus the model's collision triangles in MODEL space.
+struct ImportGpu {
+    opaque: Vec<hms_render::GpuMesh>,
+    cutout: Vec<hms_render::GpuMesh>,
+    /// MODEL space; the pose turns it into the world soup every raycast consumer reads.
+    tris: Vec<[glam::Vec3; 3]>,
+    /// What the file actually yielded, for the panel row and the status line.
+    summary: String,
+}
+
+/// #model-import: one finished background model read. The parse + image decode of a large
+/// model (26 MB of GLB, several embedded PNG/JPEG maps) runs on a worker thread; the result
+/// comes back here and `App::drain_import_loads` does the GPU upload on the render thread.
+enum ImportLoaded {
+    /// A model the user asked for (Tools ▸ Import geometry, the model browser, a script).
+    New(std::path::PathBuf, Result<Box<modelimport::ModelData>, String>),
+    /// A project's recorded imports, in the project's OWN order so the saved poses line up.
+    /// The `u64` is the import-lane generation the read was started for: opening a second
+    /// project (or "Clear all") bumps it, so a slow first batch cannot land on top of the
+    /// second one and duplicate every model.
+    Restore(u64, Vec<(project::ProjImport, Result<Box<modelimport::ModelData>, String>)>),
+}
+
+/// Build the base-colour texture ONE imported material needs, in exactly the form the mesh
+/// shader wants: sRGB-encoded texels that its `pow(x, 2.2)` turns back into linear radiance.
+///
+///   * glTF `baseColorFactor` / MTL `Kd` are LINEAR multipliers on the albedo, so they are
+///     folded in as `factor^(1/2.2)`: `pow(tex·factor^(1/2.2), 2.2) == pow(tex, 2.2)·factor`,
+///     which is the spec'd product. A material with NO map becomes a 2×2 solid of its factor —
+///     that is what makes a material-less OBJ, an untextured glTF material and a texture that
+///     failed to decode all still show their real colour instead of white.
+///   * `MASK` coverage is RE-MAPPED so the material's own `alphaCutoff` lands on the 0.5 the
+///     cutout pipeline clips at (`fs_alphatest` has no per-material cutoff register).
+///   * `MIRRORED_REPEAT` is baked as a 2× mirror tile with the UVs halved. The renderer shares
+///     ONE Repeat sampler across every material bind group, and repeat-sampling a mirror tile is
+///     exactly equivalent to mirror-sampling the original, so this costs no new sampler.
+///
+/// Returns (sRGB RGBA8 texels, width, height, UV multiplier, whether the alpha channel VARIES).
+fn import_material_texels(
+    mat: &modelimport::ImportMaterial,
+    img: Option<&modelimport::ImportImage>,
+) -> (Vec<u8>, u32, u32, [f32; 2], bool) {
+    let enc = |lin: f32| (lin.clamp(0.0, 1.0)).powf(1.0 / 2.2);
+    let f = [enc(mat.base_color[0]), enc(mat.base_color[1]), enc(mat.base_color[2])];
+    let fa = mat.base_color[3].clamp(0.0, 1.0);
+    let cut = mat.alpha_cutoff.clamp(0.001, 0.999);
+    let remap = mat.alpha_mode == modelimport::AlphaMode::Mask && (cut - 0.5).abs() > 1e-3;
+    let Some(im) = img else {
+        // No map (or an undecodable one): a flat 2×2 of the material's own colour. 2×2 rather
+        // than 1×1 so the mip chain is trivially valid at every level.
+        let px = [
+            (f[0] * 255.0 + 0.5) as u8,
+            (f[1] * 255.0 + 0.5) as u8,
+            (f[2] * 255.0 + 0.5) as u8,
+            (fa * 255.0 + 0.5) as u8,
+        ];
+        return (px.repeat(4), 2, 2, [1.0, 1.0], false);
+    };
+    let mut rgba = im.rgba.clone();
+    let (mut amin, mut amax) = (255u8, 0u8);
+    for t in rgba.chunks_exact_mut(4) {
+        for c in 0..3 {
+            t[c] = ((t[c] as f32) * f[c] + 0.5).min(255.0) as u8;
+        }
+        let mut a = (t[3] as f32 / 255.0) * fa;
+        if remap {
+            a = if a < cut { 0.5 * a / cut } else { 0.5 + 0.5 * (a - cut) / (1.0 - cut) };
+        }
+        t[3] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        amin = amin.min(t[3]);
+        amax = amax.max(t[3]);
+    }
+    let varying = amax.saturating_sub(amin) > 8;
+    let (mut w, mut h) = (im.w, im.h);
+    let mut uv_mul = [1.0f32, 1.0];
+    let mir_u = mat.wrap[0] == modelimport::Wrap::Mirror;
+    let mir_v = mat.wrap[1] == modelimport::Wrap::Mirror;
+    if (mir_u || mir_v) && (w as u64) * (h as u64) * 4 <= (modelimport::MAX_TEX_BUDGET as u64) / 8 {
+        let (nw, nh) = (if mir_u { w * 2 } else { w }, if mir_v { h * 2 } else { h });
+        let mut out = vec![0u8; (nw as usize) * (nh as usize) * 4];
+        for y in 0..nh {
+            let sy = if mir_v && y >= h { (2 * h - 1 - y).min(h - 1) } else { y.min(h - 1) };
+            for x in 0..nw {
+                let sx = if mir_u && x >= w { (2 * w - 1 - x).min(w - 1) } else { x.min(w - 1) };
+                let (s, d) = (
+                    ((sy as usize) * (w as usize) + sx as usize) * 4,
+                    ((y as usize) * (nw as usize) + x as usize) * 4,
+                );
+                out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+            }
+        }
+        rgba = out;
+        w = nw;
+        h = nh;
+        uv_mul = [if mir_u { 0.5 } else { 1.0 }, if mir_v { 0.5 } else { 1.0 }];
+    }
+    (rgba, w, h, uv_mul, varying)
+}
+
+/// Import external geometry (OBJ / glTF / GLB) as renderable meshes to forge over.
+///
+/// Converts the source Y-up convention to the viewer's Halo Z-up, uploads each material's
+/// decoded base-colour map as a GPU texture, and returns one `GpuMesh` per material plus the
+/// whole model's triangles in MODEL space.
+///
+/// LIGHTING: every sub-mesh is uploaded on the DYNAMIC-OBJECT lane (`is_object: true`), which is
+/// the same path a placed Forge piece takes — the shader adds the probe/airprobe ambient that
+/// rides the per-instance colour (written by `App::refresh_import_transforms` from the map's own
+/// airprobe grid at the model's position), a dominant-lobe geometric-normal soft shade, and the
+/// scene sun gated by the real-time shadow map; `lm.w == 2` also keeps the sky env-reflection off
+/// so an imported block reads matte like a Forge block rather than chrome. No bespoke look: an
+/// import is lit exactly like an object standing where it stands.
+///
+/// #4: the triangles come back in MODEL space and the meshes are uploaded with an IDENTITY
+/// instance matrix, because the caller owns the placement ([`extimport::ImportedModel`]) and
+/// re-writes that matrix whenever the user moves the model. The world-space soup the raycasts
+/// use is derived from the pose (`App::rebuild_import_tris`), never baked in here.
+fn build_import_meshes(
     mesh: &hms_render::MeshRenderer,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
-    path: &std::path::Path,
-) -> Option<(hms_render::GpuMesh, Vec<[glam::Vec3; 3]>)> {
-    let om = match path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref() {
-        Some("glb") | Some("gltf") => voxel::parse_glb(&std::fs::read(path).ok()?)?,
-        _ => voxel::parse_obj(&std::fs::read_to_string(path).ok()?),
-    };
-    if om.verts.is_empty() || om.tris.is_empty() {
+    data: &modelimport::ModelData,
+) -> Option<ImportGpu> {
+    if data.is_empty() {
         return None;
     }
-    // Y-up (OBJ/GLB) → Halo Z-up: (x, y, z)_src → (x, -z, y).
+    // Y-up (OBJ/glTF) → Halo Z-up: (x, y, z)_src → (x, -z, y). A rotation, so the same map
+    // applies to the normals and the uniform-scale assumption downstream still holds.
     let cvt = |v: [f32; 3]| glam::Vec3::new(v[0], -v[2], v[1]);
-    let pos: Vec<glam::Vec3> = om.verts.iter().map(|&v| cvt(v)).collect();
-    // Per-vertex normals = area-weighted average of adjacent face normals.
-    let mut nrm = vec![glam::Vec3::ZERO; pos.len()];
-    for t in &om.tris {
-        let (a, b, c) = (pos[t[0]], pos[t[1]], pos[t[2]]);
-        let fn_ = (b - a).cross(c - a);
-        nrm[t[0]] += fn_; nrm[t[1]] += fn_; nrm[t[2]] += fn_;
+    let mut out = ImportGpu {
+        opaque: Vec::new(),
+        cutout: Vec::new(),
+        tris: Vec::with_capacity(data.tri_count()),
+        summary: format!(
+            "{} \u{B7} {} part{} \u{B7} {}",
+            data.format,
+            data.parts.len(),
+            if data.parts.len() == 1 { "" } else { "s" },
+            data.material_summary()
+        ),
+    };
+    // MERGE the parts by material. A glTF scene is one primitive per node (tower_house_design
+    // is 296 of them over 11 materials), and every part that shares a material also shares its
+    // texture, its UV transform and its draw lane — so concatenating them turns 296 draws with
+    // 296 vertex buffers into 11. The node transform is already baked into the positions by the
+    // reader, so merging is a straight append with the indices offset.
+    let mut groups: Vec<(Option<usize>, Vec<&modelimport::ImportPart>)> = Vec::new();
+    for part in &data.parts {
+        if part.indices.len() < 3 || part.verts.is_empty() {
+            continue;
+        }
+        match groups.iter_mut().find(|(m, _)| *m == part.material) {
+            Some((_, v)) => v.push(part),
+            None => groups.push((part.material, vec![part])),
+        }
     }
-    let verts: Vec<hms_render::MeshVertex> = pos.iter().enumerate().map(|(i, p)| {
-        let n = if nrm[i].length_squared() > 1e-12 { nrm[i].normalize() } else { glam::Vec3::Z };
-        hms_render::MeshVertex { pos: [p.x, p.y, p.z], normal: [n.x, n.y, n.z], uv: [0.0, 0.0], color: [1.0; 4], sway: [0.0; 3], uv2: [0.0, 0.0], tangent: [0.0; 4] }
-    }).collect();
-    let indices: Vec<u32> = om.tris.iter().flat_map(|t| [t[0] as u32, t[1] as u32, t[2] as u32]).collect();
-    // World-space triangle soup for snap-to-surface raycasting.
-    let tris: Vec<[glam::Vec3; 3]> = om.tris.iter().map(|t| [pos[t[0]], pos[t[1]], pos[t[2]]]).collect();
-    let gm = mesh.upload_mesh(device, queue, &verts, &indices, &[glam::Mat4::IDENTITY], None, None, None, None, None, None, [0.0, 0.0], [1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 0.0, 1.0, [0.0, -1.0], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4], [0.0; 4], None, false, 0.0, [0.0; 4], None, None, [0.0; 4], [0.0; 4], None, None, [0.0; 4], [0.0; 4], None);
-    Some((gm, tris))
+    let mut blend_approximated = false;
+    for (mat_idx, parts) in &groups {
+        let mat = mat_idx.and_then(|i| data.materials.get(i)).cloned().unwrap_or_default();
+        let img = mat.image.and_then(|i| data.images.get(i));
+        let (texels, tw, th, uv_mul, varying) = import_material_texels(&mat, img);
+        let (view, _tex) = hms_render::upload_texture_rgba(device, queue, &texels, tw, th);
+        // Which lane: OPAQUE draws solid; MASK is a real cutout; BLEND has no imported
+        // alpha-blended pipeline, so it is approximated — a map with a VARYING alpha channel is
+        // clipped like a cutout (windows, foliage sheets), while a constant-alpha blend (a glass
+        // pane whose only transparency is `baseColorFactor.a`) draws solid rather than vanish.
+        let cutout = match mat.alpha_mode {
+            modelimport::AlphaMode::Opaque => false,
+            modelimport::AlphaMode::Mask => true,
+            modelimport::AlphaMode::Blend => {
+                if !varying {
+                    blend_approximated = true;
+                }
+                varying
+            }
+        };
+        // The renderer's one shared sampler is Repeat; per-vertex clamping is exact for the
+        // usual case (a clamped map whose UVs already lie in [0,1]) and an approximation only
+        // where the author relied on the edge smear.
+        let clamp_uv = mat.wrap[0] == modelimport::Wrap::Clamp || mat.wrap[1] == modelimport::Wrap::Clamp;
+        let nv: usize = parts.iter().map(|p| p.verts.len()).sum();
+        let ni: usize = parts.iter().map(|p| p.indices.len()).sum();
+        let mut verts: Vec<hms_render::MeshVertex> = Vec::with_capacity(nv);
+        let mut indices: Vec<u32> = Vec::with_capacity(ni);
+        for part in parts {
+            let base = verts.len() as u32;
+            for v in &part.verts {
+                let p = cvt(v.pos);
+                let n = cvt(v.normal);
+                let n = if n.length_squared() > 1e-12 { n.normalize() } else { glam::Vec3::Z };
+                let mut uv = [v.uv[0] * uv_mul[0], v.uv[1] * uv_mul[1]];
+                if clamp_uv {
+                    uv = [uv[0].clamp(0.0, 1.0), uv[1].clamp(0.0, 1.0)];
+                }
+                verts.push(hms_render::MeshVertex {
+                    pos: [p.x, p.y, p.z],
+                    normal: [n.x, n.y, n.z],
+                    uv,
+                    // COLOR_0 rides the per-vertex colour lane, which the vertex shader folds
+                    // into the baked tint (`o.tint = v.tint * v.vcolor`).
+                    color: [
+                        v.color[0].clamp(0.0, 4.0),
+                        v.color[1].clamp(0.0, 4.0),
+                        v.color[2].clamp(0.0, 4.0),
+                        1.0,
+                    ],
+                    sway: [0.0; 3],
+                    uv2: [0.0, 0.0],
+                    tangent: [0.0; 4],
+                    bone: [0, 0],
+                });
+            }
+            indices.extend(part.indices.iter().map(|i| base + *i));
+            for t in part.indices.chunks_exact(3) {
+                if let (Some(a), Some(b), Some(c)) = (
+                    part.verts.get(t[0] as usize),
+                    part.verts.get(t[1] as usize),
+                    part.verts.get(t[2] as usize),
+                ) {
+                    out.tris.push([cvt(a.pos), cvt(b.pos), cvt(c.pos)]);
+                }
+            }
+        }
+        if indices.len() < 3 {
+            continue;
+        }
+        let gm = mesh.upload_mesh(
+            device, queue, &verts, &indices, &[glam::Mat4::IDENTITY],
+            // Per-instance light colour. Starts neutral; `refresh_import_transforms` replaces it
+            // with the map's airprobe ambient at the model's position (and keeps it updated as
+            // the user moves the model).
+            Some(&[[1.0, 1.0, 1.0, 1.0]]),
+            Some(&view), None, None, None, None,
+            [0.0, 0.0], [1.0, 1.0], [0.0, 0.0, 0.0, 0.0], 0.0, 1.0, [0.0, -1.0], [0.0; 4], [0.0; 4],
+            [0.0; 4], [0.0; 4], [0.0; 4], None,
+            true, // DYNAMIC OBJECT lane: probe ambient + dominant-lobe soft shade + sun, matte env
+            0.0, [0.0; 4], None, None, [0.0; 4], [0.0; 4], None, None, [0.0; 4], [0.0; 4], None,
+        );
+        if cutout { out.cutout.push(gm) } else { out.opaque.push(gm) }
+    }
+    if out.opaque.is_empty() && out.cutout.is_empty() {
+        return None;
+    }
+    if blend_approximated {
+        out.summary += " \u{B7} alpha-blend approximated as solid";
+    }
+    out.summary += &format!(" \u{B7} {} draw(s)", out.opaque.len() + out.cutout.len());
+    Some(out)
 }
 
 /// Möller-Trumbore ray-vs-triangle-soup, returns the nearest hit distance along `dir`.
@@ -1170,6 +2244,11 @@ struct EditSnapshot {
     /// backs out "I drew a circle in the wrong place" exactly like any other mistake.
     shapes: Vec<construct::Shape>,
     sel_shape: Option<usize>,
+    /// #4: the imported models' POSES (pos, fwd, up, scale), parallel to `App::imports`, so
+    /// Ctrl+Z backs out a move/rotate of an imported model like any other transform. Only the
+    /// poses — the triangle soups are megabytes and never change, so cloning them 64 deep would
+    /// cost far more than the undo stack is worth.
+    import_poses: Vec<([f32; 3], [f32; 3], [f32; 3], f32)>,
 }
 
 struct XformOp {
@@ -1295,6 +2374,7 @@ impl ObjMeta {
         // A flag toggled in the panel goes to the whole selection too.
         if after.flags.scaled != before.flags.scaled { self.flags.scaled = after.flags.scaled; }
         if after.flags.shadow != before.flags.shadow { self.flags.shadow = after.flags.shadow; }
+        if after.flags.damage != before.flags.damage { self.flags.damage = after.flags.damage; }
         // the Halo 4 block diffs per field too (h4/edit.rs); a Reach object stays None
         if after.h4 != before.h4 { self.h4 = h4::edit::merge_h4_changed(self.h4.take(), before.h4.as_deref(), after.h4.as_deref()); }
     }
@@ -1331,7 +2411,65 @@ impl ObjMeta {
     }
 }
 
-/// One row in the custom variant file browser (folder or .mvar file) + its column metadata.
+/// #model-import: what the shared file browser is picking.
+///
+/// The browser started life as the .mvar Open/Save dialog. A model import needed the SAME
+/// thing (navigate anywhere, bookmarks, recents, sort, type a path) for a different file type, so
+/// rather than a second browser — or a bare native dialog, which has none of the quick access —
+/// the one window takes a purpose. It selects:
+///   * the extension filter the listing keeps (`.mvar` vs `.obj`/`.glb`/`.gltf`),
+///   * the quick-access sidebar group (the per-game variant folders vs the exe's models\\ folder),
+///   * the per-purpose recent lists and the folder the dialog opens in,
+///   * the primary button ("Open"/"Save" vs "Import") and what pressing it does,
+///   * the window TITLE — which is also egui's key for the remembered size/position, so each
+///     purpose keeps its own window geometry.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BrowsePurpose {
+    /// Map variants (.mvar) — File ▸ Open variant / Save As.
+    Variant,
+    /// External models (.obj / .glb / .gltf) — Tools ▸ Import geometry.
+    Model,
+    /// Reach Theater saved films (.mov / .film) — File ▸ Open saved film.
+    Film,
+    /// #prefab Saved object groups (.hmsprefab) — Tools ▸ Prefabs ▸ Import file. A prefab is one
+    /// shareable file, so importing one is "open a file from anywhere", exactly like a variant.
+    Prefab,
+}
+
+impl BrowsePurpose {
+    /// The extensions a listing in this purpose keeps (lower-case, no dot).
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            BrowsePurpose::Variant => &["mvar"],
+            BrowsePurpose::Model => &["obj", "glb", "gltf"],
+            // MCC writes saved films with the .mov extension, the autosave queue uses .film, and
+            // a recording that is still IN PROGRESS is .temp -- same container, complete header,
+            // only the finalisation-time size field missing, which this reader never trusts.
+            BrowsePurpose::Film => &crate::film::FILM_EXTENSIONS,
+            BrowsePurpose::Prefab => &[crate::prefab::EXT],
+        }
+    }
+    /// True when `path` is a file this purpose can open.
+    fn accepts(self, path: &std::path::Path) -> bool {
+        match path.extension().and_then(|x| x.to_str()) {
+            Some(x) => self.extensions().iter().any(|e| x.eq_ignore_ascii_case(e)),
+            None => false,
+        }
+    }
+    /// The window title. Also egui's key for the remembered window size/position.
+    fn window_title(self, save_mode: bool) -> &'static str {
+        match (self, save_mode) {
+            (BrowsePurpose::Variant, false) => "Open map variant",
+            (BrowsePurpose::Variant, true) => "Save map variant",
+            // The model dialog has no save mode; its own title keeps its own geometry.
+            (BrowsePurpose::Model, _) => "Import model geometry",
+            (BrowsePurpose::Film, _) => "Open saved film",
+            (BrowsePurpose::Prefab, _) => "Import prefab",
+        }
+    }
+}
+
+/// One row in the shared file browser (folder or a file of the current purpose) + its columns.
 struct FileEntry {
     path: std::path::PathBuf,
     name: String,
@@ -1346,6 +2484,11 @@ struct FileEntry {
 struct App {
     render_state: egui_wgpu::RenderState,
     renderer: SceneRenderer,
+    /// #reach-skin Posed, GPU-skinned Reach character bipeds (the `actor ...` script verb and
+    /// the Theater-clip playback). Empty unless something places one.
+    actor_scene: reach_actor::ActorScene,
+    /// Wall-clock of the previous actor advance (so playback is frame-rate independent).
+    actor_clock: Option<std::time::Instant>,
     tex_id: egui::TextureId,
     camera: Camera,
     move_speed: f32,
@@ -1418,6 +2561,54 @@ struct App {
     /// UI "hitch"/freeze) to `hms_load.log` next to the exe, tagged with the current load
     /// status — so the ACTUAL interactive freeze (invisible to headless) can be located.
     last_frame_at: Option<std::time::Instant>,
+    /// Settings ▸ Graphics & performance (persisted in `project::settings_dir()/graphics.json`).
+    gfx: gfxsettings::GfxSettings,
+    /// Fingerprint of the object pipeline's inputs the last time it was rebuilt (#gfx-perf);
+    /// `None` = rebuild unconditionally.
+    objects_sig: Option<u64>,
+    /// Next time `ensure_clients` may probe for the live-game shared memory (#gfx-perf).
+    ipc_retry_at: Option<std::time::Instant>,
+    /// Fingerprint of the object set the active screen-FX composition was derived from, so the
+    /// per-frame walk only runs when the set actually changed (#gfx-perf).
+    screenfx_objects_fp: Option<u64>,
+    /// Is the Graphics & performance window open?
+    show_graphics: bool,
+    /// Settings ▸ Controls & keyboard: the rebindable action table (issue #2), persisted in
+    /// `project::settings_dir()/keybinds.json`. EVERY input site reads this; nothing in the app
+    /// tests a raw `egui::Key` for an editor action any more.
+    keys: keybinds::Keybinds,
+    /// Held / just-pressed key POSITIONS, which `egui::InputState` does not track (it only knows
+    /// logical keys). Refreshed once per frame at the top of `update`.
+    phys: keybinds::PhysState,
+    /// Is the Controls & keyboard window open?
+    show_keybinds: bool,
+    /// The row that is currently listening for a new combination ("press a key…").
+    key_capture: Option<keybinds::Capture>,
+    /// The last thing the rebinding page did, shown under the preset row (a bind, a clash, a
+    /// failed save). Cleared when the page is closed.
+    keybind_msg: Option<String>,
+    /// #mcc-import  The "Import from MCC" section of the same page: the previewed plan and the
+    /// undo for an applied one. Empty until the user presses "Find MCC's controls" — nothing
+    /// reads the user's MCC files before that.
+    mcc_import: mccimport::ImportUi,
+    /// Monotonic frame counter — drives the particle-simulation rate divider and the idle
+    /// throttle's settle counter.
+    gfx_frame: u64,
+    /// Time the last viewport frame was produced, for the frame-rate cap.
+    gfx_last_frame: Option<std::time::Instant>,
+    /// Consecutive frames in which nothing that can change the picture happened. The idle
+    /// throttle stops asking for repaints once this passes a small threshold (a couple of frames
+    /// of slack so a one-frame-late upload still gets painted).
+    gfx_still: u32,
+    /// The in-app graphics benchmark (`HMS_BENCH`); `None` in a normal run.
+    bench: Option<gfxbench::Bench>,
+    /// HMS_NOOPT=1 — a MEASUREMENT switch that restores the pre-optimisation code paths
+    /// (the 10 Hz palette-preview re-render, the per-frame deep clones in the particle/lens
+    /// build, the per-frame variant-decode tag scan, the per-frame shared-memory probes). It
+    /// exists so the before/after numbers in this round come from ONE binary with everything
+    /// else identical, instead of two builds of a tree that other work is also changing. Never
+    /// set in normal use; the GUI is unaffected.
+    noopt: bool,
     /// HMS_FRAMEPROF=1 print-only frame profiler -- [frame start, stage laps] for the
     /// current update() plus a rolling 300-frame summary (see the end of `update`).
     frame_prof: Option<(std::time::Instant, [f32; 6], Vec<[f32; 7]>)>,
@@ -1437,12 +2628,17 @@ struct App {
     forge_table: Option<ForgeObjectTableClient>,
     transform_queue: Option<TransformQueueClient>,
     last_objects: Vec<ObjectInfo>,
+    /// #seat-entry  The last thing entering or leaving a vehicle seat said, shown under the
+    /// test-mode status line.
+    vehicle_note: String,
     /// The user's "Forge special FX" toggle (View menu > Forge extras; script
     /// `screenfx on|off`). Persisted in the settings dir, default ON. Off = the map's own default
     /// screen effect only, so screenshots can be taken without the placed FX orbs' colour grade.
     forge_fx_enabled: bool,
     /// Per-map decode cache (obje -> sefc, sefc -> elements) + the current active set.
     screenfx_cache: screenfx::ScreenFxCache,
+    /// Halo 4 / H2A decode cache (its tag reader differs; composition is the same). #forge-fx-h4
+    h4_screenfx_cache: h4::screenfx::H4ScreenFxCache,
     active_screenfx: screenfx::ActiveScreenFx,
     /// The (enabled, default tag, forge tags) last uploaded, so the post uniform is only
     /// rewritten when the set actually changes (add/delete/duplicate/toggle), not every frame.
@@ -1480,12 +2676,23 @@ struct App {
     picker_game: mapcat::Game,
     /// In-flight Halo 4 load (worker thread + mesh channel), see h4/gui.rs.
     h4_load: Option<h4::gui::H4Load>,
+    /// A Halo 3 / ODST load in flight (h3/gui.rs), and "the loaded map is a Halo 3 cache"
+    /// (read-only viewing: no editor scene). #h3
+    h3_load: Option<h3::gui::H3Load>,
+    h3_active: bool,
     /// A Halo 4 map is the loaded map (the Reach cache is closed, so `has_cache()` gates the
     /// Reach-only paths off and `objscene()` dispatches to `h4_scene`).
     h4_active: bool,
     /// A Halo 4 map variant (.mvar chunk v50) queued for the next Halo 4 map load
     /// (h4/gui.rs `h4_import_mvar` -> `h4_load_map`).
     h4_pending_mvar: Option<std::path::PathBuf>,
+    /// A Halo 3 map variant (.mvar chunk v12) queued for the next Halo 3 map load
+    /// (h3/gui.rs `h3_import_mvar` -> `h3_load_map`; placed read-only by the load worker). #h3
+    h3_pending_mvar: Option<std::path::PathBuf>,
+    /// The Halo 3 editor scene (h3/edit_scene.rs) once a Halo 3 map finished loading, and the
+    /// Halo 3-only editor state (h3/app.rs). #h3-edit
+    h3_scene: Option<Box<h3::edit_scene::H3ObjectScene>>,
+    h3_edit: h3::app::H3EditState,
     /// The Halo 4 editor scene (h4/edit_scene.rs) once a Halo 4 map finished loading;
     /// `objscene()` dispatches the editor verbs here while `h4_active`.
     h4_scene: Option<Box<h4::edit_scene::H4ObjectScene>>,
@@ -1565,6 +2772,9 @@ struct App {
     /// egui events per frame, so a press and its release land on different frames exactly as a
     /// real keyboard delivers them.
     sim_events: Vec<Vec<egui::Event>>,
+    /// A scripted mouse BUTTON press/release to inject next frame (`preview button right down`),
+    /// which stays held in egui's pointer state until the release is scripted.
+    sim_button: Option<(egui::PointerButton, bool)>,
     /// #construct-h4: a scripted press-drag (`preview drag`): start, end and the frame counter.
     /// Frame 0 presses at the start, 1..=4 move toward the end, 5 releases there -- enough
     /// motion for egui to call it a drag, which is what the press-drag tools react to.
@@ -1588,6 +2798,20 @@ struct App {
     dll_path: PathBuf,
     status: String,
 
+    /// File ▸ Open recent: the ONE history of items the user successfully opened — map
+    /// variants, base maps, saved films and imported models (recent.rs). Persisted in the
+    /// settings dir; the file browsers' own "Recent folders" sidebars are derived from it.
+    recent: recent::RecentStore,
+    /// The paths in `recent` that were NOT on disk when the Open-recent menu last opened. The
+    /// check runs once per menu OPEN (see `recent_menu_pass`), never per frame.
+    recent_missing: std::collections::HashSet<String>,
+    /// The egui pass the Open-recent submenu was last drawn on. A gap means it has just been
+    /// opened, which is the one moment the entries are stat-ed.
+    recent_menu_pass: u64,
+    /// A recent item whose file has gone — the "it has moved or been deleted; remove it from
+    /// the list?" window is up for it. Clicking a recent entry NEVER silently does nothing.
+    recent_gone: Option<recent::RecentItem>,
+
     // Forge-palette spawn IPC (opened lazily; the injected DLL connects to the
     // same named MMF). Places objects through the game's forge system.
     world_spawn: Option<WorldSpawnClient>,
@@ -1599,6 +2823,212 @@ struct App {
     /// frame paint without it; only then does the (blocking) import run (loading
     /// inline would leave the dialog on screen for the whole load).
     pending_open_variant: Option<(std::path::PathBuf, u8)>,
+    /// #film  WHICH variant path is THE FILM'S OWN Forge scene, so `import_mvar` does not tear
+    /// the clip down when that one lands.
+    ///
+    /// Opening a film goes through the same asynchronous pipeline as File ▸ Open variant
+    /// (`film_load_scene` sets `pending_open_variant`), and `import_mvar` closes any open clip
+    /// because a recording's bodies are a statement about the scene it was recorded in. The film's
+    /// own scene has to be exempt from that.
+    ///
+    /// **This is a PATH and not a bool, and that is the whole fix for a race that cost hours.**
+    /// As a bool it meant "the NEXT import is the film's", which is only true while exactly one
+    /// import is in flight — and two routinely are:
+    ///
+    /// * `film_load_scene` queues the film's scene and starts the decode, then
+    /// * the SAME map-load-completion block takes `autoload_variant` (the last-opened variant,
+    ///   restored at startup) and calls `import_mvar` immediately.
+    ///
+    /// So the autoload consumed the film's exemption, rendered the wrong variant, and a frame
+    /// later the film's own scene arrived **unexempted** and called `film_close` — which nulls
+    /// `self.film` and drops `film_index_rx`, the in-flight decode, on the floor. The symptom was
+    /// a clip that opened, drew a scene, and never decoded, with no error anywhere: `film info`
+    /// answered "no film open". It was intermittent because it needed the autoload still pending,
+    /// which is why loading a map by hand first usually hid it.
+    ///
+    /// Keyed on the path, the exemption belongs to one specific import and cannot be spent by
+    /// another. A foreign variant still closes the clip, which is the behaviour we want.
+    film_own_scene: Option<std::path::PathBuf>,
+    /// #film  The map id a film is still WAITING for, so opening a clip on a cold app works.
+    ///
+    /// `film_load_scene` has to load the film's own base map before it can draw the film's Forge
+    /// scene, and `load_map()` STREAMS the load over many frames -- it returns long before
+    /// `loaded_map_id` is set. The check right after it therefore failed for every film whose map
+    /// was not already open, and the function returned before setting `film_own_scene`,
+    /// before queueing the variant and before starting the decode. The map appeared, the film's
+    /// scene never drew, the recording was never decoded, and nothing retried; worse, the variant
+    /// landing with `film_own_scene` unset made `film_close` shut the film with "a variant
+    /// was opened". Open a film from a cold app and nothing happened; open the same film again and
+    /// it worked, because the map was up by then.
+    ///
+    /// So the rest of the work is DEFERRED rather than abandoned, the same way `pending_mvar`
+    /// already defers a variant the user picked for a not-yet-loaded map. Holding the map ID
+    /// rather than a bare flag means a pending open for one film cannot fire against another's
+    /// map load.
+    film_pending_scene_map: Option<u32>,
+    /// #film: the browsed saved film, loaded a frame later (the parse blocks).
+    pending_open_film: Option<(std::path::PathBuf, u8)>,
+    /// #prefab a prefab file the browser handed back, imported on a later frame (like the others).
+    pending_import_prefab: Option<(std::path::PathBuf, u8)>,
+    /// #prefab Tools > Prefabs: the list, the placement controls and the last report.
+    prefab_ui: prefab_app::PrefabUi,
+    /// #prefab the prefab browser's own recent-folders list.
+    prefab_browser_recent: Vec<std::path::PathBuf>,
+    /// #film: the opened saved film's header (never the whole 150 MB file) + its card state.
+    film: Option<Box<film::Film>>,
+    film_path: Option<std::path::PathBuf>,
+    film_card_open: bool,
+    /// PRIVACY: off by default -- a film embeds the recording PC's Windows account + machine name.
+    film_show_machine: bool,
+    film_status: String,
+    film_browser_recent: Vec<std::path::PathBuf>,
+    /// #film  the decoded playback index + clock, and the actors it drives.
+    film_play: Option<Box<film_play::Playback>>,
+    /// #fp-fov  The editor camera's own vertical FOV, parked while a first-person Theater camera
+    /// renders at Reach's. Put back the moment the mode is left, so the user keeps whatever they
+    /// had.
+    fov_before_first_person: Option<f32>,
+    /// #fp-fov  The first-person field of view, in the number MCC's own slider shows: degrees of
+    /// HORIZONTAL field of view at the engine's 4:3 reference. Persisted; defaults to the 78 the
+    /// globals tag authors.
+    fp_fov_deg: f32,
+    /// #skin per player slot: the synthetic armour variant's name string id (0 = none recorded)
+    /// and the two armoury colours, resolved once per film. `None` = not built yet for this film.
+    /// #film  The Theater side panel (cast, cameras, what-is-drawn). CLOSED by default: it
+    /// reshapes the viewport, so leaving it open would shrink the picture for no reason.
+    film_panel_open: bool,
+    /// #film  Hide the Forge EDITING column while a clip is open. Defaults to true, because
+    /// while watching a recording none of it is usable and it costs ~30% of the window; the
+    /// Theater strip toggles it back, and it never touches the user's own panel state.
+    film_hide_editor: bool,
+    film_driver: film_play::ActorDriver,
+    /// #play  TEST MODE — the live session, or `None` while editing. Walking around the map
+    /// you are building: `play_mode::PlayMode` owns the biped, the controller and the rig.
+    play: Option<Box<play_mode::PlayMode>>,
+    /// #play  The damage model test mode's melee calls into, when one is installed. The
+    /// damage LAW is not test mode's (see `play_damage`); this is only the holder, and while
+    /// it is `None` a swing says so instead of pretending.
+    play_damage: Option<Box<dyn play_damage::ObjectDamage>>,
+    /// #play-hud  TEST MODE'S HUD STATE: the live magazine, the player's own shield and health
+    /// pools and the authored grenade counts.
+    ///
+    /// **Held here rather than in `play_mode::PlayMode` on purpose.** The mode owns movement,
+    /// animation and the rig; the HUD's arrival changed none of that, and keeping the two apart is
+    /// what let the ammo be driven entirely off `PlayMode::shots` — a count the mode already
+    /// keeps — instead of a new field inside it.
+    play_hud: play_hud::PlayHud,
+    /// #play-hud  The last frame's HUD provenance report — one line per value with where it came
+    /// from. Printed by `play hud`, not painted over the viewport: test mode's own chrome is two
+    /// lines and a prompt, and burying the provenance in it would hide the prompt.
+    play_hud_lines: Vec<String>,
+    /// #play-hud  Whether the authored HUD and the weapon's reticule are drawn in test mode.
+    /// **The SAME two setting files Theater's toggles write**, re-read on entering test mode, so
+    /// the user has one switch for "draw the game's HUD" rather than two that disagree.
+    play_hud_on: bool,
+    play_crosshair_on: bool,
+    /// #fp The cache the FIRST-PERSON arm models were last looked for on. Keyed on the CACHE,
+    /// not a plain `done` flag, for two reasons: a cache that genuinely has no
+    /// `@player representation` must not be re-scanned on every frame of playback, and the
+    /// lookup must re-run when a different map is loaded. `None` = not looked yet.
+    ///
+    /// It also must not latch while the cache is still opening: a film can be restored before the
+    /// map behind it has finished loading, and latching there left first person with no arms for
+    /// the whole session.
+    film_fp_cache: Option<u64>,
+    /// #fp-arms  Which player's armour the first-person ARM models are currently wearing:
+    /// `(hands mode tag, player slot)`. The arms have no `hlmt`, so the variant walk
+    /// `build_actor_meshes` uses cannot reach them and the choice has to be installed as an
+    /// explicit section mask keyed by render model — which means it is one player at a time, and
+    /// re-installing it drops that model's decode. `None` = the authored default is on.
+    film_fp_armour: Option<(u32, u8)>,
+    /// #projectile  What the FILM effect lane installed last frame (muzzle flashes, projectile
+    /// trails, detonations) -- for the Theater caption.
+    film_fx: film_projectile::FxReport,
+    film_timeline_open: bool,
+    /// The worker building the index (a film is read and decoded off the UI thread).
+    film_index_rx: Option<std::sync::mpsc::Receiver<Result<film_decode::FilmIndex, String>>>,
+    /// #film-live  FOLLOW a recording that is still being written -- MCC's in-progress `.temp`
+    /// in its autosave folder, which is byte-identical in format to a finished `.mov`. On, the
+    /// open clip re-decodes as the file grows, so a match can be watched while it is played.
+    /// Persisted by `film::load_follow_live_setting` / `save_follow_live_setting`.
+    film_follow_live: bool,
+    /// #film-live  The length the open film had when it was last decoded. A `.temp` is written in
+    /// 512 KiB blocks, so growth is the only reliable signal that there is more to read.
+    film_follow_len: u64,
+    /// #film-live  When to next look at the file's length. Checking costs one `stat`, but
+    /// re-decoding does not, so it is rate-limited rather than done per frame.
+    film_follow_next: Option<std::time::Instant>,
+    /// #film-live  The re-decode in flight. Separate from `film_index_rx` so a follow landing can
+    /// never be mistaken for a fresh open: this one TRANSPLANTS the index and keeps the view.
+    film_follow_rx: Option<std::sync::mpsc::Receiver<Result<film_decode::FilmIndex, String>>>,
+    /// #film-live  What the last follow pass did, for the Theater panel to say so.
+    film_follow_note: String,
+    /// #film-stats  The open film's player statistics, computed ONCE when the index lands and
+    /// never per frame. Cleared whenever a new recording starts decoding.
+    film_stats: Option<Box<film_stats::FilmStats>>,
+    /// #gamevariant  What the open film's GAME VARIANT says every player spawned holding, once
+    /// a map has been opened to resolve the index. `None` until both are in hand; the resolve is
+    /// attempted once per (film, map) and is a no-op afterwards.
+    film_spawn_weapon: Option<film_variant::SpawnWeaponApplied>,
+    /// #gamevariant  The open map's `motl` / `lgtd` name tables, so loadouts read as weapon
+    /// names rather than indices. Built with `film_spawn_weapon`.
+    film_variant_names: Option<Box<film_variant::VariantNames>>,
+    /// #film-stats  `film stats open` forces the panel's statistics section open, so a script can
+    /// capture it without a mouse. Left false the viewer keeps control of the section.
+    film_stats_open: bool,
+    /// #film-perf  The open film's ROSTER, built ONCE when the index lands.
+    ///
+    /// `roster_lines` is a pure function of the decoded index — it reads owner groups, lives and
+    /// header players, and nothing in it depends on the playback tick — but it was called every
+    /// frame, and it is O(owners x tracks). Measured on a 9:45 Forge clip it cost **30 ms of
+    /// every frame**, which was most of the "Theater playback is slow" report: the whole update()
+    /// was 42 ms before the side panels had even run.
+    film_roster: Vec<film_ui::RosterRow>,
+    /// #camera-rows  How many bodies had a resolved biped tag when `film_roster` was built, so
+    /// the list can be rebuilt once the map answers that question. See `resolve_bipeds`.
+    film_roster_bipeds: usize,
+    /// #film-perf  The roster's coverage sentence. Also a pure function of the index, and also
+    /// used to be rebuilt every frame.
+    film_roster_coverage: String,
+    /// #film-perf  Last frame's cost of the two film stages, milliseconds, for `film perf`:
+    /// `[film_tick (clock + actor placement), the timeline strip and panel]`.
+    film_frame_ms: [f32; 2],
+    /// #bg-throttle  The egui context, kept so the COMMAND executor (which runs outside
+    /// `update`) can ask the window whether it is focused or minimised and command it. Cloning a
+    /// `Context` is an `Arc` bump.
+    egui_ctx: egui::Context,
+    /// #bg-throttle  When the scene was last actually RENDERED, for the background work gate.
+    /// `None` = never, so the first frame always draws.
+    bg_last_render: Option<std::time::Instant>,
+    /// #bg-throttle  Print-only: how many frames the background gate has skipped the scene
+    /// render on, and how many it has drawn. Read by `film perf`, so the feature can be shown
+    /// to be working rather than asserted.
+    bg_skipped: u64,
+    bg_drawn: u64,
+    /// #film-perf  The Theater frame profiler. Always on while a film is open; `film perf`
+    /// prints it. Sixteen `Instant::now()` calls a frame, which is the only honest way to answer
+    /// "playback is laggy" with a stage rather than a guess.
+    fprof: film_perf::FilmProf,
+    film_clock: Option<std::time::Instant>,
+    /// #reach-sound  The audio engine. Constructing it touches no hardware and
+    /// reads no bank; the device and the banks come up on the first sound.
+    sound: sound::SoundEngine,
+    /// #model-import: WHAT the shared browser is picking. One window, one set of navigation
+    /// state, but the extension filter, the quick-access sidebar, the recent lists, the seeded
+    /// folder and the window TITLE (which keys egui's remembered size/position) are per purpose.
+    browser_purpose: BrowsePurpose,
+    /// #model-import: recently-visited folders while browsing for MODELS (session), kept apart
+    /// from the variant list so the two dialogs don't cross-contaminate each other's history.
+    model_browser_recent: Vec<std::path::PathBuf>,
+    /// #model-import: recently IMPORTED model files, most recent first (persisted). The sidebar
+    /// offers them so re-importing yesterday's file is one click, wherever it lives.
+    model_recent_files: Vec<std::path::PathBuf>,
+    /// #model-import: labelled quick-access folders that hold models — the exe's own models\\
+    /// folder first (the pre-#model-import requirement, now just a shortcut).
+    model_browser_quick: Vec<(String, std::path::PathBuf)>,
+    /// #model-import: the selected model file's probe line ("OBJ · 1.2 KiB · 8 verts, 12 tris"),
+    /// the model-mode equivalent of a variant's title/description preview.
+    model_browser_selected_meta: Option<String>,
     variant_browser_dir: Option<std::path::PathBuf>,
     /// Entries in the current directory — subfolders + .mvar files, with metadata for the columns.
     variant_browser_listing: Vec<FileEntry>,
@@ -1619,6 +3049,11 @@ struct App {
     variant_browser_drives: Vec<std::path::PathBuf>,
     /// Labelled folders that hold .mvar files (game + per-account MCC saves).
     variant_browser_quick: Vec<(String, std::path::PathBuf)>,
+    /// The same folders grouped by game for the sidebar (`mapcat::quick_variant_groups`). #dialogs
+    variant_browser_quick_groups: Vec<(mapcat::Game, Vec<(String, std::path::PathBuf)>)>,
+    /// #dialogs  The saved-film (Theater) folders for the film dialog's sidebar, labelled by the
+    /// MCC account they belong to. Discovery walks the filesystem, so it is cached here.
+    film_browser_quick: Vec<(String, std::path::PathBuf)>,
     /// Sort column (0=Name, 1=Date modified, 2=Size) + ascending. Folders always sort before files.
     variant_browser_sort_col: u8,
     variant_browser_sort_asc: bool,
@@ -1663,6 +3098,9 @@ struct App {
     sc_convention: forge_scale::ScaleConvention,
     /// Tools ▸ Scale converter modal visibility.
     show_scale_converter: bool,
+    /// #xgame File ▸ "Convert variant to another game…" modal visibility + its state.
+    show_convert_variant: bool,
+    xgame: xgame::gui::ConvertState,
     /// The save-time "objects outside playable space" window — the save action it is
     /// holding (Save / Save As) plus the offending rows (datum, bsp index). None = closed.
     bsp_warn_pending: Option<(BspWarnAction, Vec<(u32, usize)>)>,
@@ -1675,6 +3113,14 @@ struct App {
     /// #wire-visible  Draw the SELECTION wireframe through other objects (depth test ALWAYS).
     /// Off by default, persisted (`wire_xray.txt`), script `wirexray`.
     wire_xray: bool,
+    /// #quant-error  "Save-precision ghost": draw the selected object(s) at the pose the `.mvar`
+    /// will ACTUALLY hold after its quantisers, plus the exaggeration factor that makes a
+    /// thousandth-of-a-unit drift visible. Off at x1 by default, persisted (`quant_ghost.txt`),
+    /// script `precision ghost`.
+    quant_ghost: quant_error_ui::GhostSetting,
+    /// #quant-error  Signature of everything the ghost's geometry depends on, so the shared
+    /// overlay lanes are only rebuilt when the ghost would change (it must follow a live drag).
+    quant_ghost_sig: u64,
     /// Draw the structure-design soft ceilings (kill floor / acceleration /
     /// slip planes). Off by default, persisted (`soft_ceilings.txt`), script `softceilings`.
     show_soft_ceilings: bool,
@@ -1867,10 +3313,37 @@ struct App {
     selected_model: Option<usize>,
     paint_res: u32,
     paint_scale: f32,
-    /// External geometry import (OBJ/GLB) selection — base to forge over.
+    /// External geometry import (OBJ/GLB): the models\\ catalog row the convenience combo has
+    /// picked. Browsing for a file anywhere (the shared browser in MODEL purpose) does not use it.
     selected_import: Option<usize>,
-    /// World-space triangles of imported geometry, for snap-to-surface raycasts.
+    /// #4: every imported model with its own pose (position / forward-up / uniform scale).
+    /// Index i is rendered as `renderer`'s imported mesh i and selected by the pseudo-datum
+    /// `extimport::import_datum(i)`, so the editor's gizmo + modal grab/rotate drive it.
+    imports: Vec<extimport::ImportedModel>,
+    /// The imported model the Import geometry panel's fields are editing (also set by clicking
+    /// one in the viewport). None = nothing imported / nothing picked.
+    sel_import: Option<usize>,
+    /// Set when an import's pose changed: next frame pushes the new matrices to the renderer and
+    /// rebuilds `import_tris` ONCE, instead of per-field-edit or per-drag-frame twice.
+    import_dirty: bool,
+    /// WORLD-space triangles of every imported model at its current pose — the single soup the
+    /// snap-to-surface placement, the fill tool, viewport picking and `physics_settle` all read.
+    /// Derived from `imports`; never edited directly (see `rebuild_import_tris`).
     import_tris: Vec<[glam::Vec3; 3]>,
+    /// Deferred model import: the browser sets this when Import is clicked, and a frame is burnt
+    /// first so the dialog is painted gone before the parse starts — the same trick as
+    /// `pending_open_variant`.
+    pending_import_model: Option<(std::path::PathBuf, u8)>,
+    /// #model-import: the channel the background model readers answer on (see [`ImportLoaded`]).
+    /// Owned by `App` so a reader thread can outlive the dialog that started it.
+    import_loaded_tx: std::sync::mpsc::Sender<ImportLoaded>,
+    import_loaded_rx: std::sync::mpsc::Receiver<ImportLoaded>,
+    /// File names currently being read off-thread — the panel's progress line, and what makes
+    /// the UI keep repainting while a big model is parsed instead of appearing to hang.
+    import_loading: Vec<String>,
+    /// Bumped whenever the import lane is cleared or a project's imports are (re)read, so a
+    /// batch still in flight from a previous project can be recognised and dropped.
+    import_load_gen: u64,
     /// Locally-placed forge objects (standalone editor) — rendered WITHOUT a live game,
     /// merged with live objects in tick_scene. Next local datum id.
     local_objects: Vec<ObjectInfo>,
@@ -1918,6 +3391,13 @@ struct App {
     bounds_edit_unlocked: bool,
     /// Help→Hotkeys window visibility.
     show_hotkeys: bool,
+    /// Opt-in auto-update state (check / badge / window / install) — see updater.rs.
+    updater: updater::Updater,
+    /// A recovery snapshot to apply on the first tick (`--resume-after-update`, or Restore).
+    recovery_restore: Option<std::path::PathBuf>,
+    /// After a restored variant COPY loads, point File ▸ Save back at the user's real file
+    /// (`(copy, original)`; original None = the variant was new and unsaved).
+    recovery_variant_fix: Option<(std::path::PathBuf, Option<std::path::PathBuf>)>,
     /// Map BSP load fraction 0..1 (from the load worker's Progress messages) for the status bar.
     load_frac: f32,
     /// Per-object (team, color) parsed from the .mvar for the OFFLINE render path, keyed by
@@ -2008,6 +3488,24 @@ struct App {
     selected_palette: Option<usize>,
 }
 
+/// #seat-entry  Fold the set of datums whose PLACEMENT is hidden into the object-pipeline
+/// fingerprint.
+///
+/// Free function rather than inline arithmetic so it can be gated without an `App`: `App` is
+/// built from an `eframe` creation context and cannot be constructed in a test, which is exactly
+/// why the omission this fixes went unnoticed.
+///
+/// XOR-folded so the result does not depend on the order `hidden_datums()` happens to return,
+/// with the COUNT mixed in separately so that "nothing hidden" is distinct from a one-element set
+/// whose shifted id folds to zero.
+fn fold_hidden_datums(h: u64, hidden: &[u32]) -> u64 {
+    let mut h = (h ^ hidden.len() as u64).wrapping_mul(0x100_0000_01b3);
+    for d in hidden.iter() {
+        h ^= (*d as u64) << 16;
+    }
+    h
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Install a clean system UI font (Segoe UI on Windows) as the primary PROPORTIONAL
@@ -2041,22 +3539,45 @@ impl App {
         let size = (1024u32, 768u32);
         let mut renderer = SceneRenderer::new(&render_state.device, &render_state.queue, size);
         renderer.show_grid = false; // grid off by default (toggle in the UI)
+        // Settings ▸ Graphics. The DEFAULT of this struct is the shipped renderer, so a user who
+        // has never opened the page gets `apply_quality` with an unchanged value — which is a
+        // no-op by construction (`q == self.quality` returns immediately).
+        let gfx = gfxsettings::GfxSettings::load();
+        renderer.apply_quality(&render_state.device, &render_state.queue, gfx.render_quality());
+        if gfx.rtgi {
+            renderer.set_rtgi_enabled(&render_state.queue, true);
+        }
         // Smoke-test content until a map is loaded.
         renderer.set_demo_scene(&render_state.device, &render_state.queue);
         // HMS_IMPORT=<path.obj|glb>: import external (converted) geometry as a base mesh
         // to forge over (recreate-a-mission workflow). Replaces the demo scene; rendered
         // as a lit static mesh. NOTE: a map load clears static meshes, so this is for the
         // import-only workflow (no HMS_MAP).
+        let (import_tx, import_rx) = std::sync::mpsc::channel::<ImportLoaded>();
         let mut env_import_tris: Vec<[glam::Vec3; 3]> = Vec::new();
+        let mut env_imports: Vec<extimport::ImportedModel> = Vec::new();
         if let Ok(p) = std::env::var("HMS_IMPORT") {
-            match import_geometry_mesh(renderer.mesh_renderer(), &render_state.device, &render_state.queue, std::path::Path::new(&p)) {
-                Some((m, tris)) => {
+            // Startup has no window yet, so this read is synchronous (nothing to freeze).
+            match modelimport::load(std::path::Path::new(&p))
+                .and_then(|d| build_import_meshes(renderer.mesh_renderer(), &render_state.device, &render_state.queue, &d)
+                    .map(|g| (g, d))
+                    .ok_or_else(|| format!("{p}: no drawable triangles")))
+            {
+                Ok((g, d)) => {
                     // Persistent layer (survives map loads) so import + forge-over works.
-                    renderer.set_imported_meshes(vec![m]);
-                    env_import_tris = tris;
-                    log::info!("imported base geometry from {p}");
+                    renderer.append_imported_model(g.opaque, g.cutout);
+                    // #4: the model arrives at the identity pose (exactly where the old fixed
+                    // base mesh sat) and is movable from there like any other import.
+                    let mut im = extimport::ImportedModel::at_identity(std::path::PathBuf::from(&p), g.tris);
+                    im.summary = g.summary.clone();
+                    env_import_tris = im.world_tris();
+                    env_imports.push(im);
+                    log::info!("imported base geometry from {p}: {}", g.summary);
+                    for n in &d.notes {
+                        log::warn!("HMS_IMPORT {p}: {n}");
+                    }
                 }
-                None => log::warn!("HMS_IMPORT: failed to load geometry from {p}"),
+                Err(e) => log::warn!("HMS_IMPORT: failed to load geometry from {p}: {e}"),
             }
         }
         let tex_id = render_state.renderer.write().register_native_texture(
@@ -2103,6 +3624,10 @@ impl App {
         // substring. When set, we mark auto_selected so the MapInfo live-map override
         // is skipped.
         let forced_map = std::env::var("HMS_MAP").ok().filter(|s| !s.is_empty());
+        // Auto-update controller; a `--resume-after-update` start restores its recovery snapshot
+        // instead of the persisted last variant.
+        let updater = updater::Updater::new(&std::env::args().collect::<Vec<_>>());
+        let resume_pending = updater.resume_recovery.is_some();
         let selected_map = if let Some(want) = &forced_map {
             let w = want.to_lowercase();
             map_candidates.iter().position(|c| {
@@ -2121,6 +3646,8 @@ impl App {
         Self {
             render_state,
             renderer,
+            actor_scene: Default::default(),
+            actor_clock: None,
             tex_id,
             preview_renderer,
             preview_tex,
@@ -2190,6 +3717,7 @@ impl App {
             sim_click: None,
             sim_drag: None,
             sim_events: Vec::new(),
+            sim_button: None,
             dbg_pointer: None,
             dbg_viewport: None,
             hover_preview_pinned: false,
@@ -2202,6 +3730,24 @@ impl App {
             trim_at: None,
             next_load_trim: None,
             last_frame_at: None,
+            gfx,
+            noopt: std::env::var("HMS_NOOPT").is_ok(),
+            objects_sig: None,
+            ipc_retry_at: None,
+            screenfx_objects_fp: None,
+            show_graphics: false,
+            // Controls & keyboard (issue #2). A missing or half-corrupt file falls back to the
+            // shipped keys action by action, so this can never leave the editor uncontrollable.
+            keys: keybinds::Keybinds::load(),
+            phys: keybinds::PhysState::default(),
+            show_keybinds: false,
+            mcc_import: mccimport::ImportUi::default(),
+            key_capture: None,
+            keybind_msg: None,
+            gfx_frame: 0,
+            gfx_last_frame: None,
+            gfx_still: 0,
+            bench: gfxbench::Bench::from_env(),
             frame_prof: std::env::var("HMS_FRAMEPROF").is_ok().then(|| (std::time::Instant::now(), [0.0; 6], Vec::new())),
             forge_diag: String::new(),
             load_handle: None,
@@ -2212,8 +3758,10 @@ impl App {
             forge_table: ForgeObjectTableClient::open().ok(),
             transform_queue: TransformQueueClient::open().ok(),
             last_objects: Vec::new(),
+            vehicle_note: String::new(),
             forge_fx_enabled: screenfx::load_enabled_setting(),
             screenfx_cache: screenfx::ScreenFxCache::default(),
+            h4_screenfx_cache: h4::screenfx::H4ScreenFxCache::default(),
             active_screenfx: screenfx::ActiveScreenFx::default(),
             screenfx_pushed: None,
             map_path: String::new(),
@@ -2230,7 +3778,12 @@ impl App {
             picker_game: mapcat::Game::Reach,
             h4_load: None,
             h4_active: false,
+            h3_load: None,
+            h3_active: false,
             h4_pending_mvar: None,
+            h3_pending_mvar: None,
+            h3_scene: None,
+            h3_edit: Default::default(),
             h4_scene: None,
             h4_edit: Default::default(),
             h4_map_spawn_markers: 0,
@@ -2241,6 +3794,59 @@ impl App {
             spawn_status: String::new(),
             variant_browser_open: false,
             pending_open_variant: None,
+            film_own_scene: None,
+            film_pending_scene_map: None,
+            pending_open_film: None,
+            pending_import_prefab: None,
+            prefab_ui: Default::default(),
+            prefab_browser_recent: Vec::new(),
+            film: None,
+            film_path: None,
+            film_card_open: false,
+            film_show_machine: false,
+            film_status: String::new(),
+            film_browser_recent: Vec::new(),
+            film_play: None,
+            fov_before_first_person: None,
+            fp_fov_deg: film_play::load_fov_setting(),
+            film_panel_open: false,
+            film_fp_cache: None,
+            film_fp_armour: None,
+            film_fx: Default::default(),
+            film_hide_editor: true,
+            film_driver: Default::default(),
+            play: None,
+            play_damage: None,
+            play_hud: play_hud::PlayHud::default(),
+            play_hud_lines: Vec::new(),
+            play_hud_on: reach_hud::load_hud_setting(),
+            play_crosshair_on: reach_hud::load_crosshair_setting(),
+            film_timeline_open: false,
+            film_index_rx: None,
+            film_follow_live: crate::film::load_follow_live_setting(),
+            film_follow_len: 0,
+            film_follow_next: None,
+            film_follow_rx: None,
+            film_follow_note: String::new(),
+            film_stats: None,
+            film_spawn_weapon: None,
+            film_variant_names: None,
+            film_stats_open: false,
+            film_roster: Vec::new(),
+            film_roster_bipeds: 0,
+            film_roster_coverage: String::new(),
+            film_frame_ms: [0.0; 2],
+            fprof: film_perf::FilmProf::default(),
+            egui_ctx: cc.egui_ctx.clone(),
+            bg_last_render: None,
+            bg_skipped: 0,
+            bg_drawn: 0,
+            film_clock: None,
+            sound: sound::SoundEngine::default(),
+            recent: recent::RecentStore::load(),
+            recent_missing: std::collections::HashSet::new(),
+            recent_menu_pass: 0,
+            recent_gone: None,
             variant_browser_dir: None,
             variant_browser_listing: Vec::new(),
             variant_browser_selected: None,
@@ -2251,8 +3857,15 @@ impl App {
             variant_browser_hist_pos: 0,
             variant_browser_bookmarks: Vec::new(),
             variant_browser_recent: Vec::new(),
+            browser_purpose: BrowsePurpose::Variant,
+            model_browser_recent: Vec::new(),
+            model_recent_files: Self::model_load_recent_files(),
+            model_browser_quick: Vec::new(),
+            model_browser_selected_meta: None,
             variant_browser_drives: Vec::new(),
             variant_browser_quick: Vec::new(),
+            variant_browser_quick_groups: Vec::new(),
+            film_browser_quick: Vec::new(),
             variant_browser_sort_col: 0,
             variant_browser_sort_asc: true,
             variant_browser_filename: String::new(),
@@ -2272,11 +3885,15 @@ impl App {
             edit_scale: 1.0,
             sc_convention: forge_scale::ScaleConvention::X330,
             show_scale_converter: false,
+            show_convert_variant: false,
+            xgame: xgame::gui::ConvertState::default(),
             bsp_warn_pending: None,
             save_error: None,
             bsp_warn_skip_once: false,
             show_triggers: false,
             wire_xray: wire_xray::load_setting(),
+            quant_ghost: quant_error_ui::env_setting().unwrap_or_else(quant_error_ui::load_setting),
+            quant_ghost_sig: 0,
             show_soft_ceilings: soft_ceilings::load_setting(),
             show_hard_floor: hard_floor::load_setting(),
             show_playable_bounds: hard_floor::load_playable_setting(),
@@ -2370,7 +3987,15 @@ impl App {
             paint_res: 16,
             paint_scale: 30.0,
             selected_import: None,
+            imports: env_imports,
+            sel_import: None,
+            import_dirty: false,
             import_tris: env_import_tris,
+            pending_import_model: None,
+            import_loaded_tx: import_tx,
+            import_loaded_rx: import_rx,
+            import_loading: Vec::new(),
+            import_load_gen: 0,
             local_objects: Vec::new(),
             next_local_datum: 0xF000_0000,
             scenario_objects: Vec::new(),
@@ -2389,6 +4014,9 @@ impl App {
             variant_editor: String::new(),
             variant_header_dirty: false,
             show_hotkeys: false,
+            recovery_restore: updater.resume_recovery.clone(),
+            recovery_variant_fix: None,
+            updater,
             load_frac: 0.0,
             mvar_objects: Vec::new(),
             mvar_colors: std::collections::HashMap::new(),
@@ -2398,7 +4026,16 @@ impl App {
             loaded_map_id: None,
             new_variant_template: None,
             variant_retry: None,
-            autoload_variant: mapcat::load_last_variant().map(std::path::PathBuf::from),
+            // HMS_MAP forces a map, so the persisted last variant must not re-open (its
+            // h4_import_mvar switches to the VARIANT's base map, over the forced load).
+            // HMS_MVAR=<path> loads that variant on startup. It is the same switch the headless
+            // renderer documents, honoured here so a benchmark (or an A/B capture) of a given
+            // map + variant is configured exactly like the screenshot of it.
+            autoload_variant: match std::env::var("HMS_MVAR").ok().filter(|v| !v.is_empty()) {
+                Some(v) => Some(std::path::PathBuf::from(v)),
+                None if forced_map.is_some() || resume_pending => None,
+                None => mapcat::load_last_variant().map(std::path::PathBuf::from),
+            },
             pending_mvar: None,
             static_palette: Vec::new(),
             static_palette_cat: Vec::new(),
@@ -2523,6 +4160,11 @@ impl App {
     /// scenario) are checked by datum; a LIVE game datum (not one of HMS's synthetic 0xD/0xE/0xF
     /// ranges) cannot be validated offline and is kept.
     fn object_datum_present(&self, d: u32) -> bool {
+        // #4: an imported model's pseudo-datum is present while that model is (a removed import
+        // must drop out of the selection, not leave a gizmo floating at its old origin).
+        if let Some(i) = extimport::datum_index(d) {
+            return i < self.imports.len();
+        }
         if !matches!(d >> 28, 0xD | 0xE | 0xF) {
             return true;
         }
@@ -2536,7 +4178,9 @@ impl App {
     /// meshes are left intact (only BSP-derived categories are cleared + rebuilt). Mirrors load_map's
     /// reload core minus open_cache. No-op while another load is in flight.
     fn reload_bsp_lightmaps(&mut self) {
-        if self.scene_ctl.is_none() || self.load_rx.is_some() { return; }
+        // #h3: a Halo 3 map has no Reach BSP to reload (the controller's cache is closed); the
+        // reload would only blank the viewport's lanes.
+        if self.scene_ctl.is_none() || self.load_rx.is_some() || self.h3_active { return; }
         let (fog, exposure, has_atmosphere, space_sky);
         {
             let scene = self.scene_ctl.as_mut().unwrap();
@@ -2622,7 +4266,7 @@ impl App {
     /// to avoid borrow conflicts). Enable → GPU bake (~seconds, blocks briefly) + reload with our
     /// atlas; disable → reload with the shipped atlas. Requires the scene loaded + no load in flight.
     fn apply_pathtrace_toggle(&mut self) {
-        if self.scene_ctl.is_none() || self.load_rx.is_some() || self.bake_rx.is_some() { return; }
+        if self.scene_ctl.is_none() || self.load_rx.is_some() || self.bake_rx.is_some() || self.h3_active { return; }
         if self.show_pathtraced {
             // Move the SceneController onto a worker thread for the ~10s GPU bake so
             // the window stays live + a progress bar can tick. It's handed back via `bake_rx`, then
@@ -3017,6 +4661,14 @@ impl App {
         // from the cache and uses the right pointer constant (H2A's format IS Halo 4's apart
         // from that - docs/h2a_support_plan.md). Also cancels a load in flight. #h2a
         self.h4_reset();
+        self.h3_reset();
+        // #h3: a Halo 3 / ODST cache (Reach-family container, own pure-Rust reader) loads
+        // through h3/gui.rs on its own worker - checked BEFORE the Reach default, since the
+        // native DLL would misread it as Reach.
+        if h3::is_halo3_cache(std::path::Path::new(&map_path)) {
+            self.h3_load_map(map_path);
+            return;
+        }
         if h4::cache::cache_engine(std::path::Path::new(&map_path)).is_some() {
             self.h4_load_map(map_path);
             return;
@@ -3086,6 +4738,7 @@ impl App {
     /// appends ready batches — the window stays smooth during the whole load.
     fn drive_load(&mut self, ctx: &eframe::egui::Context) {
         self.h4_drive_load(); // no-op unless a Halo 4 load is in flight
+        self.h3_drive_load(); // no-op unless a Halo 3 load is in flight
         if self.load_rx.is_none() {
             return;
         }
@@ -3139,14 +4792,13 @@ impl App {
             // Land the camera IN the map at a spawn point (unless the user pinned an
             // explicit HMS_CAM A/B view), so testing doesn't need flying to the map first.
             if std::env::var("HMS_CAM").is_err() {
-                if let Some((pos, yaw, pitch)) =
-                    self.objscene().and_then(|s| s.spawn_camera_pose())
-                {
-                    self.camera.pos = pos;
-                    self.camera.yaw = yaw;
-                    self.camera.pitch = pitch;
-                    log::info!("spawn camera: pos=[{:.1},{:.1},{:.1}] yaw={:.1} pitch={:.1}",
-                        pos.x, pos.y, pos.z, yaw.to_degrees(), pitch.to_degrees());
+                if let Some(p) = self.objscene().and_then(|s| s.spawn_camera()) {
+                    self.camera.pos = p.pos;
+                    self.camera.yaw = p.yaw;
+                    self.camera.pitch = p.pitch;
+                    log::info!("spawn camera: {}", p.describe());
+                } else {
+                    log::info!("spawn camera: no spawn / starting location / soft ceiling / bounds source - camera left as is");
                 }
             }
             if let Some(h) = self.load_handle.take() {
@@ -3154,6 +4806,12 @@ impl App {
             }
             // The palette preview is lit per map -> rebuild it for the new one.
             self.preview_for = None;
+            // #model-import: imported models are lit by the MAP's airprobe ambient, so a model
+            // imported before (or during) the load has to be re-lit against the map that just
+            // finished — otherwise it keeps the neutral white of the no-map session.
+            if !self.imports.is_empty() {
+                self.import_dirty = true;
+            }
             // Apply the per-scenario sceg colour-grade tints (Zealot purple etc.).
             if let Some((sun_tint, amb_tint)) = self.scene_ctl.as_ref().map(|s| s.scene_tints()) {
                 self.renderer.set_scene_tints(sun_tint, amb_tint);
@@ -3411,6 +5069,22 @@ impl App {
                     .and_then(|c| c.map_id)
             });
             log::info!("loaded map id = {:?} ({})", self.loaded_map_id, self.map_path);
+            // #film  A film that was waiting for exactly THIS map can now finish opening: draw
+            // its Forge scene and start decoding the recording. This is the second half of
+            // `film_load_scene`, deferred because `load_map()` streams over frames -- see
+            // `film_pending_scene_map` for what went wrong without it.
+            //
+            // Taken before the call so a re-entry cannot re-arm it and spin; and matched on the
+            // map id so one film's pending open cannot fire against a different map's load. The
+            // re-entry is safe because `film_load_base_map_only` returns immediately once
+            // `loaded_map_id` already matches, so it cannot start another load.
+            // The test is `film_export::deferred_open_fires`, written out there because the
+            // tempting `take() == loaded_map_id` form is TRUE when both are `None` and would
+            // re-enter on every load of a map with no id while a film happened to be open.
+            let pending = self.film_pending_scene_map.take();
+            if film_export::deferred_open_fires(pending, self.loaded_map_id) && self.film.is_some() {
+                self.film_load_scene();
+            }
             // Then, if a variant was queued pending this load (the user picked a variant for a
             // not-yet-loaded map), render its objects now.
             if let Some(pending) = self.pending_mvar.take() {
@@ -3431,6 +5105,7 @@ impl App {
             self.map_status = format!("Loaded {} geometry in {:.1}s — finalizing objects…", self.map_path, load_secs);
             log::info!("map geometry loaded (BSP + foliage) in {load_secs:.2}s; finalizing objects");
             mapcat::save_last_map(&self.map_path);
+            self.note_recent_map(); // File ▸ Open recent
             // Headless auto-screenshot: frame the whole map (or use HMS_CAM).
             if self.autoshot.is_some() {
                 if let Some((mn, mx)) = self.objscene().and_then(|s| s.scene_bounds()) {
@@ -3582,7 +5257,9 @@ impl App {
             // HMS_MAP forces its map regardless of the running game; otherwise only
             // auto-reopen the persisted map when the game isn't publishing one.
             let forced = std::env::var("HMS_MAP").is_ok();
-            if (forced || !game_map) && self.selected_map.is_some() && self.scene_ctl.is_some() {
+            // a Halo 4 / H2A / Halo 3 map needs no native DLL (pure-Rust readers) #h3
+            let pure_rust = self.selected_map.and_then(|i| self.map_candidates.get(i)).map_or(false, |c| c.game != mapcat::Game::Reach);
+            if (forced || !game_map) && self.selected_map.is_some() && (self.scene_ctl.is_some() || pure_rust) {
                 self.load_map();
             }
         }
@@ -3597,6 +5274,7 @@ impl App {
                 if placed > 0 {
                     mapcat::save_last_variant(&path.to_string_lossy());
                     self.current_variant_path = Some(path.clone());
+                    self.note_recent_variant(&path); // File ▸ Open recent
                 } else if attempts > 1 {
                     self.variant_retry = Some((path, attempts - 1));
                 }
@@ -3615,6 +5293,26 @@ impl App {
         // out-of-range tag entry. Only trust live tags when MCC's live map matches the
         // viewer's loaded cache; otherwise render ONLY the viewer's own scenario +
         // locally-placed objects (always valid).
+        // #gfx-perf: nothing that feeds the object lanes has changed since the last tick, no
+        // live game is publishing, and the scene has no decode/rebuild work left to budget — so
+        // the whole merge + override-map rebuild + signature hash + screen-FX recomposition below
+        // would produce exactly what is already on screen. Skip to the per-frame tail.
+        if !self.noopt
+            && self.objtable.is_none()
+            && self.forge_table.is_none()
+            && !self.objscene().map(|s| s.rebuild_pending()).unwrap_or(false)
+        {
+            let sig = self.object_pipeline_sig();
+            if self.objects_sig == Some(sig) {
+                self.tick_scene_per_frame(anim_time);
+                return;
+            }
+            self.objects_sig = Some(sig);
+        } else {
+            // Live game attached (or still streaming): the inputs are outside our control, so
+            // never cache. Drop the fingerprint so the first idle frame re-takes it.
+            self.objects_sig = None;
+        }
         let live_map_matches = self.live_map_matches();
         // Live objects from the game MMF (empty when no game / map mismatch) MERGED with
         // locally-placed objects (standalone forge editor) so placed objects render with OR
@@ -3706,6 +5404,14 @@ impl App {
         );
         objects.extend(self.mvar_objects.iter().cloned());
         objects.extend(self.local_objects.iter().cloned());
+        // #seat-entry  THE PLACEMENT OF A RIDDEN VEHICLE IS NOT DRAWN, because test mode is
+        // drawing that vehicle itself (through the actor lane, like the player's own biped).
+        //
+        // Filtered out of the RENDER set only, never out of `last_objects`: the editor's object
+        // table, its selection, its panels and the collision gather all keep seeing the vehicle,
+        // and nothing about the user's unsaved variant changes. `maybe_rebuild` hashes the set it
+        // is given, so starting and ending a ride each cost exactly one rebuild.
+        let hidden = self.play.as_ref().map(|p| p.hidden_datums()).unwrap_or_default();
         // Always-on, on-screen forge diagnostic — no console needed. Shows exactly which
         // link of the in-memory forge pipeline is broken.
         self.forge_diag = format!(
@@ -3726,7 +5432,24 @@ impl App {
         }
         // The placed Forge special-FX orbs' screen effects follow the CURRENT object set
         // (add / delete / duplicate / variant load all flow through here).
-        self.refresh_screen_fx(&objects);
+        //
+        // #gfx-perf: the composition walks EVERY object, does an O(n²) dedup of the sefc tags it
+        // finds and clones each tag's definition vector — per frame, for a result that can only
+        // change when the object set does. It is now keyed on a cheap fingerprint of
+        // (datum, mode_tag) pairs, and skipped outright when Settings ▸ Graphics has screen
+        // effects off (the identity matrix is pushed once by `apply_gfx_settings`).
+        {
+            let mut fp: u64 = 0xcbf2_9ce4_8422_2325;
+            for o in &objects {
+                fp ^= o.datum as u64 ^ ((o.mode_tag as u64) << 32);
+                fp = fp.wrapping_mul(0x100_0000_01b3);
+            }
+            let fp = fp ^ (objects.len() as u64);
+            if self.gfx.screen_fx && !self.gfx.flat_mode && (self.noopt || self.screenfx_objects_fp != Some(fp)) {
+                self.screenfx_objects_fp = Some(fp);
+                self.refresh_screen_fx(&objects);
+            }
+        }
         // Nothing to draw and nothing drawn: idle. When the set just BECAME empty (e.g. "Clear
         // placed" with no live game, or hiding a map's only scenario spawn markers) fall
         // through: the rebuild below sees the changed signature and returns empty lists for EVERY
@@ -3754,8 +5477,6 @@ impl App {
             .as_ref()
             .map(|c| c.read_full())
             .unwrap_or_default();
-        self.last_objects = objects.clone();
-
         // Per-datum visual scale for offline objects tagged with the forge "scale"
         // label (X330 spawn_seq). Only non-unity entries are stored.
         // The per-object SCALED flag is inside ObjMeta::scale; the global "Scaled
@@ -3784,14 +5505,57 @@ impl App {
         };
         // Through the ObjectScene trait (Reach SceneController / Halo 4 H4ObjectScene);
         // the field-wise accessor keeps `renderer` / `render_state` borrowable alongside.
-        if let Some(scene) = objscene_parts_mut(self.h4_active, &mut self.h4_scene, &mut self.scene_ctl) {
+        // The DISPLAYED damage state per object (DAMAGE pseudo-flag; only overrides are stored).
+        let damage: std::collections::HashMap<u32, u8> = self.mvar_meta.iter()
+            .filter_map(|(&d, m)| m.flags.damage.filter(|s| *s > 0).map(|s| (d, s)))
+            .collect();
+        // #vehicle-ride  Everything that lives on the PLACEMENT rather than the tag has to travel
+        // into a ride, or getting in visibly respawns the vehicle -- reported as "it gets in it and
+        // its basically spawning a new one so it doesn't keep the colors and everything of the
+        // original vehicle at all". `enter_vehicle` is the only place that still has the placement,
+        // so it reads this map; a datum absent from it keeps the tag's own appearance, which means a
+        // host that never calls the setter behaves exactly as before.
+        //
+        // Built BEFORE the block below, which moves `scales` and `damage` into the scene. Keyed on
+        // the UNION of the three maps rather than on an object list: a datum carrying only a colour
+        // override still has to travel, and the defaults here (scale 1.0, damage 0) are the same
+        // ones the scene applies to an unlisted datum.
+        if self.play.is_some() {
+            let mut appearance: std::collections::HashMap<u32, (Option<(u8, u8)>, f32, u8)> =
+                std::collections::HashMap::new();
+            for d in self
+                .mvar_colors
+                .keys()
+                .chain(scales.keys())
+                .chain(damage.keys())
+                .copied()
+                .collect::<std::collections::HashSet<u32>>()
+            {
+                appearance.insert(
+                    d,
+                    (
+                        self.mvar_colors.get(&d).copied(),
+                        scales.get(&d).copied().unwrap_or(1.0),
+                        damage.get(&d).copied().unwrap_or(0),
+                    ),
+                );
+            }
+            if let Some(pm) = self.play.as_mut() {
+                pm.set_object_appearance(appearance);
+            }
+        }
+        if let Some(scene) = objscene_parts_mut(self.h4_active, &mut self.h4_scene, &mut self.scene_ctl, self.h3_active, &mut self.h3_scene) {
             scene.set_object_scales(scales);
             scene.set_object_casters(casters);
+            scene.set_object_damage(damage);
         }
 
-        let rebuilt = match objscene_parts_mut(self.h4_active, &mut self.h4_scene, &mut self.scene_ctl) {
+        // One clone, and only while a ride is in progress. The filter itself lives in
+        // `play_vehicle::shown` so that showing and hiding have a single writer and a gate.
+        let shown = play_vehicle::shown(&objects, &hidden);
+        let rebuilt = match objscene_parts_mut(self.h4_active, &mut self.h4_scene, &mut self.scene_ctl, self.h3_active, &mut self.h3_scene) {
             Some(scene) if scene.has_cache() => scene.maybe_rebuild(
-                &objects,
+                shown.as_deref().unwrap_or(&objects),
                 &forge_colors,
                 self.renderer.mesh_renderer(),
                 &self.render_state.device,
@@ -3799,14 +5563,22 @@ impl App {
             ),
             _ => None,
         };
+        // #gfx-perf: `last_objects` used to be `objects.clone()` — a SECOND full copy of every
+        // scenario + variant + placed object (thousands of `ObjectInfo`) allocated every frame.
+        // `objects` is not read past the rebuild above, so it MOVES here instead. (The early
+        // `return` further up only triggers when both sides are already empty.)
+        self.last_objects = objects;
         if rebuilt.is_some() {
             self.last_rebuild_at = std::time::Instant::now();
             self.idle_released = false;
             // Keep the Halo 4 sun shadow fit on the moved / added / deleted casters
-            if let Some(Some((b, c))) = objscene_parts_mut(self.h4_active, &mut self.h4_scene, &mut self.scene_ctl).map(|s| s.h4_shadow_setup()) {
+            if let Some(Some((b, c))) = objscene_parts_mut(self.h4_active, &mut self.h4_scene, &mut self.scene_ctl, self.h3_active, &mut self.h3_scene).map(|s| s.h4_shadow_setup()) {
                 self.renderer.set_h4_shadow(b, c);
             }
         }
+        // #reach-skin Posed Reach character actors ride their own renderer lane, so the Forge
+        // object rebuild above can never wipe them.
+        self.update_actors();
         if let Some(objscene::RebuiltLanes { opaque, cutout, holo, holo_solid, blend }) = rebuilt {
             self.renderer.set_dynamic_meshes(opaque);
             // Cutout objects (tree canopies) → alpha-test pass so leaves are see-through.
@@ -3828,6 +5600,13 @@ impl App {
                 self.highlight_dirty = true;
             }
         }
+        self.tick_scene_per_frame(anim_time);
+    }
+
+    /// The part of `tick_scene` that genuinely has to run EVERY frame — the camera-relative
+    /// forge-light repack and the selection-highlight refresh — split out so the object-pipeline
+    /// early-out (#gfx-perf) can skip everything else without skipping these.
+    fn tick_scene_per_frame(&mut self, anim_time: f32) {
         // Forge lights ILLUMINATE — re-pack the SimpleLights uniform each frame so the 8
         // nearest the camera cast real light on nearby surfaces (not just self-glow). Gated so
         // maps with no forge lights keep their scenario-only lights uploaded at load.
@@ -3848,6 +5627,79 @@ impl App {
             self.apply_selection_highlight();
             self.highlight_dirty = false;
         }
+    }
+
+    /// Fingerprint of every INPUT to the object pipeline (`tick_scene`'s merge →
+    /// `maybe_rebuild`). #gfx-perf: the merge cloned the map's whole scenario object set plus the
+    /// variant plus the placed objects into a fresh Vec every frame, and `maybe_rebuild` then
+    /// hashed all of it just to discover nothing had changed — 2.1 ms a frame on the modded Forge
+    /// World the user reported as laggy, where the scenario set is large. This hashes the SOURCES
+    /// instead (hundreds of variant/placed records and the per-object override maps, not thousands
+    /// of merged clones), so an idle editor does none of that work.
+    ///
+    /// Anything that can change what the object lanes render must be mixed in here. The live-game
+    /// tables are deliberately NOT hashed: they change outside our control, so the caller refuses
+    /// to take the early-out at all while either is connected.
+    fn object_pipeline_sig(&self) -> u64 {
+        // A plain fn rather than a closure so the order-independent XOR folds below can touch
+        // `h` directly (a `&mut h` closure would hold the borrow for the whole body).
+        #[inline]
+        fn mix(h: u64, v: u64) -> u64 {
+            (h ^ v).wrapping_mul(0x100_0000_01b3)
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        h = mix(h, self.scenario_objects.len() as u64);
+        h = mix(h, self.scenario_spawn_tags.len() as u64);
+        h = mix(h, self.show_map_spawns as u64);
+        h = mix(h, self.palette.len() as u64);
+        h = mix(h, self.sc_convention as u64);
+        h = mix(h, self.obj_globals.scaled as u64 | ((self.obj_globals.shadowcasters as u64) << 1));
+        for list in [&self.mvar_objects, &self.local_objects] {
+            h = mix(h, list.len() as u64);
+            for o in list.iter() {
+                h = mix(h, o.datum as u64);
+                h = mix(h, o.mode_tag as u64);
+                for v in o.pos.iter().chain(o.fwd.iter()).chain(o.up.iter()) {
+                    h = mix(h, v.to_bits() as u64);
+                }
+            }
+        }
+        h = mix(h, self.mvar_colors.len() as u64);
+        for (d, (t, c)) in self.mvar_colors.iter() {
+            // XOR-folded, not mixed in sequence: a HashMap iterates in arbitrary order, so the
+            // fold has to be order-independent or the fingerprint would change on its own.
+            h ^= (*d as u64) ^ ((*t as u64) << 32) ^ ((*c as u64) << 40);
+        }
+        h = mix(h, self.mvar_meta.len() as u64);
+        let conv = self.sc_convention;
+        for (d, m) in self.mvar_meta.iter() {
+            h ^= (*d as u64)
+                ^ ((m.scale(conv).to_bits() as u64) << 8)
+                ^ ((m.shadow_on() as u64) << 40)
+                ^ ((m.flags.damage.unwrap_or(0) as u64) << 48);
+        }
+        match self.hover_preview.as_ref() {
+            None => h = mix(h, 0),
+            Some((_, pv)) => {
+                h = mix(h, pv.len() as u64 | 0x8000_0000);
+                for (d, (t, c)) in pv.iter() {
+                    h ^= (*d as u64) ^ ((*t as u64) << 32) ^ ((*c as u64) << 40);
+                }
+            }
+        }
+        // #seat-entry  The set of datums whose PLACEMENT is hidden this tick is an INPUT to the
+        // object pipeline, so it has to be in the pipeline's fingerprint.
+        //
+        // It was not, and that was the whole "entering a vehicle duplicates it" bug: mounting a
+        // Warthog changes nothing else this signature can see, so the idle early-return above
+        // fired and the `hidden_datums()` filter ~100 lines downstream was never reached. The
+        // placement stayed drawn while the ride lane drew the same vehicle as an actor.
+        //
+        // Folded order-independently (XOR) like the maps above, with the COUNT mixed in
+        // separately so that "nothing hidden" and "one datum hidden whose id happens to fold to
+        // zero" are different fingerprints.
+        h = fold_hidden_datums(h, &self.play.as_ref().map(|p| p.hidden_datums()).unwrap_or_default());
+        h
     }
 
     /// The properties panel reports, EVERY frame it runs, the open team/colour popup
@@ -3950,6 +5802,14 @@ impl App {
         if !self.sim_events.is_empty() {
             ev.extend(self.sim_events.remove(0));
         }
+        // A HELD mouse button (`preview button right down`): one event, then egui's pointer
+        // state keeps it down until the matching release. Needed to script a camera fly, which
+        // only moves while the fly button is held.
+        if let Some((button, pressed)) = self.sim_button.take() {
+            let pos = self.sim_pointer.map(|(p, _)| p).or(self.dbg_pointer).unwrap_or_else(|| egui::pos2(0.0, 0.0));
+            ev.push(egui::Event::PointerMoved(pos));
+            ev.push(egui::Event::PointerButton { pos, button, pressed, modifiers: Default::default() });
+        }
         // #construct-h4: the press-drag. One frame per step so egui sees real motion between the
         // press and the release (a press+release at one spot is a click, and the press-drag tools
         // -- Construct Circle / Square -- would never start).
@@ -4011,8 +5871,18 @@ impl App {
         }
         let mut lines: Vec<[f32; 3]> = Vec::new();
         let mut fallback_box = None;
+        // #4: an imported model has no object model to walk, so its selection feedback is the
+        // 12 edges of its ORIENTED bounds at the current pose (it follows a live drag).
+        for &d in &self.selected_set {
+            if let Some(m) = extimport::datum_index(d).and_then(|i| self.imports.get(i)) {
+                lines.extend(m.selection_box_lines());
+            }
+        }
         if let Some(s) = self.objscene() {
             for &d in &self.selected_set {
+                if extimport::datum_index(d).is_some() {
+                    continue;
+                }
                 if let Some(w) = s.selection_wireframe(d) {
                     lines.extend(w);
                 } else if fallback_box.is_none() {
@@ -4040,6 +5910,7 @@ impl App {
             selected_datum: self.selected_datum,
             shapes: self.shapes.clone(),
             sel_shape: self.sel_shape,
+            import_poses: self.imports.iter().map(|m| (m.pos, m.fwd, m.up, m.scale)).collect(),
         }
     }
 
@@ -4062,6 +5933,18 @@ impl App {
         self.selected_datum = s.selected_datum;
         self.shapes = s.shapes;
         self.sel_shape = s.sel_shape;
+        // #4: restore the imported models' poses when the snapshot was taken with the same set of
+        // models. A count mismatch means a model was imported/removed since (that is not an
+        // undoable edit), so the poses are left alone rather than applied to the wrong files.
+        if s.import_poses.len() == self.imports.len() {
+            for (m, (pos, fwd, up, scale)) in self.imports.iter_mut().zip(s.import_poses) {
+                m.pos = pos;
+                m.fwd = fwd;
+                m.up = up;
+                m.scale = scale;
+            }
+            self.import_dirty = true;
+        }
         self.overlays_dirty = true;
         if let Some(sc) = self.objscene_mut() {
             sc.invalidate(); // force maybe_rebuild next tick (positions/colours changed)
@@ -4075,8 +5958,9 @@ impl App {
 
     // ===================== modal transform gizmo =====================
 
-    /// Selected datums that live in an OFFLINE, mutable object list (mvar or locally-placed).
-    /// These are the only objects the modal grab/rotate/duplicate operates on.
+    /// Selected datums that live in an OFFLINE, mutable object list (mvar or locally placed),
+    /// plus any selected IMPORTED MODEL pseudo-datum (#4). These are the only things the modal
+    /// grab/rotate/duplicate and the gizmo operate on.
     fn movable_datums(&self) -> Vec<u32> {
         self.selected_set
             .iter()
@@ -4084,12 +5968,19 @@ impl App {
             .filter(|&d| {
                 self.mvar_objects.iter().any(|o| o.datum == d)
                     || self.local_objects.iter().any(|o| o.datum == d)
+                    // #4: an imported model is movable through the SAME path as an object, so
+                    // the gizmo, G/R, axis locks and numeric entry need no parallel code.
+                    || extimport::datum_index(d).is_some_and(|i| i < self.imports.len())
             })
             .collect()
     }
 
-    /// Current (pos, fwd, up) of an offline object by datum.
+    /// Current (pos, fwd, up) of an offline object — or of an imported model (#4) — by datum.
     fn movable_pose(&self, datum: u32) -> Option<(glam::Vec3, glam::Vec3, glam::Vec3)> {
+        if let Some(i) = extimport::datum_index(datum) {
+            let m = self.imports.get(i)?;
+            return Some((glam::Vec3::from(m.pos), glam::Vec3::from(m.fwd), glam::Vec3::from(m.up)));
+        }
         self.mvar_objects
             .iter()
             .chain(self.local_objects.iter())
@@ -4116,6 +6007,94 @@ impl App {
 
     /// What an object IS — tag path / class / tag id / placement — for ANY
     /// rendered datum: scenario (0xE…), variant (.mvar) or locally placed. None = unknown datum.
+    /// #reach-skin Advance + re-pose every placed Reach actor and rebuild their GPU meshes when
+    /// the actor set changed. A no-op (two branch tests) while nothing is placed, so the normal
+    /// Forge editing path pays nothing for it.
+    /// #skin Give every drawn body the armour and the colours its player actually had.
+    ///
+    /// Two halves, both per player slot:
+    ///   * the ten appearance bytes become a synthetic model VARIANT (region -> permutation picks
+    ///     out of `globals\player_model_customization`), installed on the scene once; the drawn
+    ///     actor then names that variant and the ordinary variant machinery selects its sections
+    ///     and its instanced attachments;
+    ///   * the two colour bytes index `matg` "profile colors" and become the actor's primary and
+    ///     secondary change colours.
+    ///
+    /// A body the recording could not tie to a player keeps the model's own defaults — the
+    /// picture never invents an appearance for someone it cannot name.
+    fn apply_recorded_appearance(&mut self) {
+        // ONE implementation, on the driver (`FilmDriver::apply_recorded_appearance`), so the
+        // window and the scripted host dress the bodies identically. This used to live here only,
+        // which meant a headless capture showed default armour where the window showed recorded.
+        let (Some(pb), Some(film)) = (self.film_play.as_deref(), self.film.as_deref()) else { return };
+        let Some(sc) = self.scene_ctl.as_mut() else { return };
+        if self.film_driver.apply_recorded_appearance(pb, film, sc, &mut self.actor_scene) {
+            self.actor_scene.rebuild = true;
+        }
+    }
+
+    fn update_actors(&mut self) {
+        if self.actor_scene.actors.is_empty() && !self.actor_scene.rebuild {
+            self.actor_clock = None;
+            // #armour-fx Nothing posed any more: drop the actor particle lane, or the last
+            // frame's armour effect would hang in the air where the body used to be.
+            if let Some(sc) = self.scene_ctl.as_mut() {
+                if sc.actor_particle_source_count() > 0 { sc.set_actor_particle_sources(Vec::new()); }
+            }
+            return;
+        }
+        let now = std::time::Instant::now();
+        let dt = self.actor_clock.map(|t| (now - t).as_secs_f32().min(0.25)).unwrap_or(0.0);
+        self.actor_clock = Some(now);
+        if self.actor_scene.rebuild {
+            let device = self.render_state.device.clone();
+            let queue = self.render_state.queue.clone();
+            let built = {
+                let actors = &mut self.actor_scene;
+                let mr = self.renderer.mesh_renderer();
+                self.scene_ctl
+                    .as_mut()
+                    .map(|sc| reach_actor::build_actor_meshes(actors, sc, mr, &device, &queue))
+            };
+            if let Some(b) = built {
+                // #fp-fov Two lane sets: the world's and the first-person rig's, which is drawn
+                // through the engine's narrower first-person projection.
+                self.renderer.set_first_person_fov_scale(film_play::first_person_fov_scale());
+                let (l, f) = (b.world, b.first_person);
+                self.renderer.set_actor_meshes(l.opaque, l.cutout, l.holo, l.holo_solid, l.blend);
+                self.renderer.set_first_person_meshes(f.opaque, f.cutout, f.holo, f.holo_solid, f.blend);
+            }
+        }
+        self.actor_scene.update(dt, &self.render_state.queue);
+        // #armour-fx The ACTOR PARTICLE LANE, refreshed from the pose this frame just produced
+        // (an armour effect rides a bone). Must come after `update`, which is what wrote the pose.
+        let srcs = self.actor_scene.particle_sources();
+        if let Some(sc) = self.scene_ctl.as_mut() {
+            if !srcs.is_empty() || sc.actor_particle_source_count() > 0 {
+                sc.set_actor_particle_sources(srcs);
+            }
+        }
+        // #projectile  The FILM lane, from the same pose: the weapon firing effects, the recorded
+        // projectiles' travelling effects and the detonations. Computed here rather than inside
+        // `ActorDriver::sync` for exactly the reason the actor lane is -- a muzzle flash sits on a
+        // marker of the gun in a hand, so it needs the pose `update` has just written.
+        let want_fx = match (self.film_play.as_deref(), self.scene_ctl.as_ref()) {
+            (Some(pb), Some(scene)) => match scene.cache_handle() {
+                Some(cache) => {
+                    let native = scene.native_dll();
+                    self.film_driver.film_effects(pb, &self.actor_scene, native, cache)
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        if let Some(sc) = self.scene_ctl.as_mut() {
+            if !want_fx.is_empty() || sc.film_particle_source_count() > 0 {
+                self.film_fx = film_projectile::install(sc, &want_fx);
+            }
+        }
+    }
+
     fn object_identity(&self, datum: u32) -> Option<obj_identity::ObjIdentity> {
         use obj_identity::{ObjIdentity, ObjSource};
         if let Some(o) = self.scenario_objects.iter().find(|o| o.datum == datum) {
@@ -4154,8 +6133,22 @@ impl App {
         None
     }
 
-    /// Write a new pose into whichever offline list holds this datum (and mvar_meta).
+    /// Write a new pose into whichever offline list holds this datum (and mvar_meta), or into the
+    /// imported model the pseudo-datum names (#4).
     fn set_movable_pose(&mut self, datum: u32, pos: glam::Vec3, fwd: glam::Vec3, up: glam::Vec3) {
+        // #4: an imported model. Flag it rather than re-uploading here: a live gizmo drag calls
+        // this every frame, and the mesh matrix + the world triangle soup are rebuilt once per
+        // frame from the flag (`refresh_import_transforms`).
+        if let Some(i) = extimport::datum_index(datum) {
+            if let Some(m) = self.imports.get_mut(i) {
+                m.pos = pos.into();
+                m.fwd = fwd.into();
+                m.up = up.into();
+                self.import_dirty = true;
+                self.highlight_dirty = true;
+            }
+            return;
+        }
         for o in self.mvar_objects.iter_mut().chain(self.local_objects.iter_mut()) {
             if o.datum == datum {
                 o.pos = pos.into();
@@ -5042,6 +7035,7 @@ impl App {
                 // parent) exactly as `spawn_copy_of` does -- without this a Mirror-copy or a
                 // Fill-edge copy on a Halo 4 map inherited the source's slot. No-op for Reach.
                 self.h4_copy_source_record(d, nd);
+                self.h3_copy_source_record(d, nd); // #h3-edit
                 out.push(nd);
             } else if let Some(o) = self.local_objects.iter().find(|o| o.datum == d).cloned() {
                 let nd = self.next_local_datum;
@@ -5125,7 +7119,8 @@ impl App {
                 if let Some(&c) = self.mvar_colors.get(&d) {
                     self.mvar_colors.insert(nd, c);
                 }
-                self.h4_copy_source_record(d, nd); // the copy's own .mvar record (no-op for Reach)
+                self.h4_copy_source_record(d, nd);
+                self.h3_copy_source_record(d, nd); // #h3-edit // the copy's own .mvar record (no-op for Reach)
                 out.push(nd);
             } else if let Some(o) = self.local_objects.iter().find(|o| o.datum == d).cloned() {
                 let nd = self.next_local_datum;
@@ -5517,26 +7512,33 @@ impl App {
             .pointer_latest_pos()
             .map(|p| (p.x, p.y))
             .unwrap_or_else(|| self.xform.as_ref().map(|op| op.last_raw_pointer).unwrap_or((rect.center().x, rect.center().y)));
+        // Every key here is a BINDING (Settings ▸ Controls & keyboard, keybinds.rs); the
+        // defaults are the Shift+D / G / R / E / X / Y / Z the app has always used. Escape is
+        // deliberately NOT rebindable — it is the universal way out.
+        let flying_now = self.fly_button_down(ctx);
         let (shift_d, g, r, e, kx, ky, kz, esc, enter, magnet) = ctx.input(|i| {
+            use keybinds::Action as A;
+            let ph = &self.phys;
             (
-                // While flying (RMB held), Shift is the camera speed-boost — don't let Shift+D
-                // trigger duplicate (nor Shift+A the context menu, gated below).
-                i.modifiers.shift && i.key_pressed(egui::Key::D) && !i.pointer.secondary_down(),
-                i.key_pressed(egui::Key::G),
-                // While RIGHT-CLICK (fly mode) is held, R flies the camera UP — suppress it
-                // starting object-rotation here (see update_camera, which reads R as up-thrust).
-                i.key_pressed(egui::Key::R) && !i.pointer.secondary_down(),
-                i.key_pressed(egui::Key::E),
-                i.key_pressed(egui::Key::X),
-                i.key_pressed(egui::Key::Y),
-                i.key_pressed(egui::Key::Z),
+                // While flying, the fly-boost modifier is held — don't let the duplicate chord
+                // fire as well (nor the context menu, gated below).
+                self.keys.pressed(A::Duplicate, i, ph) && !flying_now,
+                self.keys.pressed(A::ModalMove, i, ph),
+                // While the fly button is held, the rotate key may double as the fly-up key —
+                // suppress it starting object-rotation here (update_camera owns it then).
+                self.keys.pressed(A::ModalRotate, i, ph) && !flying_now,
+                self.keys.pressed(A::AxisSpace, i, ph),
+                self.keys.pressed(A::AxisX, i, ph),
+                self.keys.pressed(A::AxisY, i, ph),
+                self.keys.pressed(A::AxisZ, i, ph),
                 i.key_pressed(egui::Key::Escape),
-                i.key_pressed(egui::Key::Enter),
-                i.modifiers.ctrl || i.modifiers.command,
+                self.keys.pressed(A::ConfirmTransform, i, ph),
+                self.keys.down(A::Magnet, i, ph),
             )
         });
-        // Shift held (array/line-duplicate mode when combined with Ctrl + axis lock).
-        let shift_held = ctx.input(|i| i.modifiers.shift);
+        // The precision/array modifier held (array/line-duplicate mode when combined with the
+        // magnet modifier + an axis lock).
+        let shift_held = ctx.input(|i| self.keys.down(keybinds::Action::PrecisionSlow, i, &self.phys));
         let lclick = response.clicked_by(egui::PointerButton::Primary);
         let drag_started = response.drag_started_by(egui::PointerButton::Primary);
         let drag_stopped = response.drag_stopped_by(egui::PointerButton::Primary);
@@ -5549,7 +7551,7 @@ impl App {
         // dragging to look around would drag the object instead. Only for MODAL ops (not gizmo
         // drag_mode, which is owned by a held primary button); the cancel restores start poses and
         // the same right-drag then flows to the camera next frame.
-        let rmb_pressed = ctx.input(|i| i.pointer.secondary_pressed());
+        let rmb_pressed = ctx.input(|i| self.keys.mouse_pressed(keybinds::Action::FlyLook, i));
         let had_op = self.xform.is_some();
         let hov = response.hovered();
 
@@ -5949,7 +7951,9 @@ impl App {
                 let a = Self::xform_axis(&op, op.axis.unwrap_or(0));
                 op.array_cell = self.array_cell_for(&op, a);
             }
-            let (wheel, alt) = ctx.input(|i| (i.raw_scroll_delta.y, i.modifiers.alt));
+            let (wheel, alt) = ctx.input(|i| {
+                (i.raw_scroll_delta.y, self.keys.down(keybinds::Action::ArrayFine, i, &self.phys))
+            });
             op.wheel_accum += wheel;
             const NOTCH: f32 = 20.0; // raw scroll units per detent (device-dependent -> integrate)
             let mut notches = 0i32;
@@ -6047,7 +8051,7 @@ impl App {
     /// objects, and live objects via the transform queue). Undoable. Returns true if it acted
     /// (so the caller skips the arrow-key edit handler). Ignored while typing or transforming.
     fn handle_delete_key(&mut self, ctx: &egui::Context) -> bool {
-        let del = ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace));
+        let del = ctx.input(|i| self.keys.pressed(keybinds::Action::Delete, i, &self.phys));
         if !del || self.selected_set.is_empty() || self.xform.is_some() {
             return false;
         }
@@ -6067,6 +8071,16 @@ impl App {
             return;
         }
         let dd = self.selected_set.clone();
+        // #4: Delete also removes a selected IMPORTED MODEL — the same key does the same thing to
+        // everything the gizmo can move. Highest index first, because an import's pseudo-datum IS
+        // its index and `remove_import` re-packs the lane.
+        let mut imp: Vec<usize> = dd.iter().filter_map(|d| extimport::datum_index(*d)).filter(|i| *i < self.imports.len()).collect();
+        imp.sort_unstable();
+        imp.dedup();
+        for i in imp.iter().rev() {
+            self.remove_import(*i);
+        }
+        let n_imp = imp.len();
         // Snapshot for undo only if it touches offline objects (has render state to restore).
         let touches_offline = dd.iter().any(|d| {
             self.mvar_objects.iter().any(|o| o.datum == *d)
@@ -6094,101 +8108,60 @@ impl App {
             s.invalidate();
         }
         self.apply_selection_highlight();
-        self.status = format!("Deleted {} object(s)", dd.len());
+        self.status = match n_imp {
+            0 => format!("Deleted {} object(s)", dd.len()),
+            n => format!("Deleted {} object(s) and {n} imported model(s)", dd.len() - n),
+        };
     }
 
-    /// Gravity settle: drop `datum` onto the surface below it AND tilt it to rest flush on the
-    /// slope, the way the engine would let it come to rest — a warthog dropped on a hillside ends up
-    /// with all four tyres on the ground, not floating with the body level. We sample the surface
-    /// under a few footprint points (BSP terrain, other objects, imports), average the hit normals
-    /// to get the local slope, align the object's up to that normal (preserving its heading), and
-    /// lower it so its lowest point rests on the ground. Returns true if a surface was found.
-    fn settle_object(&mut self, datum: u32) -> bool {
-        let Some((pos, fwd, _up)) = self.movable_pose(datum) else { return false };
-        // Footprint from the object's world AABB (fall back to a small box around the origin).
-        let (mn, mx) = self
-            .objscene()
-            .and_then(|s| s.aabb_of(datum))
-            .unwrap_or(([pos.x - 1.0, pos.y - 1.0, pos.z - 1.0], [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0]));
-        let (mn, mx) = (glam::Vec3::from(mn), glam::Vec3::from(mx));
-        // How far the origin sits above the object's lowest point — we rest that point on the ground.
-        let bottom_offset = (pos.z - mn.z).max(0.0);
-        let cx = (mn.x + mx.x) * 0.5;
-        let cy = (mn.y + mx.y) * 0.5;
-        // Inset the corner samples inside the footprint so we hit real ground under the tyres, not a
-        // cliff edge just past the bumper.
-        let hx = (mx.x - mn.x) * 0.35;
-        let hy = (mx.y - mn.y) * 0.35;
-        let samples = [
-            (cx, cy),
-            (cx - hx, cy - hy),
-            (cx + hx, cy - hy),
-            (cx - hx, cy + hy),
-            (cx + hx, cy + hy),
-        ];
-        let top_z = mx.z + 2.0; // start each ray above the object
-        let dir = glam::Vec3::NEG_Z;
-        // For each footprint sample, find the nearest surface below and its normal.
-        let surface_at = |app: &Self, sx: f32, sy: f32| -> Option<(glam::Vec3, glam::Vec3)> {
-            let o = glam::Vec3::new(sx, sy, top_z);
-            let mut best: Option<(glam::Vec3, glam::Vec3)> = None;
-            let consider = |p: glam::Vec3, n: glam::Vec3, best: &mut Option<(glam::Vec3, glam::Vec3)>| {
-                if best.map(|(bp, _)| p.z > bp.z).unwrap_or(true) {
-                    *best = Some((p, n));
-                }
-            };
-            if let Some((p, n)) = app.objscene().and_then(|s| s.raycast_scene_n(o, dir)) {
-                consider(p, n, &mut best);
-            }
-            if let Some(p) = app.objscene().and_then(|s| s.raycast_objects_excluding(o, dir, &[datum])) {
-                consider(p, glam::Vec3::Z, &mut best); // object tops: treat as flat
-            }
-            if let Some(t) = raycast_tris(o, dir, &app.import_tris) {
-                consider(o + dir * t, glam::Vec3::Z, &mut best);
-            }
-            best
+    /// "Simulate physics" (#settle): a PHYSICS-ONLY rigid-body settle of `datum` - its `phmo`
+    /// shapes at its editor scale, dropped under gravity onto the level geometry and every other
+    /// drawn object's physics hull (+ imported meshes), stepped at the engine's 30 Hz until it
+    /// rests (`physics_settle`). The render mesh plays no part, so a scaled object rests where its
+    /// scaled hull touches. Runs only from the explicit menu action / `settle` script verb.
+    /// `objects` is the working list (fresh poses for the objects settled earlier in the same
+    /// action). Returns the status line; Err = nothing to simulate (no map / no physics model).
+    fn settle_object(&mut self, datum: u32, objects: &mut Vec<hms_ipc::ObjectInfo>) -> Result<String, String> {
+        let outcome = {
+            let scene = self.objscene().ok_or_else(|| "no map loaded".to_string())?;
+            physics_settle::settle_in_scene(scene, objects, datum, &self.import_tris, &physics_settle::SettleParams::default())?
         };
-        let mut center_z = None;
-        let mut nsum = glam::Vec3::ZERO;
-        let mut nhits = 0;
-        for (i, (sx, sy)) in samples.iter().enumerate() {
-            if let Some((p, n)) = surface_at(self, *sx, *sy) {
-                // Make every normal point up before averaging.
-                let n = if n.z < 0.0 { -n } else { n };
-                nsum += n;
-                nhits += 1;
-                if i == 0 {
-                    center_z = Some(p.z);
+        if outcome.moved() {
+            self.set_movable_pose(datum, outcome.pos, outcome.fwd, outcome.up);
+            if let Some(o) = objects.iter_mut().find(|o| o.datum == datum) {
+                o.pos = outcome.pos.into();
+                o.fwd = outcome.fwd.into();
+                o.up = outcome.up.into();
+            }
+        }
+        Ok(outcome.summary())
+    }
+
+    /// Settle every datum of `targets` in turn (each sees the previous ones' new poses) and
+    /// return the status line: the single summary, or the count plus the last line.
+    fn settle_targets(&mut self, targets: &[u32]) -> String {
+        let mut objects = self.last_objects.clone();
+        let mut moved = 0usize;
+        let mut last = String::new();
+        let mut errors = 0usize;
+        for &d in targets {
+            match self.settle_object(d, &mut objects) {
+                Ok(line) => {
+                    if !line.starts_with("No contact") { moved += 1; }
+                    last = line;
                 }
+                Err(e) => { errors += 1; last = e; }
             }
         }
-        if nhits == 0 {
-            return false;
+        if let Some(s) = self.objscene_mut() {
+            s.invalidate();
         }
-        // If the centre ray missed (e.g. a hole), fall back to the highest corner hit.
-        let center_z = center_z.unwrap_or_else(|| {
-            samples[1..]
-                .iter()
-                .filter_map(|(sx, sy)| surface_at(self, *sx, *sy).map(|(p, _)| p.z))
-                .fold(f32::NEG_INFINITY, f32::max)
-        });
-        // Average slope normal. Guard against garbage / near-vertical fits (keep upright then).
-        let mut up = (nsum / nhits as f32).normalize_or_zero();
-        if !up.is_finite() || up.z < 0.2 {
-            up = glam::Vec3::Z;
+        self.apply_selection_highlight();
+        if targets.len() == 1 {
+            if errors > 0 { format!("Physics: {last}") } else { last }
+        } else {
+            format!("Settled {moved} of {} object(s){} - last: {last}", targets.len(), if errors > 0 { format!(", {errors} without a physics model") } else { String::new() })
         }
-        // Preserve heading: project the current forward onto the slope plane.
-        let mut f = fwd - up * fwd.dot(up);
-        if f.length_squared() < 1e-6 {
-            f = glam::Vec3::X - up * glam::Vec3::X.dot(up);
-            if f.length_squared() < 1e-6 {
-                f = glam::Vec3::Y - up * glam::Vec3::Y.dot(up);
-            }
-        }
-        let f = f.normalize_or_zero();
-        let new_pos = glam::Vec3::new(pos.x, pos.y, center_z + bottom_offset);
-        self.set_movable_pose(datum, new_pos, f, up);
-        true
     }
 
     /// Editor shortcuts (fire only when no text field has focus):
@@ -6198,20 +8171,17 @@ impl App {
         if ctx.memory(|m| m.focused().is_some()) {
             return;
         }
+        let flying_now = self.fly_button_down(ctx);
         let (ctrl_a, shift_a, frame_f) = ctx.input(|i| {
+            use keybinds::Action as A;
+            let ph = &self.phys;
             (
-                (i.modifiers.ctrl || i.modifiers.command) && i.key_pressed(egui::Key::A),
-                i.modifiers.shift
-                    && !i.modifiers.ctrl
-                    && !i.modifiers.command
-                    && i.key_pressed(egui::Key::A)
-                    // Shift is the fly speed-boost while RMB is held — don't open the menu.
-                    && !i.pointer.secondary_down(),
-                // F frames the selection. While RMB is held F is the fly-DOWN key
+                self.keys.pressed(A::SelectAll, i, ph),
+                // The fly-boost modifier is held while flying — don't open the menu then.
+                self.keys.pressed(A::ContextMenu, i, ph) && !flying_now,
+                // Framing the selection shares its key with the fly-DOWN key by default
                 // (update_camera), so it only frames when not flying.
-                i.key_pressed(egui::Key::F)
-                    && !i.modifiers.any()
-                    && !i.pointer.secondary_down(),
+                self.keys.pressed(A::FrameSelected, i, ph) && !flying_now,
             )
         });
         if ctrl_a {
@@ -6264,39 +8234,20 @@ impl App {
                             self.status = format!("Selected {n} of the same type");
                             close = true;
                         }
-                        if ui.button("Simulate this object's physics").clicked() {
+                        if ui.button("Simulate this object's physics").on_hover_text("Drop the object's PHYSICS model (phmo shapes, at its scale) under gravity onto the level + other objects' physics hulls and step it until it rests").clicked() {
                             self.push_edit_undo();
                             self.prop_snapshotted_for = None;
-                            let moved = self.settle_object(d);
-                            if let Some(s) = self.objscene_mut() {
-                                s.invalidate();
-                            }
-                            self.apply_selection_highlight();
-                            self.status = if moved {
-                                "Settled object onto the surface below".into()
-                            } else {
-                                "No surface found below the object".into()
-                            };
+                            self.status = self.settle_targets(&[d]);
                             close = true;
                         }
                     } else {
                         ui.label(format!("{} objects selected", self.selected_set.len()));
                         ui.separator();
-                        if ui.button("Simulate physics for selection").clicked() {
+                        if ui.button("Simulate physics for selection").on_hover_text("Drop each selected object's PHYSICS model under gravity and step it until it rests").clicked() {
                             self.push_edit_undo();
                             self.prop_snapshotted_for = None;
                             let sel = self.selected_set.clone();
-                            let mut moved = 0;
-                            for d in sel {
-                                if self.settle_object(d) {
-                                    moved += 1;
-                                }
-                            }
-                            if let Some(s) = self.objscene_mut() {
-                                s.invalidate();
-                            }
-                            self.apply_selection_highlight();
-                            self.status = format!("Settled {moved} object(s)");
+                            self.status = self.settle_targets(&sel);
                             close = true;
                         }
                     }
@@ -6327,18 +8278,21 @@ impl App {
         let (mut dx, mut dy, mut dz, mut del) = (0.0f32, 0.0f32, 0.0f32, false);
         let mut ryaw = 0.0f32; // radians, yaw about +Z
         ctx.input(|i| {
-            let s = if i.modifiers.shift { 1.0 } else { 0.25 };
-            if i.key_pressed(egui::Key::ArrowRight) { dx += s; }
-            if i.key_pressed(egui::Key::ArrowLeft) { dx -= s; }
-            if i.key_pressed(egui::Key::ArrowUp) { dy += s; }
-            if i.key_pressed(egui::Key::ArrowDown) { dy -= s; }
-            if i.key_pressed(egui::Key::PageUp) { dz += s; }
-            if i.key_pressed(egui::Key::PageDown) { dz -= s; }
-            // Rotate (yaw): [ and ] — Shift = 45°, else 15°.
-            let step = if i.modifiers.shift { std::f32::consts::FRAC_PI_4 } else { 15.0f32.to_radians() };
-            if i.key_pressed(egui::Key::CloseBracket) { ryaw += step; }
-            if i.key_pressed(egui::Key::OpenBracket) { ryaw -= step; }
-            if i.key_pressed(egui::Key::Delete) { del = true; }
+            use keybinds::Action as A;
+            let ph = &self.phys;
+            let large = self.keys.down(A::NudgeLarge, i, ph);
+            let s = if large { 1.0 } else { 0.25 };
+            if self.keys.pressed(A::NudgeXPlus, i, ph) { dx += s; }
+            if self.keys.pressed(A::NudgeXMinus, i, ph) { dx -= s; }
+            if self.keys.pressed(A::NudgeYPlus, i, ph) { dy += s; }
+            if self.keys.pressed(A::NudgeYMinus, i, ph) { dy -= s; }
+            if self.keys.pressed(A::NudgeZPlus, i, ph) { dz += s; }
+            if self.keys.pressed(A::NudgeZMinus, i, ph) { dz -= s; }
+            // Yaw: 45° with the large-step modifier, else 15°.
+            let step = if large { std::f32::consts::FRAC_PI_4 } else { 15.0f32.to_radians() };
+            if self.keys.pressed(A::YawPlus, i, ph) { ryaw += step; }
+            if self.keys.pressed(A::YawMinus, i, ph) { ryaw -= step; }
+            if self.keys.pressed(A::Delete, i, ph) { del = true; }
         });
 
         if del {
@@ -6425,9 +8379,8 @@ impl App {
         }
         let (undo, redo) = ctx.input(|i| {
             (
-                i.modifiers.command && i.key_pressed(egui::Key::Z) && !i.modifiers.shift,
-                i.modifiers.command && (i.key_pressed(egui::Key::Y)
-                    || (i.modifiers.shift && i.key_pressed(egui::Key::Z))),
+                self.keys.pressed(keybinds::Action::Undo, i, &self.phys),
+                self.keys.pressed(keybinds::Action::Redo, i, &self.phys),
             )
         });
         if undo {
@@ -6549,7 +8502,7 @@ impl App {
     /// and it is hidden so it does not obscure the view. Called once per frame from the viewport
     /// update after both drivers ran.
     fn apply_cursor_capture(&mut self, ctx: &egui::Context) {
-        let want = self.flying || self.xform.is_some();
+        let want = self.flying || self.xform.is_some() || self.play.is_some();
         let mode: u8 = if !want { 0 } else if cfg!(target_os = "windows") { 2 } else {
             // Wayland supports pointer locking; X11 does not (winit returns an error) -> confine.
             let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some()
@@ -6569,7 +8522,15 @@ impl App {
         }
     }
 
-    /// WASD/QE fly + right-drag mouse-look, when the viewport is interacted with.
+    /// Is the bound fly/look button (right mouse by default) held? Several handlers ask,
+    /// because a key that flies the camera while it is held must not also fire its editor
+    /// meaning (Shift+D duplicating instead of boosting right-ward flight, say).
+    fn fly_button_down(&self, ctx: &egui::Context) -> bool {
+        ctx.input(|i| self.keys.down(keybinds::Action::FlyLook, i, &self.phys))
+    }
+
+    /// Fly + mouse-look, when the viewport is interacted with. Which keys and which mouse
+    /// button is Settings ▸ Controls & keyboard (keybinds.rs); the defaults are WASD/QE + RMB.
     fn update_camera(&mut self, ctx: &egui::Context, viewport_response: &egui::Response) {
         let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
         let cam_before = self.camera.pos;
@@ -6578,38 +8539,58 @@ impl App {
         // released, wherever the (hidden, captured) cursor is by then. While flying, mouse-look
         // integrates the RAW device motion: with the cursor locked in place the pointer position
         // never changes, so egui's drag_delta would be zero.
-        let (rmb_pressed, rmb_released) = ctx.input(|i| (i.pointer.secondary_pressed(), i.pointer.secondary_released()));
+        // The fly button is a BINDING (keybinds::Action::FlyLook, right mouse by default), so a
+        // left-handed user can put "look around" on the other button.
+        let (rmb_pressed, rmb_released) = ctx.input(|i| {
+            (self.keys.mouse_pressed(keybinds::Action::FlyLook, i), self.keys.mouse_released(keybinds::Action::FlyLook, i))
+        });
         if rmb_pressed && viewport_response.hovered() { self.flying = true; }
-        if rmb_released || !ctx.input(|i| i.pointer.secondary_down()) { self.flying = false; }
+        if rmb_released || !self.fly_button_down(ctx) { self.flying = false; }
+        // #film  While FOLLOWING a player, the same look-drag orbits the subject instead of
+        // turning a free camera. It has to work this way round: `film_tick` overwrites the app
+        // camera's position, yaw and pitch from `solve_camera` every frame in a film camera mode,
+        // so anything written to `self.camera` here would be gone on the next frame. The orbit is
+        // state on the playback that `solve_camera` consumes.
+        //
+        // A drag inside the viewport is the whole gesture -- no panel click is involved, which
+        // matters because a control needing a viewport hover AND a panel click can never fire.
+        let film_orbiting = matches!(
+            self.film_play.as_deref().map(|p| p.camera),
+            Some(film_play::FilmCamera::Follow(_)) | Some(film_play::FilmCamera::FollowOwner(_))
+        );
         if self.flying {
             const SENS: f32 = 0.005;
+            let look_btn = self.keys.pointer_button(keybinds::Action::FlyLook).unwrap_or(egui::PointerButton::Secondary);
             let d = Self::raw_mouse_motion(ctx).map(|(x, y)| egui::vec2(x, y))
-                .unwrap_or_else(|| if viewport_response.dragged_by(egui::PointerButton::Secondary) { viewport_response.drag_delta() } else { egui::Vec2::ZERO });
-            self.camera.yaw -= d.x * SENS;
-            self.camera.pitch = (self.camera.pitch - d.y * SENS)
-                .clamp(-1.5, 1.5);
+                .unwrap_or_else(|| if viewport_response.dragged_by(look_btn) { viewport_response.drag_delta() } else { egui::Vec2::ZERO });
+            if film_orbiting {
+                if let Some(pb) = self.film_play.as_deref_mut() {
+                    pb.rig.drag(-d.x * SENS, d.y * SENS);
+                }
+            } else {
+                self.camera.yaw -= d.x * SENS;
+                self.camera.pitch = (self.camera.pitch - d.y * SENS)
+                    .clamp(-1.5, 1.5);
+            }
             ctx.request_repaint();
         }
 
         // Movement only when the viewport has focus/hover (so typing in panels
-        // doesn't fly the camera) AND the right mouse button is held. Gating WASD on
-        // RMB-held means the keys are free for editor shortcuts (Ctrl+A select-all,
-        // Shift+A menu) when you're not actively flying the camera.
-        let rmb_held = ctx.input(|i| i.pointer.secondary_down());
+        // doesn't fly the camera) AND the fly button is held. Gating the fly keys on the
+        // button means they are free for editor shortcuts (select-all, the context menu)
+        // when you're not actively flying the camera.
+        //
+        // Which keys these ARE is Settings ▸ Controls & keyboard; the defaults are the
+        // familiar W/A/S/D + Q/E (and R/F), matched by key POSITION so the cluster keeps its
+        // shape on an AZERTY or Dvorak keyboard (see keybinds.rs).
+        let rmb_held = self.fly_button_down(ctx);
         if (viewport_response.hovered() || viewport_response.dragged() || self.flying) && rmb_held {
             let (fwd, right) = (self.camera.forward(), self.camera.right());
             let up = glam::Vec3::Z;
-            let mut v = glam::Vec3::ZERO;
-            ctx.input(|i| {
-                let boost = if i.modifiers.shift { 4.0 } else { 1.0 };
-                let s = self.move_speed * boost * dt;
-                if i.key_down(egui::Key::W) { v += fwd * s; }
-                if i.key_down(egui::Key::S) { v -= fwd * s; }
-                if i.key_down(egui::Key::D) { v += right * s; }
-                if i.key_down(egui::Key::A) { v -= right * s; }
-                // Up/down fly: Q/E and R/F (R up, F down) — both bindings supported.
-                if i.key_down(egui::Key::E) || i.key_down(egui::Key::R) { v += up * s; }
-                if i.key_down(egui::Key::Q) || i.key_down(egui::Key::F) { v -= up * s; }
+            // The step itself lives in keybinds::fly_velocity so it can be tested on its own:
+            // nothing in it names a key, so a rebind has exactly one place to take effect.
+            let v = ctx.input(|i| {
+                keybinds::fly_velocity(&self.keys, i, &self.phys, fwd, right, up, self.move_speed, dt)
             });
             self.camera.pos += v;
         }
@@ -6623,13 +8604,21 @@ impl App {
         // CTRL + scroll over the viewport adjusts fly speed (plain scroll would fire on every
         // stray wheel nudge while framing a shot; requiring Ctrl makes it deliberate).
         if viewport_response.hovered() {
-            ctx.input(|i| {
-                let scroll = i.raw_scroll_delta.y;
-                if scroll != 0.0 && (i.modifiers.ctrl || i.modifiers.command) {
+            let scroll = ctx.input(|i| i.raw_scroll_delta.y);
+            let ctrl = ctx.input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if scroll != 0.0 {
+                if film_orbiting && !ctrl {
+                    // #film  Plain wheel pulls the follow camera in and out. Clamped, so it can
+                    // end up neither inside the body nor out in the skybox.
+                    if let Some(pb) = self.film_play.as_deref_mut() {
+                        pb.rig.zoom(scroll * 0.01);
+                        self.status = format!("Follow distance {:.1} wu", pb.rig.dist);
+                    }
+                } else if ctrl {
                     self.move_speed = (self.move_speed * (1.0 + scroll * 0.0025)).clamp(0.5, 500.0);
                     self.status = format!("Fly speed {:.1}", self.move_speed);
                 }
-            });
+            }
         }
     }
 
@@ -6689,6 +8678,7 @@ impl App {
         if self.h4_active {
             return self.h4_place_palette_item(i, pos);
         }
+        if self.h3_active { return self.h3_place_palette_item(i, pos); } // #h3-edit
         let (obj_tag, name) = self
             .static_palette
             .get(i)
@@ -6767,6 +8757,7 @@ impl App {
                     .position(|(_, nm)| nm.to_lowercase().contains(&nl))
                     // Halo 4 rows are localized; the raw string ids match too
                     .or_else(|| self.h4_palette_index_by_raw(&nl))
+                    .or_else(|| self.h3_palette_index_by_raw(&nl)) // #h3-edit
                     .ok_or_else(|| format!("no palette object matching '{n}'"))
             }
         }
@@ -7034,17 +9025,9 @@ impl App {
                 if targets.is_empty() {
                     return Err("settle needs a datum or a selection".into());
                 }
-                let mut n = 0;
-                for d in &targets {
-                    if self.settle_object(*d) {
-                        n += 1;
-                    }
-                }
-                if let Some(s) = self.objscene_mut() {
-                    s.invalidate();
-                }
-                self.apply_selection_highlight();
-                Ok(format!("settled {n}/{} object(s)", targets.len()))
+                let line = self.settle_targets(&targets);
+                self.status = line.clone();
+                Ok(line)
             }
             EditorCommand::Set { datum, field, value } if datum == script::SET_SELECTION => {
                 // `set selection <field> <value>` — same fan-out the properties
@@ -7098,6 +9081,7 @@ impl App {
                     // Per-object pseudo-flag overrides (default = re-derive).
                     "scaled" => m.flags.scaled = forge_scale::parse_flag_value(&value)?,
                     "shadow" | "castshadow" | "shadowcaster" => m.flags.shadow = forge_scale::parse_flag_value(&value)?,
+                    "damage" | "damagestate" | "damage_state" | "state" => m.flags.damage = forge_scale::parse_damage_value(&value)?,
                     "spawnseq" | "spawn_seq" => m.spawn_seq = value.parse().map_err(|_| "spawnseq must be an int")?,
                     "scale" => {
                         // via X330: needs the "scale" label, then encode into spawn_seq.
@@ -7136,17 +9120,26 @@ impl App {
                 match c {
                     CameraCmd::To(p) => self.camera.pos = glam::Vec3::from(p),
                     CameraCmd::Nudge(d) => self.camera.pos += glam::Vec3::from(d),
+                    // #fp-frame  Print-only diagnostic; see the script host.
+                    CameraCmd::Fov(deg) => {
+                        if let Some(d) = deg.filter(|d| (1.0..179.0).contains(d)) {
+                            self.camera.fov_y = d.to_radians();
+                        }
+                        return Ok(format!("camera fov_y {:.2}°", self.camera.fov_y.to_degrees()));
+                    }
                     CameraCmd::LookAt(p) => {
                         let to = (glam::Vec3::from(p) - self.camera.pos).normalize_or_zero();
                         self.camera.yaw = to.y.atan2(to.x);
                         self.camera.pitch = to.z.clamp(-1.0, 1.0).asin();
                     }
                     CameraCmd::Spawn => {
-                        if let Some((pos, yaw, pitch)) = self.variant_spawn_camera().or_else(|| self.objscene().and_then(|s| s.spawn_camera_pose())) {
-                            self.camera.pos = pos;
-                            self.camera.yaw = yaw;
-                            self.camera.pitch = pitch;
+                        if let Some(p) = self.spawn_camera_any() {
+                            self.camera.pos = p.pos;
+                            self.camera.yaw = p.yaw;
+                            self.camera.pitch = p.pitch;
+                            return Ok(format!("camera spawn: {}", p.describe()));
                         }
+                        return Ok("camera spawn: no spawn / starting location / soft ceiling / bounds source".into());
                     }
                     CameraCmd::Frame => self.frame_on_player(),
                     CameraCmd::Get => {
@@ -7372,7 +9365,7 @@ impl App {
                 // #map-picker: say which GAME + kind the picker is showing (the rows marked *),
                 // so a script can see the same two-level grouping the panel does.
                 let count = |g: mapcat::Game, m: bool| self.map_candidates.iter().filter(|c| c.game == g && c.modded == m).count();
-                let games: Vec<String> = [mapcat::Game::Reach, mapcat::Game::Halo4, mapcat::Game::H2A]
+                let games: Vec<String> = [mapcat::Game::Reach, mapcat::Game::Halo4, mapcat::Game::H2A, mapcat::Game::Halo3]
                     .into_iter()
                     .filter(|g| count(*g, false) + count(*g, true) > 0)
                     .map(|g| format!("{} ({})", g.display_name(), count(g, false) + count(g, true)))
@@ -7418,7 +9411,11 @@ impl App {
                 self.screenshot_to(std::path::Path::new(&path));
                 Ok(format!("screenshot -> {path}"))
             }
-            EditorCommand::Wait => Ok("wait: interactive load streams over frames; let it settle".into()),
+            // #loadstatus  `wait` cannot BLOCK in the window — scripted commands run on the UI
+            // thread and so does the load drain, so blocking here would stop the very frame that
+            // advances the load (a deadlock, not a slow path). It reports the state instead, so a
+            // caller can poll it, which is the shape that actually works.
+            EditorCommand::Wait => Ok(self.load_status_line()),
             EditorCommand::Pick { delete, radius } => {
                 // Raycast from the LIVE camera forward — "what am I looking at".
                 let dir = self.camera.forward();
@@ -7459,6 +9456,16 @@ impl App {
                 }
             }
             EditorCommand::Echo(t) => Ok(t),
+            // #reach-skin `actor ...`: place / pose / arm Reach character bipeds. The mesh
+            // rebuild happens on the next frame (`update_actors`), so this stays cheap.
+            EditorCommand::Actor(args) => {
+                let cache = self.scene_ctl.as_ref().and_then(|s| s.cache_handle());
+                let Some(scene) = self.scene_ctl.as_ref() else {
+                    return Err("`actor` needs an open Reach map".into());
+                };
+                let native = scene.native_dll();
+                reach_actor::run_actor_command(&args, &mut self.actor_scene, native, cache)
+            }
             EditorCommand::ScreenFx(set) => {
                 if let Some(on) = set {
                     self.forge_fx_enabled = on;
@@ -7519,10 +9526,960 @@ impl App {
                 Ok(format!("settings panel {}", if self.show_settings { "open" } else { "closed" }))
             }
             // #dialogs test hook (print-only): drive the variant browser without a mouse.
+            // #model-import / #4: the external-model workflow, scripted end to end so a headless
+            // regression run can import from an arbitrary folder, move/rotate/scale the model and
+            // then prove the raycast soup followed (settle an object onto it).
+            // #film  Reach Theater saved films: open, describe, draw, extract.
+            EditorCommand::Film { sub, args } => {
+                match sub.as_str() {
+                    "info" | "summary" => {
+                        let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                        Ok(f.summary())
+                    }
+                    "card" | "details" => {
+                        let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                        let label = self.film_base_map_label();
+                        Ok(film_ui::metadata_rows(f, false, label.as_deref())
+                            .into_iter()
+                            .map(|(k, v)| format!("{k:<18}{v}\n"))
+                            .collect())
+                    }
+                    // #film  `film panel [on|off]` -- the Theater side panel. Scriptable so the
+                    // layout can be verified without a mouse.
+                    "panel" | "players-panel" => {
+                        self.film_panel_open = match args.first().map(|s| s.as_str()) {
+                            Some("on") | Some("open") | Some("1") => true,
+                            Some("off") | Some("close") | Some("0") => false,
+                            _ => !self.film_panel_open,
+                        };
+                        Ok(format!(
+                            "Theater side panel {}\n",
+                            if self.film_panel_open { "open" } else { "closed" }
+                        ))
+                    }
+                    // #film  `film perf` -- print-only playback instrumentation. A mesh rebuild
+                    // is supposed to be rare; a counter that climbs once per frame is the whole
+                    // actor set being dirtied every frame.
+                    // #death  `film corpses [on|off|N]` -- how many bodies may lie on the ground
+                    // at once. Off draws none, which is what the cost of the feature is measured
+                    // against.
+                    "corpses" | "bodies_dead" | "dead" => {
+                        let d = &mut self.film_driver;
+                        match args.first().map(|s| s.as_str()) {
+                            None | Some("get") | Some("status") => {}
+                            Some("off") | Some("none") | Some("0") => d.corpse_cap = 0,
+                            Some("on") | Some("default") => d.corpse_cap = 14,
+                            // #corpse-fall  print-only, handled below
+                            Some("trace") => {}
+                            Some(x) => {
+                                d.corpse_cap = x.parse::<usize>().map_err(|_| format!("film corpses on|off|<count>, got '{x}'"))?.min(32)
+                            }
+                        }
+                        let mut out = format!(
+                            "corpses: up to {} body/bodies, each left on the ground from its death \
+                             until the tick the recording DESPAWNS it (at least {:.0} s) -- {} drawn at the last frame{}\n",
+                            d.corpse_cap,
+                            film_anim::CORPSE_SECONDS,
+                            d.corpses_shown,
+                            if d.death_clips.is_empty() { String::new() } else { format!("; lying on {}", d.death_clips.join(", ")) }
+                        );
+                        // #corpse-fall  Print-only: where each body goes down, where the
+                        // recording last reports it, and how far above HMS's own collision that
+                        // is. "The ragdolls float midair" has two possible causes that look the
+                        // same on a still, and these three numbers tell them apart.
+                        if args.first().map(|s| s.as_str()) == Some("trace") {
+                            let Some(pb) = self.film_play.as_deref() else {
+                                return Err("film corpses trace: the recording is not decoded yet (film index)".into());
+                            };
+                            let tick = pb.tick.round().max(0.0) as u32;
+                            let traces = pb.corpse_traces();
+                            let drop_to = |p: [f32; 3]| -> Option<f32> {
+                                let sc = self.scene_ctl.as_ref()?;
+                                let o = glam::Vec3::new(p[0], p[1], p[2] + 0.05);
+                                sc.raycast_solid(o, glam::Vec3::NEG_Z, 60.0).map(|t| o.z - t)
+                            };
+                            out.push_str(&format!(
+                                "{} corpse record(s) in the clip; now at tick {tick}. \
+                                 'after' = positions the recording reported AFTER the body went down.\n",
+                                traces.len()
+                            ));
+                            let mut shown = 0usize;
+                            let (mut float_death, mut float_last, mut n_meas) = (0.0f32, 0.0f32, 0usize);
+                            for c in traces.iter() {
+                                let gd = drop_to(c.at_death);
+                                let gl = drop_to(c.last_pos);
+                                if let (Some(a), Some(b)) = (gd, gl) {
+                                    float_death += c.at_death[2] - a;
+                                    float_last += c.last_pos[2] - b;
+                                    n_meas += 1;
+                                }
+                                // #corpse-fall  For a body that is ON SCREEN right now, the z it
+                                // is actually DRAWN at, through the driver's own expression --
+                                // this is the number that proves the body is on the floor.
+                                let now = (tick > c.death_tick).then(|| {
+                                    let age = tick - c.death_tick;
+                                    let z = self.film_driver.corpse_drawn_z(c.net_id, c.at_death, age);
+                                    (z, gd.map(|g| z - g))
+                                });
+                                if shown < 24 || now.is_some() {
+                                    shown += 1;
+                                    out.push_str(&format!(
+                                        "  {:#010x} down at {:>7} z {:7.2} ({}) | last report {:>7} z {:7.2}, after {:>3}, fell {:5.2} \
+                                         | above floor: at-death {}, at-last {}{}\n",
+                                        c.net_id, c.death_tick, c.at_death[2],
+                                        if c.airborne { "airborne" } else { "grounded" },
+                                        c.last_tick, c.last_pos[2], c.reports_after, c.fell,
+                                        gd.map(|g| format!("{:5.2}", c.at_death[2] - g)).unwrap_or_else(|| "  n/a".into()),
+                                        gl.map(|g| format!("{:5.2}", c.last_pos[2] - g)).unwrap_or_else(|| "  n/a".into()),
+                                        match now {
+                                            Some((z, Some(above))) => format!("  | DRAWN NOW at z {z:7.2} = {above:5.2} above the floor"),
+                                            Some((z, None)) => format!("  | DRAWN NOW at z {z:7.2}, floor unknown"),
+                                            None => String::new(),
+                                        },
+                                    ));
+                                }
+                            }
+                            if n_meas > 0 {
+                                out.push_str(&format!(
+                                    "  MEAN height above the floor over {n_meas} bodies: drawn at the death tick {:.2} wu, \
+                                     drawn at the last reported position {:.2} wu\n",
+                                    float_death / n_meas as f32,
+                                    float_last / n_meas as f32
+                                ));
+                            }
+                        }
+                        Ok(out)
+                    }
+                    // #film-perf  `film perf [reset]` -- the FULL Theater frame accounting:
+                    // the wall frame period and `update()` CPU as distributions (p50/p95/p99/max,
+                    // because "laggy" is a p99 complaint), then every stage of a film frame with
+                    // its mean, its share and its own p99. `reset` empties the rolling window so
+                    // a before/after can be measured without restarting the app.
+                    "perf" => {
+                        let [tick_ms, ui_ms] = self.film_frame_ms;
+                        // #bg-throttle  `film perf bg [minimize|restore]` -- what the throttle
+                        // thinks the window's state is, what budget that gives, and how many
+                        // scene frames it has skipped. The two sub-verbs ask the WINDOW to
+                        // minimise or restore itself, which is the only way to exercise the
+                        // hidden path end to end without synthesising user input: it is the app
+                        // commanding its own viewport, the same command the title-bar button
+                        // sends. Print-only diagnostics.
+                        if matches!(args.first().map(|s| s.as_str()), Some("bg") | Some("background")) {
+                            match args.get(1).map(|s| s.as_str()) {
+                                Some("minimize") | Some("minimise") | Some("min") => {
+                                    self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                                }
+                                Some("restore") | Some("show") => {
+                                    self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                    self.egui_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                }
+                                _ => {}
+                            }
+                            let (focused, minimized) = self.egui_ctx.input(|i| {
+                                let v = i.viewport();
+                                (v.focused, v.minimized)
+                            });
+                            let budget = self.gfx.background_budget(focused.unwrap_or(true), minimized.unwrap_or(false));
+                            return Ok(format!(
+                                "window: focused={focused:?} minimized={minimized:?} | setting {} | budget {}\n\
+                                 scene frames: {} drawn, {} skipped by the throttle\n",
+                                if self.gfx.background_throttle { "on" } else { "OFF" },
+                                match budget { Some(d) => format!("{:.0} ms ({:.0} Hz)", d.as_secs_f32() * 1000.0, 1.0 / d.as_secs_f32()), None => "none (not throttled)".into() },
+                                self.bg_drawn, self.bg_skipped
+                            ));
+                        }
+                        // #bg-throttle  `film perf gpu [off]` -- turn the renderer's per-pass GPU
+                        // timestamp queries on and report them. The user asked whether HMS is
+                        // "hogging all the GPU resources"; `update()` CPU being 98% of the frame
+                        // period says it is not, but an inference is not a measurement, so this
+                        // makes the GPU side answerable from the running app.
+                        if matches!(args.first().map(|s| s.as_str()), Some("gpu")) {
+                            let want = args.get(1).map(|s| s.as_str()) != Some("off");
+                            let on = self.renderer.set_gpu_timer(&self.render_state.device, &self.render_state.queue, want);
+                            let mut out = format!(
+                                "GPU timestamps {}\n",
+                                match (want, on) {
+                                    (true, true) => "ON (play a few seconds, then `film perf gpu` again)",
+                                    (true, false) => "UNAVAILABLE: this adapter does not expose TIMESTAMP_QUERY",
+                                    (false, _) => "off",
+                                }
+                            );
+                            if let Some(t) = self.renderer.gpu_timer() {
+                                let (m, p99, max) = t.frame_stats();
+                                out.push_str(&format!("GPU per frame (sum of passes) over {} frames: mean {m:.3} ms  p99 {p99:.3}  max {max:.3}\n", t.frames()));
+                                for (name, ms) in t.report() {
+                                    out.push_str(&format!("  {name:<28} {ms:7.3} ms\n"));
+                                }
+                            }
+                            return Ok(out);
+                        }
+                        if matches!(args.first().map(|s| s.as_str()), Some("reset") | Some("clear")) {
+                            self.fprof.clear();
+                            self.film_driver.prof.clear();
+                            return Ok("film perf: the rolling window is empty; play on and ask again\n".into());
+                        }
+                        let a = &self.actor_scene;
+                        let head = format!(
+                            "actors {} | mesh builds {} (last built {} actors, pending {}) | rebuild flag {}\n\
+                             last frame: film tick (clock + actors) {tick_ms:.2} ms, timeline strip + panel {ui_ms:.2} ms\n",
+                            a.actors.len(),
+                            a.builds,
+                            a.actors_built,
+                            a.last_pending,
+                            a.rebuild
+                        );
+                        // #film-perf  The draw-call census belongs next to the timings: it is the
+                        // quantity any encode-time optimisation has to move, and "render encode"
+                        // was 54% of a Theater frame when this was first measured.
+                        // #bg-throttle  how many frames the background gate has skipped.
+                        let bg = format!(
+                            "background throttle: {} ({} scene frames drawn, {} skipped)\n",
+                            if self.gfx.background_throttle { "on" } else { "OFF (Settings > Graphics)" },
+                            self.bg_drawn, self.bg_skipped
+                        );
+                        Ok(format!("{head}{bg}{}{}\n{}\n", self.fprof.report(), self.film_driver.prof.report(), self.renderer.draw_call_census()))
+                    }
+                    // #film  `film editor [on|off]` -- the Forge editing column, hidden by
+                    // default while a clip is open.
+                    "editor" | "sidebar" => {
+                        self.film_hide_editor = match args.first().map(|s| s.as_str()) {
+                            Some("on") | Some("show") | Some("1") => false,
+                            Some("off") | Some("hide") | Some("0") => true,
+                            _ => !self.film_hide_editor,
+                        };
+                        Ok(format!(
+                            "Forge editing column {}\n",
+                            if self.film_hide_editor { "hidden (the picture gets the width)" } else { "shown" }
+                        ))
+                    }
+                    // #film-stats  `film stats [json]` -- the same numbers the CLI verb and the
+                    // side panel print, scriptable so they can be checked without a mouse.
+                    "stats" | "statistics" => {
+                        if self.film.is_none() {
+                            return Err("film: no film open (film <path>)".into());
+                        }
+                        if self.film_play.is_none() {
+                            return Err("film: the recording is not decoded yet (film index, then wait)".into());
+                        }
+                        if self.film_stats.is_none() {
+                            self.film_compute_stats();
+                        }
+                        match args.first().map(|a| a.as_str()) {
+                            Some("open") | Some("show") => self.film_stats_open = true,
+                            Some("close") | Some("hide") => self.film_stats_open = false,
+                            _ => {}
+                        }
+                        let s = self.film_stats.as_deref().ok_or("film stats: could not compute")?;
+                        Ok(match args.first().map(|a| a.as_str()) {
+                            Some("json") => s.json(),
+                            Some("open") | Some("show") => format!("statistics section open\n{}", s.lines().join("\n")),
+                            Some("close") | Some("hide") => "statistics section closed\n".into(),
+                            _ => s.table(),
+                        })
+                    }
+                    "cast" | "bodies" if self.film_play.is_some() => {
+                        // #film  Every player who had a body, named or not -- the watchable cast,
+                        // which is NOT the film header's roster.
+                        let pb = self.film_play.as_deref().expect("checked");
+                        let mut out = String::new();
+                        for o in pb.index.owner_groups() {
+                            let slot = pb.index.slot_of_owner(o);
+                            let name = slot
+                                .and_then(|s| self.film.as_deref().and_then(|f| {
+                                    f.header.players.iter().find(|p| p.present() && p.index == s as usize)
+                                }))
+                                .map(|p| p.gamertag.clone())
+                                .filter(|g| !g.is_empty());
+                            let tick = pb.tick.round().max(0.0) as u32;
+                            out.push_str(&format!(
+                                "owner {o:>2}  {:<20} {:>2} life(s)  body now {}\n",
+                                name.unwrap_or_else(|| "(not named by this recording)".into()),
+                                pb.index.owner_lives(o),
+                                pb.index
+                                    .entity_for_owner(o, tick)
+                                    .map(|t| format!("{:#010x}", t.net_id))
+                                    .unwrap_or_else(|| "-".into()),
+                            ));
+                        }
+                        out.push_str(&format!("  {}\n", film_ui::roster_coverage(
+                            pb,
+                            self.film.as_deref().map(|f| f.present_players().count()).unwrap_or(0),
+                        )));
+                        Ok(out)
+                    }
+                    "roster" | "players" | "names" => {
+                        let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                        let mut out = String::new();
+                        for p in f.present_players() {
+                            out.push_str(&format!(
+                                "slot {:<2} {:<20} [{:<4}] {}\n",
+                                p.index,
+                                if p.gamertag.is_empty() { "(no gamertag)" } else { p.gamertag.as_str() },
+                                p.service_tag,
+                                film_ui::team_name(p.team)
+                            ));
+                        }
+                        if out.is_empty() {
+                            out.push_str("no player slots are occupied in this film\n");
+                        }
+                        if let Some(pb) = self.film_play.as_ref() {
+                            match pb.index.first_player_tick() {
+                                Some(t) => out.push_str(&format!(
+                                    "first player biped appears at tick {t} ({})\n",
+                                    film_play::fmt_time(t as f32 / 60.0)
+                                )),
+                                None => out.push_str("the entity stream records no player bipeds\n"),
+                            }
+                            for (tick, n) in pb.index.player_population_changes(12) {
+                                out.push_str(&format!("  {} -> {n} alive\n", film_play::fmt_time(tick as f32 / 60.0)));
+                            }
+                        } else {
+                            out.push_str("(run `film index` first for spawn times)\n");
+                        }
+                        Ok(out)
+                    }
+                    "machine" => {
+                        // Explicit, because it names the recording PC's Windows account.
+                        let f = self.film.as_deref().ok_or("film: no film open")?;
+                        Ok(format!("recording machine: {}\n(this is the Windows account and computer name of the PC that recorded the film)\n", f.header.session_id))
+                    }
+                    "scene" | "draw" => {
+                        if self.film.is_none() { return Err("film: no film open (film <path>)".into()) }
+                        self.film_load_scene();
+                        Ok(self.film_status.clone())
+                    }
+                    // #film  playback. The clock and the actor placement are driven by
+                    // `film_tick` on the next frame, so these only move the state.
+                    "index" => {
+                        if self.film.is_none() { return Err("film: no film open".into()) }
+                        self.film_start_index();
+                        Ok("decoding the recording on a worker thread\n".into())
+                    }
+                    "timeline" => {
+                        self.film_timeline_open = true;
+                        self.film_card_open = false; // the transport bar implies you want the view
+                        Ok("timeline shown\n".into())
+                    }
+                    // #reach-hud #crosshair  The three first-person overlays as verbs, so a
+                    // scripted capture can set them -- a toggle reachable only by clicking a
+                    // checkbox cannot be put in a screenshot.
+                    "hud" | "crosshair" | "reticule" | "respawnwidget" => {
+                        let which = sub.to_string();
+                        let pb = self.film_play.as_deref_mut().ok_or("film: the recording is not decoded yet (film index)")?;
+                        let flag = match which.as_str() {
+                            "hud" => &mut pb.hud,
+                            "respawnwidget" => &mut pb.respawn_widget,
+                            _ => &mut pb.crosshair,
+                        };
+                        match args.first().map(|s| s.to_lowercase()) {
+                            Some(w) if w == "on" || w == "1" || w == "yes" => *flag = true,
+                            Some(w) if w == "off" || w == "0" || w == "no" => *flag = false,
+                            Some(w) => return Err(format!("film {which} {w}: expected on | off")),
+                            None => *flag = !*flag,
+                        }
+                        let on = *flag;
+                        match which.as_str() {
+                            "hud" => reach_hud::save_hud_setting(on),
+                            "respawnwidget" => reach_hud::save_respawn_setting(on),
+                            _ => reach_hud::save_crosshair_setting(on),
+                        }
+                        let mut out = format!("film {which}: {}\n", if on { "drawn" } else { "hidden" });
+                        for l in film_ui::hud_field_report() {
+                            out.push_str(&format!("  {l}\n"));
+                        }
+                        Ok(out)
+                    }
+                    // #nametag-mode  `film nametags [always | lookedat | hidden]`. `on` and `off`
+                    // still work, because that is what the verb took while the setting was a
+                    // bool; with no argument it CYCLES the three modes.
+                    "tags" | "nametags" => {
+                        let pb = self.film_play.as_deref_mut().ok_or("film: the recording is not decoded yet (film index)")?;
+                        pb.name_tags = match args.first().map(|s| s.as_str()) {
+                            Some(w) => reach_hud::NameTagMode::parse(w)
+                                .ok_or_else(|| format!("film nametags {w}: expected always | lookedat | hidden"))?,
+                            None => match pb.name_tags {
+                                reach_hud::NameTagMode::Always => reach_hud::NameTagMode::LookedAt,
+                                reach_hud::NameTagMode::LookedAt => reach_hud::NameTagMode::Hidden,
+                                reach_hud::NameTagMode::Hidden => reach_hud::NameTagMode::Always,
+                            },
+                        };
+                        let mode = pb.name_tags;
+                        reach_hud::save_name_tag_mode(mode);
+                        let snapshot = pb.clone();
+                        let tags = film_ui::name_tags(&snapshot, self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]), self.film_driver.cap);
+                        let named = tags.iter().filter(|t| t.named).count();
+                        Ok(format!(
+                            "name tags {}; {} tag(s) at this moment, {named} with a gamertag\n",
+                            mode.keyword(),
+                            tags.len()
+                        ))
+                    }
+                    "camera" | "cam" => {
+                        // #film  `film camera free | first <slot> | follow <slot>`.
+                        let pb = self.film_play.as_deref_mut().ok_or(
+                            "film: the recording is not decoded yet (film index, then wait)",
+                        )?;
+                        // A BARE `film camera` REPORTS; it does not change the camera. Every
+                        // other verb in this handler answers a no-argument call with its state,
+                        // and defaulting to "free" here meant that merely asking which camera was
+                        // live dropped a first-person or follow camera on the floor.
+                        if args.is_empty() {
+                            let status = film_play::camera_status(pb);
+                            return Ok(match film_play::solve_camera(pb) {
+                                Some(p) => format!(
+                                    "{status}\n  {} at ({:.2}, {:.2}, {:.2}) yaw {:.1} pitch {:.1}\n",
+                                    p.label, p.pos[0], p.pos[1], p.pos[2], p.yaw.to_degrees(), p.pitch.to_degrees()
+                                ),
+                                None => format!("{status}\n"),
+                            });
+                        }
+                        let what = args.first().map(|s| s.as_str()).unwrap_or("free");
+                        let slot = || -> Result<u8, String> {
+                            args.get(1)
+                                .ok_or_else(|| format!("film camera {what} <player slot>"))?
+                                .parse::<u8>()
+                                .map_err(|_| format!("film camera {what} <player slot 0..15>"))
+                        };
+                        pb.camera = match what {
+                            "free" | "off" | "none" => film_play::FilmCamera::Free,
+                            "first" | "fp" | "firstperson" | "eyes" => {
+                                film_play::FilmCamera::FirstPerson(slot()?)
+                            }
+                            "follow" | "chase" | "third" => film_play::FilmCamera::Follow(slot()?),
+                            // Keyed on the OWNER GROUP rather than the header slot, so a player
+                            // the recording never named is reachable from a script too. Additive:
+                            // `first` and `follow` are unchanged.
+                            "firstbody" | "fpbody" => film_play::FilmCamera::FirstPersonOwner(slot()?),
+                            "followbody" | "chasebody" => film_play::FilmCamera::FollowOwner(slot()?),
+                            // #film  The follow orbit, scriptable so the framing is testable
+                            // without a mouse: `film camera orbit <yaw deg> <elev deg> [dist wu]`.
+                            "orbit" => {
+                                let num = |i: usize| -> Option<f32> { args.get(i)?.parse::<f32>().ok() };
+                                let y = num(1).ok_or("film camera orbit <yaw deg> <elev deg> [distance wu]")?;
+                                let e = num(2).ok_or("film camera orbit <yaw deg> <elev deg> [distance wu]")?;
+                                pb.rig.yaw_off = y.to_radians();
+                                pb.rig.elev = e
+                                    .to_radians()
+                                    .clamp(-film_play::FOLLOW_PITCH_LIMIT.to_radians(), film_play::FOLLOW_PITCH_LIMIT.to_radians());
+                                if let Some(d) = num(3) {
+                                    pb.rig.dist = d.clamp(film_play::FOLLOW_DIST_MIN, film_play::FOLLOW_DIST_MAX);
+                                }
+                                pb.camera
+                            }
+                            "recenter" | "center" | "centre" => {
+                                pb.rig.recenter();
+                                pb.camera
+                            }
+                            other => {
+                                return Err(format!(
+                                    "film camera {other}: expected free | first <slot> | follow <slot>                                      | firstbody <owner> | followbody <owner>"
+                                ))
+                            }
+                        };
+                        // Apply it now so a capture taken straight after this verb sees it,
+                        // rather than only on the next frame.
+                        let pose = film_play::solve_camera(pb);
+                        let status = film_play::camera_status(pb);
+                        if let Some(p) = &pose {
+                            self.camera.pos = glam::Vec3::new(p.pos[0], p.pos[1], p.pos[2]);
+                            self.camera.yaw = p.yaw;
+                            self.camera.pitch = p.pitch;
+                        }
+                        Ok(match pose {
+                            Some(p) => format!(
+                                "{status}\n  {} at ({:.2}, {:.2}, {:.2}) yaw {:.1} pitch {:.1}\n",
+                                p.label,
+                                p.pos[0],
+                                p.pos[1],
+                                p.pos[2],
+                                p.yaw.to_degrees(),
+                                p.pitch.to_degrees()
+                            ),
+                            None => format!("{status}\n"),
+                        })
+                    }
+                    "seek" | "step" | "speed" | "play" | "pause" | "show" => {
+                        // The mutable borrow is scoped to the mutation ONLY. Everything after it
+                        // reads through a shared borrow of the same field, so this handler never
+                        // copies the index -- cloning a `Playback` deep-copies every entity track
+                        // of every tick, which is gigabytes on a long clip.
+                        {
+                        let pb = self.film_play.as_deref_mut().ok_or(
+                            "film: the recording is not decoded yet (film index, then wait)",
+                        )?;
+                        match sub.as_str() {
+                            "seek" => {
+                                let v: f32 = args.first().ok_or("film seek <seconds>")?.parse().map_err(|_| "film seek <seconds>")?;
+                                pb.playing = false;
+                                pb.seek_seconds(v);
+                            }
+                            "step" => pb.step(args.first().and_then(|s| s.parse().ok()).unwrap_or(1)),
+                            "speed" => {
+                                let v: f32 = args.first().ok_or("film speed <x>")?.parse().map_err(|_| "film speed <x>")?;
+                                pb.speed = v.clamp(0.25, 4.0);
+                            }
+                            "play" => pb.playing = true,
+                            "pause" => pb.playing = false,
+                            _ => {}
+                        }
+                        }
+                        // Two DISJOINT shared borrows: the playback and the driver are separate
+                        // fields of `self`.
+                        let pb = self.film_play.as_deref().expect("checked just above");
+                        let driver = &self.film_driver;
+                        let mut out = format!("{}\n", pb.status());
+                        if sub == "show" {
+                            // #death The corpses are listed with the living: they are on screen,
+                            // so a script (and a reader of this log) has to be able to find them.
+                            for p in pb.frame().iter().take(24).chain(pb.corpses(driver.corpse_cap).iter()) {
+                                out.push_str(&format!(
+                                    "  entity {:#010x} type {:>2} at ({:7.2}, {:7.2}, {:7.2}) yaw {:6.1}{}\n",
+                                    p.net_id, p.entity_type, p.pos[0], p.pos[1], p.pos[2], p.yaw,
+                                    match p.dead_ticks {
+                                        Some(a) => format!("  DEAD {:.1}s", a as f32 / 60.0),
+                                        None => String::new(),
+                                    }
+                                ));
+                            }
+                        }
+                        if sub == "show" || sub == "bodies" {
+                            // #film-anim: what each drawn body is DOING, and where that came from.
+                            // Recomputed from `pb` at THIS tick, never read back from whatever the
+                            // last rendered frame left behind -- a scripted `film seek` then
+                            // `film show` runs between frames, so a cached answer is a tick stale.
+                            for l in driver.body_lines(pb) {
+                                out.push_str(&format!("  {l}\n"));
+                            }
+                            if let Some(vt) = &driver.vehicles {
+                                let tick = pb.tick.round().max(0.0) as u32;
+                                // #vehicle-rot #vehicle-damage  The whole placement, not just the
+                                // heading: TILT is the quantity the old yaw-only draw discarded,
+                                // and `dmg` is the recorded damage state (W = a wreck the engine
+                                // had not collected yet).
+                                let wreck = |net: u32| driver.vehicle_damage_at(net, tick).1;
+                                for (v, pos, orient) in vt.to_draw_at_with(&pb.index, tick, &wreck).iter().take(16) {
+                                    let (st, wr) = driver.vehicle_damage_at(v.net_id, tick);
+                                    out.push_str(&format!(
+                                        "  vehicle {:#010x} {:<14} at ({:7.2}, {:7.2}, {:7.2}) yaw {:6.1} tilt {:5.1} dmg {}{} {}\n",
+                                        v.net_id, v.name, pos[0], pos[1], pos[2],
+                                        orient.map(|(f, _)| f[1].atan2(f[0]).to_degrees()).unwrap_or(f32::NAN),
+                                        orient.map(|(_, u)| film_vehicle::tilt_degrees(u)).unwrap_or(f32::NAN),
+                                        forge_scale::damage_state_name(st),
+                                        if wr { " W" } else { "" },
+                                        // #film-vehid  A vehicle identified by the definition it
+                                        // states need not have a Forge copy at all, and printing
+                                        // the distance to one that does not exist as `inf wu`
+                                        // would read like a decode failure.
+                                        if v.spawn_error.is_finite() {
+                                            format!("spawn-match {:.2} wu", v.spawn_error)
+                                        } else {
+                                            "named by its own definition; the variant places no copy".to_string()
+                                        }
+                                    ));
+                                }
+                                for r in vt.rides.iter().take(24) {
+                                    out.push_str(&format!(
+                                        "  ride: body {:#010x} in vehicle {:#010x} ({} ..) for {:.1}s{}\n",
+                                        r.biped_net_id, r.vehicle_net_id,
+                                        film_play::fmt_time(r.from_tick as f32 / 60.0), r.seconds(),
+                                        if r.covers(tick) { "  <-- NOW" } else { "" }
+                                    ));
+                                }
+                            }
+                        }
+                        out.push_str(&format!("  {}\n", driver.caption(pb)));
+                        Ok(out)
+                    }
+                    // #film-action  Print-only: every assassination the recording STATES, and for
+                    // each one everything the draw path needs in order to stage it -- whether
+                    // both parties have a track, whether the window covers the tick on screen,
+                    // and which clip names each side will be asked for. "The assassinations do
+                    // not play" has five possible causes and this says which one it is.
+                    "assassinations" | "assn" | "sync" => {
+                        let pb = self.film_play.as_deref().ok_or(
+                            "film: the recording is not decoded yet (film index, then wait)",
+                        )?;
+                        let tick = pb.tick.round().max(0.0) as u32;
+                        let list = pb.assassinations();
+                        let mut out = format!(
+                            "{} decoded assassination(s); now at tick {tick} ({:.2}s).                              Window = {} ticks from the incident.\n",
+                            list.len(),
+                            tick as f32 / 60.0,
+                            film_anim::SYNC_TICKS
+                        );
+                        let d = &self.film_driver;
+                        out.push_str(&format!(
+                            "  driver: {} row(s) prepared, {} body(ies) staged at the last frame,                              clip missing so far: {}\n",
+                            d.sync.len(),
+                            d.sync_shown,
+                            d.sync_clip_missing
+                        ));
+                        for a in list.iter().take(40) {
+                            let tr = |id: Option<u32>| {
+                                id.and_then(|i| pb.index.tracks.iter().find(|t| t.net_id == i))
+                            };
+                            let who = |id: Option<u32>| match (id, tr(id)) {
+                                (None, _) => "none".to_string(),
+                                (Some(i), None) => format!("{i:#x} NO TRACK"),
+                                (Some(i), Some(t)) => format!(
+                                    "{i:#x} {} ({}..{}){}",
+                                    d.biped_of
+                                        .get(&i)
+                                        .map(|b| b.rsplit('\\').next().unwrap_or(b).to_string())
+                                        .unwrap_or_else(|| "<biped unresolved>".into()),
+                                    t.first_tick,
+                                    t.last_tick,
+                                    if t.positions.is_empty() { " NO POSITIONS" } else { "" }
+                                ),
+                            };
+                            out.push_str(&format!(
+                                "  tick {:>7} ({:>7.2}s) {:<30} {}  attacker {}  victim {}\n",
+                                a.tick,
+                                a.tick as f32 / 60.0,
+                                a.incident,
+                                if a.covers(tick) { "<-- COVERS NOW" } else { "" },
+                                who(a.attacker),
+                                who(a.victim),
+                            ));
+                        }
+                        Ok(out)
+                    }
+                    "extract" => {
+                        if self.film.is_none() { return Err("film: no film open (film <path>)".into()) }
+                        match args.first().map(|s| s.as_str()) {
+                            Some("variant") | Some("mvar") | Some("map") => {
+                                self.film_extract_map_variant();
+                                Ok(self.film_status.clone())
+                            }
+                            Some("gametype") | Some("gv") | Some("game") => {
+                                self.film_extract_game_variant();
+                                Ok(self.film_status.clone())
+                            }
+                            Some("both") | None => {
+                                self.film_extract_map_variant();
+                                let a = self.film_status.clone();
+                                self.film_extract_game_variant();
+                                Ok(format!("{a}\n{}", self.film_status))
+                            }
+                            Some(x) => Err(format!("film extract {x}: expected variant | gametype | both")),
+                        }
+                    }
+                    "records" | "stream" => {
+                        let path = self.film_path.clone().ok_or("film: no film open")?;
+                        let f = film::open(&path).map_err(|e| e.to_string())?;
+                        let (mut tick, mut other) = (0usize, 0usize);
+                        for r in &f.data.records {
+                            if r.kind == film::RecordKind::Tick { tick += 1 } else { other += 1 }
+                        }
+                        let total: usize = f.data.records.iter().map(|r| r.len).sum();
+                        Ok(format!(
+                            "{} records ({tick} tick, {other} other), {} payload bytes, framing {}, flmh says {} ticks\n",
+                            f.data.records.len(), total,
+                            if f.data.framing_exact { "exact" } else { "BROKEN" },
+                            f.header.tick_count
+                        ))
+                    }
+                    "folders" => {
+                        let dirs = Self::film_folders();
+                        if dirs.is_empty() { return Ok("no MCC saved-film folders found\n".into()) }
+                        Ok(dirs.iter().map(|d| format!("{}\n", d.display())).collect())
+                    }
+                    "browse" | "open" => { self.open_film_browser(); Ok("film browser open".into()) }
+                    other => {
+                        // Anything else is a path.
+                        let path = std::path::PathBuf::from(other);
+                        if !path.is_file() { return Err(format!("film: no such file '{}'", path.display())) }
+                        self.open_film(path);
+                        match self.film.as_deref() {
+                            Some(f) => {
+                                let label = self.film_base_map_label();
+                                Ok(film_ui::metadata_rows(f, false, label.as_deref())
+                                    .into_iter()
+                                    .map(|(k, v)| format!("{k:<18}{v}\n"))
+                                    .collect())
+                            }
+                            None => Err(self.film_status.clone()),
+                        }
+                    }
+                }
+            }
+            EditorCommand::ImportModel { sub, args } => {
+                let f = |k: usize| -> Result<f32, String> {
+                    args.get(k)
+                        .and_then(|v| numfield::parse_signed(v))
+                        .map(|v| v as f32)
+                        .ok_or_else(|| format!("import {sub}: expected {} number(s)", if sub.eq_ignore_ascii_case("scale") { 1 } else { 3 }))
+                };
+                // The verb that is not a keyword is a PATH ("import /home/u/x.obj").
+                let key = sub.to_lowercase();
+                match key.as_str() {
+                    // Tools > Import geometry (the panel that holds the transform fields).
+                    "panel" | "window" => {
+                        self.show_import_geom = !matches!(args.first().map(|s| s.to_lowercase()).as_deref(), Some("off") | Some("0") | Some("false"));
+                        Ok(format!("import panel {}", if self.show_import_geom { "open" } else { "closed" }))
+                    }
+                    "browse" | "dialog" | "pick" => {
+                        self.show_import_geom = true;
+                        self.open_model_browser();
+                        let dir = self.variant_browser_dir.clone().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
+                        Ok(format!("model browser open in {dir} ({} entries)", self.variant_browser_listing.len()))
+                    }
+                    "list" | "ls" => {
+                        if self.imports.is_empty() {
+                            return Ok("no imported models".into());
+                        }
+                        let mut out = format!("{} imported model(s), {} world tris:", self.imports.len(), self.import_tris.len());
+                        for (i, m) in self.imports.iter().enumerate() {
+                            let e = m.euler_deg();
+                            let c = m.world_center();
+                            out += &format!(
+                                "\n  [{i}]{} {} pos=({:.3}, {:.3}, {:.3}) rot=({:.1}, {:.1}, {:.1}) scale={:.4} tris={} centre=({:.2}, {:.2}, {:.2}) path={}",
+                                if self.sel_import == Some(i) { "*" } else { " " },
+                                m.name, m.pos[0], m.pos[1], m.pos[2], e[0], e[1], e[2], m.scale, m.base_tris.len(),
+                                c.x, c.y, c.z, m.path.display()
+                            );
+                        }
+                        Ok(out)
+                    }
+                    "select" | "sel" => {
+                        let i: usize = args.first().ok_or("import select <n>")?.parse().map_err(|_| "import select <n>")?;
+                        if i >= self.imports.len() {
+                            return Err(format!("import select {i}: only {} imported", self.imports.len()));
+                        }
+                        self.select_import(i);
+                        Ok(format!("selected imported model [{i}] {} (datum 0x{:08X})", self.imports[i].name, extimport::import_datum(i)))
+                    }
+                    "clear" => { self.clear_imports(); Ok("cleared every imported model".into()) }
+                    "remove" | "delete" | "del" => {
+                        let i = match args.first() {
+                            Some(v) => v.parse::<usize>().map_err(|_| "import remove [n]")?,
+                            None => self.sel_import.ok_or("import remove: nothing selected")?,
+                        };
+                        if i >= self.imports.len() {
+                            return Err(format!("import remove {i}: only {} imported", self.imports.len()));
+                        }
+                        self.remove_import(i);
+                        Ok(self.spawn_status.clone())
+                    }
+                    "moveto" | "move" | "rotate" | "rot" | "scale" => {
+                        let i = self.sel_import.filter(|i| *i < self.imports.len()).ok_or("no imported model selected (import select <n>)")?;
+                        match key.as_str() {
+                            "moveto" => { let (x, y, z) = (f(0)?, f(1)?, f(2)?); self.imports[i].pos = [x, y, z]; }
+                            "move" => {
+                                let (x, y, z) = (f(0)?, f(1)?, f(2)?);
+                                let p = self.imports[i].pos;
+                                self.imports[i].pos = [p[0] + x, p[1] + y, p[2] + z];
+                            }
+                            "rotate" | "rot" => {
+                                let ax = args.first().map(|s| s.to_lowercase()).ok_or("import rotate <x|y|z> DEG")?;
+                                let k = match ax.as_str() { "x" | "roll" => 0, "y" | "pitch" => 1, "z" | "yaw" => 2, o => return Err(format!("import rotate: axis x|y|z, got '{o}'")) };
+                                let deg = args.get(1).and_then(|v| numfield::parse_signed(v)).ok_or("import rotate <x|y|z> DEG")? as f32;
+                                // COMPOSE about the world axis, like `rotate <datum> <axis> DEG`,
+                                // so repeated turns add up instead of overwriting the angle.
+                                let q = glam::Quat::from_axis_angle([glam::Vec3::X, glam::Vec3::Y, glam::Vec3::Z][k], deg.to_radians());
+                                let m = &mut self.imports[i];
+                                m.fwd = (q * glam::Vec3::from(m.fwd)).into();
+                                m.up = (q * glam::Vec3::from(m.up)).into();
+                            }
+                            _ => {
+                                let v = args.first().and_then(|v| numfield::parse_signed(v)).ok_or("import scale <f>")? as f32;
+                                if !(v.is_finite() && v > 0.0) { return Err("import scale: must be > 0".into()); }
+                                self.imports[i].scale = v;
+                            }
+                        }
+                        self.import_dirty = true;
+                        self.refresh_import_transforms();
+                        self.apply_selection_highlight();
+                        let m = &self.imports[i];
+                        let e = m.euler_deg();
+                        Ok(format!(
+                            "[{i}] {}: pos=({:.3}, {:.3}, {:.3}) rot=({:.1}, {:.1}, {:.1}) scale={:.4} — {} world tris",
+                            m.name, m.pos[0], m.pos[1], m.pos[2], e[0], e[1], e[2], m.scale, self.import_tris.len()
+                        ))
+                    }
+                    // Anything else is the FILE to import.
+                    _ => {
+                        // Re-join so a path with spaces still works ("import /home/u/my models/a.obj").
+                        let mut raw = sub.clone();
+                        if !args.is_empty() {
+                            raw = format!("{raw} {}", args.join(" "));
+                        }
+                        let path = std::path::PathBuf::from(raw.trim());
+                        if !path.is_file() {
+                            return Err(format!("import: no such file '{}'", path.display()));
+                        }
+                        // A script wants the result in the reply, not a "reading…" line, so this
+                        // path reads the file inline (see `import_model_file_blocking`).
+                        if !self.import_model_file_blocking(&path) {
+                            return Err(self.spawn_status.clone());
+                        }
+                        Ok(self.spawn_status.clone())
+                    }
+                }
+            }
+            // File ▸ Open recent, scripted (recent.rs). Print-only apart from the verbs that
+            // do exactly what clicking a menu entry does.
+            EditorCommand::RecentDbg { sub, a1, a2 } => {
+                // `recent <verb> <a1> <rest...>`: the path argument is a1 + the rest of the line.
+                let joined = |a1: &Option<String>, a2: &Option<String>| -> Option<String> {
+                    match (a1, a2) {
+                        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+                        (Some(a), None) => Some(a.clone()),
+                        _ => None,
+                    }
+                };
+                // An entry by index into `recent list`, or by path.
+                let pick = |app: &Self, key: &str| -> Option<recent::RecentItem> {
+                    if let Ok(n) = key.parse::<usize>() {
+                        return app.recent.items().get(n).cloned();
+                    }
+                    app.recent.items().iter().find(|i| i.path == key || i.name == key).cloned()
+                };
+                match sub.as_str() {
+                    "list" | "status" | "" => {
+                        let where_ = recent::RecentStore::file_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(no settings dir)".into());
+                        let mut out = format!("recent: {} item(s), cap {}/kind -> {where_}\n", self.recent.len(), recent::PER_KIND_CAP);
+                        for (i, it) in self.recent.items().iter().enumerate() {
+                            out.push_str(&format!(
+                                "{i:2}  {:<8}  {:<44}  {}{}\n",
+                                format!("{:?}", it.kind).to_lowercase(),
+                                it.menu_label(),
+                                it.path,
+                                if it.exists() { "" } else { "   [MISSING]" }
+                            ));
+                        }
+                        Ok(out)
+                    }
+                    // What the submenu draws, in its own grouping.
+                    "menu" => {
+                        self.recent_refresh_missing();
+                        if self.recent.is_empty() {
+                            return Ok("Open recent: Nothing opened yet.".into());
+                        }
+                        let mut out = format!("Open recent ({})\n", self.recent.len());
+                        for kind in recent::RecentKind::ALL {
+                            let items: Vec<_> = self.recent.of_kind(kind).collect();
+                            if items.is_empty() { continue; }
+                            out.push_str(&format!("  {}\n", kind.group_label()));
+                            for it in items {
+                                let gone = self.recent_missing.contains(&it.path);
+                                out.push_str(&format!("    {}{}\n", if gone { "✕ " } else { "" }, it.menu_label()));
+                            }
+                        }
+                        let n = self.recent_missing.len();
+                        if n > 0 { out.push_str(&format!("  Remove {n} missing item(s)\n")); }
+                        out.push_str("  Clear recent items\n");
+                        Ok(out)
+                    }
+                    "open" => {
+                        let key = joined(&a1, &a2).ok_or("recent open <n|path>")?;
+                        let it = pick(self, &key).ok_or_else(|| format!("recent open: no entry '{key}'"))?;
+                        let gone = !it.exists();
+                        self.recent_open(it.clone());
+                        Ok(if gone {
+                            format!("recent open: '{}' is MISSING ({}) - the 'file is no longer there' window is up", it.display_name(), it.path)
+                        } else {
+                            format!("recent open: {:?} {} -> {}", it.kind, it.display_name(), it.path)
+                        })
+                    }
+                    // Record an entry without opening it (how a test seeds the list, and how the
+                    // missing-file path is reached: note a file, then move it away).
+                    "note" | "add" => {
+                        let kind = match a1.as_deref().unwrap_or("").to_lowercase().as_str() {
+                            "variant" | "mvar" => recent::RecentKind::Variant,
+                            "map" => recent::RecentKind::Map,
+                            "film" | "mov" => recent::RecentKind::Film,
+                            "model" | "obj" => recent::RecentKind::Model,
+                            _ => return Err("recent note <variant|map|film|model> <path>".into()),
+                        };
+                        let path = a2.clone().ok_or("recent note <variant|map|film|model> <path>")?;
+                        let p = std::path::PathBuf::from(&path);
+                        let game = match kind {
+                            recent::RecentKind::Model => String::new(),
+                            _ => self
+                                .selected_map
+                                .and_then(|i| self.map_candidates.get(i))
+                                .map(|c| c.game.display_name().to_string())
+                                .unwrap_or_default(),
+                        };
+                        self.recent_note(recent::RecentItem::new(kind, &p, &game, ""));
+                        self.model_recent_files = self.recent.paths_of_kind(recent::RecentKind::Model);
+                        Ok(format!("recent note: {:?} {path} ({} item(s))", kind, self.recent.len()))
+                    }
+                    "remove" | "forget" => {
+                        let key = joined(&a1, &a2).ok_or("recent remove <n|path>")?;
+                        let it = pick(self, &key).ok_or_else(|| format!("recent remove: no entry '{key}'"))?;
+                        self.recent.remove(it.kind, &it.path);
+                        self.recent.save();
+                        self.recent_missing.remove(&it.path);
+                        self.model_recent_files = self.recent.paths_of_kind(recent::RecentKind::Model);
+                        Ok(format!("recent remove: {} ({} left)", it.path, self.recent.len()))
+                    }
+                    "missing" => {
+                        self.recent_refresh_missing();
+                        if self.recent_missing.is_empty() {
+                            return Ok(format!("recent missing: none of the {} item(s) are gone", self.recent.len()));
+                        }
+                        let mut v: Vec<&String> = self.recent_missing.iter().collect();
+                        v.sort();
+                        Ok(format!("recent missing: {}\n{}", v.len(), v.iter().map(|p| format!("  {p}")).collect::<Vec<_>>().join("\n")))
+                    }
+                    // The two buttons of the "that file is no longer there" window, so the
+                    // missing-file path can be driven end to end from a script.
+                    "gone" | "dismiss" => {
+                        let remove = matches!(a1.as_deref(), Some("remove") | Some("forget") | Some("drop"));
+                        Ok(format!("recent gone: {}", self.recent_gone_answer(remove)))
+                    }
+                    "sweep" | "removemissing" => {
+                        let n = self.recent.remove_missing();
+                        self.recent.save();
+                        self.recent_refresh_missing();
+                        self.model_recent_files = self.recent.paths_of_kind(recent::RecentKind::Model);
+                        Ok(format!("recent sweep: removed {n} missing item(s), {} left", self.recent.len()))
+                    }
+                    "clear" => {
+                        self.recent.clear();
+                        self.recent.save();
+                        self.recent_missing.clear();
+                        self.model_recent_files.clear();
+                        Ok("recent clear: the list is empty".into())
+                    }
+                    // Re-read the file from disk (proves what was PERSISTED, not just held).
+                    "reload" => {
+                        self.recent = recent::RecentStore::load();
+                        self.recent_refresh_missing();
+                        Ok(format!("recent reload: {} item(s) read back from disk", self.recent.len()))
+                    }
+                    other => Err(format!("unknown recent verb '{other}' (list|menu|open|note|remove|missing|sweep|clear|reload)")),
+                }
+            }
             EditorCommand::DialogDbg { sub, a1, a2 } => {
                 match sub.as_str() {
                     "open" => self.open_variant_browser(),
+                    // #model-import: the model-purpose browser, for the scripted dialog capture.
+                    "models" | "model" | "import" => self.open_model_browser(),
                     "saveas" => self.save_variant_as(),
+                    // #xgame File > "Convert variant to another game...", so the modal can be
+                    // opened and captured from a script (`dialog convert` then `dialog shot`)
+                    // with no pointer or keyboard input synthesised anywhere.
+                    "convert" | "xgame" | "convertvariant" => {
+                        self.open_convert_variant();
+                        if let Some(p) = a1.as_deref() { self.xgame.load_source(std::path::PathBuf::from(p)); }
+                        if let Some(g) = a2.as_deref().and_then(xgame::game_from_str) {
+                            self.xgame.target_game = g;
+                            self.xgame.target_canvas = self.xgame.canvas_list(g).first().cloned().unwrap_or_default();
+                            self.xgame.preview = None;
+                        }
+                        return Ok(format!("convert dialog open: {}", self.xgame.status));
+                    }
+                    "convertpreview" => {
+                        if !self.show_convert_variant { return Err("open it first: dialog convert <src.mvar> [game]".into()); }
+                        if let Some(c) = a1.as_deref() { self.xgame.target_canvas = c.to_string(); self.xgame.preview = None; }
+                        self.xgame.dry_run();
+                        return Ok(self.xgame.status.clone());
+                    }
                     "savebrowser" | "save" => {
                         self.open_variant_save_browser();
                         if let Some(n) = &a1 { self.variant_browser_filename = n.clone(); }
@@ -7539,6 +10496,110 @@ impl App {
                         let p = a1.as_deref().ok_or("dialog shot <path>")?;
                         self.egui_shot_request = Some(std::path::PathBuf::from(p));
                     }
+                    // Settings ▸ Controls & keyboard, scriptable (print-only test hooks), so the
+                    // rebinding page, a live capture and a reported clash can all be driven and
+                    // screenshotted without a human at the keyboard.
+                    "keybinds" | "controls" => {
+                        self.show_keybinds = !matches!(a1.as_deref(), Some("off") | Some("0"));
+                        if !self.show_keybinds {
+                            self.key_capture = None;
+                            self.keys.listening = false;
+                        }
+                        return Ok(format!("controls page {}", if self.show_keybinds { "open" } else { "closed" }));
+                    }
+                    "keypreset" => {
+                        let want = a1.as_deref().ok_or("dialog keypreset right|left|leftcluster|default")?.to_ascii_lowercase();
+                        let p = match want.as_str() {
+                            "right" | "righthanded" | "default" => keybinds::Preset::RightHanded,
+                            "left" | "lefthanded" | "arrows" | "leftarrows" => keybinds::Preset::LeftHandedArrows,
+                            "leftcluster" | "ijkl" => keybinds::Preset::LeftHandedCluster,
+                            x => return Err(format!("dialog keypreset right|left|leftcluster, got '{x}'")),
+                        };
+                        self.keys = keybinds::Keybinds::of(p);
+                        let saved = self.keys.save().map(|p| p.display().to_string()).unwrap_or_else(|e| format!("NOT saved: {e}"));
+                        self.keybind_msg = Some(format!("Applied the \"{}\" controls.", p.label()));
+                        return Ok(format!("controls preset {} ({saved})", p.label()));
+                    }
+                    // `dialog keybind <action-id> <spec> [slot]` — set one binding outright
+                    // ("cam_forward Up", "undo Ctrl+Z", "select_all pos:Q").
+                    "keybind" => {
+                        // `<action-id>` or `<action-id>:1` for the alternative slot.
+                        let raw = a1.as_deref().ok_or("dialog keybind <action-id>[:slot] <spec>")?;
+                        let (id, slot) = match raw.split_once(':') {
+                            Some((n, s)) => (n, s.parse::<usize>().unwrap_or(0)),
+                            None => (raw, 0),
+                        };
+                        let a = keybinds::Action::from_id(id)
+                            .ok_or_else(|| format!("dialog keybind: '{id}' is not an action id"))?;
+                        let spec = a2.as_deref().ok_or("dialog keybind <action-id>[:slot] <spec>")?;
+                        let b = keybinds::Binding::parse(spec)
+                            .ok_or_else(|| format!("dialog keybind: '{spec}' is not a key combination"))?;
+                        let mut bind = self.keys.bind(a);
+                        bind.set(slot.min(1), b);
+                        self.keys.set_bind(a, bind);
+                        let saved = self.keys.save().map(|p| p.display().to_string()).unwrap_or_else(|e| format!("NOT saved: {e}"));
+                        let clash = self.keys.conflicts().iter().map(|c| c.describe()).collect::<Vec<_>>().join("; ");
+                        return Ok(format!(
+                            "{id} = {} ({saved}){}",
+                            self.keys.bind(a).label(),
+                            if clash.is_empty() { String::new() } else { format!("\nCONFLICT {clash}") }
+                        ));
+                    }
+                    // `dialog keycapture <action-id> [slot]` — put one row into its
+                    // "press a key…" state, exactly as clicking it does.
+                    "keycapture" => {
+                        let id = a1.as_deref().ok_or("dialog keycapture <action-id> [slot]")?;
+                        let a = keybinds::Action::from_id(id)
+                            .ok_or_else(|| format!("dialog keycapture: '{id}' is not an action id"))?;
+                        let slot: usize = a2.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0);
+                        self.show_keybinds = true;
+                        self.keybind_msg = None;
+                        self.key_capture = Some(keybinds::Capture::new(a, slot.min(1)));
+                        return Ok(format!("capturing a key for {id} (slot {slot})"));
+                    }
+                    // `dialog keyget [action-id]` — the whole table, or one row.
+                    "keyget" => {
+                        let mut out = format!("preset {}\n", self.keys.matched_preset().label());
+                        for a in keybinds::Action::ALL {
+                            if let Some(id) = a1.as_deref() {
+                                if a.id() != id {
+                                    continue;
+                                }
+                            }
+                            out.push_str(&format!("{:<20} {}\n", a.id(), self.keys.bind(a).label()));
+                        }
+                        for c in self.keys.conflicts() {
+                            out.push_str(&format!("CONFLICT {}\n", c.describe()));
+                        }
+                        return Ok(out);
+                    }
+                    // Settings ▸ Graphics, scriptable: open/close the window and switch preset.
+                    // Lets the quality ladder be captured and A/B'd without a human in the loop,
+                    // and gives the script console the same reach the menu has.
+                    "graphics" | "gfx" => {
+                        self.show_graphics = !matches!(a1.as_deref(), Some("off") | Some("0"));
+                        return Ok(format!("graphics panel {}", if self.show_graphics { "open" } else { "closed" }));
+                    }
+                    "gfxpreset" | "preset" => {
+                        let want = a1.as_deref().ok_or("dialog gfxpreset flat|low|medium|high|ultra")?.to_ascii_lowercase();
+                        let p = match want.as_str() {
+                            "flat" | "white" | "whitemesh" => gfxsettings::Preset::Flat,
+                            "low" => gfxsettings::Preset::Low,
+                            "medium" | "med" => gfxsettings::Preset::Medium,
+                            "high" | "default" => gfxsettings::Preset::High,
+                            "ultra" => gfxsettings::Preset::Ultra,
+                            _ => return Err("dialog gfxpreset flat|low|medium|high|ultra".into()),
+                        };
+                        self.gfx = gfxsettings::GfxSettings::of(p);
+                        self.apply_gfx_settings();
+                        return Ok(format!("graphics preset {} applied (render scale {:.0}%, shadows {:?}, flat {})",
+                            p.label(), self.gfx.render_scale * 100.0, self.gfx.shadows, self.gfx.flat_mode));
+                    }
+                    "gfxflat" => {
+                        self.gfx.flat_mode = !matches!(a1.as_deref(), Some("off") | Some("0"));
+                        self.apply_gfx_settings();
+                        return Ok(format!("flat / white mesh {}", if self.gfx.flat_mode { "on" } else { "off" }));
+                    }
                     // Headless equivalents of navigating / pressing Save / confirming overwrite.
                     "nav" => {
                         let d = std::path::PathBuf::from(a1.as_deref().ok_or("dialog nav <dir>")?);
@@ -7548,22 +10609,76 @@ impl App {
                         self.variant_browser_overwrite = None;
                     }
                     "setname" => { self.variant_browser_filename = a1.clone().unwrap_or_default(); }
+                    // #model-import: select a row and press the primary button, headless — the
+                    // two halves of "browse to a folder and import the file" a mouse would do.
+                    "select" | "sel" => {
+                        let f = std::path::PathBuf::from(a1.as_deref().ok_or("dialog select <file>")?);
+                        if !f.is_file() {
+                            return Err(format!("dialog select: no such file '{}'", f.display()));
+                        }
+                        if self.browser_purpose == BrowsePurpose::Model {
+                            self.model_browser_selected_meta = Some(Self::model_probe_line(&f));
+                        }
+                        self.variant_browser_filename = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        self.variant_browser_selected = Some(f);
+                    }
+                    "doopen" | "doimport" | "primary" => {
+                        let f = self.variant_browser_selected.clone().ok_or("dialog doopen: nothing selected")?;
+                        self.variant_browser_open = false;
+                        match self.browser_purpose {
+                            BrowsePurpose::Model => self.pending_import_model = Some((f, 1)),
+                            BrowsePurpose::Variant => self.pending_open_variant = Some((f, 1)),
+                            BrowsePurpose::Film => self.pending_open_film = Some((f, 1)),
+                            BrowsePurpose::Prefab => self.pending_import_prefab = Some((f, 1)),
+                        }
+                    }
                     "dosave" => { if self.browser_try_save() { self.variant_browser_open = false; } }
                     "confirmsave" => { if self.browser_confirm_overwrite() { self.variant_browser_open = false; } }
                     "close" => self.variant_browser_open = false,
                     "status" | "resolve" => {}
-                    other => return Err(format!("dialog: unknown '{other}' (open|saveas|savebrowser|size|shot|close|status)")),
+                    // QA hook for the auto-updater (updater.rs): drive check / window / download /
+                    // install without a mouse and print its state. Print-only apart from what the
+                    // Update window's own buttons do.
+                    "update" => {
+                        match a1.as_deref() {
+                            Some("check") => self.updater.check_now(),
+                            Some("open") => self.updater.show_window = true,
+                            Some("close") => self.updater.show_window = false,
+                            Some("download") => self.updater.start_download(),
+                            Some("auto") => self.updater.install_auto = true,
+                            Some("install") => self.updater.install_requested = true,
+                            Some("dismiss") => self.updater.dismiss_current(),
+                            Some("status") | None => {}
+                            Some(o) => return Err(format!("dialog update: unknown '{o}' (check|open|close|download|auto|install|dismiss|status)")),
+                        }
+                        return Ok(self.updater.status_line());
+                    }
+                    other => return Err(format!("dialog: unknown '{other}' (open|models|saveas|savebrowser|size|shot|close|status|update)")),
                 }
                 let dir = self.variant_browser_dir.clone().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default();
                 let file = self.variant_browser_filename.clone();
+                let purpose = self.browser_purpose;
                 let resolved = self.variant_browser_dir.clone()
                     .and_then(|d| Self::resolve_save_target(&d, &file))
                     .map(|p| p.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let overwrite = self.variant_browser_overwrite.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
-                Ok(format!("dialog open={} save_mode={} dir={} file={} resolved={} overwrite={} status={}",
-                    self.variant_browser_open, self.variant_browser_save, dir, file, resolved, overwrite, self.spawn_status))
+                // #model-import: the model browser's DETAILS line (format, size, verts/tris,
+                // materials, textures) is what the user reads before importing, so the scripted
+                // view of the dialog reports it verbatim.
+                let probe = match (purpose, &self.model_browser_selected_meta) {
+                    (BrowsePurpose::Model, Some(m)) => format!(" probe='{}'", m.replace('\n', " | ")),
+                    _ => String::new(),
+                };
+                Ok(format!("dialog open={} purpose={purpose:?} title='{}' save_mode={} dir={} entries={} file={} resolved={} overwrite={}{probe} status={}",
+                    self.variant_browser_open,
+                    purpose.window_title(self.variant_browser_save),
+                    self.variant_browser_save, dir,
+                    self.variant_browser_listing.len(), file, resolved, overwrite, self.spawn_status))
             }
+            // #quant-error  The save-precision prediction: numbers, the worst-offender list,
+            // the viewport ghost and the snap action, all through one verb.
+            EditorCommand::Precision { sub, args } => self.precision_cmd(&sub, &args),
             // #wire-visible  Persisted like the View checkbox; applied straight to the lane.
             EditorCommand::WireXray(set) => {
                 if let Some(on) = set {
@@ -7675,7 +10790,7 @@ impl App {
                     script::PointerSim::Move { x, y, frames } => { self.sim_pointer = Some((egui::pos2(x, y), frames.max(1))); }
                     script::PointerSim::Click { x, y } => { self.sim_click = Some((egui::pos2(x, y), 0)); }
                     script::PointerSim::Drag { x1, y1, x2, y2 } => { self.sim_drag = Some((egui::pos2(x1, y1), egui::pos2(x2, y2), 0)); }
-                    script::PointerSim::Key { name } => {
+                    script::PointerSim::Key { name, hold, mods } => {
                         // egui's names are capitalised ("Enter", "Escape", "R"), so accept any
                         // casing the caller types.
                         let mut cap = name.clone();
@@ -7685,9 +10800,42 @@ impl App {
                             .or_else(|| egui::Key::from_name(&name.to_uppercase()))
                             .or_else(|| egui::Key::from_name(&cap))
                             .ok_or_else(|| format!("preview key: '{name}' is not an egui key name"))?;
-                        let mk = |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: Default::default() };
-                        self.sim_events.push(vec![mk(true)]);
-                        self.sim_events.push(vec![mk(false)]);
+                        // `physical_key` is set to the same key, which is what a US-layout
+                        // keyboard reports -- so a scripted key drives position bindings too.
+                        // The MODIFIERS the event carries. egui takes `InputState::modifiers`
+                        // from the event stream, so a binding that is a modifier chord (Ctrl to
+                        // crouch, Shift to sprint) or a Ctrl+key shortcut can only be driven
+                        // through the real input path if the injected event states them.
+                        let mut m = egui::Modifiers::default();
+                        for k in &mods {
+                            match k.as_str() {
+                                "ctrl" | "control" | "cmd" | "command" => {
+                                    m.ctrl = true;
+                                    m.command = true;
+                                }
+                                "shift" => m.shift = true,
+                                "alt" | "option" => m.alt = true,
+                                other => return Err(format!("preview key: '{other}' is not a modifier (ctrl / shift / alt)")),
+                            }
+                        }
+                        let mk = move |pressed| egui::Event::Key { key, physical_key: Some(key), pressed, repeat: false, modifiers: m };
+                        match hold {
+                            // down / up: leave it held (or let it go) instead of tapping, which
+                            // is what the HELD fly keys need.
+                            Some(down) => self.sim_events.push(vec![mk(down)]),
+                            None => {
+                                self.sim_events.push(vec![mk(true)]);
+                                self.sim_events.push(vec![mk(false)]);
+                            }
+                        }
+                    }
+                    script::PointerSim::Button { button, pressed } => {
+                        let b = match button {
+                            0 => egui::PointerButton::Primary,
+                            2 => egui::PointerButton::Middle,
+                            _ => egui::PointerButton::Secondary,
+                        };
+                        self.sim_button = Some((b, pressed));
                     }
                     script::PointerSim::Type { text } => {
                         // One CHARACTER per frame: the app's numeric entry reads Text events as
@@ -7706,6 +10854,33 @@ impl App {
             EditorCommand::VariantGet(field) => self.variant_globals_report(field.as_deref()),
             EditorCommand::VariantSet { field, value } => self.variant_set(&field, &value),
             // `bspwarn list` — the same list the save-time window shows.
+            // #prefab the saved-object-group verb (save / list / show / place / rename / delete /
+            // import / export), the same executor the panel and the headless host use.
+            EditorCommand::Prefab(args) => self.prefab_command(&args),
+            EditorCommand::ConvertVariant(args) => xgame::convert_cli(&args),
+            EditorCommand::XGame { what, filter } => {
+                let cat = xgame::catalog::Catalog::load();
+                Ok(match what.as_str() {
+                    "table" => xgame::table::describe(&xgame::table::Table::load(), &cat, filter.as_deref()),
+                    "canvases" => {
+                        let want = filter.as_deref().and_then(xgame::game_from_str);
+                        let mut s = String::new();
+                        for g in xgame::GAMES {
+                            if want.map_or(false, |w| w != g) { continue; }
+                            let cs = xgame::convert::canvases(&cat, g);
+                            s.push_str(&format!("{} - {} canvases\n", g.display_name(), cs.len()));
+                            for (stem, id) in cs {
+                                let n = cat.on_canvas(g, &stem).len();
+                                s.push_str(&format!("  {stem:<28} map id {:<8} {n} placeable objects\n", id.map(|i| i.to_string()).unwrap_or_else(|| "-".into())));
+                            }
+                        }
+                        s
+                    }
+                    _ => xgame::catalog::describe(&cat, filter.as_deref()),
+                })
+            }
+            // #play  Test mode, scripted: one executor, shared with the Play menu.
+            EditorCommand::Play(args) => self.play_command(&args),
             EditorCommand::BspWarnList => {
                 let Some(scene) = self.objscene() else { return Err("no map loaded".into()) };
                 let mut out = scene.bsp_flags_report();
@@ -7932,9 +11107,11 @@ impl App {
             self.spawn_status = "Select a forge-palette object first.".into();
             return;
         };
-        // Halo 4 rows go through `instantiate` so the placed object saves (h4_app.rs)
-        if self.h4_active {
-            self.spawn_status = match self.h4_place_palette_item(i, p) {
+        // Halo 4 rows go through `instantiate` so the placed object saves (h4_app.rs); Halo 3
+        // rows the same way through h3/app.rs #h3-edit
+        if self.h4_active || self.h3_active {
+            let r = if self.h4_active { self.h4_place_palette_item(i, p) } else { self.h3_place_palette_item(i, p) };
+            self.spawn_status = match r {
                 Ok((_, name)) => format!("Placed '{name}' at ({:.1},{:.1},{:.1})", p.x, p.y, p.z),
                 Err(e) => format!("Place failed: {e}"),
             };
@@ -8018,15 +11195,44 @@ impl App {
         self.map_candidates.iter().position(|c| c.map_id == Some(map_id))
     }
 
+    /// The installed base map a Reach .mvar targets: by MCC map GUID first (the only key a
+    /// variant saved on a Workshop/modded map carries -- its numeric `map_id` is 0xFFFFFFFE),
+    /// then by numeric map id (stock maps).
+    fn find_map_for_variant(&self, variant: &mvar::Variant) -> Option<usize> {
+        mapcat::find_map_for_variant(&self.map_candidates, variant.map_id, variant.mcc_map_id)
+    }
+
     /// Load a .mvar by path. If the variant targets a DIFFERENT base map than the one
     /// loaded, switch to (and load) that map first, then render the objects once it
     /// finishes (deferred via `pending_mvar`). If it's the SAME map, just re-render the
     /// forge objects in place — no geometry reload. Renders entirely offline.
     fn import_mvar(&mut self, path: std::path::PathBuf) {
+        // #film  Opening a variant CLOSES any Theater clip. A recording's bodies are a statement
+        // about the scene it was recorded in: left standing in somebody else's map (or somebody
+        // else's GAME -- this path dispatches Halo 4 and Halo 3 below) they are drawn at
+        // coordinates that mean nothing, and they went on being drawn because
+        // `film_driver.clear` was only ever called when a NEW FILM was opened.
+        //
+        // The one case that is NOT the user opening a variant is the film loading its own Forge
+        // scene, which arrives here through the same deferred pipeline -- see
+        // `film_own_scene`.
+        // #film  Exempt ONLY the film's own scene, matched by PATH. A bool here meant "the next
+        // import", which another import in flight could spend -- see `film_own_scene`.
+        if film_export::import_is_the_films_own_scene(self.film_own_scene.as_deref(), &path) {
+            self.film_own_scene = None;
+        } else {
+            self.film_close();
+        }
         // A Halo 4 variant (mvar chunk v50) never reaches the Reach reader, which would
         // mis-decode it (its content header is one bit shorter) and try to load a random map.
         if h4::mvar::is_h4_variant(&path) {
             self.h4_import_mvar(path);
+            return;
+        }
+        // A Halo 3 variant (mvar chunk v12: its own bitstream, not the Reach one) loads its base
+        // map through the Halo 3 path, which places the objects read-only. #h3
+        if h3::mvar::is_h3_variant(&path) {
+            self.h3_import_mvar(path);
             return;
         }
         let Some(variant) = mvar::parse_variant(&path) else {
@@ -8037,8 +11243,8 @@ impl App {
         // If the variant's base map isn't the one loaded, load the correct map FIRST and
         // defer the object render until it's ready. Only when we can actually identify the
         // target map among the installed candidates — otherwise fall through to best-effort.
-        if self.loaded_map_id != Some(variant.map_id) {
-            if let Some(idx) = self.find_map_by_id(variant.map_id) {
+        if self.loaded_map_id != Some(variant.map_id) || mvar::is_unassigned_map_id(variant.map_id) {
+            if let Some(idx) = self.find_map_for_variant(&variant) {
                 // If the variant's base map is ALREADY the loaded one (matched by PATH,
                 // not the cached loaded_map_id — which can be None after a MANUAL map load whose
                 // .mapinfo read_map_id failed), do NOT reload the geometry; just set
@@ -8075,6 +11281,7 @@ impl App {
         if placed > 0 {
             mapcat::save_last_variant(&path.to_string_lossy());
             self.current_variant_path = Some(path.clone()); // remember for File->Save
+            self.note_recent_variant(&path); // File ▸ Open recent
             self.variant_retry = None;
         } else {
             self.variant_retry = Some((path, 8));
@@ -8086,6 +11293,7 @@ impl App {
     /// folder), clear the placed objects and reset the header so Save / Save As write a fresh file.
     fn new_variant(&mut self) {
         if self.h4_active { self.h4_new_variant(); return; }
+        if self.h3_active { self.h3_new_variant(); return; } // #h3-edit #h3-place
         let Some(map_id) = self.loaded_map_id else {
             self.spawn_status = "New variant: load a base map first.".into();
             return;
@@ -8437,6 +11645,7 @@ impl App {
         if self.h4_active {
             return self.h4_save_variant_to(dst);
         }
+        if self.h3_active { return self.h3_save_variant_to(dst); } // #h3-edit
         let src = self.current_variant_path.as_ref().or(self.new_variant_template.as_ref()).ok_or("no variant is open")?;
         let variant = mvar::parse_variant(src).ok_or("cannot re-read the source variant")?;
         let (mut list, unsaveable) = build_save_list(
@@ -8492,6 +11701,7 @@ impl App {
     /// still occupy theirs) versus an object with no resolvable palette entry.
     fn save_failure_note(&self) -> String {
         if self.h4_active { return self.h4_edit.last_save_note.borrow().clone(); }
+        if self.h3_active { return self.h3_edit.last_save_note.borrow().clone(); } // #h3-edit
         let (np, ns) = (self.last_save_no_palette.get(), self.last_save_no_slot.get());
         let mut parts: Vec<String> = Vec::new();
         if ns > 0 {
@@ -8838,36 +12048,167 @@ impl App {
             }
     }
 
-    /// Import external geometry (OBJ/GLB — converted from another game's BSP) as a persistent
-    /// base to forge over.
+    /// Import external geometry (OBJ/GLB/GLTF — e.g. another game's BSP converted by the user)
+    /// as a movable model to forge over.
+    ///
+    /// #model-import: the primary action is **Browse…**, which opens the shared file browser in
+    /// MODEL purpose — any folder on disk, exactly like opening a .mvar. The models-folder
+    /// drop-down stays as a convenience for files that are already there.
+    /// #4: every import below is listed with POSITION / ROTATION / SCALE fields, and the selected
+    /// one carries the normal editor gizmo (and G / R) in the viewport.
     fn import_geometry_ui(&mut self, ui: &mut egui::Ui) {
-            ui.small("OBJ/GLB in the exe's models\\ folder. Convert other-game BSPs to OBJ/GLB, then import + forge on top.");
-            let sel = self
-                .selected_import
-                .and_then(|i| self.model_candidates.get(i))
-                .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Select .obj/.glb…".into());
-            egui::ComboBox::from_id_salt("import-geo-picker")
-                .selected_text(sel)
-                .show_ui(ui, |ui| {
-                    for (i, p) in self.model_candidates.iter().enumerate() {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                        ui.selectable_value(&mut self.selected_import, Some(i), name);
-                    }
-                });
             ui.horizontal(|ui| {
-                if ui.button("↻").on_hover_text("Rescan models\\").clicked() {
-                    self.model_candidates = voxel::model_catalog();
+                if ui.button("Browse…")
+                    .on_hover_text("Pick an .obj / .glb / .gltf anywhere on disk (bookmarks, recent files, type a path)")
+                    .clicked()
+                {
+                    self.open_model_browser();
                 }
-                if ui.button("Import as base").clicked() {
-                    self.do_import_geometry();
-                }
-                if ui.button("Clear imported").clicked() {
-                    self.renderer.clear_imported_meshes();
-                    self.import_tris.clear();
-                    self.spawn_status = "Cleared imported geometry.".into();
+                if ui.button("Clear all").on_hover_text("Remove every imported model").clicked() {
+                    self.clear_imports();
                 }
             });
+            ui.small("Convert other-game BSPs to OBJ/GLB, import them, then forge on top. Files do NOT have to live in the models\\ folder.");
+            ui.separator();
+            // --- convenience: the models\ catalog next to the exe ---
+            egui::CollapsingHeader::new("From the models\\ folder")
+                .default_open(self.imports.is_empty())
+                .show(ui, |ui| {
+                    if self.model_candidates.is_empty() {
+                        ui.small("No .obj/.glb next to the exe — use Browse… instead.");
+                    }
+                    let sel = self
+                        .selected_import
+                        .and_then(|i| self.model_candidates.get(i))
+                        .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Select .obj/.glb…".into());
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("import-geo-picker")
+                            .selected_text(sel)
+                            .show_ui(ui, |ui| {
+                                for (i, p) in self.model_candidates.iter().enumerate() {
+                                    let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                                    ui.selectable_value(&mut self.selected_import, Some(i), name);
+                                }
+                            });
+                        if ui.button("↻").on_hover_text("Rescan the models\\ folder").clicked() {
+                            self.model_candidates = voxel::model_catalog();
+                        }
+                        if ui.add_enabled(self.selected_import.is_some(), egui::Button::new("Import")).clicked() {
+                            self.do_import_geometry();
+                        }
+                    });
+                });
+            ui.separator();
+            // #model-import: a big model is read on a worker thread — say so, so the user does
+            // not think the (still responsive) window ignored the click.
+            if !self.import_loading.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Reading {}\u{2026}", self.import_loading.join(", ")));
+                });
+            }
+            // --- the imported models + their transforms (#4) ---
+            if self.imports.is_empty() {
+                if self.import_loading.is_empty() {
+                    ui.weak("Nothing imported yet.");
+                }
+                return;
+            }
+            ui.strong(format!("Imported models ({})", self.imports.len()));
+            let mut pick: Option<usize> = None;
+            let mut drop_idx: Option<usize> = None;
+            let mut frame_idx: Option<usize> = None;
+            for i in 0..self.imports.len() {
+                let (name, path) = (self.imports[i].name.clone(), self.imports[i].path.clone());
+                let selected = self.sel_import == Some(i);
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(selected, format!("\u{1F4E6} {name}")).on_hover_text(path.to_string_lossy()).clicked() {
+                        pick = Some(i);
+                    }
+                    if ui.small_button("\u{1F3AF}").on_hover_text("Point the camera at it").clicked() { frame_idx = Some(i); }
+                    if ui.small_button("\u{2716}").on_hover_text("Remove this model").clicked() { drop_idx = Some(i); }
+                });
+                if !selected {
+                    continue;
+                }
+                // #model-import: what the file brought with it — parts, materials, textures — so
+                // a model drawing in flat colours says why right here.
+                if !self.imports[i].summary.is_empty() {
+                    ui.indent(("imp-sum", i), |ui| ui.small(self.imports[i].summary.clone()));
+                }
+                // The selected model's transform. Nothing is written unless a widget changed, so
+                // merely drawing the panel can never nudge the model.
+                let before = (self.imports[i].pos, self.imports[i].euler_deg(), self.imports[i].scale);
+                let (mut pos, mut rot, mut scale) = before;
+                ui.indent(("imp-xform", i), |ui| {
+                    egui::Grid::new(("imp-grid", i)).num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+                        ui.label("position");
+                        ui.horizontal(|ui| {
+                            // A typed '-' anywhere flips the sign (numfield), as everywhere else.
+                            for c in 0..3 {
+                                ui.add(egui::DragValue::new(&mut pos[c]).speed(0.1).custom_parser(numfield::parse_signed));
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("rotation");
+                        ui.horizontal(|ui| {
+                            for (c, name) in ["X", "Y", "Z"].iter().enumerate() {
+                                ui.add(
+                                    egui::DragValue::new(&mut rot[c])
+                                        .speed(1.0)
+                                        .range(-360.0..=360.0)
+                                        .suffix("\u{B0}")
+                                        .prefix(*name)
+                                        .custom_parser(numfield::parse_signed),
+                                );
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("scale");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::DragValue::new(&mut scale).speed(0.01).range(0.001..=10000.0).custom_parser(numfield::parse_signed));
+                            if ui.small_button("1\u{D7}").on_hover_text("Reset the scale").clicked() { scale = 1.0; }
+                        });
+                        ui.end_row();
+                    });
+                    ui.small("X = roll \u{B7} Y = pitch \u{B7} Z = yaw. Uniform scale only (a non-uniform one would break the lighting normals).");
+                    ui.horizontal(|ui| {
+                        if ui.button("Drop to origin").on_hover_text("Move it back to (0, 0, 0) with no rotation and scale 1").clicked() {
+                            pos = [0.0; 3];
+                            rot = [0.0; 3];
+                            scale = 1.0;
+                        }
+                        if ui.button("To camera").on_hover_text("Move its bounds centre to the surface 20u ahead of the camera").clicked() {
+                            let anchor = self.camera.pos + self.camera.forward() * 20.0;
+                            // Keep the bounds CENTRE (not the file origin) under the camera.
+                            let m = &self.imports[i];
+                            let off = m.world_center() - glam::Vec3::from(m.pos);
+                            pos = (anchor - off).into();
+                        }
+                    });
+                    ui.small("In the viewport: click the model to select it, then use the gizmo handles, or G to grab and R to rotate.");
+                });
+                if (pos, rot, scale) != before {
+                    let m = &mut self.imports[i];
+                    m.pos = pos;
+                    m.set_euler_deg(rot);
+                    m.scale = if scale.is_finite() { scale.clamp(0.001, 10000.0) } else { 1.0 };
+                    self.import_dirty = true;
+                    self.highlight_dirty = true;
+                }
+            }
+            if let Some(i) = pick {
+                self.select_import(i);
+            }
+            if let Some(i) = frame_idx {
+                let (c, r) = (self.imports[i].world_center(), self.imports[i].world_radius().max(1.0));
+                self.camera.pos = c - self.camera.forward() * (r * 2.5 + 5.0);
+                self.status = format!("Camera framed on {}", self.imports[i].name);
+            }
+            if let Some(i) = drop_idx {
+                self.remove_import(i);
+            }
     }
 
     /// Lighting Lab: live sliders for every lighting term, plus real-time probe GI and the
@@ -9055,6 +12396,61 @@ impl App {
     /// what-is-DRAWN switch -- geometry, the Forge extras and the overlays -- lives in the View
     /// menu instead, so "how it is rendered" and "what I can see" are not in the same list.
     fn view_settings_ui(&mut self, ui: &mut egui::Ui) {
+        // #reach-sound  Film audio. Reading this row opens no device: the
+        // engine reports "audio starts with the first sound in a film" until
+        // something actually plays.
+        crate::sound::volume_ui(&mut self.sound, ui);
+        ui.separator();
+        // #fp-fov  Theater's FIRST-PERSON field of view, in the game's own units -- the number
+        // MCC's FOV slider shows. Separate from the editor's fly camera on purpose: nothing in
+        // Reach ties the two together, and the editor's wide 70 degrees vertical is what makes
+        // flying around a map comfortable.
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::Slider::new(&mut self.fp_fov_deg, film_play::FOV_MIN_DEG..=film_play::FOV_MAX_DEG)
+                    .text("first-person FOV")
+                    .suffix("\u{00B0}"),
+            );
+            // Persist when the drag ENDS (or when a value is typed), not on every frame of the
+            // drag -- a slider writes `changed()` continuously and that would be a file write per
+            // frame.
+            if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                film_play::save_fov_setting(self.fp_fov_deg);
+            }
+            r.on_hover_text(format!(
+                "The field of view a Theater FIRST-PERSON camera renders at, in the same degrees \
+                 MCC's own FOV slider uses (horizontal, at the engine's 4:3 reference). Reach \
+                 authors 78 in its globals tag and that is the default here. Reach is Hor+: the \
+                 vertical stays put and a wider window shows more to the sides. Does not affect \
+                 the editor's fly camera.\n\n\
+                 The ARMS AND WEAPON are drawn through their own, narrower camera, exactly as the \
+                 engine does it ({:.0}% of the world camera's vertical FOV): at this setting the \
+                 world is {:.1}\u{00B0} vertical and the rig {:.1}\u{00B0}. That is what stops a \
+                 viewmodel splaying and shrinking as this slider widens.",
+                film_play::first_person_fov_scale() * 100.0,
+                film_play::reach_vertical_fov_for(self.fp_fov_deg).to_degrees(),
+                film_play::reach_first_person_model_fov_for(self.fp_fov_deg).to_degrees(),
+            ));
+            if ui
+                .small_button("Reach default")
+                .on_hover_text("78\u{00B0} -- the value the globals tag authors (matg +0x3FC camera block, +0x024)")
+                .clicked()
+            {
+                self.fp_fov_deg = film_play::REACH_FIELD_OF_VIEW_DEG;
+                film_play::save_fov_setting(self.fp_fov_deg);
+            }
+        });
+        ui.small(
+            egui::RichText::new(format!(
+                "= {:.1}\u{00B0} vertical, {:.1}\u{00B0} horizontal at 16:9",
+                film_play::reach_vertical_fov_for(self.fp_fov_deg).to_degrees(),
+                2.0 * ((16.0 / 9.0) * (film_play::reach_vertical_fov_for(self.fp_fov_deg) * 0.5).tan())
+                    .atan()
+                    .to_degrees()
+            ))
+            .weak(),
+        );
+        ui.add_space(4.0);
         // Fly speed (Ctrl + wheel over the viewport is the quick way).
         ui.add(egui::Slider::new(&mut self.move_speed, 0.5..=200.0).text("fly speed"))
             .on_hover_text("Camera speed while flying (hold the right mouse button + WASD). Ctrl + mouse wheel over the viewport does the same.");
@@ -9244,6 +12640,7 @@ impl App {
     /// baseline (and the quota `placed` column, chunk length / hash, stamps) from it so the
     /// pending-edit markers clear and the next diff is against what is on disk.
     fn resync_variant_globals(&mut self, path: &std::path::Path) {
+        if self.h3_active { self.h3_resync_after_save(path); return; } // #h3-edit
         let g = if self.h4_active { h4::mvar::parse_h4_variant(path).ok().map(|v| v.globals()) } else { mvar::parse_variant(path).map(|v| v.globals) };
         if let Some(g) = g {
             let unlocked = self.bounds_edit_unlocked;
@@ -9274,6 +12671,10 @@ impl App {
     fn game_map_variants_dir(&self) -> Option<std::path::PathBuf> {
         if self.h4_active {
             crate::h4::cache::maps_dir()
+                .and_then(|m| m.parent().map(|d| d.join("map_variants")))
+                .filter(|d| d.is_dir())
+        } else if self.h3_active { // #h3-edit
+            crate::h3::maps_dir()
                 .and_then(|m| m.parent().map(|d| d.join("map_variants")))
                 .filter(|d| d.is_dir())
         } else {
@@ -9398,9 +12799,19 @@ impl App {
     /// Open the FULLY-CUSTOM variant file browser (Blender-style: sidebar + nav bar + file list),
     /// seeding its directory from the current/last variant. Caches drives + bookmarks once here.
     fn open_variant_browser(&mut self) {
+        // #model-import: seed from the last VARIANT folder, not `variant_browser_dir` -- that one
+        // is the shared window's current folder, which a model-import browse may have left in the
+        // models folder.
+        self.browser_purpose = BrowsePurpose::Variant;
+        // The sidebar's "Recent folders" used to start empty every launch: seed it from the one
+        // recent-items history (the folders the recent variants came from) the first time.
+        if self.variant_browser_recent.is_empty() {
+            self.variant_browser_recent = self.recent.folders_of_kind(recent::RecentKind::Variant);
+        }
         let dir = self
-            .variant_browser_dir
-            .clone()
+            .variant_browser_recent
+            .first()
+            .cloned()
             .or_else(|| self.current_variant_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())))
             .or_else(|| {
                 Self::hms_data_dir()
@@ -9424,6 +12835,1371 @@ impl App {
         self.variant_browser_save = false; // #dialogs: OPEN mode
         self.variant_browser_overwrite = None;
         self.variant_browser_open = true;
+    }
+
+
+    // --------------------------------------------------------------------------------- #prefab
+    /// Open the shared file browser in PREFAB purpose, so a prefab someone shared can be imported
+    /// from ANYWHERE on disk (the prefabs folder itself is just the first place it looks).
+    fn open_prefab_browser(&mut self) {
+        self.browser_purpose = BrowsePurpose::Prefab;
+        let dir = self
+            .prefab_browser_recent
+            .first()
+            .cloned()
+            .or_else(|| prefab::prefabs_dir().filter(|d| d.is_dir()))
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.variant_browser_drives = Self::vb_volumes();
+        self.variant_browser_bookmarks = Self::vb_load_bookmarks();
+        self.variant_browser_history.clear();
+        self.variant_browser_hist_pos = 0;
+        self.vb_navigate(&dir, true);
+        self.variant_browser_save = false;
+        self.variant_browser_overwrite = None;
+        self.variant_browser_open = true;
+    }
+
+    // ----------------------------------------------------------------------------------- #film
+    /// Open the shared file browser in FILM purpose. Seeds from this session's last film folder,
+    /// then MCC's own saved-film folders (where films actually live), then Home.
+    fn open_film_browser(&mut self) {
+        self.browser_purpose = BrowsePurpose::Film;
+        if self.film_browser_recent.is_empty() {
+            self.film_browser_recent = self.recent.folders_of_kind(recent::RecentKind::Film);
+        }
+        let dir = self
+            .film_browser_recent
+            .first()
+            .cloned()
+            .or_else(|| self.film_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())))
+            .or_else(|| Self::film_folders().into_iter().next())
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.variant_browser_drives = Self::vb_volumes();
+        self.variant_browser_bookmarks = Self::vb_load_bookmarks();
+        self.variant_browser_history.clear();
+        self.variant_browser_hist_pos = 0;
+        self.vb_navigate(&dir, true);
+        self.variant_browser_save = false;
+        self.variant_browser_overwrite = None;
+        self.variant_browser_open = true;
+    }
+
+    /// Where MCC keeps Reach saved films (shared with the headless host).
+    fn film_folders() -> Vec<std::path::PathBuf> {
+        film_ui::film_search_folders()
+    }
+
+    /// Open a saved film: read its HEADER ONLY, show the card, and load its base map + embedded
+    /// Forge scene. The Forge scene is drawn by extracting the film's map variant to a real
+    /// `.mvar` under the app's own data folder and handing that to the ordinary variant loader —
+    /// the same code path, and the same byte-exact encoder, that `File > Open .mvar` uses.
+    fn open_film(&mut self, path: std::path::PathBuf) {
+        match film::open_header(&path) {
+            Ok(f) => {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                self.film_status.clear();
+                // The details card is reference text, not something to keep on screen: it used to
+                // open itself over the viewport on every film opened. It stays available from
+                // File > Saved film details.
+                self.film_card_open = false;
+                let has_variant = !f.header.map_variant.is_empty();
+                let secs = f.content.seconds;
+                let objects = f.forge_object_count();
+                let film_title = f.content.title.clone();
+                self.film = Some(Box::new(f));
+                self.film_driver.appearance = None; // #skin a new cast: rebuild the armour/colour table
+                self.recent_note(recent::RecentItem::new(recent::RecentKind::Film, &path, "Reach", &film_title)); // File ▸ Open recent
+                self.film_path = Some(path);
+                // #film-live  Start following from the length it has NOW, so opening a clip does
+                // not immediately re-decode what was just decoded.
+                self.film_follow_len = self
+                    .film_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                self.film_follow_next = None;
+                self.film_follow_rx = None;
+                self.film_follow_note = String::new();
+                self.film_browser_recent.retain(|p| Some(p.as_path()) != self.film_path.as_deref().and_then(|p| p.parent()));
+                if let Some(d) = self.film_path.as_ref().and_then(|p| p.parent()) {
+                    self.film_browser_recent.insert(0, d.to_path_buf());
+                    self.film_browser_recent.truncate(12);
+                }
+                if has_variant {
+                    self.spawn_status = format!("{name}: {} s, loading its Forge scene ({objects} objects)…", secs);
+                    self.film_load_scene();
+                } else {
+                    self.spawn_status = format!("{name}: {} s, recorded on a stock map (no Forge variant)", secs);
+                    self.film_load_base_map_only();
+                }
+            }
+            Err(e) => {
+                self.spawn_status = format!("Not a Reach saved film: {e}");
+                self.film_status = self.spawn_status.clone();
+            }
+        }
+    }
+
+    /// Load the base map and draw the film's embedded Forge scene.
+    fn film_load_scene(&mut self) {
+        let Some(f) = self.film.clone() else { return };
+        if f.header.map_variant.is_empty() {
+            self.film_status = "This film was recorded on a stock map — there is no Forge scene to draw.".into();
+            return;
+        }
+        // Load the film's OWN base map first. Setting `pending_open_variant` and leaving it to
+        // `import_mvar` to notice the map is wrong does not reliably switch canvas: when its
+        // resolution fails it falls through to "render on whatever is loaded", which drew the
+        // film's Forge objects onto someone else's map. Loading the map here makes the canvas
+        // switch the first thing that happens, not a side effect of the variant import.
+        self.film_load_base_map_only();
+        // #film  THREE outcomes, not two. `load_map()` streams the load over many frames, so "the
+        // film's map is not loaded yet" is the NORMAL state for any film whose map was not already
+        // open -- it is not a failure, and treating it as one is what made opening a clip on a
+        // cold app load a map and do nothing else. The decision lives in
+        // `film_export::scene_open_decision` so the gate for it tests this code and not a copy.
+        let selected_id =
+            self.selected_map.and_then(|i| self.map_candidates.get(i)).and_then(|c| c.map_id);
+        match film_export::scene_open_decision(f.content.map_id, self.loaded_map_id, selected_id) {
+            film_export::SceneOpen::Proceed => self.film_pending_scene_map = None,
+            film_export::SceneOpen::WaitFor(id) => {
+                self.film_pending_scene_map = Some(id);
+                self.film_status = format!(
+                    "Loading {} first \u{2014} the clip's scene and recording follow\u{2026}",
+                    f.header.scenario_name()
+                );
+                return;
+            }
+            // `film_load_base_map_only` has already put the reason in `film_status`.
+            film_export::SceneOpen::Impossible => {
+                self.film_pending_scene_map = None;
+                return;
+            }
+        }
+        // #film-action  ONE decision and one set of words, in `film_export::scene_request`.
+        // The APPLY stays here and must: the GUI switches canvas through its asynchronous
+        // `pending_open_variant` pipeline so the switch is the first thing that happens rather
+        // than a side effect of the import, while the script host applies straight. Those two
+        // cannot be forced together; the decision and the wording can, and when they were not,
+        // the script host silently drew no scene at all.
+        match film_export::scene_request(&f) {
+            Ok(out) => {
+                self.film_status = format!(
+                    "Drawing {} objects from {:?} (canvas: {}) \u{2014} decoding the recording\u{2026}",
+                    out.objects,
+                    out.title,
+                    out.template.file_name().unwrap_or_default().to_string_lossy()
+                );
+                // #film  The clip is loading its OWN scene; this is not the user opening a
+                // variant, so `import_mvar` must leave the film alone when it lands.
+                self.film_own_scene = Some(out.path.clone());
+                self.pending_open_variant = Some((out.path, 1));
+                self.film_start_index();
+            }
+            Err(why) => {
+                // `scene_request` has already said what the user can act on.
+                self.film_status = why;
+                self.spawn_status = self.film_status.clone();
+            }
+        }
+    }
+
+    /// No Forge variant (or the canvas is missing): just load the film's base map, so the user
+    /// still sees where the film was recorded.
+    fn film_load_base_map_only(&mut self) {
+        let Some(f) = self.film.as_deref() else { return };
+        let map_id = f.content.map_id;
+        if self.loaded_map_id == Some(map_id) { return }
+        if let Some(idx) = mapcat::find_map_for_variant(&self.map_candidates, map_id, None) {
+            self.show_modded_maps = self.map_candidates[idx].modded;
+            self.picker_game = self.map_candidates[idx].game;
+            self.selected_map = Some(idx);
+            self.load_map();
+        } else {
+            self.film_status = format!("{} (map id {map_id}) is not installed, so its map cannot be loaded.", f.header.scenario_name());
+        }
+    }
+
+    /// The installed base map's label for the card, from the cached candidate list.
+    fn film_base_map_label(&self) -> Option<String> {
+        let f = self.film.as_deref()?;
+        let idx = mapcat::find_map_for_variant(&self.map_candidates, f.content.map_id, None)?;
+        Some(self.map_candidates[idx].label())
+    }
+
+    /// Extract the film's map variant to a `.mvar` the user keeps.
+    fn film_extract_map_variant(&mut self) {
+        let Some(f) = self.film.clone() else { return };
+        let stem = film_export::safe_stem(&f.header.map_variant.metadata.title, "extracted_variant");
+        let dir = self
+            .film_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .or_else(|| mapcat::variant_dirs().into_iter().next())
+            .unwrap_or_else(std::env::temp_dir);
+        let dst = Self::film_unique_path(&dir, &stem, "mvar");
+        match film_export::export_map_variant(&f, &dst) {
+            Ok(out) => {
+                self.film_status = format!("Wrote {} objects to {}", out.objects, out.path.display());
+            }
+            Err(e) => self.film_status = format!("Could not extract the map variant: {e}"),
+        }
+        self.spawn_status = self.film_status.clone();
+    }
+
+    /// Extract the film's game variant (raw struct + readable notes).
+    fn film_extract_game_variant(&mut self) {
+        let Some(f) = self.film.clone() else { return };
+        let stem = film_export::safe_stem(&f.header.game_variant.title, "extracted_gametype");
+        let dir = self
+            .film_path
+            .as_ref()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(std::env::temp_dir);
+        let dst = Self::film_unique_path(&dir, &stem, "reach_gv");
+        match film_export::export_game_variant(&f, &dst) {
+            Ok(out) => {
+                self.film_status = format!(
+                    "Wrote {} bytes to {} (and the notes to {}). This is the raw struct, NOT a loadable .bin — see the notes.",
+                    out.bytes,
+                    out.struct_path.display(),
+                    out.notes_path.file_name().unwrap_or_default().to_string_lossy()
+                );
+            }
+            Err(e) => self.film_status = format!("Could not extract the gametype: {e}"),
+        }
+        self.spawn_status = self.film_status.clone();
+    }
+
+    /// `<dir>/<stem>.<ext>`, with ` (2)`, ` (3)`… appended rather than overwriting a file.
+    fn film_unique_path(dir: &std::path::Path, stem: &str, ext: &str) -> std::path::PathBuf {
+        let first = dir.join(format!("{stem}.{ext}"));
+        if !first.exists() { return first }
+        for n in 2..1000 {
+            let p = dir.join(format!("{stem} ({n}).{ext}"));
+            if !p.exists() { return p }
+        }
+        first
+    }
+
+    /// #film  Decode the whole recording into entity tracks, OFF the UI thread. Sub-second even
+    /// on the longest film measured, so there is no progressive streaming and no disk cache --
+    /// the whole clip is ready at once and scrubbing is instant.
+    /// #film  Close the open Theater clip: stop the clock, drop the bodies, forget the cast.
+    ///
+    /// Called when the user opens a map VARIANT (of any title), because the recording's bodies
+    /// are meaningless in a scene they were not recorded in. The film's own scene load is
+    /// exempted by `film_own_scene`.
+    ///
+    /// A no-op when nothing is open, so it costs nothing on the ordinary variant path.
+    fn film_close(&mut self) -> bool {
+        if self.film.is_none() && self.film_play.is_none() && self.film_index_rx.is_none() {
+            return false;
+        }
+        let name = self
+            .film_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "the recording".into());
+        // The actors first: `clear` hands their meshes back to the scene.
+        self.film_driver.clear(&mut self.actor_scene);
+        self.film_play = None;
+        self.film_index_rx = None;
+        self.film_clock = None;
+        self.film = None;
+        self.film_path = None;
+        self.film_stats = None;
+        self.film_spawn_weapon = None;
+        self.film_variant_names = None;
+        self.film_driver.appearance = None;
+        self.film_fp_cache = None;
+        self.film_roster.clear();
+        self.film_roster_bipeds = 0;
+        self.film_roster_coverage.clear();
+        self.film_timeline_open = false;
+        self.film_card_open = false;
+        self.film_status = format!("{name} was closed: a variant was opened, and a recording's bodies belong to the scene it was recorded in.");
+        self.spawn_status = self.film_status.clone();
+        true
+    }
+
+    fn film_start_index(&mut self) {
+        let Some(path) = self.film_path.clone() else { return };
+        self.film_play = None;
+        self.film_stats = None;
+        self.film_spawn_weapon = None;
+        self.film_variant_names = None;
+        self.film_roster.clear();
+        self.film_roster_bipeds = 0;
+        self.film_roster_coverage.clear();
+        self.film_driver.clear(&mut self.actor_scene);
+        // #fp `clear` drops the arms' actors, so they have to be placed again.
+        self.film_fp_cache = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.film_index_rx = Some(rx);
+        std::thread::spawn(move || {
+            // #film  CATCH A PANIC AND REPORT IT, because the alternative is silence.
+            //
+            // If this worker unwinds, `tx` is dropped without a value and the receiver sees
+            // `Disconnected` -- which the collector used to treat as "nothing to do" and clear.
+            // The observable result was a film that opened, drew its Forge scene, and simply
+            // never decoded, with NOTHING anywhere saying why: `film show` answered "the
+            // recording is not decoded yet" for as long as you cared to wait. That was reported
+            // as an intermittent failure (roughly 3 opens in 10) and it cost real time to chase
+            // because the one thing a panic here could not do was announce itself.
+            //
+            // The decode is also a much bigger surface than it looks: `build_index_players`
+            // reaches `AppearanceKey::shared()`, which scans EVERY film on the machine to build
+            // the cross-recording name key -- so it opens dozens of other files, including the
+            // `.temp` autosave the game may be writing at that moment. A short or torn read of
+            // one of those is exactly the kind of thing that panics intermittently while the
+            // film under test is perfectly fine.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                film::open(&path).map_err(|e| e.to_string()).map(|f| {
+                    film_decode::build_index_players(
+                        &f.bytes,
+                        &f.data,
+                        &f.header.map_variant,
+                        f.recorder_slot(),
+                        &f.header.players,
+                    )
+                })
+            }))
+            .unwrap_or_else(|e| {
+                // The payload is whatever `panic!` was given: `&str` and `String` cover the
+                // standard macros and every panic in this codebase.
+                let why = e
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a panic with no message".to_string());
+                Err(format!("the decoder panicked: {why}"))
+            });
+            let _ = tx.send(r);
+        });
+    }
+
+    /// #film-stats  Fold the decoded recording into per-player statistics, once per film.
+    ///
+    /// Called when the index lands, NOT from any frame path: on a 47-minute 1,689-body clip this
+    /// is tens of milliseconds, which is nothing once but would be ruinous at 60 Hz. The vehicle
+    /// and weapon TAG NAMES come from the open map when there is one; everything else comes from
+    /// the film alone, which is why the same function serves the GPU-free `--film-stats` verb.
+    fn film_compute_stats(&mut self) {
+        let s = {
+            let (Some(f), Some(pb)) = (self.film.as_deref(), self.film_play.as_deref()) else { return };
+            let names = match (self.scene_ctl.as_ref(), self.scene_ctl.as_ref().and_then(|s| s.cache_handle())) {
+                (Some(sc), Some(c)) => Some(film_stats::MapNames::build(sc.native_dll(), c)),
+                _ => None,
+            };
+            match &names {
+                Some(n) => film_stats::compute(f, &pb.index, n),
+                None => film_stats::compute(f, &pb.index, &film_stats::NoNames),
+            }
+        };
+        self.film_stats = Some(Box::new(s));
+    }
+
+    /// #gamevariant  Give every recorded body the weapon the film's own GAME VARIANT says its
+    /// player spawned with.
+    ///
+    /// Needs both the decoded index AND an open map (the variant stores a `motl` collection
+    /// index, which only the map can turn into a `weap` tag), and the two arrive in either
+    /// order, so this is attempted once per frame until it lands and is a no-op after that.
+    fn film_resolve_spawn_weapon(&mut self) {
+        if self.film_spawn_weapon.is_some() || self.film_play.is_none() {
+            return;
+        }
+        let Some(sc) = self.scene_ctl.as_ref() else { return };
+        let Some(cache) = sc.cache_handle() else { return };
+        let native = sc.native_dll();
+        let Some(gv) = self.film.as_deref().and_then(|f| f.header.gametype.clone()) else {
+            self.film_spawn_weapon = Some(film_variant::SpawnWeaponApplied {
+                why: "this recording carries no game variant",
+                ..Default::default()
+            });
+            return;
+        };
+        let names = film_variant::VariantNames::build(native, cache);
+        let weap_tags = native.tags_by_group(cache, "weap");
+        let applied = {
+            let Some(pb) = self.film_play.as_deref_mut() else { return };
+            film_variant::apply_spawn_weapons(
+                &mut pb.index.tracks,
+                film_play::BIPED_TYPE,
+                &gv,
+                &names,
+                &weap_tags,
+            )
+        };
+        self.film_variant_names = Some(Box::new(names));
+        self.film_spawn_weapon = Some(applied);
+    }
+
+    /// #film-live  Re-decode an in-progress recording as it grows, keeping the view where it is.
+    ///
+    /// MCC writes the match being played to a `.temp` in its autosave folder. That file is the
+    /// same container as a finished `.mov` -- same `_blf` header, same `chdr` -- and this reader
+    /// frames the stream forward and stops at the last complete record, so a partially written
+    /// one decodes cleanly up to wherever the game has got to. Following it is therefore just
+    /// "notice the file got bigger, decode it again, transplant the index".
+    ///
+    /// Rate-limited to one `stat` every two seconds, and only one re-decode in flight at a time:
+    /// the decode itself is tens of milliseconds to a few seconds depending on the clip's length,
+    /// so it runs on the same worker the first open uses and never on the UI thread.
+    fn film_follow_tick(&mut self) {
+        // Collect a finished re-decode first, whatever happens next.
+        if let Some(rx) = &self.film_follow_rx {
+            match rx.try_recv() {
+                Ok(Ok(idx)) => {
+                    let before = self.film_play.as_deref().map(|p| p.total_ticks()).unwrap_or(0);
+                    let after = idx.ticks;
+                    if let Some(pb) = self.film_play.as_deref_mut() {
+                        // TRANSPLANT, so the camera, the rig, the playhead and every toggle the
+                        // viewer set survive. See `Playback::replace_index`.
+                        pb.replace_index(idx);
+                    }
+                    self.film_follow_rx = None;
+                    self.film_follow_note = format!(
+                        "following the live recording: {} -> {} s",
+                        before / film_play::TICK_HZ as u32,
+                        after / film_play::TICK_HZ as u32
+                    );
+                    // The stats and the roster are folded from the index, so they are stale now.
+                    self.film_compute_stats();
+                    (self.film_roster, self.film_roster_coverage) =
+                        match (self.film.as_deref(), self.film_play.as_deref()) {
+                            (Some(f), Some(pb)) => (
+                                film_ui::roster_lines(f, pb, &self.film_driver.biped_of),
+                                film_ui::roster_coverage(pb, f.present_players().count()),
+                            ),
+                            _ => (Vec::new(), String::new()),
+                        };
+                    self.film_roster_bipeds = self.film_driver.biped_of.len();
+                }
+                Ok(Err(e)) => {
+                    // A read that failed mid-write is ordinary: keep the index we have and try
+                    // again on the next pass rather than throwing the clip away.
+                    //
+                    // The length has to be rolled BACK for that retry to happen at all. It is
+                    // advanced before the worker is spawned (so a growth is never claimed twice),
+                    // which means leaving it advanced here would mark this growth as consumed and
+                    // the clip would stop following until the file grew again -- the comment above
+                    // would have been describing something the code did not do.
+                    self.film_follow_len = self.film_follow_len.saturating_sub(1);
+                    self.film_follow_note = format!("the live recording could not be re-read: {e}");
+                    self.film_follow_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return, // one at a time
+                Err(_) => self.film_follow_rx = None,
+            }
+        }
+        if !self.film_follow_live || self.film_play.is_none() {
+            return;
+        }
+        let Some(path) = self.film_path.clone() else { return };
+        if !crate::film::is_in_progress(&path) {
+            return; // a finished film cannot grow
+        }
+        let now = std::time::Instant::now();
+        if self.film_follow_next.is_some_and(|t| now < t) {
+            return;
+        }
+        self.film_follow_next = Some(now + std::time::Duration::from_secs(2));
+        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if len <= self.film_follow_len {
+            return; // nothing new has been written
+        }
+        self.film_follow_len = len;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.film_follow_rx = Some(rx);
+        std::thread::spawn(move || {
+            let r = film::open(&path).map_err(|e| e.to_string()).map(|f| {
+                film_decode::build_index_players(
+                    &f.bytes,
+                    &f.data,
+                    &f.header.map_variant,
+                    f.recorder_slot(),
+                    &f.header.players,
+                )
+            });
+            let _ = tx.send(r);
+        });
+    }
+
+    /// Collect the worker's index, then advance the clock and place the actors for this frame.
+    fn film_tick(&mut self, ctx: &egui::Context) {
+        self.film_resolve_spawn_weapon();
+        // #film-live  Pick up more of a recording that is still being written.
+        self.film_follow_tick();
+        if let Some(rx) = &self.film_index_rx {
+            match rx.try_recv() {
+                Ok(Ok(idx)) => {
+                    self.film_status = idx.report();
+                    let movers = idx.moving().count();
+                    self.film_play = Some(Box::new(film_play::Playback::new(idx)));
+                    self.film_timeline_open = movers > 0;
+                    self.film_index_rx = None;
+                    // #film-stats  ONCE, here, where the index lands -- never on a frame path.
+                    self.film_compute_stats();
+                    // #film-perf  Same for the roster: a pure function of the index.
+                    (self.film_roster, self.film_roster_coverage) =
+                        match (self.film.as_deref(), self.film_play.as_deref()) {
+                            (Some(f), Some(pb)) => (
+                                film_ui::roster_lines(f, pb, &self.film_driver.biped_of),
+                                film_ui::roster_coverage(pb, f.present_players().count()),
+                            ),
+                            _ => (Vec::new(), String::new()),
+                        };
+                    self.film_roster_bipeds = self.film_driver.biped_of.len();
+                }
+                Ok(Err(e)) => {
+                    self.film_status = format!("Could not decode the recording: {e}");
+                    self.film_index_rx = None;
+                }
+                // #bg-throttle  Through the pump: the decode is sub-second, so polling it at the
+                // background rate costs at most a tenth of a second of extra wait, and leaving it
+                // unconditional would hold a 60 Hz egui pass while the window is not even on screen.
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.pump(ctx),
+                // #film  A DISCONNECT IS A FAILURE AND MUST SAY SO. The sender was dropped
+                // without a value, which means the decode worker died -- and `film_start_index`
+                // now catches its own panics, so reaching here at all is something unaccounted
+                // for. Clearing silently is what made "the clip opened, drew its scene and never
+                // decoded" undiagnosable: there was no error, no status line and no log, so the
+                // only symptom was an absence.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.film_status =
+                        "The recording's decoder stopped without returning anything. \
+                         Re-open the clip; if it keeps happening the film may be unreadable."
+                            .to_string();
+                    log::error!("film: the index worker disconnected without sending a result");
+                    self.film_index_rx = None;
+                }
+            }
+        }
+        if self.film_play.is_none() {
+            self.film_clock = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let dt = self.film_clock.map(|t| (now - t).as_secs_f32().min(0.25)).unwrap_or(0.0);
+        self.film_clock = Some(now);
+        let mut was_playing = false;
+        {
+            // Scoped so the mutable borrow of `film_play` ends before the placement below, which
+            // needs to read it WHILE `actor_scene` is borrowed mutably. Holding it across both is
+            // what forced a `Playback` clone here, and a `Playback` owns the whole decoded
+            // `FilmIndex` (every entity track of every tick — hundreds of thousands of messages on
+            // a long clip), so that clone deep-copied the entire recording EVERY FRAME. On a
+            // 20-minute film that is gigabytes per second of allocation: the app ballooned, the
+            // window froze, and the OS killed it. Disjoint field borrows need no copy at all.
+            let pb = self.film_play.as_deref_mut().expect("checked above");
+            if pb.playing {
+                pb.advance(dt);
+                // #bg-throttle  Taken BEFORE `advance`, which CLEARS `playing` on the frame the
+                // clip reaches its end. Re-testing it afterwards would skip the pump on exactly
+                // that frame, which is a (harmless, but real) difference from what this did
+                // before the throttle existed -- and "harmless" is not a reason to change it.
+                was_playing = true;
+            }
+        }
+        // #bg-throttle  Keep the frames coming for playback -- through the pump, so an unfocused
+        // window plays at the background rate instead of the display's. The clock above advances
+        // on REAL ELAPSED TIME, so the clip keeps its timing either way: it is drawn less often,
+        // never played slower. This is the single most important pump to route; left
+        // unconditional it alone would hold the full frame rate behind the game.
+        if was_playing {
+            self.pump(ctx);
+        }
+        self.fprof.lap(1); // #film-perf  the clock
+        // Place the actors. Moving one is pos/yaw only -- the bone palette folds the placement
+        // in -- so a frame of playback costs no mesh rebuild.
+        let cache = self.scene_ctl.as_ref().and_then(|s| s.cache_handle());
+        // #fp Reach's FIRST-PERSON ARM models, resolved ONCE per map and handed to the driver.
+        //
+        // They live on the globals, not on the biped: `matg` +0x474 `@player representation`
+        // (+0x14 `first person hands`, +0x24 `first person body`), with a per-scenario override
+        // at `scnr` +0x794. Both are bare `mode` tags with no `hlmt`, so the decode has no
+        // variant to pick a permutation with and its fallback would allow EVERY permutation of
+        // every region at once -- two sets of arms plus all five forearm attachments. The section
+        // pick is therefore computed here and installed on the scene BEFORE the first mesh build.
+        if let (Some(c), Some(scene)) = (cache, self.scene_ctl.as_ref()) {
+            let _ = scene;
+            if self.film_fp_cache != Some(c.0) {
+                // #fp-arms  EVERY representation, one per playable species -- ONE
+                // implementation, in `film_play`, because the GUI and the script runner each
+                // keep their own driver. Taking the first row put Spartan hands on an Elite.
+                if let Some(sc) = self.scene_ctl.as_mut() {
+                    if self.film_driver.resolve_first_person(sc) {
+                        self.film_fp_cache = Some(c.0);
+                        self.film_fp_armour = None;
+                    }
+                }
+            }
+        }
+        // #fp-arms  Dress the FIRST-PERSON arms in the subject player's OWN armour.
+        //
+        // A player's appearance is ten option indices in the film's player record, and the two
+        // regions the Spartan arms carry (`arms`, `flair_forearm`) and the one the Elite arms
+        // carry (`armor_pieces`) are all overridden by them. The ordinary route — the `hlmt`
+        // variant walk — cannot be used: these are bare `mode` tags with no model tag at all, so
+        // the picks are resolved here and installed as a section mask instead. One player at a
+        // time, which is exactly right for a view through one player's eyes.
+        let fp_dress: Option<(u8, Vec<u8>)> = self.film_play.as_deref().and_then(|pb| {
+            // #film-camera  The resolved camera, not the chosen mode -- there are no arms to
+            // dress while a context camera has the view out of first person.
+            if !pb.view_is_first_person() {
+                return None;
+            }
+            // #fp-arms  The CAMERA's subject, by slot -- including the owner-keyed route the
+            // window's camera list uses. Asking only the body's slot binding returned None for an
+            // owner group the recording never bound, and no armour was installed at all.
+            let slot = pb.subject_slot()?;
+            let a = self
+                .film
+                .as_deref()?
+                .header
+                .players
+                .iter()
+                .find(|p| p.index as u8 == slot)?
+                .appearance()?;
+            Some((slot, a.slots.to_vec()))
+        });
+        if let (Some((slot, app)), Some(sc)) = (fp_dress, self.scene_ctl.as_mut()) {
+            self.film_fp_armour = self.film_driver.dress_first_person(sc, slot, &app, self.film_fp_armour);
+        }
+        self.fprof.lap(2); // #film-perf  the first-person arm resolve + armour
+        // #film-action  Which BIPED each recorded body was spawned from. One implementation,
+        // in `film_play`, because the script host runs its own driver and would otherwise need a
+        // copy of it.
+        if let (Some(c), Some(scene), Some(pb)) = (cache, self.scene_ctl.as_ref(), self.film_play.as_deref()) {
+            let n = scene.native_dll();
+            let mp = scene.open_map_path().map(|p| p.to_path_buf());
+            self.film_driver.resolve_bipeds(pb, n, c, mp.as_deref());
+        }
+        self.fprof.lap(3); // #film-perf  which biped each body was spawned from
+        // #camera-rows  The camera list is built when the INDEX lands, which is before the map
+        // has told us what each body was spawned from -- so a row that should read
+        // "monitor 0x1a3f" would be stuck reading a bare entity id for the life of the session.
+        // Rebuild it the once, when that resolution actually arrives. A length compare per frame,
+        // and `roster_lines` is a pure function of data already in hand.
+        if self.film_driver.biped_of.len() != self.film_roster_bipeds {
+            self.film_roster_bipeds = self.film_driver.biped_of.len();
+            if let (Some(f), Some(pb)) = (self.film.as_deref(), self.film_play.as_deref()) {
+                self.film_roster = film_ui::roster_lines(f, pb, &self.film_driver.biped_of);
+            }
+        }
+        if let (Some(cache), Some(scene)) = (cache, self.scene_ctl.as_ref()) {
+            let native = scene.native_dll();
+            let pb = self.film_play.as_deref().expect("checked above");
+            // #corpse-fall  Find the floor under any body that has just gone down, BEFORE the
+            // placement that uses it. One cast per corpse for the life of the film; see
+            // `ActorDriver::ground_corpses` for why a film cannot answer this itself.
+            self.film_driver.ground_corpses(pb, &|p: [f32; 3]| {
+                let o = glam::Vec3::new(p[0], p[1], p[2] + 0.05);
+                scene
+                    .raycast_solid(o, glam::Vec3::NEG_Z, film_play::GROUND_REACH)
+                    .map(|t| o.z - t)
+            });
+            self.fprof.lap(4); // #film-perf  the corpse floor casts
+            self.film_driver.sync(pb, &mut self.actor_scene, native, cache);
+            self.fprof.lap(5); // #film-perf  placing every body at this tick
+            // #ragdoll  Then the ARTICULATED solver poses every dead body, after `sync` has
+            // placed them and chosen the death clip the simulation is seeded from. The same call
+            // the scripted host makes.
+            self.film_driver.simulate_ragdolls(pb, &mut self.actor_scene, native, cache, scene, &self.last_objects);
+            self.fprof.lap(6); // #film-perf  the articulated solver
+            // #skin Dress each drawn body as its player really was: their two armoury colours and
+            // their ten armour selections. The pool re-assigns actors to bodies as players come and
+            // go, so this is re-checked every frame and only marks a rebuild when something
+            // actually changed.
+            self.apply_recorded_appearance();
+            self.fprof.lap(7); // #film-perf  per-player armour / colours
+            // The scene-rebuild path that normally calls `update_actors` RETURNS EARLY while the
+            // Forge scene is unchanged, which is exactly the case during playback -- so without
+            // this the actors would be re-placed but never re-posed, and the picture would stay
+            // frozen at the moment their meshes were built. Re-pose here instead.
+            self.update_actors();
+            self.fprof.lap(8); // #film-perf  pose + bone palettes (+ any mesh rebuild)
+        }
+        // Drive the camera from the film in the player camera modes. Done AFTER the actors are
+        // placed so a first-person pose uses this tick's position, and it writes the ordinary
+        // free camera's fields, so leaving the mode just stops writing them and the user keeps
+        // control from wherever they were.
+        // Changing subject must recenter the orbit, or the camera keeps the angle it was left at
+        // for the previous player and starts the new one off pointing at nothing in particular.
+        // #film-camera  And hand the playback the tag-authored camera bits the driver decoded off
+        // the loaded map — which vehicle seats force third person, which weapons do. Without them
+        // the context resolver answers from its stated fallbacks, which is honest but coarse;
+        // `set_camera_tags` drops the derived timeline so it is rebuilt against the real flags
+        // the first frame a map is open.
+        let cam_tags = self.film_driver.camera_tags().clone();
+        if let Some(pb) = self.film_play.as_deref_mut() {
+            pb.set_camera_tags(cam_tags);
+            let subject = pb.camera.owner(&pb.index);
+            if subject != pb.rig_subject {
+                pb.rig.recenter();
+                pb.rig_subject = subject;
+            }
+        }
+        // #fp-fov  A first-person Theater camera renders at REACH'S OWN field of view, not the
+        // editor's. HMS's default camera is 70 degrees VERTICAL (about 102 horizontal at 16:9);
+        // Reach plays at 49.097 vertical / 78.15 horizontal, and at 70 the first-person arms sat
+        // so far out in the periphery that the view did not read as first person at all. The
+        // editor's own FOV is remembered and put back the moment the mode is left, so nothing the
+        // user set is lost.
+        // #film-camera  Deliberately the chosen MODE and not `view_is_first_person()`, which is
+        // the opposite of the rule that applies to the arms and the hidden body. Reach's own
+        // third-person cameras — `following`, `dead`, `orbiting` — all render at the SAME authored
+        // field of view as first person, because none of the units involved authors an
+        // `override fov` (measured: both the Spartan's `unit camera` and its `sync action camera`
+        // read 0.0). Switching this to the resolved camera would snap the view back to the
+        // editor's 70-degree default for the duration of a death, which is a framing the game
+        // never shows.
+        let fp_live = self.film_play.as_deref().is_some_and(|pb| pb.camera.is_first_person());
+        if fp_live {
+            if self.fov_before_first_person.is_none() {
+                self.fov_before_first_person = Some(self.camera.fov_y);
+            }
+            self.camera.fov_y = film_play::reach_vertical_fov_for(self.fp_fov_deg);
+        } else if let Some(f) = self.fov_before_first_person.take() {
+            self.camera.fov_y = f;
+        }
+        if let Some(pb) = self.film_play.as_deref() {
+            if let Some(mut pose) = film_play::solve_camera_at(pb, self.film_driver.eye_height(pb)) {
+                // #film  Keep the follow camera out of the walls. Orbiting a player standing next
+                // to a rock would otherwise put the view inside the rock. The cast is from the
+                // SUBJECT outwards, so the camera is pulled in along the same line rather than
+                // shoved sideways, and the shot stays framed on the player.
+                //
+                // #film-camera  The test is on the POSE, not on the mode. A first-person camera
+                // that the engine's context rules have taken into an assassination or a death
+                // orbit is standing off a pivot like any other third-person shot, and it needs
+                // the cast just as much; keying off `is_first_person()` would have skipped it and
+                // put the kill cam inside a wall.
+                if pose.pivot.is_some() {
+                    if let (Some(scene), Some(pivot)) = (self.scene_ctl.as_ref(), pose.pivot) {
+                        let p = glam::Vec3::from(pivot);
+                        let c = glam::Vec3::from(pose.pos);
+                        let to_cam = c - p;
+                        let d = to_cam.length();
+                        if d > 1e-3 {
+                            let dir = to_cam / d;
+                            if let Some(hit) = scene.raycast_solid(p, dir, d) {
+                                let keep = (hit - 0.12).clamp(0.25, d);
+                                let np = p + dir * keep;
+                                pose.pos = [np.x, np.y, np.z];
+                            }
+                        }
+                    }
+                }
+                self.camera.pos = glam::Vec3::new(pose.pos[0], pose.pos[1], pose.pos[2]);
+                self.camera.yaw = pose.yaw;
+                self.camera.pitch = pose.pitch;
+            }
+        }
+        self.fprof.lap(9); // #film-perf  camera tags + the camera solve
+
+        // #reach-sound  Audio, LAST, so the listener is this frame's camera
+        // rather than the previous frame's. Nothing here can block: the device
+        // and the banks come up lazily on a worker thread and a sound whose
+        // sample is not decoded yet is skipped, never waited for.
+        if let (Some(cache), Some(scene)) = (cache, self.scene_ctl.as_ref()) {
+            if let (Some(pb), Some(map)) = (
+                self.film_play.as_deref(),
+                scene.open_map_path().map(|p| p.to_path_buf()),
+            ) {
+                let fwd = self.camera.forward();
+                let right = self.camera.right();
+                // Halo's basis: x forward, y LEFT, z up -- which is what
+                // `reach_sound::to_listener_space` and the engine's speaker
+                // table expect, so the left axis is -right.
+                let left = -right;
+                let up = right.cross(fwd).normalize_or_zero();
+                self.sound.tick(
+                    pb,
+                    &self.film_driver,
+                    scene.native_dll(),
+                    cache,
+                    &map,
+                    (
+                        self.camera.pos.into(),
+                        fwd.into(),
+                        left.into(),
+                        up.into(),
+                    ),
+                );
+            }
+        }
+        self.fprof.lap(10); // #film-perf  audio
+    }
+
+    /// #film  The playback timeline window.
+    /// #film  The Theater controls.
+    ///
+    /// Two PANELS, not a floating window, and that distinction is the whole of the fix for
+    /// "the menus take up most of the viewport". An `egui::Window` floats OVER the picture; a
+    /// `TopBottomPanel` / `SidePanel` RESHAPES it, so the central area shrinks to fit and nothing
+    /// is ever hidden behind the chrome. Theater is a viewer — the content is the point.
+    ///
+    /// * a slim strip across the bottom, of FIXED height, carrying only what a viewer needs while
+    ///   watching: play/pause, step, time, how many are alive, speed, the scrub slider;
+    /// * a right-hand panel, CLOSED by default, carrying everything verbose: the cast and its
+    ///   cameras, what is drawn and how, and the draw options.
+    ///
+    /// Must be called BEFORE the central viewport panel, which is what lets egui reflow it.
+    fn film_timeline_window(&mut self, ctx: &egui::Context) {
+        if !self.film_timeline_open || self.film_play.is_none() {
+            return;
+        }
+        // #film-perf  The caption and the per-body lines are the SIDE PANEL's text and nothing
+        // else reads them, so they are built only when the panel is open. Both walk every track
+        // at this tick (4.6 ms and 1.9 ms measured), and the panel is closed by default — paying
+        // for them on a frame that cannot show them was pure waste.
+        let (caption, body_lines) = if self.film_panel_open {
+            let pb = self.film_play.as_deref().expect("checked above");
+            // ONE `states_at` for both: it is the expensive half, and the two have to describe the
+            // same tick anyway.
+            let (states, total) = self.film_driver.states_and_total(pb);
+            (
+                self.film_driver.caption_with(pb, &states, total),
+                film_play::ActorDriver::body_lines_from(&states),
+            )
+        } else {
+            (String::new(), Vec::new())
+        };
+        // Built once when the index landed; neither depends on the tick.
+        let roster = std::mem::take(&mut self.film_roster);
+        let coverage = std::mem::take(&mut self.film_roster_coverage);
+        let header_players = self.film.as_deref().map(|f| f.present_players().count()).unwrap_or(0);
+        let mut close = false;
+        let mut toggle_panel = false;
+        let mut toggle_editor = false;
+        // #film-action  Where an assassination jump landed, reported after the panel's borrow ends.
+        let mut jumped_to: Option<(u32, bool)> = None;
+        let panel_open = self.film_panel_open;
+        let editor_hidden = self.film_hide_editor;
+        // The button must count what it OPENS ONTO -- the watchable cast. Counting every row made
+        // it read "Players (16)" against the panel's own "14 player(s) had a body", which looks
+        // like a contradiction even though both are true; the two header players with no matched
+        // body are still listed inside, where the row explains them.
+        let cast = roster.iter().filter(|r| r.owner.is_some()).count();
+
+        // The strip. `exact_height` is load-bearing: a panel whose height is derived from its
+        // contents would move its own controls whenever anything inside changed, which is the
+        // defect this replaces.
+        if let Some(pb) = self.film_play.as_deref_mut() {
+            egui::TopBottomPanel::bottom("film_transport")
+                .exact_height(film_ui::TRANSPORT_HEIGHT)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    let act = film_ui::transport_ui(ui, pb, panel_open, cast, editor_hidden);
+                    close = act.close;
+                    toggle_panel = act.toggle_panel;
+                    toggle_editor = act.toggle_editor;
+                    jumped_to = act.jumped_to;
+                });
+        }
+        if self.film_panel_open {
+            let stats_ref = self.film_stats.as_deref();
+            // #reach-widget  the player list is drawn from the open map's own scoreboard tags.
+            let scene_ref = self.scene_ctl.as_ref();
+            let stats_open = self.film_stats_open;
+            // #film-live  A property of the FILE, not of playback, so it lives on the app. Lifted
+            // out here because the panel below holds a mutable borrow of `self.film_play` and
+            // cannot take a second one of `self`; written back the moment that borrow ends.
+            let mut follow_live = self.film_follow_live;
+            let follow_note = std::mem::take(&mut self.film_follow_note);
+            // #film-objects  Same reason: it lives on the actor driver, and the panel below
+            // holds a mutable borrow of `self.film_play`.
+            let mut show_objects = self.film_driver.show_objects;
+            let object_status = self.film_driver.object_status.clone();
+            // #fp-fov  The first-person field of view, mirrored into the Theater panel.
+            let mut fp_fov = self.fp_fov_deg;
+            // #reach-sound  A DISJOINT FIELD BORROW, taken before the one below. The panel
+            // cannot call a method on `self` while `self.film_play` is borrowed, but two
+            // separate `self.field` borrows are fine -- which is why this is a field reference
+            // and not a `mem::take`: taking the engine out would drop its open device and its
+            // decoded samples once a frame.
+            let sound = &mut self.sound;
+            if let Some(pb) = self.film_play.as_deref_mut() {
+                egui::SidePanel::right("film_panel")
+                    .default_width(360.0)
+                    .width_range(300.0..=520.0)
+                    .show(ctx, |ui| {
+                        egui::ScrollArea::vertical().id_salt("film_panel_scroll").show(ui, |ui| {
+                            film_ui::side_panel_ui(ui, pb, &roster, header_players, &caption, &body_lines, &coverage, scene_ref, stats_ref, &mut follow_live, &follow_note, &mut show_objects, &object_status, &mut fp_fov, sound);
+                            // #film-stats  The one hook this module needs. Everything inside the
+                            // section lives in `film_stats`, and the numbers were computed once
+                            // when the index landed.
+                            film_stats::panel_ui(ui, stats_ref, stats_open);
+                        });
+                    });
+            }
+            // #film-live  put them back now the panel's borrow of `self.film_play` is over.
+            self.film_follow_live = follow_live;
+            self.film_driver.show_objects = show_objects;
+            self.fp_fov_deg = fp_fov;
+            if self.film_follow_note.is_empty() {
+                self.film_follow_note = follow_note;
+            }
+        }
+        if toggle_panel {
+            self.film_panel_open = !self.film_panel_open;
+        }
+        if toggle_editor {
+            self.film_hide_editor = !self.film_hide_editor;
+        }
+        // #film-action  Say where the jump landed and whether the RECORDING stated this kill was
+        // an assassination or HMS derived it -- the same distinction the panel and the body
+        // provenance already draw, so a derived one is never presented as a recorded fact.
+        if let Some((tick, stated)) = jumped_to {
+            self.status = format!(
+                "Assassination at {} \u{2014} camera on the victim{}",
+                film_play::fmt_time(tick as f32 / 60.0),
+                if stated { "" } else { " (derived, not stated by the recording)" }
+            );
+        }
+        self.film_roster = roster;
+        self.film_roster_coverage = coverage;
+        if close {
+            self.film_timeline_open = false;
+            self.film_panel_open = false;
+        }
+    }
+
+    /// The saved-film metadata card.
+    fn film_card_ui(&mut self, ctx: &egui::Context) {
+        if !self.film_card_open || self.film.is_none() { return }
+        let Some(f) = self.film.clone() else { return };
+        let label = self.film_base_map_label();
+        let mut open = true;
+        let mut action = film_ui::FilmAction::None;
+        let mut show_machine = self.film_show_machine;
+        let title = self
+            .film_path
+            .as_ref()
+            .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Saved film".into());
+        egui::Window::new(format!("Saved film — {title}"))
+            .open(&mut open)
+            .default_width(560.0)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                action = film_ui::card_ui(
+                    ui,
+                    &f,
+                    &mut show_machine,
+                    label.as_deref(),
+                    &self.film_status,
+                    self.film_variant_names.as_deref(),
+                );
+            });
+        self.film_show_machine = show_machine;
+        match action {
+            film_ui::FilmAction::LoadScene => self.film_load_scene(),
+            film_ui::FilmAction::ExtractMapVariant => self.film_extract_map_variant(),
+            film_ui::FilmAction::ExtractGameVariant => self.film_extract_game_variant(),
+            film_ui::FilmAction::Close => open = false,
+            film_ui::FilmAction::None => {}
+        }
+        self.film_card_open = open;
+    }
+
+    /// #model-import: open the SHARED file browser in MODEL purpose -- "browse for the file",
+    /// the same way opening a .mvar works. Seeds the folder from (in order) this session's last
+    /// model folder, the folder remembered from a previous session, the exe's own models folder,
+    /// Home, the working directory.
+    fn open_model_browser(&mut self) {
+        self.browser_purpose = BrowsePurpose::Model;
+        if self.model_browser_recent.is_empty() {
+            self.model_browser_recent = self.recent.folders_of_kind(recent::RecentKind::Model);
+        }
+        let dir = self
+            .model_browser_recent
+            .first()
+            .cloned()
+            .or_else(Self::model_load_last_dir)
+            .filter(|d| d.is_dir())
+            .or_else(|| Self::exe_models_dir().filter(|d| d.is_dir()))
+            .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from).filter(|d| d.is_dir()))
+            .or_else(|| std::env::var_os("USERPROFILE").map(std::path::PathBuf::from).filter(|d| d.is_dir()))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.variant_browser_drives = Self::vb_volumes();
+        self.variant_browser_bookmarks = Self::vb_load_bookmarks();
+        self.model_browser_quick = Self::model_quick_dirs();
+        self.model_recent_files = Self::model_load_recent_files();
+        self.variant_browser_history.clear();
+        self.variant_browser_hist_pos = 0;
+        self.vb_navigate(&dir, true);
+        self.variant_browser_save = false; // the model dialog has no save mode
+        self.variant_browser_overwrite = None;
+        self.variant_browser_open = true;
+    }
+
+    /// #model-import: `<exe dir>/models` -- the folder the import feature used to REQUIRE.
+    /// It is now only a quick-access shortcut; any folder works.
+    fn exe_models_dir() -> Option<std::path::PathBuf> {
+        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("models")))
+    }
+
+    /// #model-import: the model dialog's quick-access group -- the exe's models folder first.
+    /// Home / Downloads / Documents already have their own "System" section, and the user's
+    /// bookmarks their own, so this stays the one model-specific entry.
+    fn model_quick_dirs() -> Vec<(String, std::path::PathBuf)> {
+        let mut out: Vec<(String, std::path::PathBuf)> = Vec::new();
+        if let Some(d) = Self::exe_models_dir().filter(|d| d.is_dir()) {
+            out.push(("\u{1F4E6} models\\ (next to the exe)".to_string(), d));
+        }
+        // A dev/source run has no models folder beside the exe; offer ./models when it exists.
+        if let Some(d) = std::env::current_dir().ok().map(|d| d.join("models")).filter(|d| d.is_dir()) {
+            if !out.iter().any(|(_, p)| *p == d) {
+                out.push(("\u{1F4E6} ./models".to_string(), d));
+            }
+        }
+        out
+    }
+
+    /// #model-import: persisted "the folder I was last browsing models in".
+    fn model_last_dir_path() -> Option<std::path::PathBuf> {
+        Self::hms_data_dir().map(|d| d.join("last_model_dir.txt"))
+    }
+    fn model_load_last_dir() -> Option<std::path::PathBuf> {
+        let t = std::fs::read_to_string(Self::model_last_dir_path()?).ok()?;
+        let t = t.trim().to_string();
+        (!t.is_empty()).then(|| std::path::PathBuf::from(t))
+    }
+    fn model_save_last_dir(dir: &std::path::Path) {
+        if let Some(p) = Self::model_last_dir_path() {
+            let _ = std::fs::write(p, dir.to_string_lossy().as_bytes());
+        }
+    }
+
+    /// #model-import: persisted recent model FILES (one path per line, most recent first).
+    fn model_recent_files_path() -> Option<std::path::PathBuf> {
+        Self::hms_data_dir().map(|d| d.join("recent_models.txt"))
+    }
+    /// The recent model FILES, newest first. These now come out of the ONE recent-items store
+    /// (recent.rs) rather than a list of their own, so an imported model is listed both in this
+    /// dialog's sidebar and under File ▸ Open recent. `recent_models.txt` written by builds
+    /// before the unification is read once, as a migration, when the store has no models yet.
+    fn model_load_recent_files() -> Vec<std::path::PathBuf> {
+        let from_store = recent::RecentStore::load().paths_of_kind(recent::RecentKind::Model);
+        if !from_store.is_empty() {
+            return from_store;
+        }
+        Self::model_recent_files_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.lines().filter(|l| !l.trim().is_empty()).map(std::path::PathBuf::from).collect())
+            .unwrap_or_default()
+    }
+    /// Record a successfully imported model: into the shared recent-items store (dedup + cap +
+    /// persist live there), mirrored into this dialog's sidebar list, and its folder remembered
+    /// as the model browser's next starting point.
+    fn model_note_recent_file(&mut self, path: &std::path::Path) {
+        self.recent_note(recent::RecentItem::new(recent::RecentKind::Model, path, "", ""));
+        self.model_recent_files = self.recent.paths_of_kind(recent::RecentKind::Model);
+        if let Some(d) = path.parent() {
+            Self::model_save_last_dir(d);
+        }
+    }
+
+    // --------------------------------------------------------------- File ▸ Open recent
+    /// Record an opened item and persist the history immediately (a crash or a power cut must
+    /// not lose "what I was working on" — that is the whole point of the list).
+    fn recent_note(&mut self, item: recent::RecentItem) {
+        self.recent.note(item);
+        self.recent.save();
+    }
+
+    /// Record the .mvar that was just opened, with the title it shows and the game whose base
+    /// map it was loaded on (so a Halo 3 variant is never listed as a Reach one).
+    fn note_recent_variant(&mut self, path: &std::path::Path) {
+        // A saved film's Forge scene is drawn by extracting its map variant into the app's own
+        // data folder and handing THAT to the ordinary loader; the cross-game preview does the
+        // same. Those scratch files are not things the user opened, so they stay out of the list
+        // (the film itself is already in it).
+        if let Some(d) = project::settings_dir() {
+            if path.starts_with(&d) {
+                return;
+            }
+        }
+        let game = self
+            .selected_map
+            .and_then(|i| self.map_candidates.get(i))
+            .map(|c| c.game.display_name().to_string())
+            .or_else(|| self.variant_globals.as_ref().map(|g| format!("{}", g.game)))
+            .unwrap_or_default();
+        // Shipped variants title themselves with a localization KEY ("$h4_mvar_settler_name");
+        // resolve it to the text the rest of the UI shows, so the menu row is readable.
+        let title = h4::localization::display(&self.variant_title);
+        self.recent_note(recent::RecentItem::new(recent::RecentKind::Variant, path, &game, &title));
+    }
+
+    /// Record the base map that has just finished loading (called from every game's
+    /// load-complete tick, beside `mapcat::save_last_map`).
+    fn note_recent_map(&mut self) {
+        if self.map_path.trim().is_empty() {
+            return;
+        }
+        let p = std::path::PathBuf::from(self.map_path.clone());
+        let (game, title) = match self.map_candidates.iter().find(|c| c.path == p) {
+            Some(c) => {
+                let stem = if c.stem.is_empty() { c.file_name.clone() } else { c.stem.clone() };
+                // A Workshop map usually carries the SAME scenario name as the stock map it
+                // replaces, so say which one this is.
+                (c.game.display_name().to_string(), if c.modded { format!("{stem} (Workshop)") } else { stem })
+            }
+            None => (String::new(), String::new()),
+        };
+        self.recent_note(recent::RecentItem::new(recent::RecentKind::Map, &p, &game, &title));
+    }
+
+    /// Stat every entry — run when the Open-recent menu OPENS, never per frame.
+    fn recent_refresh_missing(&mut self) {
+        self.recent_missing = self
+            .recent
+            .items()
+            .iter()
+            .filter(|i| !i.exists())
+            .map(|i| i.path.clone())
+            .collect();
+    }
+
+    /// Open a recent item through the SAME code path the browser uses, so a variant still routes
+    /// to its own base map (Workshop maps included — they resolve by MCC map GUID) and a model
+    /// still goes through the ordinary import. A file that has gone raises the window below
+    /// instead of doing nothing.
+    fn recent_open(&mut self, item: recent::RecentItem) {
+        let path = item.as_path().to_path_buf();
+        if !path.exists() {
+            self.recent_missing.insert(item.path.clone());
+            self.status = format!("'{}' is no longer at {}", item.display_name(), item.path);
+            self.spawn_status = self.status.clone();
+            self.recent_gone = Some(item);
+            return;
+        }
+        // The browser's deferral: close/paint first, load on the next frame (the parse blocks).
+        match item.kind {
+            recent::RecentKind::Variant => {
+                self.pending_open_variant = Some((path, 1));
+                self.spawn_status = format!("Opening {}…", item.display_name());
+            }
+            recent::RecentKind::Film => {
+                self.pending_open_film = Some((path, 1));
+                self.spawn_status = format!("Opening saved film {}…", item.display_name());
+            }
+            recent::RecentKind::Model => {
+                self.pending_import_model = Some((path, 1));
+                self.spawn_status = format!("Importing {}…", item.display_name());
+            }
+            recent::RecentKind::Map => self.recent_open_map(&path),
+        }
+        self.status = self.spawn_status.clone();
+    }
+
+    /// Load a recent BASE map: the picker drives the loader by catalog index, so the path is
+    /// looked up there (and the catalog rescanned once if the map is not in it yet — a Workshop
+    /// item subscribed since launch).
+    fn recent_open_map(&mut self, path: &std::path::Path) {
+        let mut idx = self.map_candidates.iter().position(|c| c.path == path);
+        if idx.is_none() {
+            self.map_candidates = mapcat::enumerate();
+            idx = self.map_candidates.iter().position(|c| c.path == path);
+        }
+        let Some(i) = idx else {
+            self.map_status = format!("{} is not among the detected maps — rescan (↻) or pick it in the list.", path.display());
+            self.status = self.map_status.clone();
+            return;
+        };
+        self.picker_game = self.map_candidates[i].game;
+        self.show_modded_maps = self.map_candidates[i].modded;
+        self.selected_map = Some(i);
+        let label = self.map_candidates[i].label();
+        self.load_map();
+        self.map_status = format!("Loading {label}…");
+    }
+
+    /// `File ▸ Open recent`: the history, grouped by kind and labelled with its game, each row
+    /// opening the item directly. Entries whose file has gone are marked (stat-ed once, when the
+    /// menu opens) and say so when clicked.
+    fn recent_menu_ui(&mut self, ui: &mut egui::Ui) {
+        let total = self.recent.len();
+        let title = if total == 0 { "Open recent".to_string() } else { format!("Open recent ({total})") };
+        let mut open_item: Option<recent::RecentItem> = None;
+        let mut clear = false;
+        let mut sweep = false;
+        let resp = ui.menu_button(title, |ui| {
+            // Just opened? (not drawn on the previous pass) → check the files ONCE. egui can
+            // run more than one pass per frame, hence the slack.
+            let pass = ui.ctx().cumulative_pass_nr();
+            if pass.saturating_sub(self.recent_menu_pass) > 2 {
+                self.recent_refresh_missing();
+            }
+            self.recent_menu_pass = pass;
+            if self.recent.is_empty() {
+                ui.weak("Nothing opened yet.");
+                ui.small("Variants, base maps, saved films and imported models you open are listed here.");
+                return;
+            }
+            ui.set_min_width(260.0);
+            for kind in recent::RecentKind::ALL {
+                let items: Vec<recent::RecentItem> = self.recent.of_kind(kind).cloned().collect();
+                if items.is_empty() {
+                    continue;
+                }
+                ui.label(egui::RichText::new(kind.group_label()).strong().small());
+                for it in items {
+                    let gone = self.recent_missing.contains(&it.path);
+                    let label = if gone {
+                        egui::RichText::new(format!("✕ {}", it.menu_label())).weak()
+                    } else {
+                        egui::RichText::new(it.menu_label())
+                    };
+                    let hover = if gone {
+                        format!("{}\n\nThis file is no longer there — click to remove it from the list.", it.hover())
+                    } else {
+                        it.hover()
+                    };
+                    if ui.add(egui::Button::new(label)).on_hover_text(hover).clicked() {
+                        open_item = Some(it);
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+            }
+            let n_missing = self.recent_missing.len();
+            if n_missing > 0
+                && ui
+                    .button(format!("Remove {n_missing} missing item{}", if n_missing == 1 { "" } else { "s" }))
+                    .on_hover_text("Drop the entries whose file has been moved, renamed or deleted")
+                    .clicked()
+            {
+                sweep = true;
+                ui.close_menu();
+            }
+            if ui
+                .button("Clear recent items")
+                .on_hover_text("Forget the whole list. The files themselves are not touched.")
+                .clicked()
+            {
+                clear = true;
+                ui.close_menu();
+            }
+        });
+        resp.response.on_hover_text("Reopen something you were working on: map variants, base maps, saved films and imported models, newest first");
+        if sweep {
+            let n = self.recent.remove_missing();
+            self.recent.save();
+            self.recent_refresh_missing();
+            self.status = format!("Removed {n} missing item(s) from Open recent.");
+        }
+        if clear {
+            self.recent.clear();
+            self.recent.save();
+            self.recent_missing.clear();
+            self.model_recent_files.clear();
+            self.status = "Cleared the recent-items list.".into();
+        }
+        if let Some(it) = open_item {
+            self.recent_open(it);
+        }
+    }
+
+    /// The "that file is gone" window: a recent entry whose file has been moved, renamed or
+    /// deleted says so and offers to drop it (the alternative — a click that does nothing —
+    /// just looks broken).
+    fn recent_missing_ui(&mut self, ctx: &egui::Context) {
+        let Some(item) = self.recent_gone.clone() else { return };
+        let mut win_open = true;
+        let mut remove = false;
+        let mut keep = false;
+        egui::Window::new("That file is no longer there")
+            .collapsible(false)
+            .resizable(false)
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut win_open)
+            .show(ctx, |ui| {
+                ui.set_max_width(560.0);
+                let what = if item.game.is_empty() {
+                    item.kind.noun().to_string()
+                } else {
+                    format!("{} {}", item.game, item.kind.noun())
+                };
+                ui.label(egui::RichText::new(format!("{} — {}", item.display_name(), what)).strong());
+                ui.add_space(4.0);
+                ui.label(&item.path);
+                ui.add_space(4.0);
+                ui.small("It has been moved, renamed or deleted since you opened it, so there is nothing to open. Nothing was loaded.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Remove from recent").clicked() {
+                        remove = true;
+                    }
+                    if ui.button("Keep it in the list").on_hover_text("Leave the entry alone — for a file on a drive that is not plugged in").clicked() {
+                        keep = true;
+                    }
+                });
+            });
+        if remove {
+            self.recent_gone_answer(true);
+        }
+        if keep || !win_open {
+            self.recent_gone_answer(false);
+        }
+    }
+
+    /// The two answers to that window, in ONE place so the buttons and the `recent gone` test
+    /// verb can never drift: remove the entry, or leave it alone. Either way the window closes.
+    fn recent_gone_answer(&mut self, remove: bool) -> String {
+        let Some(item) = self.recent_gone.take() else {
+            return "no 'file is no longer there' window is up".into();
+        };
+        if !remove {
+            return format!("kept '{}' in Open recent", item.display_name());
+        }
+        self.recent.remove(item.kind, &item.path);
+        self.recent.save();
+        self.recent_missing.remove(&item.path);
+        self.model_recent_files = self.recent.paths_of_kind(recent::RecentKind::Model);
+        self.status = format!("Removed '{}' from Open recent — the file is gone.", item.display_name());
+        self.spawn_status = self.status.clone();
+        self.status.clone()
+    }
+
+    /// #model-import: the details line for the selected model file -- "OBJ - 1.2 KiB - 842 verts,
+    /// 1600 tris". This PARSES the file, so it runs on selection only (never per listing row).
+    fn model_probe_line(path: &std::path::Path) -> String {
+        let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_uppercase();
+        let size = Self::vb_fmt_size(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0));
+        match modelimport::load(path) {
+            Ok(m) if !m.is_empty() => {
+                // #model-import: the material / texture tail is the point — it tells the user
+                // BEFORE importing whether the model carries any textures at all, or whether it
+                // is going to draw in flat material colours.
+                let mut line = format!(
+                    "{ext} \u{B7} {size} \u{B7} {} verts, {} tris \u{B7} {}",
+                    m.vert_count(), m.tri_count(), m.material_summary()
+                );
+                if m.parts.len() > 1 {
+                    line += &format!(" \u{B7} {} parts", m.parts.len());
+                }
+                if let Some(n) = m.notes.first() {
+                    line += &format!("\n{n}");
+                }
+                line
+            }
+            Ok(_) => format!("{ext} \u{B7} {size} \u{B7} no triangles (nothing to import)"),
+            Err(e) => format!("{ext} \u{B7} {size} \u{B7} {e}"),
+        }
     }
 
     /// Per-user data dir for browser state (`project::settings_dir`: %LOCALAPPDATA% on Windows,
@@ -9453,8 +14229,12 @@ impl App {
 
     /// Navigate to `dir`: read its listing, push to history (unless `record`==false for back/fwd),
     /// bump recent, and sync the editable path field. Clears the selection.
+    ///
+    /// #model-import: the listing keeps the files of the CURRENT purpose (.mvar, or
+    /// .obj/.glb/.gltf), and the per-purpose recent-folder list is the one that gets bumped.
     fn vb_navigate(&mut self, dir: &std::path::Path, record: bool) {
-        // Read subfolders + .mvar files with metadata.
+        // Read subfolders + the files this purpose accepts, with metadata.
+        let purpose = self.browser_purpose;
         let mut dirs: Vec<FileEntry> = Vec::new();
         let mut files: Vec<FileEntry> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -9467,11 +14247,22 @@ impl App {
                 let modified = md.as_ref().and_then(|m| m.modified().ok());
                 if is_dir {
                     dirs.push(FileEntry { path, name, is_dir: true, size: 0, modified, hint: String::new() });
-                } else if path.extension().and_then(|x| x.to_str()).map_or(false, |x| x.eq_ignore_ascii_case("mvar")) {
+                } else if purpose.accepts(&path) {
                     let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
                     // A Halo 4 variant (mvar chunk v50) gets its resolved name, base map,
-                    // object count and author in the row; Reach files keep a bare file name
-                    let hint = h4::mvar::read_h4_summary(&path).map(|sm| self.h4_summary_line(&sm)).unwrap_or_default();
+                    // object count and author in the row; Reach files keep a bare file name.
+                    // A model row carries only its extension: probing every file in a folder
+                    // would mean parsing every mesh in it just to draw the list.
+                    let hint = match purpose {
+                        BrowsePurpose::Model => path.extension().and_then(|x| x.to_str()).map(|x| x.to_ascii_uppercase()).unwrap_or_default(),
+                        BrowsePurpose::Variant => h4::mvar::read_h4_summary(&path).map(|sm| self.h4_summary_line(&sm))
+                            .or_else(|| h3::mvar::read_h3_summary(&path).map(|sm| self.h3_summary_line(&sm))) // #h3
+                            .unwrap_or_default(),
+                        // Header-prefix read only (0x1F8A8 bytes): a film can be 150 MB.
+                        BrowsePurpose::Film => film_ui::browser_row_hint(&path).unwrap_or_default(),
+                        // #prefab one glance at a shared file: what it holds and which game it is from
+                        BrowsePurpose::Prefab => prefab::load_file(&path).map(|(pf, _)| pf.summary()).unwrap_or_else(|e| format!("unreadable: {e}")),
+                    };
                     files.push(FileEntry { path, name, is_dir: false, size, modified, hint });
                 }
             }
@@ -9486,6 +14277,7 @@ impl App {
         self.variant_browser_path_edit = dir.to_string_lossy().into_owned();
         self.variant_browser_selected = None;
         self.variant_browser_selected_meta = None;
+        self.model_browser_selected_meta = None;
         self.variant_browser_filename.clear();
         if record {
             // Truncate any forward history, then push.
@@ -9494,10 +14286,21 @@ impl App {
                 self.variant_browser_history.push(dir.to_path_buf());
                 self.variant_browser_hist_pos = self.variant_browser_history.len() - 1;
             }
-            // Recent: most-recent-first, dedup, cap 12.
-            self.variant_browser_recent.retain(|p| p != dir);
-            self.variant_browser_recent.insert(0, dir.to_path_buf());
-            self.variant_browser_recent.truncate(12);
+            // Recent: most-recent-first, dedup, cap 12 — in the CURRENT purpose's own list.
+            let recent = match purpose {
+                BrowsePurpose::Model => &mut self.model_browser_recent,
+                BrowsePurpose::Variant => &mut self.variant_browser_recent,
+                BrowsePurpose::Film => &mut self.film_browser_recent,
+                BrowsePurpose::Prefab => &mut self.prefab_browser_recent,
+            };
+            recent.retain(|p| p != dir);
+            recent.insert(0, dir.to_path_buf());
+            recent.truncate(12);
+            // #model-import: remember the model folder across sessions (the variant side already
+            // has `last_variant.txt`, written when a variant is opened/saved).
+            if purpose == BrowsePurpose::Model {
+                Self::model_save_last_dir(dir);
+            }
         }
     }
 
@@ -9845,6 +14648,48 @@ impl App {
     /// Tools ▸ Scale converter — pick the convention the loaded map's SCALE objects were
     /// authored in (they re-render at the right size immediately), then convert them onto X330.
     /// This actually rewrites the objects' spawn sequences; it is not a calculator.
+    /// #xgame File ▸ "Convert variant to another game…": open the modal, seeded from whatever
+    /// variant is open (so the common case needs no file picking).
+    fn open_convert_variant(&mut self) {
+        self.show_convert_variant = true;
+        self.xgame.ensure_loaded();
+        if self.xgame.source.is_none() {
+            if let Some(p) = self.current_variant_path.clone().or_else(|| self.new_variant_template.clone()) {
+                self.xgame.load_source(p);
+            } else {
+                self.xgame.status = "No variant is open - pick a .mvar, or open one with File ▸ Open .mvar….".into();
+            }
+        }
+    }
+
+    /// Draw the conversion modal and act on what it asks for: a source file pick, and loading a
+    /// freshly-written file on its target canvas so the layout can be LOOKED at.
+    fn convert_variant_ui(&mut self, ctx: &egui::Context) {
+        if !self.show_convert_variant { return; }
+        let mut open = self.show_convert_variant;
+        let mut pick = false;
+        xgame::gui::ui(&mut self.xgame, ctx, &mut open, &mut pick);
+        self.show_convert_variant = open;
+        if pick {
+            let mut dlg = rfd::FileDialog::new().add_filter("Halo map variant", &["mvar"]).set_title("Convert which variant?");
+            if let Some(d) = self.variant_browser_recent.first().cloned()
+                .or_else(|| self.current_variant_path.as_ref().and_then(|p| p.parent().map(|x| x.to_path_buf()))) {
+                dlg = dlg.set_directory(d);
+            }
+            if let Some(f) = dlg.pick_file() { self.xgame.load_source(f); }
+        }
+        // Show in viewport / Save As: load the file on the TARGET canvas so the layout is visible.
+        // The modal stays open for a preview (so the offset / yaw can be nudged and re-previewed)
+        // and closes once the real file has been written.
+        if let Some(p) = self.xgame.want_preview_load.take() {
+            let saved = p.file_name().map_or(true, |n| n != "xgame_preview.mvar");
+            self.status = if saved { format!("Converted -> {} (loading it on the target canvas)", p.display()) }
+                else { "Preview: the converted layout on the target canvas (nothing saved yet)".into() };
+            if saved { self.show_convert_variant = false; }
+            self.import_mvar(p);
+        }
+    }
+
     fn scale_converter_ui(&mut self, ctx: &egui::Context) {
         if !self.show_scale_converter {
             return;
@@ -9946,16 +14791,50 @@ impl App {
         let mut confirm_overwrite = false;
         let mut cancel_overwrite = false;
         let sys_dirs = Self::vb_system_dirs();
+        // #model-import: the model dialog has no save mode (nothing is written), so force OPEN
+        // mode -- a stale save_mode from the variant dialog must not turn Import into Save.
+        let purpose = self.browser_purpose;
+        let models = purpose == BrowsePurpose::Model;
+        if models || purpose == BrowsePurpose::Film || purpose == BrowsePurpose::Prefab {
+            // None of these purposes writes anything, so a stale save_mode from the variant
+            // dialog must not turn Open into Save.
+            self.variant_browser_save = false;
+        }
         // The folders that actually hold variants — the game's own map_variants /
         // hopper_map_variants plus every per-account MCC save folder. Cached on the App because
         // discovery walks the filesystem and this runs every frame the window is open.
-        if self.variant_browser_quick.is_empty() {
+        if !models && purpose != BrowsePurpose::Film && self.variant_browser_quick.is_empty() {
             self.variant_browser_quick = mapcat::quick_variant_dirs();
+            self.variant_browser_quick_groups = mapcat::quick_variant_groups(); // #dialogs: by game
         }
-        // #dialogs: one window, two modes. The title also keys egui's remembered size/pos, so
-        // Open and Save each keep their own.
+        // #dialogs  THEATER: the saved-film folders, so a clip can be opened without knowing that
+        // MCC buries them under AppData (or, on Linux, inside a Proton prefix seven levels down).
+        // `film::film_search_dirs` already finds every one of them — a mounted Windows partition's
+        // user tree, every Steam library's compatdata prefixes, and $HOME — so this only surfaces
+        // what the film reader already searches. Cached: discovery walks the filesystem and this
+        // runs every frame the window is open.
+        if purpose == BrowsePurpose::Film && self.film_browser_quick.is_empty() {
+            self.film_browser_quick = crate::film::film_search_dirs()
+                .into_iter()
+                .take(12)
+                .map(|p| {
+                    // Label it by the ACCOUNT folder when there is one, because a machine with
+                    // several MCC profiles otherwise shows a column of identical "Temporary".
+                    let acct = p
+                        .parent()
+                        .and_then(|q| q.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let leaf = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let label = if acct.is_empty() { format!("🎬 {leaf}") } else { format!("🎬 {acct} / {leaf}") };
+                    (label, p)
+                })
+                .collect();
+        }
+        // #dialogs / #model-import: one window, three jobs (open variant / save variant / import
+        // model). The title also keys egui's remembered size+position, so each keeps its own.
         let save_mode = self.variant_browser_save;
-        let title = if save_mode { "Save map variant" } else { "Open map variant" };
+        let title = purpose.window_title(save_mode);
         let mut win = egui::Window::new(title)
             .open(&mut win_open)
             .pivot(egui::Align2::CENTER_CENTER)
@@ -9965,7 +14844,19 @@ impl App {
         // run can screenshot the reflow at min / default / large.
         win = match self.variant_browser_force_size {
             Some(sz) => win.fixed_size(sz).resizable(false),
-            None => win.resizable(true).default_size([760.0, 560.0]).min_size([560.0, 380.0]),
+            None => {
+                // A normal, movable, resizable dialog - NEVER full-screen. The body's scroll areas
+                // take `available_height`, so without a cap an auto-sizing window (or a stale
+                // remembered size) grows to fill the screen. Bound it to a sensible size that also
+                // stays inside the current window. #dialogs
+                let sr = ctx.screen_rect().size();
+                let maxw = (sr.x - 48.0).clamp(400.0, 1100.0);
+                let maxh = (sr.y - 48.0).clamp(320.0, 760.0);
+                win.resizable(true)
+                    .default_size([760.0_f32.min(maxw), 560.0_f32.min(maxh)])
+                    .min_size([560.0_f32.min(maxw), 380.0_f32.min(maxh)])
+                    .max_size([maxw, maxh])
+            }
         };
         win.show(ctx, |ui| {
                 // ── Nav bar: back / forward / up / refresh + editable path + search ──
@@ -10018,13 +14909,66 @@ impl App {
                                 });
                             }
                             ui.separator();
-                            ui.strong("Game");
-                            if self.variant_browser_quick.is_empty() {
-                                ui.small("no variant folders found");
-                            }
-                            for (label, path) in &self.variant_browser_quick {
-                                if ui.selectable_label(false, label.as_str()).on_hover_text(path.to_string_lossy()).clicked() {
-                                    navigate = Some(path.clone());
+                            if models {
+                                // #model-import: the model dialog's own quick access -- the exe's
+                                // models folder (the old requirement, now just a shortcut) and the
+                                // recently imported FILES, wherever on disk they live.
+                                ui.strong("Models");
+                                if self.model_browser_quick.is_empty() {
+                                    ui.small("no models\\ folder found");
+                                }
+                                for (label, path) in &self.model_browser_quick {
+                                    if ui.selectable_label(false, label.as_str()).on_hover_text(path.to_string_lossy()).clicked() {
+                                        navigate = Some(path.clone());
+                                    }
+                                }
+                                ui.separator();
+                                ui.strong("Recent models");
+                                if self.model_recent_files.is_empty() {
+                                    ui.small("nothing imported yet");
+                                }
+                                for f in self.model_recent_files.clone() {
+                                    let nm = f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| f.to_string_lossy().into_owned());
+                                    // One click goes to the file's folder AND selects it, so Import
+                                    // is armed immediately; a double-click imports it outright.
+                                    let resp = ui.selectable_label(false, format!("\u{1F4E6} {nm}")).on_hover_text(f.to_string_lossy());
+                                    if resp.clicked() {
+                                        if let Some(d) = f.parent() { navigate = Some(d.to_path_buf()); }
+                                        select = Some(f.clone());
+                                    }
+                                    if resp.double_clicked() { open_now = Some(f.clone()); }
+                                }
+                            } else if purpose == BrowsePurpose::Film {
+                                // #dialogs  The saved-film folders MCC writes to.
+                                ui.strong("Theater");
+                                if self.film_browser_quick.is_empty() {
+                                    ui.small("no saved-film folders found on this machine");
+                                }
+                                for (label, path) in &self.film_browser_quick {
+                                    if ui
+                                        .selectable_label(false, label.as_str())
+                                        .on_hover_text(path.to_string_lossy())
+                                        .clicked()
+                                    {
+                                        navigate = Some(path.clone());
+                                    }
+                                }
+                            } else {
+                                // #dialogs: the game folders GROUPED BY GAME (Reach / Halo 3 / Halo 4 /
+                                // Halo 2 Anniversary), the game's name in bold above its folders
+                                if self.variant_browser_quick_groups.is_empty() {
+                                    ui.strong("Game");
+                                    ui.small("no variant folders found");
+                                }
+                                for (game, folders) in &self.variant_browser_quick_groups {
+                                    ui.label(egui::RichText::new(game.display_name()).strong());
+                                    ui.indent(("vb-game", game.short_name()), |ui| {
+                                        for (label, path) in folders {
+                                            if ui.selectable_label(false, label.as_str()).on_hover_text(path.to_string_lossy()).clicked() {
+                                                navigate = Some(path.clone());
+                                            }
+                                        }
+                                    });
                                 }
                             }
                             ui.separator();
@@ -10038,8 +14982,9 @@ impl App {
                                 if ui.selectable_label(false, format!("💾 {}", d.to_string_lossy())).clicked() { navigate = Some(d.clone()); }
                             }
                             ui.separator();
-                            ui.strong("Recent");
-                            for r in &self.variant_browser_recent {
+                            ui.strong("Recent folders");
+                            let recent_dirs = if models { self.model_browser_recent.clone() } else { self.variant_browser_recent.clone() };
+                            for r in &recent_dirs {
                                 let nm = r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| r.to_string_lossy().into_owned());
                                 if ui.selectable_label(false, format!("📁 {nm}")).on_hover_text(r.to_string_lossy()).clicked() { navigate = Some(r.clone()); }
                             }
@@ -10088,8 +15033,34 @@ impl App {
                     });
                 });
                 ui.separator();
-                // ── Details for the selected variant ──
-                if let (Some(_sel), Some((title, desc, author, editor, extra))) =
+                // ── Details for the selection ──
+                // #model-import: a model row has no title/author to show, so its strip is the
+                // probe line (format, size, vert/tri count) plus the full path.
+                if models {
+                    match (&self.variant_browser_selected, &self.model_browser_selected_meta) {
+                        (Some(sel), Some(info)) => {
+                            // The probe line's first line is the summary; a second line (when the
+                            // reader had something to warn about) goes under it.
+                            let mut lines = info.splitn(2, '\n');
+                            let head = lines.next().unwrap_or("");
+                            let note = lines.next();
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("Model:");
+                                ui.strong(sel.file_name().unwrap_or_default().to_string_lossy());
+                                ui.separator();
+                                ui.label(head);
+                            });
+                            if let Some(n) = note {
+                                ui.label(egui::RichText::new(n).weak());
+                            }
+                            ui.label(egui::RichText::new(sel.to_string_lossy()).italics().weak());
+                        }
+                        _ => {
+                            ui.weak("Pick an .obj / .glb / .gltf anywhere on disk — it does not have to be in the models\\ folder.");
+                            ui.weak("Imported models are movable: select one in the viewport and use the gizmo, G/R, or the numeric fields.");
+                        }
+                    }
+                } else if let (Some(_sel), Some((title, desc, author, editor, extra))) =
                     (&self.variant_browser_selected, &self.variant_browser_selected_meta)
                 {
                     ui.horizontal_wrapped(|ui| {
@@ -10137,7 +15108,10 @@ impl App {
                         if ui.button("Cancel").clicked() { close_win = true; }
                     } else {
                         let sel_file = self.variant_browser_selected.clone();
-                        if ui.add_enabled(sel_file.is_some(), egui::Button::new("Open")).clicked() {
+                        // #model-import: the model dialog's primary action is "Import", and it
+                        // appends the model to the scene rather than replacing the open document.
+                        let label = if models { "Import" } else { "Open" };
+                        if ui.add_enabled(sel_file.is_some(), egui::Button::new(label)).clicked() {
                             if let Some(p) = sel_file { open_now = Some(p); }
                         }
                         if ui.button("Cancel").clicked() { close_win = true; }
@@ -10188,23 +15162,38 @@ impl App {
             self.variant_browser_overwrite = None;
         }
         if let Some(p) = select {
-            // A Halo 4 file is read by its own decoder (the Reach reader mis-decodes it);
-            // both games' `$key` titles / descriptions are shown as their English text
-            let meta = if let Some(sm) = h4::mvar::read_h4_summary(&p) {
-                let map = self.h4_base_map_label(sm.map_id);
-                Some((sm.title, sm.description, sm.author, sm.editor, format!("Halo 4: {map}, {} objects", sm.objects)))
+            // #model-import: a model file is probed (format / size / vert+tri count) instead of
+            // being read as a variant -- the Reach/Halo 4 mvar decoders would reject it anyway.
+            if models {
+                self.model_browser_selected_meta = Some(Self::model_probe_line(&p));
+                self.variant_browser_selected_meta = None;
+                self.variant_browser_filename = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.variant_browser_selected = Some(p);
             } else {
-                mvar::parse_variant(&p).map(|v| (
-                    h4::localization::display(&v.title), h4::localization::display(&v.description), v.author.clone(), v.editor.clone(), String::new()))
-            };
-            self.variant_browser_filename = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            self.variant_browser_selected = Some(p);
-            self.variant_browser_selected_meta = meta;
+                // A Halo 4 file is read by its own decoder (the Reach reader mis-decodes it);
+                // both games' `$key` titles / descriptions are shown as their English text
+                let meta = if let Some(sm) = h4::mvar::read_h4_summary(&p) {
+                    let map = self.h4_base_map_label(sm.map_id);
+                    Some((sm.title, sm.description, sm.author, sm.editor, format!("Halo 4: {map}, {} objects", sm.objects)))
+                } else {
+                    mvar::parse_variant(&p).map(|v| (
+                        h4::localization::display(&v.title), h4::localization::display(&v.description), v.author.clone(), v.editor.clone(), String::new()))
+                };
+                self.variant_browser_filename = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.variant_browser_selected = Some(p);
+                self.variant_browser_selected_meta = meta;
+            }
         }
         if let Some(p) = open_now {
-            // Close now; import on a later frame (see `pending_open_variant`).
+            // Close now; load on a later frame (see `pending_open_variant` /
+            // `pending_import_model`) so the dialog is painted gone before the blocking parse.
             win_open = false;
-            self.pending_open_variant = Some((p, 1));
+            match purpose {
+                BrowsePurpose::Model => self.pending_import_model = Some((p, 1)),
+                BrowsePurpose::Film => self.pending_open_film = Some((p, 1)),
+                BrowsePurpose::Variant => self.pending_open_variant = Some((p, 1)),
+                BrowsePurpose::Prefab => self.pending_import_prefab = Some((p, 1)),
+            }
             ctx.request_repaint();
         }
         // #dialogs: Save pressed — resolve <current dir>/<name> (append .mvar if the user typed
@@ -10318,6 +15307,21 @@ impl App {
                     self.open_variant_browser();
                     ui.close_menu();
                 }
+                // #experimental  Theater playback ships labelled EXPERIMENTAL for the same
+                // reason as test mode: what it decodes is solid and measured, but what it draws
+                // is incomplete (no in-game HUD capture, some identity channels inferred rather
+                // than stated), so the label manages the expectation rather than the feature.
+                if ui.button("Open saved film\u{2026} (experimental)").on_hover_text("EXPERIMENTAL \u{2014} Open a Halo: Reach Theater clip (.mov / .film): shows what it recorded, draws its Forge scene, and can extract the map variant and gametype out of it. Playback is still being completed, so some of what the clip recorded is not yet drawn.").clicked() {
+                    self.open_film_browser();
+                    ui.close_menu();
+                }
+                if self.film.is_some() && ui.button("Saved film details").clicked() {
+                    self.film_card_open = true;
+                    ui.close_menu();
+                }
+                // The ONE history of everything that gets reopened (recent.rs): map variants,
+                // base maps, saved films and imported models, grouped and labelled by game.
+                self.recent_menu_ui(ui);
                 ui.separator();
                 let has = self.current_variant_path.is_some() || self.new_variant_template.is_some();
                 // Both games get Save (in place) and Save As.
@@ -10327,6 +15331,14 @@ impl App {
                 }
                 if ui.add_enabled(has, egui::Button::new("Save As…")).clicked() {
                     self.save_variant_as();
+                    ui.close_menu();
+                }
+                // #xgame: re-create this variant on another title's Forge canvas.
+                if ui.button("Convert variant to another game…")
+                    .on_hover_text("Re-create this Forge variant on a Forge canvas of another Halo title: each placed object is mapped to the nearest equivalent in the target game's palette (by category, name and render-model size). Shows the coverage and a per-object report before it writes anything.")
+                    .clicked()
+                {
+                    self.open_convert_variant();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -10424,6 +15436,10 @@ impl App {
                     .clicked()
                 {
                     self.frame_selected();
+                    ui.close_menu();
+                }
+                if self.film_play.is_some() && ui.button("Theater timeline").on_hover_text("Show the playback timeline for the open saved film").clicked() {
+                    self.film_timeline_open = true;
                     ui.close_menu();
                 }
                 if ui.button("Screenshot").on_hover_text("Save a PNG of the viewport (F12)").clicked() {
@@ -10532,6 +15548,33 @@ impl App {
                     wire_xray::save_setting(self.wire_xray);
                     self.renderer.set_highlight_xray(self.wire_xray);
                 }
+                // #quant-error  The save-precision ghost: the selected object(s) at the pose the
+                // .mvar will really hold, plus the exaggeration factor. Off at x1 by default,
+                // persisted (`quant_ghost.txt`); the status bar always says when it is on and
+                // SHOUTS when the drift is being exaggerated.
+                let qg_status = self.quant_ghost_status();
+                let mut qg = self.quant_ghost;
+                if ui.checkbox(&mut qg.on, "Save-precision ghost")
+                    .on_hover_text(format!("Draw the SELECTED object(s) a second time, in violet, at the pose the .mvar will actually hold once the game's quantisers have had their way with it -- so you can see the drift a save costs before you save. The error is usually tiny, so the factor below exaggerates it; at x1 the ghost is the real thing. Off by default. Script: precision ghost on|off|<factor>.\n{qg_status}"))
+                    .changed()
+                {
+                    self.quant_ghost = qg;
+                    quant_error_ui::save_setting(qg);
+                    self.overlays_dirty = true;
+                }
+                if qg.on {
+                    ui.horizontal(|ui| {
+                        ui.add_space(18.0);
+                        ui.small("exaggerate");
+                        let r = ui.add(egui::DragValue::new(&mut qg.exaggerate).speed(1.0).range(1.0..=quant_error_ui::EXAGGERATE_MAX).prefix("x"))
+                            .on_hover_text("Amplify the predicted drift so it is visible: x1 is the true, usually sub-millimetre, offset. An exaggerated ghost is NOT where the object lands, and the status bar says so.");
+                        if r.changed() {
+                            self.quant_ghost = qg;
+                            quant_error_ui::save_setting(qg);
+                            self.overlays_dirty = true;
+                        }
+                    });
+                }
                 // The scenario's trigger volumes (kill/safe/plain boxes). Not persisted.
                 if ui.checkbox(&mut self.show_triggers, "Trigger volumes")
                     .on_hover_text("Draw the scenario's trigger volumes as wireframe boxes: red = kill, green = safe, amber = plain. Script: triggers on|off|get.")
@@ -10565,6 +15608,87 @@ impl App {
                 {
                     hard_floor::save_playable_setting(self.show_playable_bounds);
                     self.overlays_dirty = true;
+                }
+            });
+            // #play  TEST MODE lives in a top-level menu of its own, not under Tools: it is a
+            // MODE (it turns the editor into the game) rather than a tool, and this user has
+            // already said they could not find things that were buried.
+            // #experimental  Test mode ships labelled EXPERIMENTAL. It is a real feature and
+            // worth having, but its physics is not yet the engine's: the biped still fights
+            // inclines and stairs, vehicles do not handle like the game, and the engine's own
+            // character-physics law is still being recovered. Saying so in the menu is cheaper
+            // than a user discovering it and concluding the whole app is rough.
+            ui.menu_button("Play (experimental)", |ui| {
+                let playing = self.play.is_some();
+                if !playing {
+                    ui.label(egui::RichText::new("Walk around the map you are building").weak());
+                    ui.label(
+                        egui::RichText::new(
+                            "EXPERIMENTAL — the movement and vehicle physics are still being \
+                             matched to the game, so expect rough edges on slopes, stairs and \
+                             while driving.",
+                        )
+                        .weak()
+                        .italics(),
+                    );
+                    for sp in [play_mode::Species::Spartan, play_mode::Species::Elite] {
+                        if ui
+                            .button(format!("Play as {}", sp.label()))
+                            .on_hover_text(
+                                "Spawn on this map's own spawn point as a biped and walk around it in first person.                                  Movement uses your camera keys, Space jumps, Ctrl crouches, Shift sprints, Alt walks,                                  V swings. Escape leaves. Every movement constant is read from the map's own bipd and                                  matg tags. Script: play spartan | play elite | play off | play get.",
+                            )
+                            .clicked()
+                        {
+                            let msg = self.enter_play(sp);
+                            self.status = msg;
+                            ui.close_menu();
+                        }
+                    }
+                } else {
+                    let (label, other) = match self.play.as_ref().map(|p| p.view) {
+                        Some(play_mode::PlayView::FirstPerson) => ("Third person", play_mode::PlayView::ThirdPerson),
+                        _ => ("First person", play_mode::PlayView::FirstPerson),
+                    };
+                    if ui
+                        .button(format!("{label} ({})", self.keys.label(keybinds::Action::PlayView)))
+                        .on_hover_text(
+                            "Switch between looking through the biped's own eyes and watching it from behind. \
+                             Reach itself draws no legs in first person, so the third-person view is where you \
+                             see your whole body — which is what you want when judging where you are standing \
+                             relative to a block you have just placed.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(p) = self.play.as_mut() {
+                            p.view = other;
+                        }
+                        ui.close_menu();
+                    }
+                    // #play  GIVE A WEAPON. Reported: "no way to add/pickup a weapon and use it
+                    // in any way." The map's own `weap` tags, by leaf name.
+                    ui.menu_button("Give weapon", |ui| {
+                        let list = self.play_weapon_list();
+                        if list.is_empty() {
+                            ui.label("this map has no weapon tags");
+                        }
+                        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                            if ui.button("(empty hands)").clicked() {
+                                self.status = self.play_give_weapon(None);
+                                ui.close_menu();
+                            }
+                            for (tag, leaf) in list {
+                                if ui.button(&leaf).clicked() {
+                                    self.status = self.play_give_weapon(Some(tag));
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    });
+                    ui.separator();
+                    if ui.button("Leave test mode (Esc)").clicked() {
+                        self.status = self.leave_play();
+                        ui.close_menu();
+                    }
                 }
             });
             ui.menu_button("Tools", |ui| {
@@ -10603,6 +15727,15 @@ impl App {
                     }
                 });
                 ui.separator();
+                if ui.button("Prefabs…")
+                    .on_hover_text("Save the selected objects as a reusable prefab, then drop it into any variant - of any of the four games. One shareable file each.")
+                    .clicked()
+                {
+                    self.prefab_ui.open = true;
+                    self.prefab_ui.listed = false;
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button("Scale converter…")
                     .on_hover_text("Convert between a visual scale multiplier and the spawnSequence encoding, for a chosen Forge scale convention")
                     .clicked()
@@ -10633,10 +15766,21 @@ impl App {
                     ui.close_menu();
                 }
                 if ui.button("Import geometry…")
-                    .on_hover_text("Load an OBJ/GLB as a persistent base to forge over")
+                    .on_hover_text("Import OBJ/GLB models to forge over — browse for a file anywhere, then move/rotate/scale it")
                     .clicked()
                 {
                     self.show_import_geom = true;
+                    ui.close_menu();
+                }
+                // #model-import: one click straight to the file browser, so "import a model" does
+                // not require finding the Browse… button inside the panel first. The panel opens
+                // behind it, which is where the imported model's transform fields live.
+                if ui.button("Import model from file…")
+                    .on_hover_text("Browse for an .obj / .glb / .gltf anywhere on disk (it does not have to be in the models\\ folder)")
+                    .clicked()
+                {
+                    self.show_import_geom = true;
+                    self.open_model_browser();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -10649,11 +15793,27 @@ impl App {
                 }
             });
             ui.menu_button("Settings", |ui| {
+                if ui.button("Graphics & performance…")
+                    .on_hover_text("Quality presets (including a flat white-mesh view), render scale, shadows, post-processing, texture quality, foliage/particle density, frame-rate cap and the idle throttle.")
+                    .clicked()
+                {
+                    self.show_graphics = true;
+                    ui.close_menu();
+                }
                 if ui.button("Lighting & rendering…")
                     .on_hover_text("Exposure, bloom and fog sliders, real-time probe GI, the path-traced bake, camera and every render/display toggle. Diagnostics are under Advanced at the bottom.")
                     .clicked()
                 {
                     self.show_settings = true;
+                    ui.close_menu();
+                }
+                // Issue #2: every key in the editor is rebindable, with a left-handed preset
+                // for people who hold the mouse in the other hand.
+                if ui.button("Controls & keyboard…")
+                    .on_hover_text("Change any key: the camera fly keys, the move / rotate / duplicate keys, undo, delete and the rest. Ready-made right-handed and left-handed sets.")
+                    .clicked()
+                {
+                    self.show_keybinds = true;
                     ui.close_menu();
                 }
             });
@@ -10662,7 +15822,19 @@ impl App {
                     self.show_hotkeys = true;
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui.button("Software update…").on_hover_text("Current vs latest version, release notes, download and install (Settings ▸ Updates for the automatic check).").clicked() {
+                    self.updater.show_window = true;
+                    ui.close_menu();
+                }
+                if ui.button("Check for updates now").clicked() {
+                    self.updater.check_now();
+                    self.updater.show_window = true;
+                    ui.close_menu();
+                }
+                ui.small(format!("Halo Map Studio v{}", env!("CARGO_PKG_VERSION")));
             });
+            self.updater.ui_badge(ui); // the small "Update x.y.z available" pill (none when up to date / skipped)
             if let Some(p) = &self.current_variant_path {
                 ui.separator();
                 ui.small(p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default());
@@ -10674,6 +15846,13 @@ impl App {
     /// distinct sefc tags the placed Forge special-FX objects spawn, per-term max like the engine)
     /// and upload it when (enabled, default, tags) changed. Cheap enough to call every tick.
     fn refresh_screen_fx(&mut self, objects: &[ObjectInfo]) {
+        // Halo 4 / H2A maps use the pure-Rust reader (no SceneController cache); the placed FX
+        // objects arrive here as ObjectInfos whose primary_tag is the H4 editor tag. #forge-fx-h4
+        if self.h4_active {
+            self.h4_refresh_screen_fx(objects);
+            return;
+        }
+        if self.h3_active { return; } // #h3: no screen-fx objects on a Halo 3 map
         let Some(scene) = self.scene_ctl.as_ref() else { return };
         let default_tag = scene.screen_fx().map(|f| f.tag).unwrap_or(0);
         let active = screenfx::active_screen_fx(scene, &mut self.screenfx_cache, default_tag, objects.iter().map(|o| (o.datum, o.primary_tag)));
@@ -10681,6 +15860,27 @@ impl App {
         if self.screenfx_pushed.as_ref() != Some(&key) {
             let line = screenfx::push_to_renderer(&self.renderer, &self.render_state.queue, &active, self.forge_fx_enabled);
             log::info!("{line}");
+            self.screenfx_pushed = Some(key);
+        }
+        self.active_screenfx = active;
+    }
+
+    /// Halo 4 / H2A screen FX: resolve the placed objects' `sefc` tags through the pure-Rust
+    /// reader, compose them (engine-generic math, shared with Reach) and upload. H4 forge maps
+    /// carry no scenario-default screen effect, so "Forge special FX off" is identity. #forge-fx-h4
+    fn h4_refresh_screen_fx(&mut self, objects: &[ObjectInfo]) {
+        let Some(cache) = self.h4_scene.as_deref().map(|s| s.cache().clone()) else { return };
+        let mut obje_tags: Vec<usize> = Vec::new();
+        for o in objects {
+            if let Some(idx) = h4::edit::h4_tag_index(o.primary_tag) {
+                if !obje_tags.contains(&idx) { obje_tags.push(idx); }
+            }
+        }
+        let active = h4::screenfx::active_screen_fx(&cache, &mut self.h4_screenfx_cache, obje_tags.into_iter());
+        let key = (self.forge_fx_enabled, 0u32, active.forge_tags.clone());
+        if self.screenfx_pushed.as_ref() != Some(&key) {
+            let line = screenfx::push_to_renderer(&self.renderer, &self.render_state.queue, &active, self.forge_fx_enabled);
+            log::info!("h4 {line}");
             self.screenfx_pushed = Some(key);
         }
         self.active_screenfx = active;
@@ -10696,58 +15896,41 @@ impl App {
         }
     }
 
-    /// A camera pose from the loaded variant's SPAWN points — preferring INITIAL
-    /// spawns, then any spawn point. None when the variant places no spawn points (caller
-    /// then falls back to the scenario's built-in spawns / bounds).
-    fn variant_spawn_camera(&self) -> Option<(glam::Vec3, f32, f32)> {
-        // A Halo 4 variant's camera comes from the H4 scene's `spawn_camera_pose`
-        // (loadout camera / initial spawn by team, stood off the geometry) - the callers fall
-        // through to it.
-        if self.h4_active { return None; }
+    /// The spawn camera for whatever is loaded: the Reach variant's own spawn points (initial
+    /// spawns first) merged with the scene's candidates through the shared rule
+    /// (`spawn_camera.rs`), so the variant's spawns win, then the scenario's, then the starting
+    /// locations / soft ceilings / bounds. Halo 4 / H2A / Halo 3 scenes gather their own variant
+    /// spawns inside their `spawn_camera`.
+    fn spawn_camera_any(&self) -> Option<spawn_camera::Pose> {
+        let variant = self.variant_spawn_candidates();
+        if variant.is_empty() {
+            return self.objscene().and_then(|s| s.spawn_camera());
+        }
+        let scene = self.objscene()?;
+        let vols = spawn_camera::Volumes { scene_bounds: scene.scene_bounds().map(|(a, b)| (glam::Vec3::from(a), glam::Vec3::from(b))), ..Default::default() };
+        let rc = |o: glam::Vec3, d: glam::Vec3, m: f32| scene.raycast_solid(o, d, m);
+        spawn_camera::choose(&variant, &vols, Some(&rc)).or_else(|| scene.spawn_camera())
+    }
+
+    /// The loaded Reach variant's SPAWN points as camera candidates (palette name contains
+    /// "spawn"; "initial" ones rank first). Empty for Halo 4 / Halo 3 (their scenes gather
+    /// their own) and when the variant places no spawn points.
+    fn variant_spawn_candidates(&self) -> Vec<spawn_camera::Candidate> {
+        if self.h4_active || self.h3_active { return Vec::new(); }
         let name_of = |datum: u32| {
             self.mvar_meta.get(&datum).map(|m| m.name.to_lowercase()).unwrap_or_default()
         };
-        let mut initial: Vec<(glam::Vec3, glam::Vec3)> = Vec::new();
-        let mut any_spawn: Vec<(glam::Vec3, glam::Vec3)> = Vec::new();
+        let mut out = Vec::new();
         for o in &self.mvar_objects {
             let n = name_of(o.datum);
-            if !n.contains("spawn") {
+            if !n.contains("spawn") || n.contains("zone") {
                 continue;
             }
-            let entry = (glam::Vec3::from(o.pos), glam::Vec3::from(o.fwd));
-            if n.contains("initial") {
-                initial.push(entry);
-            }
-            any_spawn.push(entry);
+            let kind = if n.contains("initial") { spawn_camera::Kind::VariantInitialSpawn } else { spawn_camera::Kind::VariantSpawn };
+            let team = self.mvar_colors.get(&o.datum).map(|(t, _)| *t as i8).unwrap_or(-1);
+            out.push(spawn_camera::Candidate::new(kind, glam::Vec3::from(o.pos), glam::Vec3::from(o.fwd)).team(team));
         }
-        let picks = if !initial.is_empty() {
-            initial
-        } else if !any_spawn.is_empty() {
-            any_spawn
-        } else {
-            return None;
-        };
-        // Centroid of ALL variant objects → a sensible facing when a spawn has no forward.
-        let all: Vec<glam::Vec3> = self.mvar_objects.iter().map(|o| glam::Vec3::from(o.pos)).collect();
-        let centroid = if all.is_empty() {
-            picks[0].0
-        } else {
-            all.iter().fold(glam::Vec3::ZERO, |a, &p| a + p) / (all.len() as f32)
-        };
-        let (spawn, fwd) = *picks
-            .iter()
-            .min_by(|a, b| (a.0 - centroid).length_squared().total_cmp(&(b.0 - centroid).length_squared()))
-            .unwrap();
-        // STAND at the spawn: ~player eye height (Reach world units, player ≈0.7wu tall), not
-        // floating metres above it. Look level along the spawn's forward.
-        let eye = spawn + glam::Vec3::Z * 0.62;
-        let yaw = if fwd.x.hypot(fwd.y) > 0.1 {
-            fwd.y.atan2(fwd.x)
-        } else {
-            let to = centroid - eye;
-            if to.x.hypot(to.y) > 1.0 { to.y.atan2(to.x) } else { 0.0 }
-        };
-        Some((eye, yaw, 0.0))
+        out
     }
 
     /// Resolve a parsed variant's placements → ObjectInfo through the loaded map's sandbox
@@ -10938,13 +16121,11 @@ impl App {
         // spawn points first (initial spawns preferred), then the scenario's built-in spawns
         // (biped placements), then the playable-area centre. Skipped when HMS_CAM pins a view.
         if placed > 0 && std::env::var("HMS_CAM").is_err() {
-            let pose = self
-                .variant_spawn_camera()
-                .or_else(|| self.objscene().and_then(|s| s.spawn_camera_pose()));
-            if let Some((pos, yaw, pitch)) = pose {
-                self.camera.pos = pos;
-                self.camera.yaw = yaw;
-                self.camera.pitch = pitch;
+            if let Some(p) = self.spawn_camera_any() {
+                self.camera.pos = p.pos;
+                self.camera.yaw = p.yaw;
+                self.camera.pitch = p.pitch;
+                log::info!("variant spawn camera: {}", p.describe());
             } else if let Some((mn, mx)) = self.objscene().and_then(|s| s.scene_bounds()) {
                 let c = (glam::Vec3::from(mn) + glam::Vec3::from(mx)) * 0.5;
                 self.camera.pos = c + glam::Vec3::new(-10.0, -10.0, 6.0);
@@ -10966,21 +16147,253 @@ impl App {
         placed
     }
 
-    /// Import the selected OBJ/GLB geometry (converted from another game's BSP) as a
-    /// persistent base mesh to forge over. Appends so multiple can be loaded.
+    /// Import the model picked in the models-folder convenience combo. Browsing for a file
+    /// anywhere goes through `open_model_browser` → `import_model_file`.
     fn do_import_geometry(&mut self) {
         let Some(path) = self.selected_import.and_then(|i| self.model_candidates.get(i)).cloned() else {
-            self.spawn_status = "Select an .obj/.glb (put files in the exe's models\\ folder).".into();
+            self.spawn_status = "Pick a model from the list, or press Browse… to choose a file anywhere.".into();
             return;
         };
-        match import_geometry_mesh(self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue, &path) {
-            Some((m, mut tris)) => {
-                self.renderer.append_imported_meshes(vec![m]);
-                self.import_tris.append(&mut tris);
-                self.spawn_status = format!("Imported base geometry: {}", path.file_name().unwrap_or_default().to_string_lossy());
-            }
-            None => self.spawn_status = "Failed to load geometry (OBJ/GLB).".into(),
+        self.import_model_file(&path);
+    }
+
+    /// #4 / #model-import: import one OBJ/GLB/GLTF file from ANYWHERE on disk as a movable model.
+    ///
+    /// The READ runs on a worker thread: a 26 MB GLB is ~0.8 M triangles plus several embedded
+    /// PNG/JPEG base-colour maps to decode, and doing that inline froze the window for a second
+    /// or more. The parse result arrives in `drain_import_loads`, which does the (fast) GPU
+    /// upload on the render thread and appends the model. Returns true when the read was queued.
+    fn import_model_file(&mut self, path: &std::path::Path) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        if !path.is_file() {
+            self.spawn_status = format!("Could not read {name} — no such file.");
+            return false;
         }
+        self.model_note_recent_file(path);
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        self.import_loading.push(name.clone());
+        self.spawn_status = format!("Reading {name} ({})\u{2026}", Self::vb_fmt_size(size));
+        let tx = self.import_loaded_tx.clone();
+        let p = path.to_path_buf();
+        std::thread::spawn(move || {
+            let res = modelimport::load(&p).map(Box::new);
+            let _ = tx.send(ImportLoaded::New(p, res));
+        });
+        true
+    }
+
+    /// #model-import: import one file and finish it before returning — the scripted /
+    /// non-interactive path (`import <file>` in a script, `HMS_IMPORT`, the headless harness),
+    /// where the caller wants the result in the reply rather than a "reading…" line and there is
+    /// no window to keep responsive.
+    fn import_model_file_blocking(&mut self, path: &std::path::Path) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        match modelimport::load(path) {
+            Ok(d) => {
+                self.model_note_recent_file(path);
+                self.finish_import(path, &d)
+            }
+            Err(e) => {
+                self.spawn_status = format!("Could not load {name}: {e}");
+                false
+            }
+        }
+    }
+
+    /// #model-import: drain whatever the background model readers finished. Runs once per frame.
+    fn drain_import_loads(&mut self) {
+        while let Ok(msg) = self.import_loaded_rx.try_recv() {
+            match msg {
+                ImportLoaded::New(path, res) => {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    if let Some(p) = self.import_loading.iter().position(|n| *n == name) {
+                        self.import_loading.remove(p);
+                    }
+                    match res {
+                        Ok(d) => {
+                            self.finish_import(&path, &d);
+                        }
+                        Err(e) => self.spawn_status = format!("Could not load {name}: {e}"),
+                    }
+                }
+                ImportLoaded::Restore(gen, list) => {
+                    if gen != self.import_load_gen {
+                        continue; // a later project load (or a clear) superseded this batch
+                    }
+                    self.import_loading.clear();
+                    let mut missing: Vec<String> = Vec::new();
+                    for (rec, res) in list {
+                        let path = std::path::PathBuf::from(&rec.path);
+                        let Ok(d) = res else {
+                            missing.push(rec.path.clone());
+                            continue;
+                        };
+                        if !self.finish_import(&path, &d) {
+                            missing.push(rec.path.clone());
+                            continue;
+                        }
+                        if let Some(m) = self.imports.last_mut() {
+                            m.pos = rec.pos;
+                            m.fwd = rec.fwd;
+                            m.up = rec.up;
+                            m.scale = if rec.scale.is_finite() && rec.scale > 0.0 { rec.scale } else { 1.0 };
+                        }
+                    }
+                    self.sel_import = (!self.imports.is_empty()).then_some(0);
+                    self.import_dirty = true;
+                    self.refresh_import_transforms();
+                    if !missing.is_empty() {
+                        self.status = format!("{} imported model file(s) could not be re-read: {}", missing.len(), missing.join(", "));
+                        log::warn!("project imports missing: {}", missing.join(", "));
+                    }
+                }
+            }
+        }
+    }
+
+    /// #model-import: upload a parsed model and append it as a new import at the identity pose
+    /// (exactly where the old fixed base mesh sat), selected so the gizmo and the numeric fields
+    /// are immediately on it, with the world triangle soup the raycasts read rebuilt.
+    fn finish_import(&mut self, path: &std::path::Path, data: &modelimport::ModelData) -> bool {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let Some(gpu) = build_import_meshes(self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue, data) else {
+            self.spawn_status = format!("{name} has no drawable triangles (OBJ/GLB/GLTF with faces expected).");
+            return false;
+        };
+        for n in &data.notes {
+            log::warn!("import {name}: {n}");
+        }
+        let idx = self.renderer.append_imported_model(gpu.opaque, gpu.cutout);
+        let mut model = extimport::ImportedModel::at_identity(path.to_path_buf(), gpu.tris);
+        model.summary = gpu.summary.clone();
+        let ntris = model.base_tris.len();
+        self.imports.push(model);
+        // The renderer and `self.imports` must stay index-aligned: an import's pseudo-datum IS
+        // its index in BOTH. They only diverge if an upload is dropped, which cannot happen here
+        // (the append above already succeeded), but assert it in the log rather than mis-address.
+        if idx + 1 != self.imports.len() {
+            log::error!("imported model lane desync: renderer idx {idx}, app slot {}", self.imports.len() - 1);
+        }
+        let idx = self.imports.len() - 1;
+        self.sel_import = Some(idx);
+        // Select it the way clicking it in the viewport would, so the gizmo is on it at once.
+        self.select_import(idx);
+        self.import_dirty = true;
+        self.refresh_import_transforms();
+        let note = if data.notes.is_empty() { String::new() } else { format!(" \u{B7} {}", data.notes[0]) };
+        self.spawn_status = format!(
+            "Imported {name} ({ntris} tris, {}){note} — move it with the gizmo, G/R, or the Position/Rotation/Scale fields.",
+            gpu.summary
+        );
+        true
+    }
+
+    /// Make imported model `idx` the current selection (pseudo-datum), so every editor verb that
+    /// works on a selection — the gizmo, G/R, the status line — works on it.
+    fn select_import(&mut self, idx: usize) {
+        if idx >= self.imports.len() {
+            return;
+        }
+        self.sel_import = Some(idx);
+        let d = extimport::import_datum(idx);
+        self.selected_set = vec![d];
+        self.selected_datum = Some(d);
+        self.apply_selection_highlight();
+    }
+
+    /// #4: push every import's pose to its GPU sub-meshes and rebuild `import_tris`.
+    /// Called whenever a pose changed (`import_dirty`) — once per frame at most, not per edit.
+    ///
+    /// #model-import: the pose push also re-samples the model's LIGHT. An import is lit on the
+    /// map's own dynamic-object path, so the per-instance colour carries the absolute airprobe
+    /// ambient where the model now stands — moving a model from a sunlit plateau into a shaded
+    /// gully re-lights it, exactly as it would a Forge piece. One nearest-probe lookup per model
+    /// per change (the grid makes it ~O(1)); with no map loaded the ambient stays neutral white,
+    /// which is what the import-only workflow has always shown.
+    fn refresh_import_transforms(&mut self) {
+        for i in 0..self.imports.len() {
+            let m = &self.imports[i];
+            let (mat, center) = (m.matrix(), m.world_center());
+            self.renderer.set_imported_transform(&self.render_state.queue, i, mat);
+            let amb = self.scene_ctl.as_ref().and_then(|s| s.import_ambient(center)).unwrap_or([1.0; 3]);
+            self.renderer.set_imported_tint(
+                &self.render_state.queue,
+                i,
+                [amb[0].max(0.0), amb[1].max(0.0), amb[2].max(0.0), 1.0],
+            );
+        }
+        self.rebuild_import_tris();
+        self.import_dirty = false;
+        self.highlight_dirty = true;
+    }
+
+    /// #4: the WORLD-space triangle soup for every import at its current pose. This is the single
+    /// source the snap-to-surface placement, the fill tool, viewport picking and
+    /// `physics_settle::settle_in_scene` read, so moving a model moves what lands on it.
+    fn rebuild_import_tris(&mut self) {
+        let n: usize = self.imports.iter().map(|m| m.base_tris.len()).sum();
+        let mut out = Vec::with_capacity(n);
+        for m in &self.imports {
+            out.extend(m.world_tris());
+        }
+        self.import_tris = out;
+    }
+
+    /// Raycast the imported models; returns (model index, distance along `dir`) of the nearest hit.
+    /// Per-model (not against the flattened soup) so a click can say WHICH model it hit, and
+    /// against each model's own MODEL-space triangles with the ray pushed through the inverse
+    /// pose — a converted BSP is millions of triangles, so a click must not build a world copy.
+    fn import_pick(&self, origin: glam::Vec3, dir: glam::Vec3) -> Option<(usize, f32)> {
+        let mut best: Option<(usize, f32)> = None;
+        for (i, m) in self.imports.iter().enumerate() {
+            let (o, d) = m.ray_to_model(origin, dir);
+            if let Some(t) = raycast_tris(o, d, &m.base_tris) {
+                if best.map_or(true, |(_, bt)| t < bt) {
+                    best = Some((i, t));
+                }
+            }
+        }
+        best
+    }
+
+    /// Drop imported model `idx`: its GPU sub-meshes, its pose and its triangles.
+    ///
+    /// #model-import: the renderer drops that model's SPAN out of the imported lanes and shifts
+    /// the rest, so removing one of several imports no longer re-reads and re-uploads every
+    /// remaining model file (which, with a 26 MB GLB still in the list, took seconds and could
+    /// silently drop a model whose file had since moved).
+    fn remove_import(&mut self, idx: usize) {
+        if idx >= self.imports.len() {
+            return;
+        }
+        let name = self.imports[idx].name.clone();
+        self.imports.remove(idx);
+        self.renderer.remove_imported_model(idx);
+        self.sel_import = (!self.imports.is_empty()).then(|| idx.min(self.imports.len() - 1));
+        self.selected_set.retain(|d| extimport::datum_index(*d).is_none());
+        if self.selected_datum.and_then(extimport::datum_index).is_some() {
+            self.selected_datum = self.selected_set.last().copied();
+        }
+        self.import_dirty = true;
+        self.refresh_import_transforms();
+        self.apply_selection_highlight();
+        self.spawn_status = format!("Removed imported model {name}.");
+    }
+
+    /// Clear every imported model (the panel's "Clear all" button).
+    fn clear_imports(&mut self) {
+        self.import_load_gen = self.import_load_gen.wrapping_add(1);
+        self.import_loading.clear();
+        self.renderer.clear_imported_meshes();
+        self.imports.clear();
+        self.import_tris.clear();
+        self.sel_import = None;
+        self.selected_set.retain(|d| extimport::datum_index(*d).is_none());
+        if self.selected_datum.and_then(extimport::datum_index).is_some() {
+            self.selected_datum = self.selected_set.last().copied();
+        }
+        self.apply_selection_highlight();
+        self.spawn_status = "Cleared imported geometry.".into();
     }
 
     /// Model Painter: voxelize the selected .obj and spawn a forge block per
@@ -11152,7 +16565,7 @@ impl App {
         // Re-key on (mode_tag, variant_sid) so switching variant (rocket↔gauss) rebuilds the preview.
         // #h4-preview: a Halo 4 palette VARIANT is its own obje tag (h4/palette.rs), and two rows can
         // share a render model (or the marker cube), so the Halo 4 key carries the obje tag instead.
-        let preview_key = if self.h4_active { mode_tag ^ obj_tag.rotate_left(16) } else { mode_tag ^ variant_sid.rotate_left(16) };
+        let preview_key = if self.h4_active || self.h3_active { mode_tag ^ obj_tag.rotate_left(16) } else { mode_tag ^ variant_sid.rotate_left(16) };
         if self.preview_for != Some(preview_key) {
             self.preview_for = Some(preview_key);
             self.preview_ok = false;
@@ -11168,6 +16581,9 @@ impl App {
             // preview renderer's Halo 4 post state was mirrored at map load (h4/gui.rs).
             let built = if self.h4_active {
                 self.h4_scene.as_deref_mut().map_or(Err(false), |s| s.build_preview_meshes(
+                    obj_tag, variant_sid, at, self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue))
+            } else if self.h3_active { // #h3-edit
+                self.h3_scene.as_deref_mut().map_or(Err(false), |s| s.build_preview_meshes(
                     obj_tag, variant_sid, at, self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue))
             } else {
                 self.scene_ctl.as_mut().map_or(Err(false), |s| s.build_preview_meshes(
@@ -11236,7 +16652,13 @@ impl App {
         self.preview_frame = self.preview_frame.wrapping_add(1);
         let key = (preview_key, self.preview_yaw, self.preview_pitch, self.preview_zoom);
         let changed = self.preview_last != Some(key);
-        if changed || self.preview_frame % 6 == 0 {
+        // #gfx-perf: a preview render is the WHOLE pipeline a second time (shadow + sky + scene
+        // + the eleven bloom passes + post) on the UI thread. The 10 Hz refresh exists only so
+        // animated materials move in a 190-pixel thumbnail, so it now runs only while the pointer
+        // is actually on the thumbnail; otherwise the preview is still redrawn the instant the
+        // model, orbit or zoom changes, which is every case a user can see.
+        let animate = self.noopt || resp.hovered() || resp.dragged();
+        if changed || (animate && self.preview_frame % 6 == 0) {
             self.preview_renderer.render(&self.render_state.device, &self.render_state.queue, &cam, t);
             self.preview_last = Some(key);
         }
@@ -11265,6 +16687,7 @@ impl App {
                 // The row markers follow the EFFECTIVE flags (team/label/override/globals)
                 mix(m.team as u64 + 3);
                 mix(((m.scaled_on() as u64) << 1 | m.shadow_on() as u64) + 5);
+                mix(m.flags.damage_state() as u64 + 29);
                 if let Some(h) = m.h4.as_deref() { mix(h.scale_q as u64 + 19); mix(m.spawn_seq as u64 + 23); }
             }
         }
@@ -11478,6 +16901,435 @@ impl App {
         }
     }
 
+    /// #film #reach-font  Floating name tags over the bipeds a film is driving.
+    ///
+    /// Painted into the viewport's own Ui, so they are clipped to the render view and sit under
+    /// every window. A tag carries a gamertag only where the player/entity link passed its
+    /// confidence bar; otherwise it shows the entity id, because a wrong name is worse than none.
+    /// The engine's own rules for how one looks live in `film_ui::paint_name_tags`.
+    /// #film-objects  The objective waypoints as name-tag records, so one painter and one set of
+    /// authored chud rules draw both them and the player names.
+    ///
+    /// Appended AFTER the player names have been coloured and anchored and after the look-at
+    /// filter, because an objective waypoint is neither a player name nor a look-at target: the
+    /// engine's objective waypoint is on for as long as the objective exists.
+    fn film_objective_waypoints(&self) -> Vec<film_ui::NameTag> {
+        let Some(pb) = self.film_play.as_deref() else { return Vec::new() };
+        if !self.film_driver.show_objects {
+            return Vec::new();
+        }
+        let Some(table) = self.film_driver.objects.as_ref() else { return Vec::new() };
+        let tick = pb.tick.round().max(0.0) as u32;
+        let bipeds: Vec<(u32, [f32; 3])> =
+            pb.bipeds(self.film_driver.cap).into_iter().map(|p| (p.net_id, p.pos)).collect();
+        let players = self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]);
+        // The VIEWER, exactly as the player names resolve one: whoever the Theater camera is on,
+        // else the player who recorded the film.
+        let (viewer_team, teams) = match self.film.as_deref() {
+            Some(f) => {
+                let v = pb
+                    .camera
+                    .owner(&pb.index)
+                    .and_then(|o| pb.index.slot_of_owner(o))
+                    .or_else(|| f.recorder_slot());
+                let t = v
+                    .and_then(|s| f.header.players.iter().find(|p| p.present() && p.index == s as usize))
+                    .map(|p| p.team)
+                    .unwrap_or(reach_chud::TEAM_NONE);
+                (t, f.header.gametype.as_ref().is_some_and(|g| g.misc.teams_enabled()))
+            }
+            None => (reach_chud::TEAM_NONE, false),
+        };
+        let team_of = |net: u32| -> u8 {
+            pb.index
+                .slot_of_entity(net)
+                .and_then(|s| players.iter().find(|q| q.present() && q.index == s as usize))
+                .map(|q| q.team)
+                .unwrap_or(reach_chud::TEAM_NONE)
+        };
+        let ws = film_objective::waypoints(table, &pb.index, tick, &bipeds, viewer_team, teams, &team_of);
+        film_objective::waypoint_name_tags(&ws)
+    }
+
+    fn film_name_tags(&mut self, ui: &mut egui::Ui, viewport: egui::Rect) {
+        let Some(pb) = self.film_play.as_deref() else { return };
+        // #film-objects  The OBJECTIVE waypoints are a different chud producer from the player
+        // name -- in Reach a Megalo script action inserts them -- so they are drawn whether or
+        // not the player-name mode is on, and are switched by the object lane's own toggle.
+        // Resolved FIRST so there is something to paint even when the names are off.
+        let objective = self.film_objective_waypoints();
+        if !pb.name_tags.is_on() && objective.is_empty() {
+            return;
+        }
+        let mut tags = match pb.name_tags.is_on() {
+            true => film_ui::name_tags(
+                pb,
+                self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]),
+                self.film_driver.cap,
+            ),
+            false => Vec::new(),
+        };
+        // The VIEWER: whoever the Theater camera is on, else the player who recorded the film.
+        let (viewer, viewer_team, teams) = match self.film.as_deref() {
+            Some(f) => {
+                let v = pb
+                    .camera
+                    .owner(&pb.index)
+                    .and_then(|o| pb.index.slot_of_owner(o))
+                    .or_else(|| f.recorder_slot());
+                let t = v
+                    .and_then(|s| f.header.players.iter().find(|p| p.present() && p.index == s as usize))
+                    .map(|p| p.team)
+                    .unwrap_or(crate::reach_chud::TEAM_NONE);
+                (v, t, f.header.gametype.as_ref().is_some_and(|g| g.misc.teams_enabled()))
+            }
+            None => (None, crate::reach_chud::TEAM_NONE, false),
+        };
+        // Colours FIRST: they decide `show_icon`, which decides which of the engine's two lifts
+        // each body's anchor gets.
+        film_ui::resolve_name_colors(&mut tags, viewer, viewer_team, teams);
+        // The engine anchors on the body's POSED `head` marker, so ask the actor pool for it, and
+        // it takes every colour out of the open cache's own chud globals.
+        let mut rules = film_ui::NamePlateRules::default();
+        let mut icon = None;
+        if let Some((n, c)) = self.scene_ctl.as_ref().and_then(|s| s.cache_handle().map(|c| (s.native_dll(), c))) {
+            film_ui::resolve_head_anchors(&mut tags, &self.actor_scene, n, c);
+            if let Some(g) = reach_chud::globals_for(n, c) {
+                if let Some(skin) = g.default_skin() {
+                    rules = film_ui::NamePlateRules::from_chud(skin);
+                    icon = film_ui::nameplate_icon(ui.ctx(), n, c, skin);
+                }
+            }
+        }
+        // #nametag-mode  "Only when looked at" is the engine's SECOND name display: the gamertag
+        // of whoever the viewer's own aim target is. The cone is the engine's own — a hard-coded
+        // 3-degree half-angle out to 40 world units times the held weapon's zoom magnification
+        // (`reach_hud::LookAtCone`) — and the engine holds exactly ONE target, so this keeps
+        // exactly one tag. Anchors are already on the engine's own `head` marker by now, so the
+        // test is against the same point the name is drawn over. There is no line-of-sight test,
+        // because the producer path that writes the name record has none either.
+        if pb.name_tags == reach_hud::NameTagMode::LookedAt {
+            let zoom = self
+                .scene_ctl
+                .as_ref()
+                .and_then(|s| s.cache_handle().map(|c| (s.native_dll(), c)))
+                .zip(self.film_driver.fp_weapon_tag)
+                .and_then(|((n, c), w)| reach_hud::ZoomLevels::read(n, c, w));
+            // The recording's zoom LEVEL is not held forward per body yet, so the resting
+            // (unscoped) magnification is used, which is the narrower range of the two.
+            let cone = reach_hud::LookAtCone::for_weapon(zoom, -1);
+            let anchors: Vec<glam::Vec3> = tags.iter().map(|t| glam::Vec3::from(t.pos)).collect();
+            let eye = self.camera.pos;
+            let fwd = self.camera.forward();
+            match reach_hud::looked_at(&cone, eye, fwd, &anchors) {
+                Some(k) => {
+                    let keep = tags.swap_remove(k);
+                    tags.clear();
+                    tags.push(keep);
+                }
+                None => tags.clear(),
+            }
+        }
+        // #film-objects  LAST, so neither the colour pass (which would recolour it from a team it
+        // has none of), the head-marker anchor pass (an objective has no `head` marker) nor the
+        // look-at cull (an objective is not an aim target) can touch it.
+        tags.extend(objective);
+        film_ui::paint_name_tags(
+            ui.ctx(),
+            &ui.painter_at(viewport),
+            viewport,
+            &tags,
+            &rules,
+            icon.as_deref(),
+            self.camera.pos,
+            &|p| self.world_to_screen(p, viewport),
+        );
+    }
+
+    /// #spectate  Theater's own spectated-player card, drawn from
+    /// `ui\cui\in_game\film_playback\film_cameras` while the camera is on one body.
+    ///
+    /// The engine shows this bar whenever a Theater camera is bound to a player, and nothing when
+    /// the camera is free, so that is exactly when HMS draws it. The name comes from the SAME
+    /// accessors the camera itself uses (`FilmCamera::owner` -> `slot_of_owner`), so the card and
+    /// the camera can never name different players.
+    fn film_spectate_card(&mut self, ui: &mut egui::Ui, viewport: egui::Rect) {
+        let Some(pb) = self.film_play.as_deref() else { return };
+        if !pb.spectate_card || pb.camera == film_play::FilmCamera::Free {
+            return;
+        }
+        let Some(slot) = pb.camera.owner(&pb.index).and_then(|o| pb.index.slot_of_owner(o)) else { return };
+        let Some(film) = self.film.as_deref() else { return };
+        let Some(p) = film.header.players.iter().find(|q| q.present() && q.index == slot as usize) else { return };
+        let Some(sc) = self.scene_ctl.as_ref() else { return };
+        let Some(cache) = sc.cache_handle() else { return };
+        let Some(screen) = reach_chud::spectate_screen(sc.native_dll(), cache) else { return };
+        reach_chud::paint_spectate_card(
+            ui.ctx(),
+            &ui.painter_at(viewport),
+            viewport,
+            &screen,
+            reach_chud::SpectateText { name: &p.gamertag, service_tag: &p.service_tag },
+            cache,
+            &|t| sc.decode_bitmap_keep_alpha_public(t),
+            // #row-colour  The spectated player's own colour, resolved exactly the way a
+            // scoreboard row's is, so the card and the row can never show different colours for
+            // the same player.
+            reach_widget::ui_globals_for(sc.native_dll(), cache).and_then(|g| {
+                let rows = film_ui::scoreboard_rows(&self.film_roster, self.film_stats.as_deref());
+                let row = rows.iter().find(|r| r.name == p.gamertag)?;
+                film_ui::bitmap_tint(&g, row)
+            }),
+        );
+    }
+
+    /// #reach-hud #crosshair #respawn  The first-person HUD, from Reach's own `chud` tags.
+    ///
+    /// Three overlays, each separately switchable and each remembered between sessions:
+    ///
+    /// * the held weapon's own **reticule** (`weap` +0x3C4 `chud interface` -> its `crosshair`
+    ///   collection), or the player HUD's `unarmed_crosshair` with nothing in hand;
+    /// * the authored **HUD** — the weapon's ammo block, the grenade counts, the shield and
+    ///   health meters, and a seated player's vehicle chud;
+    /// * the **respawn countdown** over a body that has died.
+    ///
+    /// EVERY NUMBER IS LABELLED. A saved film does not carry ammo, and it cannot be counted
+    /// either (the unit's own `rounds loaded` / `reserve` fields are never written — zero
+    /// occurrences over eight films and 5.4 M messages — and a `weapon_reload` event carries four
+    /// flag bits and no count). So the ammo NUMBERS are not drawn: the authored schematic glyph
+    /// and the block around it are, the numbers are left out, and the panel says which fields the
+    /// recording cannot give. A meter with no recorded level is drawn neither full nor empty.
+    fn film_first_person_hud(&mut self, ui: &mut egui::Ui, viewport: egui::Rect) {
+        let Some(pb) = self.film_play.as_deref() else {
+            film_ui::set_hud_field_report(Vec::new());
+            return;
+        };
+        if !(pb.crosshair || pb.hud || pb.respawn_widget) {
+            film_ui::set_hud_field_report(Vec::new());
+            return;
+        }
+        // #reach-hud  The WEAPON half of the HUD belongs to a first-person VIEW, not to the
+        // first-person MODE. `camera.is_first_person()` is the mode the viewer chose and it stays
+        // true right through a death — so gating on it kept drawing a reticule and an ammo block
+        // over the third-person shot the engine cuts to when you die. `view_is_first_person()`
+        // asks what the camera actually RESOLVED to, which is the question.
+        //
+        // The respawn countdown is deliberately NOT gated on it: that widget exists precisely
+        // while the view is third person, because the engine shows it over your own body while
+        // you wait. So the split here is the engine's own — dying takes the weapon HUD away and
+        // gives you the countdown.
+        let fp_view = pb.view_is_first_person();
+        if !fp_view && !pb.respawn_widget {
+            film_ui::set_hud_field_report(vec![
+                "The weapon HUD is a first-person display: put the camera on a player (film camera first <slot>)"
+                    .into(),
+            ]);
+            return;
+        }
+        let Some((native, cache)) =
+            self.scene_ctl.as_ref().and_then(|s| s.cache_handle().map(|c| (s.native_dll(), c)))
+        else {
+            film_ui::set_hud_field_report(vec!["No map open, so no chud tags to draw from".into()]);
+            return;
+        };
+        let skin = reach_chud::globals_for(native, cache).and_then(|g| g.default_skin().cloned());
+        let vs = match &skin {
+            Some(s) => reach_hud::VirtualScreen::from_skin(viewport, s),
+            None => reach_hud::VirtualScreen::fallback(viewport),
+        };
+        let painter = ui.painter_at(viewport);
+        let tick = pb.tick.round().max(0.0) as u32;
+
+        // ---- what the recording can and cannot say about this body -------------------------
+        let mut v = reach_hud::HudValues { weapon_tag: self.film_driver.fp_weapon_tag, ..Default::default() };
+        let net = pb.hidden_entity();
+        let track = net.and_then(|n| pb.index.tracks.iter().find(|t| t.net_id == n));
+        // ALIVE or DEAD is the one thing about a body's vitality a film states. There is no
+        // shield or health channel anywhere in the format, so the meters are drawn full for a
+        // living body and empty for a dead one -- never an invented middle.
+        let died_at = track.and_then(|t| pb.death_at(t));
+        let dead = died_at.is_some_and(|d| tick >= d);
+        v.shield = reach_hud::Field::derived(if dead { 0.0 } else { 1.0 });
+        v.health = reach_hud::Field::derived(if dead { 0.0 } else { 1.0 });
+
+        // ---- the respawn clock --------------------------------------------------------------
+        let mut clock = None;
+        if let (Some(t), Some(d)) = (track, died_at) {
+            // The recording's own next life: a player gets a BRAND-NEW network entity every
+            // respawn, and every life of one player carries the same 4-bit owner value, so the
+            // next track with this owner whose creation is after the death is exact to one tick.
+            let next = t
+                .owner_raw
+                .and_then(|o| {
+                    pb.index
+                        .tracks
+                        .iter()
+                        .filter(|x| x.owner_raw == Some(o) && x.entity_type == t.entity_type && x.first_tick > d)
+                        .min_by_key(|x| x.first_tick)
+                })
+                .map(|x| x.first_tick);
+            clock = Some(match next {
+                Some(r) => reach_hud::RespawnClock::NextLife {
+                    died_at: d as f32 / 60.0,
+                    respawn_at: r as f32 / 60.0,
+                },
+                None => {
+                    let g = self.film.as_deref().and_then(|f| f.header.gametype.as_ref());
+                    let rules = g
+                        .map(|g| reach_hud::RespawnRules {
+                            base: g.respawn.respawn_time,
+                            growth: g.respawn.respawn_growth,
+                            suicide: g.respawn.suicide_penalty,
+                            betrayal: g.respawn.betrayal_penalty,
+                        })
+                        .unwrap_or_default();
+                    // WHICH penalty: the recording's own `incident` row names the killer, so a
+                    // suicide is killer == victim. A betrayal needs both players' teams, which
+                    // HMS has only for a body whose owner resolved to a header slot, so an
+                    // unresolvable one is counted as a plain death rather than guessed at.
+                    let kind = match pb.deaths().get(&t.net_id).and_then(|&(_, _, k)| k) {
+                        Some(k) if k == t.net_id => reach_hud::DeathKind::Suicide,
+                        _ => reach_hud::DeathKind::Normal,
+                    };
+                    reach_hud::RespawnClock::FromRules { died_at: d as f32 / 60.0, rules, deaths_before: 0, kind }
+                }
+            });
+        }
+        let now = pb.tick / 60.0;
+        let left = clock.and_then(|c| c.remaining(now));
+        if let (Some(c), Some(s)) = (clock, left) {
+            v.respawn = reach_hud::Field::derived(s);
+            v.respawn_note = c.note();
+        }
+
+        // ---- the crosshair -----------------------------------------------------------------
+        let mut lines: Vec<String> = Vec::new();
+        if pb.crosshair && fp_view {
+            let art = v.weapon_tag.and_then(|w| reach_chud::crosshair_for(ui.ctx(), native, cache, w));
+            match (&art, &skin) {
+                (Some(a), Some(sk)) if !dead => {
+                    reach_chud::paint_crosshair(&painter, viewport, a, sk, vs.vpx);
+                    let n = a.crosshair.parts.len();
+                    let name = native.tag_name(cache, a.crosshair.chud_tag).unwrap_or_default();
+                    lines.push(format!("Crosshair: {n} authored part(s) from {name}"));
+                }
+                _ if dead => lines.push("Crosshair: the subject is dead, so the engine draws none".into()),
+                _ => {
+                    // The engine's own empty-handed reticule, out of the player HUD.
+                    let path = if self.film_driver.fp_subject_elite {
+                        reach_hud::PLAYER_CHUD_ELITE
+                    } else {
+                        reach_hud::PLAYER_CHUD_SPARTAN
+                    };
+                    let drew = reach_hud::chud_by_path(native, cache, path)
+                        .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+                        .and_then(|a| {
+                            let i = a.chud.collections.iter().position(|c| c.base.name == "unarmed_crosshair")?;
+                            Some(reach_hud::paint_collection(
+                                ui.ctx(),
+                                &painter,
+                                &vs,
+                                &a,
+                                i,
+                                skin.as_ref(),
+                                &v,
+                                0,
+                            ))
+                        });
+                    lines.push(match (v.weapon_tag, drew) {
+                        (None, Some((d, _))) if d > 0 => {
+                            "Crosshair: the recording never says what this body is holding, so the player HUD's \
+                             own `unarmed_crosshair` is drawn"
+                                .into()
+                        }
+                        (None, _) => "Crosshair: the recording never says what this body is holding".into(),
+                        (Some(_), _) => "Crosshair: this weapon authors no reticule that draws at rest".into(),
+                    });
+                }
+            }
+        }
+
+        // ---- the authored HUD ---------------------------------------------------------------
+        if pb.hud && fp_view && !dead {
+            let (mut drawn, mut skipped) = (0usize, 0usize);
+            // The weapon's own ammo block. The collection is named `ammo_area` on some weapons
+            // and `ammo_area_right` on others, so it is matched by prefix.
+            if let Some(w) = v.weapon_tag {
+                if let Some(a) = reach_chud::weapon_chud(native, cache, w)
+                    .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+                {
+                    for (i, c) in a.chud.collections.iter().enumerate() {
+                        if !c.base.name.starts_with(reach_hud::WEAPON_AMMO_PREFIX) {
+                            continue;
+                        }
+                        let (d, s) =
+                            reach_hud::paint_collection(ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, 0);
+                        drawn += d;
+                        skipped += s;
+                    }
+                }
+            }
+            // The player HUD: shields, health, grenades.
+            let path = if self.film_driver.fp_subject_elite {
+                reach_hud::PLAYER_CHUD_ELITE
+            } else {
+                reach_hud::PLAYER_CHUD_SPARTAN
+            };
+            if let Some(a) =
+                reach_hud::chud_by_path(native, cache, path).and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+            {
+                for want in reach_hud::PLAYER_COLLECTIONS {
+                    let Some(i) = a.chud.collections.iter().position(|c| c.base.name == want) else { continue };
+                    // The grenade block is datasource-driven: one repeat per grenade TYPE.
+                    let reps = if a.chud.collections[i].datasource == Some(0) { 2 } else { 1 };
+                    for r in 0..reps {
+                        let (d, s) =
+                            reach_hud::paint_collection(ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, r);
+                        drawn += d;
+                        skipped += s;
+                    }
+                }
+            }
+            // A seated player's own vehicle HUD.
+            if let Some((p, seat)) = &v.vehicle {
+                lines.push(format!("Vehicle HUD: {p}, seat {seat}"));
+            }
+            lines.push(format!("HUD: {drawn} authored widget(s) drawn, {skipped} left out for want of a value"));
+        }
+
+        // ---- the respawn countdown ----------------------------------------------------------
+        if pb.respawn_widget {
+            match left {
+                Some(s) => {
+                    let at = reach_hud::chud_by_path(native, cache, reach_hud::MP_CHUD)
+                        .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+                        .and_then(|a| reach_hud::paint_respawn(ui.ctx(), &painter, &vs, &a, skin.as_ref(), s));
+                    if at.is_none() {
+                        lines.push("Respawn countdown: the status slot could not be read out of ui\\chud\\scoreboard".into());
+                    }
+                }
+                None if dead => lines
+                    .push("Respawn countdown: this body's own next life is not in the recording and the clock has run out".into()),
+                None => {}
+            }
+        }
+        let unresolved = reach_hud::take_unresolved_strings();
+        if !unresolved.is_empty() {
+            // The weapon SCHEMATIC and friends: an authored string id whose text lives in a
+            // localized table HMS does not read, and whose glyph lives in MCC's icon font
+            // rather than the Editing Kit's text fonts. Named rather than drawn as its id.
+            lines.push(format!(
+                "Not drawn ({} authored string(s) HMS cannot resolve to a glyph): {}",
+                unresolved.len(),
+                unresolved.join(", ")
+            ));
+        }
+        for l in v.report() {
+            lines.push(l);
+        }
+        film_ui::set_hud_field_report(lines);
+    }
+
     /// Blender-style floating tool buttons overlaid on the viewport (top-left). Select / Move /
     /// Rotate pick the active tool mode (which gizmo shows + what a gizmo drag does).
     /// Drawn INSIDE the viewport's own Ui (the CentralPanel, Order::Background) as a
@@ -11660,6 +17512,9 @@ impl App {
                         self.placing = Some(d);
                     } else {
                         self.edit_undo.pop(); // spawn failed -> discard the snapshot
+                        // #h3-place a refused drop used to vanish without a trace; carry the
+                        // reason `place_local_at` wrote into the tool status line as well.
+                        self.status = self.spawn_status.clone();
                     }
                 }
                 self.pending_place = None;
@@ -11849,8 +17704,30 @@ impl App {
             return;
         }
 
-        let hit = self.objscene().and_then(|s| s.pick(near, dir));
-        let shift = response.ctx.input(|i| i.modifiers.shift);
+        // #4: imported models are pickable like objects. Whichever is NEARER along the ray wins:
+        // a forge block standing on an imported floor still selects the block, and map geometry in
+        // FRONT of an import shields it (clicking a wall must not grab the model behind it).
+        // Objects win exact ties — they are what a click usually means — while the BSP compare
+        // carries a small epsilon so a model resting flush on the terrain stays clickable.
+        let obj_hit = self.objscene().and_then(|s| s.pick(near, dir));
+        // `pick` returns the datum only, so the distance comes from the same scene's ray queries.
+        let obj_dist = obj_hit
+            .and(self.objscene().and_then(|s| s.raycast_objects_excluding(near, dir, &[])))
+            .map(|p| (p - near).length())
+            .unwrap_or(f32::MAX);
+        let bsp_dist = self
+            .objscene()
+            .and_then(|s| s.raycast_scene(near, dir))
+            .map(|p| (p - near).length())
+            .unwrap_or(f32::MAX);
+        let hit = match self.import_pick(near, dir) {
+            Some((i, t)) if t < obj_dist && t < bsp_dist + 0.05 => {
+                self.sel_import = Some(i);
+                Some(extimport::import_datum(i))
+            }
+            _ => obj_hit,
+        };
+        let shift = response.ctx.input(|i| self.keys.down(keybinds::Action::SelectAdd, i, &self.phys));
         if shift {
             // Shift+click: toggle the hit object in/out of the multi-select set.
             if let Some(d) = hit {
@@ -11875,8 +17752,15 @@ impl App {
         }
         self.status = match hit {
             Some(d) => {
-                // Name WHAT was clicked (tag path, class, tag id, placement).
-                let what = self.object_identity(d).map(|id| id.status_line()).unwrap_or_else(|| format!("0x{d:08X}"));
+                // Name WHAT was clicked (tag path, class, tag id, placement) — or, for an
+                // imported model (#4), its file name and pose.
+                let what = match extimport::datum_index(d).and_then(|i| self.imports.get(i)) {
+                    Some(m) => format!(
+                        "imported model '{}' at ({:.2}, {:.2}, {:.2}) x{:.3} — gizmo / G / R move it",
+                        m.name, m.pos[0], m.pos[1], m.pos[2], m.scale
+                    ),
+                    None => self.object_identity(d).map(|id| id.status_line()).unwrap_or_else(|| format!("0x{d:08X}")),
+                };
                 if self.selected_set.len() > 1 {
                     format!("Selected {} objects (last: {what})", self.selected_set.len())
                 } else {
@@ -11913,6 +17797,18 @@ impl App {
     /// Lazily (re)open the read-only consumer MMFs — they only exist once the DLL
     /// is injected, so we retry each frame until they connect.
     fn ensure_clients(&mut self) {
+        // #gfx-perf: each `open()` below is an OS call to open a named shared-memory object, and
+        // on the normal offline run ALL SEVEN fail every single frame. Retry at 2 Hz instead —
+        // the same cadence `auto_attach` already uses, and far faster than a human can start MCC.
+        if !self.noopt {
+            let now = std::time::Instant::now();
+            if let Some(t) = self.ipc_retry_at {
+                if now < t {
+                    return;
+                }
+            }
+            self.ipc_retry_at = Some(now + std::time::Duration::from_millis(500));
+        }
         if self.map_info.is_none() {
             self.map_info = hms_ipc::MapInfoClient::open().ok();
         }
@@ -12142,6 +18038,14 @@ impl App {
                 xray.extend(l);
             }
         }
+        // #quant-error  The save-precision ghost: the selected object(s) drawn at the pose the
+        // .mvar will really hold. Its OWN lane (depth-ALWAYS + the exposure-compensated wire
+        // shader): at TRUE SCALE the ghost sits a few thousandths of a unit inside the object's
+        // own surface, where a depth-tested line would be invisible and a plain line would
+        // saturate to white against a bright Forge piece.
+        let mut ghost: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+        self.push_quant_ghost(&mut ghost);
+        self.renderer.set_ghost_lines(&self.render_state.device, &ghost);
         self.renderer.set_xray_lines(&self.render_state.device, &xray);
         self.renderer.set_zone_tris(&self.render_state.device, if ztris.is_empty() { None } else { Some(&ztris) });
 
@@ -12153,6 +18057,148 @@ impl App {
         segs.extend(trigger_volume_segments(&vols));
         self.renderer.set_overlay_lines(&self.render_state.device, &segs);
         self.status = format!("{} trigger volumes", vols.len());
+    }
+
+    /// Push Settings ▸ Graphics to the renderer and persist it. Called ONLY from a widget's
+    /// `.changed()` (see `gfxsettings`'s rule 2) and once at startup, never per frame.
+    ///
+    /// `// #h4-expo-3`: the Lighting panel used to push values it had merely READ and silently
+    /// replaced a Halo 4 map's engine-accurate exposure, filmic curve and grading LUT. Nothing
+    /// here touches an exposure, tonemap or lighting term — the Graphics page only gates passes,
+    /// resizes targets and caps uploads — with ONE exception, the screen-FX matrix, which is
+    /// restored from the map's own authored state (`refresh_screen_fx`) rather than from a
+    /// remembered value, exactly so that turning it off and on again cannot drift.
+    fn apply_gfx_settings(&mut self) {
+        let (device, queue) = (self.render_state.device.clone(), self.render_state.queue.clone());
+        self.renderer.apply_quality(&device, &queue, self.gfx.render_quality());
+        // A render-scale change REALLOCATES the scene targets, including the colour texture egui
+        // samples — and the viewport is only re-registered when its SIZE changes, which it did
+        // not. Without this the viewport keeps showing the last frame drawn into the freed
+        // texture: changing the preset appeared to do nothing at all (caught in the capture pass,
+        // where Medium / Low / Flat came back byte-identical to each other).
+        self.render_state.renderer.write().update_egui_texture_from_wgpu_texture(
+            &device,
+            self.renderer.color_view_srgb(),
+            wgpu::FilterMode::Linear,
+            self.tex_id,
+        );
+        // The upload cap is a global read by the texture helpers; it takes effect on the next load.
+        hms_render::quality::set_texture_max_dim(self.gfx.texture_max_dim);
+        self.renderer.set_rtgi_enabled(&queue, self.gfx.rtgi);
+        // Screen effects: off = the identity colour matrix; on = re-derive from the map's tags.
+        if self.gfx.screen_fx && !self.gfx.flat_mode {
+            let objs = std::mem::take(&mut self.last_objects);
+            self.refresh_screen_fx(&objs);
+            self.last_objects = objs;
+            self.screenfx_pushed = None; // force the next tick to re-upload
+        } else {
+            let id = screenfx::ScreenFxRender::identity();
+            self.renderer.set_screen_fx(&queue, id.gain, id.gamma_exp, id.cols);
+            self.screenfx_pushed = None;
+        }
+        match self.gfx.save() {
+            Ok(_) => {}
+            Err(e) => self.status = format!("Graphics settings could not be saved: {e}"),
+        }
+    }
+
+    /// Per-frame auto-update plumbing: background results, the scheduled check, the Update
+    /// window (an install request = snapshot + swap files + restart), the post-update banner /
+    /// recovery offer, and the deferred recovery restore. All UI; never blocks.
+    fn updater_tick(&mut self, ctx: &egui::Context) {
+        if self.updater.tick() { ctx.request_repaint_after(std::time::Duration::from_millis(250)); }
+        if let Some(path) = self.recovery_restore.take() {
+            self.restore_recovery(&path);
+        }
+        match self.updater.ui_banner(ctx) {
+            Some(true) => { if let Some(p) = self.updater.offered_recovery.take() { self.restore_recovery(&p); } }
+            Some(false) => { if let Some(p) = self.updater.offered_recovery.take() { updater::discard_recovery(&p); } }
+            None => {}
+        }
+        if let Some(req) = self.updater.ui_window(ctx).or_else(|| self.updater.take_install_request()) {
+            self.install_update_and_restart(req, ctx);
+        }
+        // The restored variant COPY has loaded: File ▸ Save must target the user's real file again
+        // (the copy lives in the recovery folder and is never the thing to save into).
+        if let Some((copy, original)) = self.recovery_variant_fix.clone() {
+            if self.current_variant_path.as_deref() == Some(copy.as_path()) {
+                match original {
+                    // The objects are in memory and Save re-reads the ORIGINAL for the parts it
+                    // copies verbatim, so the copy has done its job.
+                    Some(o) => { mapcat::save_last_variant(&o.to_string_lossy()); self.current_variant_path = Some(o); let _ = std::fs::remove_file(&copy); }
+                    None => { self.current_variant_path = None; self.new_variant_template = Some(copy); }
+                }
+                self.recovery_variant_fix = None;
+            }
+        }
+    }
+
+    /// Finish an update: write the recovery snapshot (project record + an exact copy of the open
+    /// variant with its unsaved edits), swap the files (rename transaction), start the new build
+    /// (it waits for this process) and close. Any failure leaves the install untouched and is shown
+    /// in the Update window.
+    fn install_update_and_restart(&mut self, req: updater::InstallRequest, ctx: &egui::Context) {
+        let Some(dir) = updater::recovery_dir() else { self.updater.install_error = Some("no settings directory for the recovery snapshot".into()); return };
+        let stamp = updater::recovery_stamp();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut meta = updater::RecoveryMeta {
+            from_version: env!("CARGO_PKG_VERSION").into(),
+            to_version: req.staged.version.to_string(),
+            variant_original: self.current_variant_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            variant_was_new: self.current_variant_path.is_none() && self.new_variant_template.is_some(),
+            show_settings: self.show_settings,
+            show_hotkeys: self.show_hotkeys,
+            show_script: self.show_script,
+            ..Default::default()
+        };
+        if self.current_variant_path.is_some() || self.new_variant_template.is_some() {
+            let copy = dir.join(format!("{stamp}.mvar"));
+            match self.save_variant_to(&copy) {
+                Ok(_) => meta.variant_copy = Some(format!("{stamp}.mvar")),
+                Err(e) => { self.updater.install_error = Some(format!("could not snapshot the open variant ({e}); nothing was changed")); return; }
+            }
+        }
+        let record = self.build_project_record();
+        if let Err(e) = updater::write_recovery(&dir, &stamp, &mut meta, &record) {
+            self.updater.install_error = Some(format!("could not write the recovery snapshot ({e}); nothing was changed"));
+            return;
+        }
+        if let Err(e) = updater::apply(&req.staged) {
+            self.updater.install_error = Some(format!("install failed, previous version restored: {e}"));
+            return;
+        }
+        if let Err(e) = updater::spawn_resumed(&req.staged.install_dir, &req.staged.version) {
+            self.updater.install_error = Some(format!("installed, but could not restart: {e}. Start Halo Map Studio again by hand; your session will be offered."));
+            return;
+        }
+        self.status = format!("Updating to {} — restarting…", req.staged.version);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Apply a recovery snapshot: the project record (map, camera, flags) with the variant COPY
+    /// (unsaved edits included) in place of the original path, then re-point Save at the original.
+    fn restore_recovery(&mut self, path: &std::path::Path) {
+        match updater::load_recovery(path) {
+            Ok((meta, mut p)) => {
+                let rdir = path.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+                let original = meta.variant_original.as_ref().map(std::path::PathBuf::from);
+                if let Some(copy) = &meta.variant_copy {
+                    let copy = rdir.join(copy);
+                    p.variant_path = copy.to_string_lossy().into_owned();
+                    self.recovery_variant_fix = Some((copy, original));
+                }
+                self.show_settings = meta.show_settings;
+                self.show_hotkeys = meta.show_hotkeys;
+                self.show_script = meta.show_script;
+                self.apply_project(p);
+                self.status = format!("Session restored from the update recovery snapshot ({}).", meta.from_version);
+                // consumed; the variant copy is removed once Save points at the original again
+                // (see updater_tick), or kept as the template of a never-saved variant.
+                let _ = std::fs::remove_file(path);
+                let _ = std::fs::remove_file(rdir.join(&meta.project_file));
+            }
+            Err(e) => self.status = format!("Could not restore the session: {e}"),
+        }
     }
 
     /// Save map + camera + placed-object snapshot to the .mmsproj project.
@@ -12233,7 +18279,7 @@ impl App {
             .mvar_meta
             .iter()
             .filter(|(_, m)| !m.flags.is_default())
-            .map(|(&datum, m)| project::ProjObjFlags { slot: m.slot, datum, scaled: m.flags.scaled, shadow: m.flags.shadow })
+            .map(|(&datum, m)| project::ProjObjFlags { slot: m.slot, datum, scaled: m.flags.scaled, shadow: m.flags.shadow, damage: m.flags.damage })
             .collect();
         obj_flags.sort_by_key(|f| (f.slot, f.datum));
         let p = project::Project {
@@ -12245,6 +18291,19 @@ impl App {
             objects,
             variant_path: self.current_variant_path.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
             obj_flags,
+            // #4: the imported models and where the user put them. The geometry is re-read from
+            // each path on load; only the pose is stored.
+            imports: self
+                .imports
+                .iter()
+                .map(|m| project::ProjImport {
+                    path: m.path.to_string_lossy().into_owned(),
+                    pos: m.pos,
+                    fwd: m.fwd,
+                    up: m.up,
+                    scale: m.scale,
+                })
+                .collect(),
         };
         p
     }
@@ -12268,6 +18327,7 @@ impl App {
                 if let Some(m) = self.mvar_meta.get_mut(&d) {
                     m.flags.scaled = f.scaled;
                     m.flags.shadow = f.shadow;
+                    m.flags.damage = f.damage.filter(|d| (1..=4).contains(d));
                     n += 1;
                 }
             }
@@ -12353,6 +18413,9 @@ impl App {
 
     /// Restore camera + map from a project record (shared by the quick slot and Open Project…).
     fn apply_project(&mut self, p: project::Project) {
+        // #4: the imported models first — they are a persistent layer that survives the map load
+        // kicked off below, and re-reading each file is what gives the poses something to apply to.
+        self.restore_project_imports(&p.imports);
         self.camera.pos = glam::Vec3::from(p.cam_pos);
         self.camera.yaw = p.cam_yaw;
         self.camera.pitch = p.cam_pitch;
@@ -12376,6 +18439,40 @@ impl App {
             // No map recorded: open the variant directly (it loads its own base map).
             self.import_mvar(v);
         }
+    }
+
+    /// #4: re-import every model a project recorded and put it back at its saved pose. A file
+    /// that has since moved or been deleted is reported and skipped (the rest still load) rather
+    /// than leaving a pose with no mesh, which would desync index ↔ pseudo-datum.
+    ///
+    /// #model-import: the project stores the FILE PATH plus the pose, never the geometry, so the
+    /// materials and textures come back from the file itself — nothing about them has to be
+    /// saved. The re-read runs on ONE worker thread (the records are parsed in the project's own
+    /// order so the poses still line up) and lands in `drain_import_loads`, so opening a project
+    /// that references a 26 MB model does not freeze the window.
+    fn restore_project_imports(&mut self, recs: &[project::ProjImport]) {
+        self.clear_imports();
+        if recs.is_empty() {
+            return;
+        }
+        let recs: Vec<project::ProjImport> = recs.to_vec();
+        let gen = self.import_load_gen;
+        self.import_loading = recs
+            .iter()
+            .map(|r| std::path::Path::new(&r.path).file_name().unwrap_or_default().to_string_lossy().into_owned())
+            .collect();
+        self.spawn_status = format!("Reading {} imported model file(s)\u{2026}", recs.len());
+        let tx = self.import_loaded_tx.clone();
+        std::thread::spawn(move || {
+            let out: Vec<(project::ProjImport, Result<Box<modelimport::ModelData>, String>)> = recs
+                .into_iter()
+                .map(|r| {
+                    let res = modelimport::load(std::path::Path::new(&r.path)).map(Box::new);
+                    (r, res)
+                })
+                .collect();
+            let _ = tx.send(ImportLoaded::Restore(gen, out));
+        });
     }
 
     /// Save the current viewport to captures\viewer_<n>.png (F12).
@@ -12510,19 +18607,64 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.gfx_frame = self.gfx_frame.wrapping_add(1);
+        // #film-perf  Must be the FIRST thing in the frame: the wall period it samples is the
+        // gap between consecutive entries, which is the number the user actually experiences.
+        self.fprof.frame_begin();
+        if let Some(b) = self.bench.as_mut() {
+            b.frame_begin();
+            let want = b.gpu_timer_wanted();
+            let on = self.renderer.set_gpu_timer(&self.render_state.device, &self.render_state.queue, want);
+            if want && !on {
+                eprintln!("HMS_BENCH: this adapter has no TIMESTAMP_QUERY — per-pass GPU timing unavailable");
+            }
+        }
         self.dbg_pointer = ctx.input(|i| i.pointer.latest_pos()); // `preview where`
-        if self.sim_pointer.is_some() || self.sim_click.is_some() || self.sim_drag.is_some() || !self.sim_events.is_empty() {
+        // Key POSITIONS held/pressed this frame, for the bindings that match by position rather
+        // than by letter (keybinds.rs). Must run before any handler reads a binding.
+        ctx.input(|i| self.phys.begin_frame(i));
+        // Settings ▸ Controls & keyboard (issue #2): while a row is waiting for a key, EVERY
+        // action reads as "not firing", so the key being assigned cannot also do its old job
+        // (pressing G to bind it must not start a modal move, and the fly keys must not fly the
+        // camera out of the map while you reassign them). Decided here, at the top of the frame,
+        // so it covers every handler in it — not from halfway down, which would leave the
+        // handlers one frame of stale state.
+        self.keys.listening = self.show_keybinds && self.key_capture.is_some();
+        // #play  THE WAY OUT OF TEST MODE, handled HERE — at the top of the frame, before a
+        // single panel or widget is drawn and before anything can consume the key.
+        //
+        // This has to come first because test mode hides the editor chrome, INCLUDING the menu
+        // bar: if Escape were read further down and some widget swallowed it, the user would be
+        // left with no visible exit and a captured cursor, i.e. force-quitting the app with an
+        // unsaved variant. A guaranteed exit is what makes hiding the menu bar safe rather than
+        // a trap, and the on-screen "Esc to leave" line below is the other half of that bargain.
+        if self.play.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.status = self.leave_play();
+        }
+        self.updater_tick(ctx); // auto-update check / window / recovery restore (updater.rs)
+        // #model-import: collect whatever the background model readers finished, and keep frames
+        // coming while one is still reading so the progress line actually updates (egui repaints
+        // on input only, and a 26 MB model takes ~a second).
+        self.drain_import_loads();
+        if !self.import_loading.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.sim_pointer.is_some() || self.sim_click.is_some() || self.sim_drag.is_some() || !self.sim_events.is_empty() || self.sim_button.is_some() {
             ctx.request_repaint(); // keep frames coming while a scripted pointer is pending
         }
         // Print-only frame profiler (HMS_FRAMEPROF=1). Stages: 0 = windows/menus +
         // load/tick/commands (everything before the side panels), 1 = side panels + properties,
         // 2 = particle sim, 3 = render encode, 4 = exposure meter, 5 = viewport input + rest.
+        // A benchmark always wants the stage split, so it turns the profiler on for itself.
+        if self.bench.is_some() && self.frame_prof.is_none() {
+            self.frame_prof = Some((std::time::Instant::now(), [0.0; 6], Vec::new()));
+        }
         let prof_on = self.frame_prof.is_some();
         if let Some(p) = self.frame_prof.as_mut() { p.0 = std::time::Instant::now(); p.1 = [0.0; 6]; }
         // The Construct TOOL is the single source of truth for construction mode —
         // picking it in the toolbar (or pressing C) arms the guide-drawing clicks. `C` is ignored
         // while a text field has focus so it cannot fire mid-rename.
-        if ctx.input(|i| i.key_pressed(egui::Key::C) && !i.modifiers.command && !i.modifiers.ctrl)
+        if ctx.input(|i| self.keys.pressed(keybinds::Action::ConstructTool, i, &self.phys))
             && ctx.memory(|m| m.focused().is_none())
         {
             self.tool_mode = if self.tool_mode == ToolMode::Construct { ToolMode::Select } else { ToolMode::Construct };
@@ -12555,6 +18697,73 @@ impl eframe::App for App {
                 .show(ctx, |ui| self.import_geometry_ui(ui));
             self.show_import_geom = open;
         }
+        if self.show_graphics {
+            let mut open = true;
+            let mut changed = false;
+            egui::Window::new("Graphics & performance")
+                .open(&mut open)
+                .default_width(430.0)
+                .default_height(620.0)
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    changed = gfxsettings::ui(&mut self.gfx, ui);
+                });
+            self.show_graphics = open;
+            if changed {
+                self.apply_gfx_settings();
+            }
+        }
+        if self.show_keybinds {
+            let mut open = true;
+            let mut changed = false;
+            egui::Window::new("Controls & keyboard")
+                .open(&mut open)
+                .default_width(560.0)
+                .default_height(640.0)
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    let st = keybinds::UiState {
+                        keys: &mut self.keys,
+                        capture: &mut self.key_capture,
+                        msg: &mut self.keybind_msg,
+                    };
+                    changed = keybinds::ui(st, &self.phys, ui);
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    // #mcc-import  Adopt the user's own MCC controls. Reads nothing until the
+                    // button in this section is pressed, and every import is undoable.
+                    //
+                    // #mcc-fov  The first-person FOV travels through `ImportUi::fov` as an in/out
+                    // channel: filled with the live value here so the import has something to
+                    // snapshot for Undo, and drained afterwards. A channel rather than a
+                    // parameter so adding it changed neither `mccimport::ui`'s signature nor any
+                    // of that module's tests.
+                    self.mcc_import.fov = Some(self.fp_fov_deg);
+                    changed |= mccimport::ui(&mut self.mcc_import, &mut self.keys, ui);
+                    if let Some(f) = self.mcc_import.fov {
+                        if (f - self.fp_fov_deg).abs() > 1e-3 {
+                            self.fp_fov_deg = f;
+                            film_play::save_fov_setting(f);
+                        }
+                    }
+                });
+            if !open {
+                self.show_keybinds = false;
+                self.key_capture = None;
+                self.keybind_msg = None;
+                self.keys.listening = false;
+            }
+            if changed {
+                match self.keys.save() {
+                    Ok(p) => self.status = format!("Controls saved to {}", p.display()),
+                    Err(e) => {
+                        self.keybind_msg = Some(format!("Could not save the controls: {e}"));
+                        self.status = format!("Controls not saved: {e}");
+                    }
+                }
+            }
+        }
         if self.show_settings {
             let mut open = true;
             egui::Window::new("Settings")
@@ -12569,6 +18778,10 @@ impl eframe::App for App {
                     ui.add_space(6.0);
                     egui::CollapsingHeader::new("Camera & rendering").default_open(true).show(ui, |ui| {
                         self.view_settings_ui(ui);
+                    });
+                    ui.add_space(6.0);
+                    egui::CollapsingHeader::new("Updates").default_open(false).show(ui, |ui| {
+                        self.updater.ui_settings(ui);
                     });
                     ui.add_space(6.0);
                     // Every diagnostic readout lives here, closed by default, so the working UI
@@ -12595,19 +18808,39 @@ impl eframe::App for App {
 
         // Themed "open variant by name" browser (self-gates on `variant_browser_open`).
         self.variant_browser_ui(ctx);
+        self.film_card_ui(ctx); // #film
+        // #film-perf  The two film stages are timed every frame (two `Instant::now` calls) and
+        // reported by `film perf`, because "Theater playback is slow" was a per-frame cost hidden
+        // inside one of them and nothing in the app could say which.
+        let _t_tick = std::time::Instant::now();
+        self.fprof.lap(0); // #film-perf  everything before the film tick is "pre"
+        self.film_tick(ctx); // #film  clock + actor placement
+        let _t_ui = std::time::Instant::now();
+        self.film_timeline_window(ctx); // #film
+        self.fprof.lap(10); // #film-perf  the transport strip + the side panel
+        if self.film_play.is_some() {
+            let now = std::time::Instant::now();
+            self.film_frame_ms = [
+                (_t_ui - _t_tick).as_secs_f32() * 1000.0,
+                (now - _t_ui).as_secs_f32() * 1000.0,
+            ];
+        }
+        self.recent_missing_ui(ctx); // a recent item whose file has gone
         self.scale_converter_ui(ctx);
+        self.convert_variant_ui(ctx);
         self.bsp_warn_window_ui(ctx); // save-time "outside playable space" window
         self.save_error_window_ui(ctx);
+        self.prefab_panel_ui(ctx); // #prefab Tools > Prefabs
         self.h4_save_window_ui(ctx); // the Halo 4 save check (bounds / quota / budget)
         self.drive_lightbake_scan(ctx);
         self.lightbake_map_ui(ctx);
         // Help → Hotkeys reference window (Help menu toggles `show_hotkeys`).
         if self.show_hotkeys {
             let mut open = true;
-            // The ONE authoritative list. Every row below matches its handler (update_camera,
-            // handle_pick, box-select, update_object_transform, handle_editor_shortcuts,
-            // handle_delete_key, handle_selected_edit, handle_undo_redo, the C / F12 checks in
-            // update). Keys are only listed with the condition they fire under.
+            // The ONE authoritative list — and it is generated from the SAME binding table the
+            // handlers read (`self.keys`, keybinds.rs), so it cannot drift from what the keys
+            // actually do and it shows the user's own bindings, not the shipped defaults. Keys
+            // are only listed with the condition they fire under.
             egui::Window::new("Keyboard shortcuts")
                 .open(&mut open)
                 .collapsible(false)
@@ -12620,60 +18853,91 @@ impl eframe::App for App {
                             ui.label(desc);
                         });
                     };
-                    ui.strong("Camera (hold the RIGHT mouse button over the viewport to fly)");
-                    row(ui, "Right-drag", "Look around");
-                    row(ui, "W A S D", "Fly forward / left / back / right (RMB held)");
-                    row(ui, "E or R", "Fly up (RMB held)");
-                    row(ui, "Q or F", "Fly down (RMB held)");
-                    row(ui, "Shift (hold)", "4x fly speed (RMB held)");
+                    // Every key below is read from the live binding table (keybinds.rs), so this
+                    // window shows what the user's keys ACTUALLY are — rebind one in
+                    // Settings > Controls & keyboard and this list changes with it.
+                    use keybinds::Action as A;
+                    let k = &self.keys;
+                    let kb = |a: A| k.label(a);
+                    let fly = kb(A::FlyLook);
+                    ui.strong(format!("Camera (hold {} over the viewport to fly)", fly.to_lowercase()));
+                    row(ui, &format!("{}-drag", fly), "Look around");
+                    row(ui, &k.labels(&[A::CamForward, A::CamLeft, A::CamBack, A::CamRight]), "Fly forward / left / back / right (fly button held)");
+                    row(ui, &kb(A::CamUp), "Fly up (fly button held)");
+                    row(ui, &kb(A::CamDown), "Fly down (fly button held)");
+                    row(ui, &format!("{} (hold)", kb(A::FlyFaster)), "4x fly speed (fly button held)");
+                    row(ui, &format!("{} (hold)", kb(A::FlySlower)), "Quarter fly speed, for lining up a close shot (fly button held)");
                     row(ui, "Ctrl + wheel", "Change fly speed (viewport hovered)");
-                    row(ui, "F", "Fly the camera to the selected object (not flying, no text field focused)");
-                    row(ui, "F12", "Screenshot to the captures folder");
+                    row(ui, &kb(A::FrameSelected), "Fly the camera to the selected object (not flying, no text field focused)");
+                    row(ui, &kb(A::Screenshot), "Screenshot to the captures folder");
+                    ui.separator();
+                    // #play  Test mode's own controls. The Help window is hand-written rather than
+                    // generated from the action table, so a new action is invisible here until it
+                    // is listed -- and a control the user cannot find is a control they do not
+                    // have (they have said as much about the first-person FOV).
+                    ui.strong("Test mode (Play menu)");
+                    row(ui, &k.labels(&[A::CamForward, A::CamLeft, A::CamBack, A::CamRight]), "Walk / strafe (the same keys that fly the camera, so one rebind covers both)");
+                    row(ui, "Mouse", "Look around (the cursor is captured while playing)");
+                    row(ui, &kb(A::PlayJump), "Jump (the biped's own authored jump velocity)");
+                    row(ui, &format!("{} (hold)", kb(A::PlayCrouch)), "Crouch -- the view drops to the biped's own crouching camera height");
+                    row(ui, &format!("{} (hold)", kb(A::PlaySprint)), "Sprint (the globals' own full-speed multiplier)");
+                    row(ui, &format!("{} (hold)", kb(A::PlayWalk)), "Walk slowly, at the authored walking speed");
+                    row(ui, &kb(A::PlayFire), "Fire the weapon in your hands, along the crosshair");
+                    row(ui, &kb(A::PlayMelee), "Melee -- plays the weapon class's own swing, at the weapon's own authored lunge range");
+                    row(ui, &kb(A::PlayView), "First / third person -- Reach draws no legs in first person, so third person is where you see your whole body");
+                    // #pickup #seat-entry  ONE action key for three things, listed once. It was
+                    // missing from this window entirely, which by this window's own comment above
+                    // means the user did not have it.
+                    row(ui, &kb(A::PlayUseVehicle), "Use: get into the vehicle seat you are standing at, get out of the one you are in, or pick up the weapon you are standing next to (a vehicle wins when both are in range). The game's own prompt names this key.");
+                    row(ui, "Play menu", "Give weapon: put any of the map's own weapons in your hands (or just walk up to one on the map and press Use)");
+                    row(ui, "Esc", "Leave test mode and put the editor camera back");
                     ui.separator();
                     ui.strong("Selection (Select tool)");
                     row(ui, "Left-click", "Select the object under the cursor (empty space clears)");
-                    row(ui, "Shift + click", "Add / remove the object under the cursor");
-                    row(ui, "Left-drag", "Box-select everything inside the rectangle (Shift adds to the selection)");
-                    row(ui, "Ctrl+A", "Select every variant / placed object");
-                    row(ui, "Shift+A", "Object context menu at the cursor (needs a selection)");
-                    row(ui, "Delete / Backspace", "Delete the selection (undoable)");
+                    row(ui, &format!("{} + click", kb(A::SelectAdd)), "Add / remove the object under the cursor");
+                    row(ui, "Left-drag", &format!("Box-select everything inside the rectangle ({} adds to the selection)", kb(A::SelectAdd)));
+                    row(ui, &kb(A::SelectAll), "Select every variant / placed object");
+                    row(ui, &kb(A::ContextMenu), "Object context menu at the cursor (needs a selection)");
+                    row(ui, &kb(A::Delete), "Delete the selection (undoable)");
                     row(ui, "Objects list", "Click = select, Ctrl+click = toggle, Shift+click = range, double-click = fly to");
                     ui.separator();
                     ui.strong("Edit");
-                    row(ui, "Ctrl+Z", "Undo");
-                    row(ui, "Ctrl+Y or Ctrl+Shift+Z", "Redo");
-                    row(ui, "Arrow keys", "Nudge the selection on X / Y by 0.25 wu (Shift = 1 wu)");
-                    row(ui, "PageUp / PageDown", "Nudge the selection on Z by 0.25 wu (Shift = 1 wu)");
-                    row(ui, "[ / ]", "Yaw the selection by 15 deg (Shift = 45 deg)");
+                    row(ui, &kb(A::Undo), "Undo");
+                    row(ui, &kb(A::Redo), "Redo");
+                    row(ui, &k.labels(&[A::NudgeYPlus, A::NudgeXMinus, A::NudgeYMinus, A::NudgeXPlus]), &format!("Nudge the selection on X / Y by 0.25 wu ({} = 1 wu)", kb(A::NudgeLarge)));
+                    row(ui, &format!("{} / {}", kb(A::NudgeZPlus), kb(A::NudgeZMinus)), &format!("Nudge the selection on Z by 0.25 wu ({} = 1 wu)", kb(A::NudgeLarge)));
+                    row(ui, &format!("{} / {}", kb(A::YawMinus), kb(A::YawPlus)), &format!("Yaw the selection by 15 deg ({} = 45 deg)", kb(A::NudgeLarge)));
                     row(ui, "Angle / position fields", "Type the sign WHENEVER you like: '90 -' means the same as '-90' (also 90deg, 90 degrees)");
                     ui.separator();
                     ui.strong("Transform (Blender-style, viewport hovered, selection non-empty)");
-                    row(ui, "G", "Grab / move the selection (or drag the move gizmo)");
-                    row(ui, "R", "Rotate the selection (or drag the rotate gizmo)");
-                    row(ui, "Shift+D", "Duplicate the selection and start moving the copies");
-                    row(ui, "X / Y / Z", "During G/R: lock to that axis (press again to unlock)");
-                    row(ui, "E", "During G/R: toggle world / local axes");
-                    row(ui, "Ctrl (hold)", "During G: magnet -- push the selection's nearest real face flush against the nearest other face / map surface, then line the edges up");
-                    row(ui, "Ctrl + X/Y/Z", "During G: the magnet may only travel on that axis (both directions)");
-                    row(ui, "Shift (hold)", "During G/R: precision (slow) movement");
-                    row(ui, "Shift+Ctrl + axis", "During a Shift+D grab: array copies along the locked axis");
+                    row(ui, &kb(A::ModalMove), "Grab / move the selection (or drag the move gizmo)");
+                    row(ui, &kb(A::ModalRotate), "Rotate the selection (or drag the rotate gizmo)");
+                    row(ui, &kb(A::Duplicate), "Duplicate the selection and start moving the copies");
+                    row(ui, &k.labels(&[A::AxisX, A::AxisY, A::AxisZ]), "During a move / rotate: lock to that axis (press again to unlock)");
+                    row(ui, &kb(A::AxisSpace), "During a move / rotate: toggle world / local axes");
+                    row(ui, &format!("{} (hold)", kb(A::Magnet)), "During a move: magnet -- push the selection's nearest real face flush against the nearest other face / map surface, then line the edges up");
+                    row(ui, &format!("{} + axis", kb(A::Magnet)), "During a move: the magnet may only travel on that axis (both directions)");
+                    row(ui, &format!("{} (hold)", kb(A::PrecisionSlow)), "During a move / rotate: precision (slow) movement");
+                    row(ui, &format!("{}+{} + axis", kb(A::PrecisionSlow), kb(A::Magnet)), "During a duplicate grab: array copies along the locked axis");
                     row(ui, "Wheel (arraying)", "Change the array step: up = spread out, down = overlap (0.25 wu)");
-                    row(ui, "Alt + wheel (arraying)", "Fine array step (0.05 wu)");
-                    row(ui, "Digits, - .", "During G/R: type an exact distance (wu) / angle (deg); Backspace edits. A '-' typed ANYWHERE flips the sign, so 90- is the same as -90");
-                    row(ui, "Click or Enter", "Confirm the transform");
-                    row(ui, "Esc or right-click", "Cancel the transform (gizmo drags: Esc only)");
+                    row(ui, &format!("{} + wheel (arraying)", kb(A::ArrayFine)), "Fine array step (0.05 wu)");
+                    row(ui, "Digits, - .", "During a move / rotate: type an exact distance (wu) / angle (deg); Backspace edits. A '-' typed ANYWHERE flips the sign, so 90- is the same as -90");
+                    row(ui, &format!("Click or {}", kb(A::ConfirmTransform)), "Confirm the transform");
+                    row(ui, &format!("Esc or {}", fly.to_lowercase()), "Cancel the transform (gizmo drags: Esc only). Esc is not rebindable.");
                     ui.separator();
                     ui.strong("Tools");
-                    row(ui, "C", "Construct tool on / off (construction guides & CAD panel)");
-                    row(ui, "G (Construct)", "Move the selected construction shape; click or Enter places, Esc cancels");
+                    row(ui, &kb(A::ConstructTool), "Construct tool on / off (construction guides & CAD panel)");
+                    row(ui, &format!("{} (Construct)", kb(A::ModalMove)), "Move the selected construction shape; click or Enter places, Esc cancels");
                     row(ui, "Esc (Construct)", "Drop a half-drawn guide / face pick / line array");
                     row(ui, "Line array (Construct)", "Click the line's START then its END; the selection fills it by count or by step (step below the piece size = overlap)");
                     ui.separator();
                     ui.strong("View menu (what is DRAWN)");
                     // #wire-visible
                     row(ui, "Wireframe x-ray", "View > \"Selection wireframe through objects\": draw the selected object's wireframe through anything in front of it (off by default, persisted). The wireframe always has a dark outline under a bright core, so it reads on white Forge pieces and in dark interiors alike. Script: wirexray on|off|get");
+                    // #quant-error
+                    row(ui, "Save-precision ghost", "View > Overlays > \"Save-precision ghost\": draw the selected object(s) in violet at the pose the .mvar will really hold after the game's quantisers, with an exaggeration factor for sub-millimetre drift (off by default, persisted; the status bar says when it is exaggerated). The numbers are in the Object panel's \"save precision\" section, and \"Snap to representable\" removes the error. Script: precision | precision <datum> | precision worst [n] | precision snap | precision ghost on|off|<factor>");
                     ui.separator();
-                    ui.small(egui::RichText::new("Keys are ignored while a text field has focus. File, Edit, View and Tools actions live in the menu bar: View holds what is DRAWN (geometry: BSP / Terrain / Forge objects / Water / Sky; Forge extras: special FX / scaled objects / shadow casters; overlays: grid, lights, boundary shapes, the selection's collision + physics hulls, spawn points, hidden-block hulls, selection wireframe x-ray, trigger volumes, soft ceilings, hard floor, playable bounds), while Settings keeps the camera and the lighting / render tuning.").weak());
+                    ui.small(egui::RichText::new("EVERY key on this list can be changed in Settings > Controls & keyboard (ready-made right-handed and left-handed sets, or rebind one at a time) -- what you see here is your own current set. Escape and Tab stay fixed. Keys are ignored while a text field has focus. File, Edit, View and Tools actions live in the menu bar: View holds what is DRAWN (geometry: BSP / Terrain / Forge objects / Water / Sky; Forge extras: special FX / scaled objects / shadow casters; overlays: grid, lights, boundary shapes, the selection's collision + physics hulls, spawn points, hidden-block hulls, selection wireframe x-ray, trigger volumes, soft ceilings, hard floor, playable bounds), while Settings keeps the camera, the lighting / render tuning and the controls.").weak());
                 });
             self.show_hotkeys = open;
         }
@@ -12720,7 +18984,7 @@ impl eframe::App for App {
             // Pump frames + the hitch clock for the ENTIRE load — the streaming phase AND the
             // post-Done object-model rebuild tail (settle_pending); without the tail coverage the
             // window would only advance on user input while objects pop in. Halo 4 loads too.
-            if self.load_rx.is_some() || self.settle_pending || self.h4_load.is_some() {
+            if self.load_rx.is_some() || self.settle_pending || self.h4_load.is_some() || self.h3_load.is_some() {
                 // While the load is in flight, return freed transient decode heap to the OS
                 // every ~1.2s (native _heapmin + a working-set trim). The decode frees large temp
                 // buffers (decompressed pages, per-mesh CPU arrays) into the CRT free-list as it
@@ -12756,14 +19020,22 @@ impl eframe::App for App {
         // user never has to attach/inject manually.
         self.auto_attach();
         self.ensure_clients();
-        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+        if ctx.input(|i| self.keys.pressed(keybinds::Action::Screenshot, i, &self.phys)) {
             self.screenshot();
         }
 
         // Top MENU BAR — like a normal desktop app, above everything else.
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
-            self.menu_bar_ui(ui);
-        });
+        //
+        // #play  HIDDEN while test mode is live: "play mode also needs to hide the toolbar and
+        // editor panel and any other object panels and stuff". Nothing of the user's own panel
+        // state is changed — this only suppresses the DRAW, so leaving test mode restores exactly
+        // the layout they had. The menu bar goes too, which is only safe because Escape is
+        // handled at the very top of this function and the viewport prints the exit.
+        if self.play.is_none() {
+            egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+                self.menu_bar_ui(ui);
+            });
+        }
 
         // Scripting console: the command layer (shared executor with the command server).
         // Multi-line input → run each line → output log; the whole run is one undo step.
@@ -12822,10 +19094,13 @@ impl eframe::App for App {
         // Stream in a chunk of the map if a load is in flight (keeps UI live).
         self.drive_load(ctx);
         // Read the live object table + rebuild object meshes if it changed.
+        self.fprof.lap(0); // #film-perf  everything since the last lap is still "pre"
         self.tick_scene(ctx.input(|i| i.time) as f32);
+        self.fprof.lap(11); // #film-perf  the Forge scene tick (and its own `update_actors`)
         // Run any commands queued by external clients (the hms-mcp bridge) this frame.
         self.drain_commands();
         self.frame_prof_lap(0);
+        self.fprof.lap(0);
         // Post-load settle: once the object-model rebuild tail (spread over frames by the decode
         // budget) has drained, stamp the TRUE end-to-end load time — the map is now fully built
         // AND the window stayed responsive throughout (settle_pending gated request_repaint above).
@@ -12840,19 +19115,41 @@ impl eframe::App for App {
                 }
                 let total = self.load_t0.elapsed().as_secs_f32();
                 self.map_status = format!("Ready {} in {:.1}s.", self.map_path, total);
+                // #gpu-build  The object tail in the two numbers that matter: the wall time it
+                // cost, and the number of FRAMES it spread over — the second is what reads as
+                // "objects trickling in" however small the first is.
+                if let Some((f, m, ms)) = self.scene_ctl.as_ref().map(|s| s.gpu_tail_stats()) {
+                    log::info!("object tail: {m} models built over {f} frame(s), {ms:.0} ms of GPU build");
+                    if std::env::var("HMS_LOADPROF").is_ok() {
+                        eprintln!("HMS_LOADPROF object tail: {m} models over {f} frame(s), {ms:.0} ms building, load total {total:.2}s");
+                    }
+                }
                 log::info!("map FULLY ready (geometry + objects) in {total:.2}s");
             }
         }
         if self.follow_player {
             self.frame_on_player();
         }
-        self.handle_editor_shortcuts(ctx);
-        self.draw_context_menu(ctx);
-        if !self.handle_delete_key(ctx) {
-            self.handle_selected_edit(ctx);
+        // #play  TEST MODE owns the keyboard, and this is not a nicety: the player's keys OVERLAP
+        // the editor's. Sprint is Shift and strafe-right is D, and `Shift+D` is **Duplicate** —
+        // so a player sprinting to the right would have silently duplicated the selection, over
+        // and over, while walking around their own map. The same applies to Delete, Ctrl+Z, the
+        // nudges and a modal move (G). None of them may fire while a biped is being driven.
+        if self.play.is_none() {
+            self.handle_editor_shortcuts(ctx);
+            self.draw_context_menu(ctx);
+            if !self.handle_delete_key(ctx) {
+                self.handle_selected_edit(ctx);
+            }
+            self.handle_undo_redo(ctx);
         }
-        self.handle_undo_redo(ctx);
         // Refresh selection-dependent overlays (boundary zones) once if selection changed.
+        // #quant-error  The save-precision ghost must follow a live gizmo drag, but it shares the
+        // overlay lanes with the collision / blocker walks -- so poll a cheap signature of the
+        // selection's poses and only mark the lanes dirty when the ghost would actually move.
+        if self.quant_ghost.on && self.quant_ghost_poll() {
+            self.overlays_dirty = true;
+        }
         if self.overlays_dirty {
             self.overlays_dirty = false;
             self.rebuild_overlays();
@@ -12873,6 +19170,16 @@ impl eframe::App for App {
         // (The Blender-style tool toolbar is a FLOATING overlay drawn on the viewport itself —
         // see `floating_toolbar` in the CentralPanel below.)
 
+        // #film  While a clip is playing, the editing column is dead weight: you are watching a
+        // recording, not placing objects, and it costs about 30% of the window width. Hidden by
+        // default while a film is open, restored the moment the film closes — and the toggle is
+        // on the Theater strip, so it is one click either way. This is a separate flag, so the
+        // user's own panel state is never destroyed.
+        // #play  ...and test mode hides the same column, for the same reason and in the same way:
+        // a separate condition rather than a change to the user's settings.
+        let hide_editor = self.play.is_some()
+            || (self.film_play.is_some() && self.film_timeline_open && self.film_hide_editor);
+        if !hide_editor {
         egui::SidePanel::left("left").default_width(300.0).show(ctx, |ui| {
           // Whole panel scrolls (drag_to_scroll off so palette-item / preview drags aren't eaten)
           // so the object list + model preview are always reachable no matter the panel height.
@@ -12892,7 +19199,7 @@ impl eframe::App for App {
             let n_of = |g: mapcat::Game, modded: bool| -> usize {
                 self.map_candidates.iter().filter(|c| c.game == g && c.modded == modded).count()
             };
-            let games: Vec<mapcat::Game> = [mapcat::Game::Reach, mapcat::Game::Halo4, mapcat::Game::H2A]
+            let games: Vec<mapcat::Game> = [mapcat::Game::Reach, mapcat::Game::Halo4, mapcat::Game::H2A, mapcat::Game::Halo3]
                 .into_iter()
                 .filter(|g| n_of(*g, false) + n_of(*g, true) > 0)
                 .collect();
@@ -13005,6 +19312,26 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("No variant open").weak());
                 }
             });
+            // Empty state: with nothing open, offer the variants that were open recently right
+            // here — the same entries as File ▸ Open recent, one click each.
+            if self.current_variant_path.is_none() && self.new_variant_template.is_none() {
+                let recents: Vec<recent::RecentItem> =
+                    self.recent.of_kind(recent::RecentKind::Variant).take(5).cloned().collect();
+                if recents.is_empty() {
+                    ui.small("Open a variant (or File ▸ New variant) to start building.");
+                } else {
+                    ui.small("Recent variants:");
+                    let mut pick: Option<recent::RecentItem> = None;
+                    for it in recents {
+                        if ui.link(format!("↺ {}", it.menu_label())).on_hover_text(it.hover()).clicked() {
+                            pick = Some(it);
+                        }
+                    }
+                    if let Some(it) = pick {
+                        self.recent_open(it);
+                    }
+                }
+            }
             ui.horizontal(|ui| {
                 if ui.button("Open…").on_hover_text("Browse and open a .mvar (File > Open .mvar…)").clicked() {
                     self.open_variant_browser();
@@ -13170,21 +19497,40 @@ impl eframe::App for App {
                                     let cname = forge_category_pretty(cat);
                                     ui.add_space(4.0);
                                     ui.label(egui::RichText::new(cname).strong().color(egui::Color32::from_gray(150)));
+                                    // #forge-subcat: sub-group by the SUBCATEGORY (the entry = the middle
+                                    // "·" part of the display), the way the game's Forge menu nests items
+                                    // (Gadgets > Man Cannons > Cannon, Man, Heavy). A multi-item
+                                    // subcategory becomes a collapsible header; a lone item shows directly.
+                                    let mut subs: Vec<(String, Vec<usize>)> = Vec::new();
                                     for &i in idxs {
-                                        let full = self.static_palette[i].1.clone();
-                                        let leaf = full.split(" · ").last().unwrap_or(&full).to_string();
-                                        let sel = self.selected_static_pal == Some(i);
-                                        // Click selects. A second interaction over the SAME rect with a
-                                        // STABLE id senses the drag (drag-out into the viewport), so the
-                                        // drag survives list reflow (auto-id churn would break it).
-                                        let r = ui.selectable_label(sel, format!("  {leaf}"));
-                                        if r.clicked() {
-                                            self.selected_static_pal = Some(i);
+                                        let full = &self.static_palette[i].1;
+                                        let parts: Vec<&str> = full.split(" · ").collect();
+                                        let sub = if parts.len() >= 3 { parts[1].to_string() } else { String::new() };
+                                        match subs.last_mut() {
+                                            Some((s, v)) if *s == sub => v.push(i),
+                                            _ => subs.push((sub, vec![i])),
                                         }
-                                        let dr = ui.interact(r.rect, egui::Id::new(("paldrag", i)), egui::Sense::drag());
-                                        if dr.drag_started() {
-                                            self.selected_static_pal = Some(i);
-                                            self.pending_place = Some(i);
+                                    }
+                                    // Click selects; a second interaction over the SAME rect with a STABLE
+                                    // id senses the drag-out (survives list reflow).
+                                    macro_rules! item_row { ($app:ident, $ui:ident, $i:expr) => {{
+                                        let i = $i;
+                                        let full = $app.static_palette[i].1.clone();
+                                        let leaf = full.split(" · ").last().unwrap_or(&full).to_string();
+                                        let sel = $app.selected_static_pal == Some(i);
+                                        let r = $ui.selectable_label(sel, format!("  {leaf}"));
+                                        if r.clicked() { $app.selected_static_pal = Some(i); }
+                                        let dr = $ui.interact(r.rect, egui::Id::new(("paldrag", i)), egui::Sense::drag());
+                                        if dr.drag_started() { $app.selected_static_pal = Some(i); $app.pending_place = Some(i); }
+                                    }}; }
+                                    for (sub, sidxs) in &subs {
+                                        if sub.is_empty() {
+                                            for &i in sidxs { item_row!(self, ui, i); }
+                                        } else {
+                                            egui::CollapsingHeader::new(egui::RichText::new(sub).color(egui::Color32::from_gray(135)))
+                                                .id_salt(("palsub", cat.as_str(), sub.as_str()))
+                                                .default_open(!filter.is_empty())
+                                                .show(ui, |ui| { for &i in sidxs { item_row!(self, ui, i); } });
                                         }
                                     }
                                 }
@@ -13212,11 +19558,21 @@ impl eframe::App for App {
             }
           }); // end left-panel ScrollArea
         });
+        } // end `if !hide_editor`
 
+        if self.play.is_none() {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.small(&self.status);
                 // Which special-FX screen effects are active (and whether they are shown).
+                // #quant-error  An EXAGGERATED precision ghost must never sit on screen silently:
+                // the banner is up for as long as the ghost is, and names the factor.
+                if let Some(txt) = self.quant_ghost_banner() {
+                    ui.separator();
+                    let col = if self.quant_ghost.exaggerate > 1.0 { egui::Color32::from_rgb(235, 140, 235) } else { egui::Color32::from_rgb(170, 130, 190) };
+                    ui.label(egui::RichText::new(txt).small().color(col))
+                        .on_hover_text("View > Overlays > \"Save-precision ghost\"; script `precision ghost on|off|<factor>`");
+                }
                 if !self.active_screenfx.forge_names.is_empty() {
                     ui.separator();
                     let txt = self.screenfx_status();
@@ -13225,6 +19581,7 @@ impl eframe::App for App {
                 }
             });
         });
+        } // #play  end `if self.play.is_none()` — the status bar is hidden while playing
 
         // Properties panel for the selected forge object (team/color/pose/delete).
         // The team/colour dropdown entry under the cursor this frame (None = nothing
@@ -13301,6 +19658,13 @@ impl eframe::App for App {
                     }
                     ui.add_space(2.0);
                     let mut m = m0.clone();
+                    // The damage states this object's model (and its attachments) actually author,
+                    // for the DAMAGE pseudo-flag dropdown (empty = the model has none: default only).
+                    // `last_objects` is the merged snapshot the rebuild sees (variant + placed +
+                    // scenario), so a just-placed vehicle gets its list too.
+                    let dmg_states: Vec<u8> = self.last_objects.iter().find(|o| o.datum == datum)
+                        .and_then(|o| self.objscene().map(|s| s.damage_states_of(o)))
+                        .unwrap_or_default();
                     egui::Grid::new("mvar-edit").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
                         ui.label("quota/variant");
                         ui.horizontal(|ui| {
@@ -13428,6 +19792,31 @@ impl eframe::App for App {
                                 .on_hover_text("Pseudo-flag (not saved in the .mvar): draw this object into the sun shadow map so it casts a shadow over the ground and other objects. Default ON for the gametype rule GREEN team + \"scale\" label. Vehicles and other engine-default casters always cast. Right-click: back to automatic.");
                             if r.clicked() { m.flags.shadow = Some(if mixed_shadow { true } else { shadow }); }
                             if r.secondary_clicked() { m.flags.shadow = None; }
+                            // DAMAGE: which authored damage state the object is DISPLAYED in. The
+                            // list is what the model authors (union over its regions + attachments);
+                            // "default" = the undamaged model and clears the override, as does a right-click.
+                            let mixed_damage = sel_metas.iter().any(|t| t.flags.damage != m0.flags.damage);
+                            let cur = m.flags.damage_state();
+                            let cur_txt = if mixed_damage { "mixed".to_string() } else if cur == 0 { "default (undamaged)".to_string() } else {
+                                format!("{}{}", forge_scale::damage_state_name(cur), if dmg_states.contains(&cur) { "" } else { " (not authored)" })
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(format!("DAMAGE {}", tag(m.flags.damage.is_some())))
+                                    .on_hover_text("Pseudo-flag (not saved in the .mvar): show this object in one of the damage states its model authors (hlmt variant permutation states: minor / medium / major / destroyed). Display only - physics and collision are unchanged. Right-click: back to default.");
+                                let r = egui::ComboBox::from_id_salt(("obj-damage", datum))
+                                    .selected_text(cur_txt)
+                                    .show_ui(ui, |ui| {
+                                        let mut pick: Option<Option<u8>> = None;
+                                        if ui.selectable_label(!mixed_damage && cur == 0, "default (undamaged)").clicked() { pick = Some(None); }
+                                        for &st in &dmg_states {
+                                            if ui.selectable_label(!mixed_damage && cur == st, forge_scale::damage_state_name(st)).clicked() { pick = Some(Some(st)); }
+                                        }
+                                        if dmg_states.is_empty() { ui.small(egui::RichText::new("model authors no damage states").weak()); }
+                                        pick
+                                    });
+                                if let Some(Some(pick)) = r.inner { m.flags.damage = pick; }
+                                if r.response.secondary_clicked() { m.flags.damage = None; }
+                            });
                             if !self.obj_globals.scaled || !self.obj_globals.shadowcasters {
                                 ui.small(egui::RichText::new(format!("global: {}", self.obj_globals.status_line())).weak())
                                     .on_hover_text("Settings ▸ Lighting & rendering ▸ Forge objects");
@@ -13833,13 +20222,30 @@ impl eframe::App for App {
                             self.highlight_dirty = true;
                         }
                     }
+                    // #quant-error  What the SAVE will cost this pose: the per-axis position
+                    // delta, the rotation delta split into roll/pitch/yaw, and the snap action.
+                    self.quant_error_rows(ui, datum);
                 }
                 if !self.mvar_meta.contains_key(&datum) {
                     // An object with no editable record (a scenario piece the viewer renders but
                     // the variant does not own, or a live-engine object in the injection build).
                     // Say WHAT the map object is (tag path / class / tag id / placement), read-only.
                     let is_scnr = self.scenario_objects.iter().any(|o| o.datum == datum);
-                    if is_scnr {
+                    // #4: an IMPORTED MODEL is selected. It is not a variant object and never will
+                    // be (it is not in the .mvar at all), but it IS movable — say so and point at
+                    // the panel that owns its fields, instead of the misleading read-only notice.
+                    if let Some(m) = extimport::datum_index(datum).and_then(|i| self.imports.get(i)) {
+                        let (name, pos, e, scale) = (m.name.clone(), m.pos, m.euler_deg(), m.scale);
+                        ui.label(egui::RichText::new(format!("Imported model:  {name}")).strong());
+                        ui.small(format!(
+                            "position ({:.2}, {:.2}, {:.2}) · rotation ({:.1}°, {:.1}°, {:.1}°) · scale {:.3}",
+                            pos[0], pos[1], pos[2], e[0], e[1], e[2], scale
+                        ));
+                        ui.small("Move it with the gizmo, G (grab) or R (rotate) — or type exact numbers in Tools > Import geometry.");
+                        if ui.button("Open the Import geometry panel").clicked() {
+                            self.show_import_geom = true;
+                        }
+                    } else if is_scnr {
                         let (cls, leaf) = self.object_identity(datum).map(|id| (id.class.clone(), id.leaf().to_string())).unwrap_or_default();
                         let mut head = if cls.is_empty() { "Map object".to_string() } else { format!("Map object ({cls})") };
                         if !leaf.is_empty() {
@@ -13851,7 +20257,10 @@ impl eframe::App for App {
                         ui.label(egui::RichText::new("Not a variant object").strong());
                         ui.small("This piece belongs to the map itself; only variant / placed objects are editable.");
                     }
-                    self.identity_rows_ui(ui, datum, true);
+                    // An imported model has no obje/mode tag to report.
+                    if extimport::datum_index(datum).is_none() {
+                        self.identity_rows_ui(ui, datum, true);
+                    }
                 }
                 // The live-engine editors (Team/Color combos + "Apply team/color", "Apply (live)"
                 // scale, "Set persistent (X330)", "Prevent GC (pin)") only work with the injected
@@ -13940,13 +20349,19 @@ impl eframe::App for App {
         // bottom so it never covers the viewport.
         // Distinct Id from the "status" text bar above: two panels sharing one Id
         // makes egui report "Second use of widget ID" every frame.
+        if self.play.is_none() {
         egui::TopBottomPanel::bottom("status_progress").show(ctx, |ui| {
-            let map_loading = self.load_rx.is_some() || self.h4_load.is_some();
+            let map_loading = self.load_rx.is_some() || self.h4_load.is_some() || self.h3_load.is_some();
             let waiting_variant = self.pending_mvar.is_some();
             let preparing = self.settle_pending || self.variant_retry.is_some();
             // Variant object-decode progress: how many of the variant's unique render models are
             // decoded (they stream in over frames after the base map finishes).
-            let (vdone, vtotal) = if !self.mvar_objects.is_empty() {
+            // #gfx-perf: this allocates, sorts and dedups ~650 tag ids and then does one hash
+            // lookup each — every frame, for a progress bar that is only DRAWN while the scene
+            // still has decode work pending. `rebuild_pending` is the cheap half of the old
+            // `variant_decoding` predicate, so it now gates the expensive half.
+            let variant_pending = self.objscene().map(|s| s.rebuild_pending()).unwrap_or(false);
+            let (vdone, vtotal) = if variant_pending && !self.mvar_objects.is_empty() {
                 if let Some(scene) = self.scene_ctl.as_ref() {
                     let mut tags: Vec<u32> = self
                         .mvar_objects
@@ -13967,7 +20382,6 @@ impl eframe::App for App {
             // Belt-and-suspenders: if some tag can never be counted (never lands in geom_cache), the
             // bar would otherwise hang forever; once the scene reports no pending work, the variant is
             // done regardless of the per-tag tally, so the spinner always clears.
-            let variant_pending = self.objscene().map(|s| s.rebuild_pending()).unwrap_or(false);
             let variant_decoding = vtotal > 0 && vdone < vtotal && variant_pending;
             ui.horizontal(|ui| {
                 if map_loading {
@@ -14028,6 +20442,7 @@ impl eframe::App for App {
                 ctx.request_repaint(); // keep progress + spinner animating
             }
         });
+        } // #play  end `if self.play.is_none()` — the progress bar is hidden while playing
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let avail = ui.available_size();
@@ -14049,29 +20464,67 @@ impl eframe::App for App {
 
             // Render the 3D scene to the offscreen texture. Time drives the
             // decorator wind sway.
-            let time = ctx.input(|i| i.time) as f32;
+            //
+            // #blade-anim  With a FILM open this is the PLAYBACK POSITION, not the wall clock.
+            // Every animated material reads this one number — the energy sword's scrolling
+            // plasma, a flashing Forge light, water — so on the wall clock the picture at a given
+            // tick depends on when you happened to look at it: pause and the blade keeps
+            // scrolling, scrub away and back and it is at a different phase. Off the tick, a
+            // Theater frame is a pure function of the playback position, the same rule the
+            // ragdolls and the death clips already follow.
+            let time = match self.film_play.as_ref() {
+                Some(pb) => pb.anim_seconds(),
+                None => ctx.input(|i| i.time) as f32,
+            };
             self.frame_prof_lap(1);
+            self.fprof.lap(12);
             // Per-frame CPU simulation of the effect particle systems (grav-lift plasma /
             // sparks, effect_scenery waterfalls) billboarded for this camera → particle pass.
+            // Settings ▸ Graphics ▸ Particles / Lens flares. The particle build re-simulates and
+            // re-UPLOADS the whole map's systems every frame (new vertex/index/instance buffers
+            // and a bind group per batch), so the rate divider is the biggest single CPU knob on
+            // a map with waterfalls; "off" skips it and the previous meshes are dropped so
+            // nothing is left frozen on screen.
+            // #bg-throttle  ONE decision for the expensive third of the frame: the particle
+            // simulation, the 3D render and the exposure readback. A frame the user cannot see
+            // costs an egui pass and nothing else -- and because the gate is here rather than in
+            // the repaint requests, it holds even if something asks for a repaint at the full
+            // rate. Always open while the window is focused (see `App::scene_render_due`).
+            let draw_scene = self.scene_render_due(ctx);
+            let sim_particles = draw_scene && self.gfx.simulate_particles(self.gfx_frame);
+            let want_flares = draw_scene && self.gfx.lens_flares && !self.gfx.flat_mode;
             if let Some(scene) = self.scene_ctl.as_mut() {
-                if scene.has_cache() {
+                if scene.has_cache() && (sim_particles || want_flares) {
                     let fwd = self.camera.forward();
                     let right = self.camera.right();
                     let up = right.cross(fwd).normalize();
-                    let pm = scene.build_particle_meshes(self.camera.pos, fwd, right, up, time, self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue);
-                    self.renderer.set_particle_meshes(pm);
+                    if sim_particles {
+                        let pm = scene.build_particle_meshes(self.camera.pos, fwd, right, up, time, self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue);
+                        self.renderer.set_particle_meshes(pm);
+                    }
                     // Placed lens flares (efsc street-light glares, object attachment flares).
-                    self.renderer.set_lens_flare_instances(scene.lens_flare_instances(&self.render_state.device, &self.render_state.queue));
+                    if want_flares {
+                        self.renderer.set_lens_flare_instances(scene.lens_flare_instances(&self.render_state.device, &self.render_state.queue));
+                    }
                 }
             }
+            if self.gfx.particle_rate == 0 || self.gfx.flat_mode {
+                // Particles switched off entirely: drop the last batch so the final simulated
+                // frame cannot sit frozen in mid-air. (Assigning an empty Vec is free.)
+                self.renderer.set_particle_meshes(Vec::new());
+            }
             self.frame_prof_lap(2);
-            self.renderer.render(
-                &self.render_state.device,
-                &self.render_state.queue,
-                &self.camera,
-                time,
-            );
+            self.fprof.lap(13);
+            if draw_scene {
+                self.renderer.render(
+                    &self.render_state.device,
+                    &self.render_state.queue,
+                    &self.camera,
+                    time,
+                );
+            }
             self.frame_prof_lap(3);
+            self.fprof.lap(14);
 
             // Temporal auto-exposure smoothing. The shader recomputes gain from the RAW per-frame
             // 1×1 meter every frame, so panning the view (sky in/out of frame) would make the
@@ -14082,7 +20535,7 @@ impl eframe::App for App {
             // clamped to the cfxs band, × base), lerp a persistent value toward it, and drive it as a
             // FIXED exposure. Only in AUTO mode (manual/Lighting-Lab-fixed sets its own). Headless is
             // untouched (single frame → the shader's direct meter is already converged for a still).
-            if !self.ll_manual_exp {
+            if !self.ll_manual_exp && draw_scene {
                 self.ae_frame = self.ae_frame.wrapping_add(1);
                 // The meter readback is NON-BLOCKING (a 3-slot staging ring, polled without
                 // waiting; the value is 2-3 frames old — the engine's own readback ring is 3 slots
@@ -14128,7 +20581,7 @@ impl eframe::App for App {
                     };
                     self.ae_smoothed = gain;
                     self.renderer.set_fixed_exposure(&self.render_state.queue, gain);
-                    ctx.request_repaint(); // keep the ramp animating even when otherwise idle
+                    self.pump(ctx); // #bg-throttle  keep the ramp animating; see `App::pump`
                 } else {
                     // Before the first readback (fresh map load): use the shader's own metered path.
                     self.renderer.set_fixed_exposure(&self.render_state.queue, 0.0);
@@ -14136,6 +20589,7 @@ impl eframe::App for App {
             }
 
             self.frame_prof_lap(4);
+            self.fprof.lap(15);
             let img = egui::Image::new(egui::load::SizedTexture::new(
                 self.tex_id,
                 egui::vec2(size.0 as f32, size.1 as f32),
@@ -14147,7 +20601,22 @@ impl eframe::App for App {
             self.dbg_viewport = Some(response.rect);
             // Blender-style floating tool buttons overlaid on the viewport (top-left), drawn in
             // THIS panel's layer and clamped to the viewport rect (see floating_toolbar).
-            self.floating_toolbar(ui, response.rect);
+            self.film_name_tags(ui, response.rect);
+            // #reach-hud  Under the name tags and the card, over the render: the authored
+            // first-person HUD, the weapon's reticule and the respawn countdown.
+            self.film_first_person_hud(ui, response.rect);
+            self.film_spectate_card(ui, response.rect);
+            // #play  The floating toolbar is editor chrome: hidden while playing.
+            if self.play.is_none() {
+                self.floating_toolbar(ui, response.rect);
+            } else {
+                // #play-hud  THE TEST-MODE HUD DRAW SITE. Under the overlay prompt (so a vehicle
+                // or pickup prompt is never covered by a meter) and over the render. This call is
+                // the thing `play_hud_call_site_gates` asserts exists: the capability existing and
+                // nothing invoking it is a mistake this project has made four times.
+                self.play_hud_lines = self.play_first_person_hud(ui, response.rect);
+                self.play_overlay(ui, response.rect);
+            }
             // Drag-out placement (BEFORE the transform/camera handlers so it owns input this frame):
             // when a queued palette item's held cursor enters the viewport, spawn it under the cursor;
             // it then snaps to the surface under the cursor until release.
@@ -14157,9 +20626,29 @@ impl eframe::App for App {
             // Build the gizmo from the SAME positions the current object meshes
             // were built from (this frame's tick_scene, i.e. before this frame's move) so the
             // gizmo/constraint-line and the solid meshes advance in lockstep — no lead/lag.
+            // #4: an import's pose changed this/last frame (gizmo drag, numeric field, script):
+            // push the matrices + rebuild the world triangle soup ONCE, before the gizmo is
+            // rebuilt, so the mesh, the selection box and the raycasts all agree in the same frame.
+            if self.import_dirty {
+                self.refresh_import_transforms();
+            }
             self.refresh_gizmo();
-            let xform_active = if placing_active { false } else { self.update_object_transform(ctx, &response) };
-            if !xform_active && !placing_active {
+            // #play  A modal move / rotate must not start while test mode is driving the biped
+            // either — `G` is a transform and a player holding keys should never begin dragging
+            // their own scenery.
+            let xform_active = if placing_active || self.play.is_some() {
+                false
+            } else {
+                self.update_object_transform(ctx, &response)
+            };
+            // #play  TEST MODE owns input outright while it is live. It has to be checked FIRST
+            // and it has to be exclusive: the editor camera must not fly while the player walks
+            // (both would read the same WASD cluster and the view would do both at once), and
+            // object picking must not fire under the crosshair. Escape leaves, which
+            // `update_play` handles itself so it works with no menu open.
+            if self.play.is_some() {
+                self.update_play(ctx, &response);
+            } else if !xform_active && !placing_active {
                 self.update_camera(ctx, &response);
                 self.handle_pick(&response);
             } else {
@@ -14168,7 +20657,15 @@ impl eframe::App for App {
             self.apply_cursor_capture(ctx);
             // Box-select (Select mode): left-drag a rubber band to select every object whose
             // centre falls inside it. Only when no transform op owns the drag.
-            if self.tool_mode == ToolMode::Select && !xform_active && !placing_active && self.pending_place.is_none() {
+            // #play  No box-select while test mode is driving the biped: the cursor is locked, so
+            // a click-drag is a look, not a rubber band, and it would otherwise select whatever
+            // the player happened to sweep past.
+            if self.play.is_none()
+                && self.tool_mode == ToolMode::Select
+                && !xform_active
+                && !placing_active
+                && self.pending_place.is_none()
+            {
                 if response.drag_started_by(egui::PointerButton::Primary) {
                     self.box_select_start = response.interact_pointer_pos();
                 }
@@ -14180,7 +20677,7 @@ impl eframe::App for App {
                     }
                     if response.drag_stopped_by(egui::PointerButton::Primary) {
                         if let Some(cur) = ctx.pointer_latest_pos() {
-                            let additive = ctx.input(|i| i.modifiers.shift);
+                            let additive = ctx.input(|i| self.keys.down(keybinds::Action::SelectAdd, i, &self.phys));
                             self.box_select(start, cur, response.rect, additive);
                         }
                         self.box_select_start = None;
@@ -14203,10 +20700,55 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        // Drive continuous animation (fly camera, sway, live tick) at a CAPPED
-        // ~60 fps. An unbounded request_repaint() saturates the swapchain and the UI
-        // thread blocks on GPU backpressure.
-        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        // Drive continuous animation (fly camera, sway, live tick) at the user's frame-rate cap
+        // (Settings ▸ Graphics; 60 fps by default, which is the cadence this line always used).
+        // An unbounded request_repaint() saturates the swapchain and the UI thread blocks on GPU
+        // backpressure, so "Unlimited" still goes through request_repaint_after with a 1 ms floor.
+        //
+        // IDLE THROTTLE: before this, the app re-ran a whole update() and a whole offscreen 3D
+        // render 60 times a second forever, even with the window untouched and nothing in the
+        // scene moving. The throttle drops that to 4 Hz — but ONLY when the scene has no animated
+        // content at all (`has_animated_content`, a deliberate superset: water, foliage,
+        // particles, flares, holograms, blend lanes, probe GI), nothing is loading or rebuilding,
+        // no live game is attached, the exposure has converged and the user has not touched
+        // anything for ¾ of a second. It is a floor, not a stop, so even if that predicate were
+        // ever wrong the worst case is a slow animation, never a frozen viewport.
+        {
+            // A benchmark run is never paced by the user's cap — it would measure the cap.
+            let interval_ms = match self.bench {
+                Some(_) => 1,
+                None => self.gfx.frame_interval().map(|s| (s * 1000.0).round().max(1.0) as u64).unwrap_or(1),
+            };
+            let busy = self.load_rx.is_some()
+                || self.settle_pending
+                || self.objscene().map(|s| s.rebuild_pending()).unwrap_or(false)
+                || self.objtable.is_some()
+                || self.placing.is_some()
+                || self.autoshot_frames > 0
+                || self.bench.is_some()
+                || self.renderer.has_animated_content();
+            let interacted = ctx.input(|i| {
+                !i.events.is_empty()
+                    || i.pointer.any_down()
+                    || i.pointer.velocity().length_sq() > 0.0
+                    || i.raw_scroll_delta != egui::Vec2::ZERO
+            });
+            let converging = !self.ll_manual_exp && self.ae_target > 0.0 && (self.ae_smoothed - self.ae_target).abs() > self.ae_target * 1e-3;
+            if interacted || busy || converging {
+                self.gfx_still = 0;
+            } else {
+                self.gfx_still = self.gfx_still.saturating_add(1);
+            }
+            let idle = self.gfx.idle_throttle && self.gfx_still > 45; // ~0.75 s at 60 Hz
+            let mut delay = std::time::Duration::from_millis(if idle { 250 } else { interval_ms });
+            // #bg-throttle  ...and never faster than the background budget while the window is
+            // not the one being used. `max` and not a replacement: the idle throttle's 250 ms is
+            // already slower than the unfocused budget, and whichever is slower should win.
+            if let Some(bg) = self.repaint_budget(ctx) {
+                delay = delay.max(bg);
+            }
+            ctx.request_repaint_after(delay);
+        }
 
         // Deferred variant open: the browser set this when Open was clicked. One frame is
         // burnt first so the window is actually painted gone before the blocking import
@@ -14217,6 +20759,35 @@ impl eframe::App for App {
                 ctx.request_repaint();
             } else {
                 self.import_mvar(path);
+            }
+        }
+        // #film: the same deferral for a browsed saved film.
+        if let Some((path, wait)) = self.pending_open_film.take() {
+            if wait > 0 {
+                self.pending_open_film = Some((path, wait - 1));
+                ctx.request_repaint();
+            } else {
+                self.open_film(path);
+            }
+        }
+        // #model-import: the same deferral for a browsed model file — the parse+upload blocks,
+        // so the dialog is painted gone first.
+        if let Some((path, wait)) = self.pending_import_model.take() {
+            if wait > 0 {
+                self.pending_import_model = Some((path, wait - 1));
+                ctx.request_repaint();
+            } else {
+                self.import_model_file(&path);
+                self.status = self.spawn_status.clone();
+            }
+        }
+        // #prefab: the same deferral for a browsed prefab file (the import validates + copies).
+        if let Some((path, wait)) = self.pending_import_prefab.take() {
+            if wait > 0 {
+                self.pending_import_prefab = Some((path, wait - 1));
+                ctx.request_repaint();
+            } else {
+                self.prefab_import_file(path);
             }
         }
         // #dialogs test hook: capture the whole egui frame (dialogs included) to a PNG. The
@@ -14247,10 +20818,121 @@ impl eframe::App for App {
             }
         }
         if prof_on { self.frame_prof_lap(5); self.frame_prof_report(); }
+        // #film-perf  Everything not charged to a named stage lands in "input + rest".
+        self.fprof.lap(16);
+        self.fprof.frame_end(self.film_play.is_some());
+        // The graphics benchmark drives the frame loop itself: keep frames coming, and when the
+        // run is complete print the result and exit (no human in the loop).
+        if self.bench.is_some() {
+            ctx.request_repaint();
+            // "Settled" for every game: nothing streaming, nothing decoding, nothing rebuilding.
+            // (The Reach loader has `settle_pending`; the Halo 4 / H2A / Halo 3 loaders do not,
+            // so the benchmark derives it from the same signals the status bar uses.)
+            let busy = self.load_rx.is_some()
+                || self.h4_load.is_some()
+                || self.h3_load.is_some()
+                || self.settle_pending
+                || self.objscene().map(|s| s.rebuild_pending()).unwrap_or(false);
+            let stages = self.frame_prof.as_ref().map(|p| p.1).unwrap_or([0.0; 6]);
+            if !busy && !self.map_path.is_empty() {
+                let census = self.renderer.draw_call_census();
+                if let Some(b) = self.bench.as_mut() { b.scene_settled_with(census); }
+            }
+            let done = self.bench.as_mut().map(|b| b.frame_end(stages)).unwrap_or(false);
+            if done {
+                let (avail, report, frame) = match self.renderer.gpu_timer() {
+                    Some(t) => (t.frames() > 0, t.report(), t.frame_stats()),
+                    None => (false, Vec::new(), (0.0, 0.0, 0.0)),
+                };
+                if let Some(b) = self.bench.as_mut() {
+                    b.take_gpu_report(avail, report, frame);
+                    b.finish();
+                }
+                std::process::exit(0);
+            }
+        }
+    }
+}
+
+/// #bg-throttle  Is the scene due to be drawn, given how long ago it last was and the budget?
+///
+/// A free function of `(elapsed, budget)` so the TIMING half of the throttle can be gated without
+/// a window to focus or minimise. `None` elapsed means "never drawn", which must always be due --
+/// otherwise the very first frame after the app starts in the background would show nothing at all.
+fn scene_due_after(elapsed: Option<std::time::Duration>, budget: std::time::Duration) -> bool {
+    match elapsed {
+        None => true,
+        Some(e) => e >= budget,
     }
 }
 
 impl App {
+    /// #bg-throttle  How long a frame may be deferred for, given this window's state right now.
+    ///
+    /// `None` means "do not throttle": the window is focused, or the user has switched the
+    /// setting off. Everything about the foreground frame is therefore untouched by this feature.
+    ///
+    /// eframe reports both facts on the viewport each frame. They are `Option<bool>` because not
+    /// every platform tells us, and an unknown is treated as FOCUSED AND VISIBLE -- the
+    /// conservative answer, because the cost of guessing wrong the other way is a window the user
+    /// is looking at that updates at 10 Hz.
+    fn repaint_budget(&self, ctx: &egui::Context) -> Option<std::time::Duration> {
+        let (focused, hidden) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.focused.unwrap_or(true), v.minimized.unwrap_or(false))
+        });
+        self.gfx.background_budget(focused, hidden)
+    }
+
+    /// #bg-throttle  "Keep frames coming" -- at the foreground rate when the window is in use,
+    /// and at the background budget when it is not.
+    ///
+    /// egui takes the MINIMUM of every repaint request in a frame, so one unconditional
+    /// `ctx.request_repaint()` on a per-frame path defeats the whole throttle. Every PER-FRAME
+    /// pump therefore goes through here. These are deliberately NOT routed through it, because
+    /// each is a short-lived wait the user is actively blocked on, or a one-shot that cannot
+    /// defeat a throttle because it does not repeat:
+    ///
+    /// * a map load or an object-rebuild tail in flight (the progress line has to move);
+    /// * the model-import drain, for the same reason;
+    /// * a scripted pointer or a benchmark/autoshot run, which drive the loop themselves;
+    /// * the one-shot "burn a frame before a blocking operation" sites (a deferred variant open,
+    ///   a prefab import, a pending screenshot) -- these fire once and stop.
+    ///
+    /// The work gate ([`App::scene_render_due`]) is what makes the feature hold even so: a stray
+    /// 60 Hz pump can cost an egui pass, but it cannot cost a 3D render.
+    fn pump(&self, ctx: &egui::Context) {
+        match self.repaint_budget(ctx) {
+            Some(d) => ctx.request_repaint_after(d),
+            None => ctx.request_repaint(),
+        }
+    }
+
+    /// #bg-throttle  May the scene be rendered on THIS frame?
+    ///
+    /// This is the layer that makes the throttle hold by construction rather than by discipline.
+    /// The expensive third of a frame -- the particle simulation, `SceneRenderer::render` and the
+    /// exposure readback -- is behind it, so a frame nobody can see costs an egui pass and
+    /// nothing else EVEN IF something requested a repaint at the full rate. Routing the pumps
+    /// reduces the frame count; this bounds the work whatever the frame count turns out to be.
+    ///
+    /// Always true when the window is focused or the setting is off, so the foreground path is
+    /// exactly what it was.
+    fn scene_render_due(&mut self, ctx: &egui::Context) -> bool {
+        let Some(budget) = self.repaint_budget(ctx) else {
+            self.bg_last_render = Some(std::time::Instant::now());
+            return true;
+        };
+        let due = scene_due_after(self.bg_last_render.map(|t| t.elapsed()), budget);
+        if due {
+            self.bg_last_render = Some(std::time::Instant::now());
+            self.bg_drawn = self.bg_drawn.saturating_add(1);
+        } else {
+            self.bg_skipped = self.bg_skipped.saturating_add(1);
+        }
+        due
+    }
+
     /// Record the time since the previous lap into stage `k` (HMS_FRAMEPROF only).
     fn frame_prof_lap(&mut self, k: usize) {
         if let Some(p) = self.frame_prof.as_mut() {
@@ -14288,6 +20970,1260 @@ impl App {
                 p.2.len(), tot.iter().sum::<f32>() / n, tot[tot.len() / 2], tot.last().copied().unwrap_or(0.0), means.join(" "));
             p.2.clear();
         }
+    }
+}
+
+// =============================================================================================
+// #play  TEST MODE — entering, leaving and the per-frame step
+// =============================================================================================
+
+impl App {
+    /// #play  Enter test mode as `species`. Returns the status line (which says what it read, or
+    /// why it refused).
+    ///
+    /// Refuses rather than half-works: without the `matg` player-information row and the `bipd`
+    /// physics there are no movement constants, and test mode will not invent a walk speed.
+    fn enter_play(&mut self, species: play_mode::Species) -> String {
+        if self.play.is_some() {
+            return "already in test mode".into();
+        }
+        // #play-hud  Re-read the two HUD switches from the SAME setting files Theater's toggles
+        // write, so one switch governs both and a change made in Theater is in force here without
+        // a restart. The user double-clicks the app, so this must not depend on an env var.
+        self.play_hud_on = reach_hud::load_hud_setting();
+        self.play_crosshair_on = reach_hud::load_crosshair_setting();
+        self.play_hud = play_hud::PlayHud::default();
+        self.play_hud_lines.clear();
+        let cam = play_mode::EntryCamera {
+            pos: self.camera.pos,
+            yaw: self.camera.yaw,
+            pitch: self.camera.pitch,
+            fov_y: self.camera.fov_y,
+        };
+        let objects = self.last_objects.clone();
+        let Some(sc) = self.scene_ctl.as_ref() else {
+            return "test mode needs a map open".into();
+        };
+        let Some(cache) = sc.cache_handle() else {
+            return "test mode needs a map open".into();
+        };
+        let native = sc.native_dll();
+        let built = play_mode::PlayMode::enter(
+            native,
+            cache,
+            sc as &dyn objscene::ObjectScene,
+            &objects,
+            &mut self.actor_scene,
+            species,
+            cam,
+        );
+        let mut pm = match built {
+            Ok(p) => p,
+            Err(e) => return format!("test mode: {e}"),
+        };
+        // #fp  The arms rig, from `matg @player representation` + the WEAPON's own first-person
+        // graph. Resolved here because only the scene can answer both questions.
+        let rows = sc.first_person_models();
+        let elite_of = |t: u32| sc.model_is_elite(t);
+        pm.mount_first_person(native, cache, &rows, &elite_of, &mut self.actor_scene);
+        // #fp-fov  The first-person lane is drawn through the engine's own narrower projection,
+        // exactly as Theater's rig is.
+        self.renderer.set_first_person_fov_scale(film_play::first_person_fov_scale());
+        let report = pm.report();
+        let (pos, yaw, pitch) = pm.camera();
+        self.play = Some(Box::new(pm));
+        self.camera.pos = pos;
+        self.camera.yaw = yaw;
+        self.camera.pitch = pitch;
+        // #fp-fov  Through the player's own eyes at the engine's vertical field of view for the
+        // persisted first-person FOV setting -- the same number MCC's own slider shows, so a user
+        // who plays at 120 sees 120.
+        self.camera.fov_y = film_play::reach_vertical_fov_for(self.fp_fov_deg);
+        self.actor_scene.rebuild = true;
+        format!("TEST MODE\n{report}")
+    }
+
+    /// #play  Leave test mode: take the actors out of the scene and put the editor camera back
+    /// exactly as it was, including its field of view.
+    fn leave_play(&mut self) -> String {
+        let Some(mut pm) = self.play.take() else {
+            return "not in test mode".into();
+        };
+        pm.leave(&mut self.actor_scene);
+        // #play  THE CAMERA STAYS WHERE THE PLAYER WAS. `update_play` has already written the
+        // play camera into `self.camera` this frame, so leaving it alone IS the fix -- the user
+        // walks to a spot, leaves, and edits there.
+        //
+        // It used to restore `pm.restore`, which teleported them back to wherever they pressed
+        // Play. That is the wrong default for this feature: you enter test mode to go and look at
+        // something, so the place you stopped is the place you want to build. Entering already
+        // works the same way round (the spawn is the editor camera, not the map's spawn point),
+        // so this makes the two halves consistent -- the camera is continuous across both
+        // transitions and nothing jumps.
+        //
+        // The FIELD OF VIEW is still restored, and that is not an inconsistency: the
+        // first-person FOV is a property of the rig (the engine renders the viewmodel at
+        // 0.6908 of the world camera's vertical FOV), not a place the user navigated to, so
+        // carrying it into the editor would silently change how the editor looks.
+        self.camera.fov_y = pm.restore_fov;
+        self.actor_scene.rebuild = true;
+        self.flying = false;
+        "left test mode (the camera stayed where you were standing)".into()
+    }
+
+    /// #play  One frame of test mode: read the bindings, step the controller, pose the biped and
+    /// put the camera on its eye.
+    ///
+    /// Owns input for the frame (see the call site): nothing else may read the movement keys
+    /// while this is live.
+    fn update_play(&mut self, ctx: &egui::Context, response: &egui::Response) {
+        // Escape is handled at the TOP OF THE FRAME, not here — see `update()`. One writer: a
+        // second check in this function would be read after the panels have drawn, which is
+        // exactly the ordering that lets a widget swallow the only way out.
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.1);
+        // Mouse look off the RAW device motion: the cursor is locked, so its position never
+        // changes and a drag delta would be zero. The same primitive the fly camera uses.
+        let (dx, dy) = Self::raw_mouse_motion(ctx).unwrap_or((0.0, 0.0));
+        let (stick, buttons) = ctx.input(|i| {
+            (
+                keybinds::play_stick(&self.keys, i, &self.phys),
+                keybinds::play_buttons(&self.keys, i, &self.phys),
+            )
+        });
+        let (jump, crouch, sprint, walk, melee) = buttons;
+        let (fire, switch_view) = ctx.input(|i| keybinds::play_actions(&self.keys, i, &self.phys));
+        // #play-hud  The deliberate reload. The engine reloads a dry magazine by itself, so
+        // this only matters for topping up a partial one -- but pressing R is muscle memory,
+        // and a bound key that does nothing is worse than no key at all.
+        let reload = ctx.input(|i| keybinds::play_reload(&self.keys, i, &self.phys));
+        // #seat-entry  The enter/exit-vehicle action, and the LABEL of whatever it is bound to —
+        // the prompt prints the player's own key in place of the engine's button glyph.
+        let use_vehicle = ctx.input(|i| keybinds::play_use_vehicle(&self.keys, i, &self.phys));
+        let use_label = self.keys.label(keybinds::Action::PlayUseVehicle);
+        if switch_view {
+            if let Some(p) = self.play.as_mut() {
+                p.view = match p.view {
+                    play_mode::PlayView::FirstPerson => play_mode::PlayView::ThirdPerson,
+                    play_mode::PlayView::ThirdPerson => play_mode::PlayView::FirstPerson,
+                };
+            }
+        }
+        let (yaw, pitch) = {
+            let p = self.play.as_ref().expect("checked by the caller");
+            keybinds::play_look(p.st.yaw, p.st.pitch, dx, dy, 1.0)
+        };
+        let input = play_ctl::MoveInput {
+            fwd: stick.0,
+            right: stick.1,
+            yaw,
+            pitch,
+            jump,
+            crouch,
+            walk,
+            sprint,
+        };
+        // The melee is a separate verb from the step: the swing plays whatever the controller
+        // does, and the DAMAGE (if a model is installed at all) is `play_damage`'s business.
+        // #play  LEAVE rather than limp. If the map has been closed or swapped under test mode
+        // (a load clears the actor scene, which takes the player's own body with it) there is
+        // nothing left to walk around, and carrying on would leave the camera parked inside a
+        // biped that no longer exists with no way back to the editor. Checked every frame because
+        // the map can go away at any point, not only on a menu action.
+        let body_gone = self
+            .play
+            .as_ref()
+            .and_then(|p| p.body)
+            .map(|id| self.actor_scene.get(id).is_none())
+            .unwrap_or(true);
+        let no_map = self.scene_ctl.as_ref().and_then(|sc| sc.cache_handle()).is_none();
+        if body_gone || no_map {
+            self.status = self.leave_play();
+            if no_map {
+                self.status = "left test mode: the map was closed".into();
+            }
+            return;
+        }
+        let objects = self.last_objects.clone();
+        let Some(sc) = self.scene_ctl.as_ref() else { return };
+        let Some(cache) = sc.cache_handle() else { return };
+        let native = sc.native_dll();
+        let scene = sc as &dyn objscene::ObjectScene;
+        // The damage model is taken OUT for the call and put back: `scene` is borrowed from
+        // `self.scene_ctl` for the whole block, so handing a `&mut` reborrow of another field of
+        // the same `self` into a trait object would outlive the method's own borrow of `self`.
+        let mut dmg = self.play_damage.take();
+        // #play-hud  Bind the HUD's value sources BEFORE anything is pulled: the biped's own
+        // authored vitality and grenade counts, and the held weapon's magazine. Both are no-ops
+        // once bound, so this costs a pair of integer compares per frame.
+        if let Some(pm) = self.play.as_ref() {
+            let (biped, weapon, shots) = (pm.biped_tag, pm.weapon_tag, pm.shots);
+            self.play_hud.bind(native, cache, biped);
+            self.play_hud.set_weapon(native, cache, weapon, shots);
+        }
+        // #play-hud  THE FIRE GATE, and it only ever REFUSES. It never spends a round — the
+        // magazine's single writer is the `PlayMode::shots` delta below, so a pull the rate
+        // limiter swallows cannot cost ammunition and a pull this refuses cannot either.
+        // Short-circuited on `fire` so an un-pressed trigger never counts as a dry pull.
+        let fire_allowed = !fire || self.play_hud.before_fire();
+        // #play-hud  One writer for the reload clock: `start_reload` refuses a magazine that is
+        // already full or already reloading, so holding the key cannot restart it.
+        if reload && self.play.is_some() {
+            self.play_hud.start_reload();
+        }
+        if let Some(pm) = self.play.as_mut() {
+            if melee {
+                pm.melee(scene, dmg.as_deref_mut());
+            }
+            if fire && fire_allowed {
+                pm.fire(scene, dmg.as_deref_mut());
+            }
+            pm.action_key_label = use_label;
+            pm.tick(&input, dt, native, cache, scene, &objects, &mut self.actor_scene);
+            // #seat-entry  Entering and leaving a seat, AFTER the tick so the offer the key acts
+            // on is this frame's. The vehicle's own prompt named this key, so pressing it when
+            // nothing is offered is a no-op with a reason rather than a silent nothing.
+            if use_vehicle {
+                let msg = if pm.riding.is_some() {
+                    pm.exit_vehicle(native, cache)
+                } else if pm.offer.is_some() {
+                    match pm.enter_vehicle(native, cache, &objects) {
+                        Ok(m) => m,
+                        Err(why) => why,
+                    }
+                } else if pm.pickup.is_some() {
+                    // #pickup  ONE ACTION KEY, and the vehicle wins when both are in range —
+                    // which is the engine's own arrangement and also the only sensible one: a
+                    // Warthog you are standing in the door of is what you meant. Reported: "I
+                    // also can't pick up any of the weapons on the map".
+                    let rows = sc.first_person_models();
+                    let elite_of = |t: u32| sc.model_is_elite(t);
+                    match pm.pick_up(native, cache, &mut self.actor_scene, &rows, &elite_of) {
+                        Ok(m) => m,
+                        Err(why) => why,
+                    }
+                } else {
+                    match pm.enter_vehicle(native, cache, &objects) {
+                        Ok(m) => m,
+                        Err(why) => why,
+                    }
+                };
+                self.vehicle_note = msg;
+            }
+            let (pos, cyaw, cpitch) = pm.camera();
+            self.camera.pos = pos;
+            self.camera.yaw = cyaw;
+            self.camera.pitch = cpitch;
+            // #seat-entry  A seat that authors an `override fov` gets it; `App` owns the field of
+            // view, so the seat reports and this applies. Measured: no shipped Reach seat authors
+            // one, so in practice this never fires.
+            if let Some(f) = pm.seat_fov() {
+                self.camera.fov_y = f;
+            }
+            self.status = pm.status();
+            if !self.vehicle_note.is_empty() {
+                self.status = format!("{}\n{}", self.status, self.vehicle_note);
+            }
+        }
+        self.play_damage = dmg;
+        // #play-hud  ADVANCE THE HUD. One call, after the tick, so the magazine is spent by shots
+        // that actually left the barrel (`PlayMode::shots` counts the pulls the mode accepted) and
+        // the reload clock runs on the same `dt` the controller used.
+        let shots = self.play.as_ref().map(|p| p.shots).unwrap_or(0);
+        self.play_hud.tick(dt, shots);
+        // #play  POSE AND BUILD THE BIPED. Without this line test mode draws no body at all --
+        // which is exactly what shipped, and the user's report was "I still have no biped or
+        // anything in the play mode".
+        //
+        // `update_actors` is what poses every actor and builds its GPU meshes, and it is called
+        // from only two places: inside `tick_scene`'s scene-rebuild path, and from `film_tick`.
+        // **Neither runs here.** `tick_scene` takes its `#gfx-perf` fast path and RETURNS as soon
+        // as the object-pipeline signature is unchanged -- which it is on every frame once the
+        // Forge scene is stable -- so the call site below it is unreachable in an editor that is
+        // merely being walked around. Theater already works around exactly this and says so in
+        // its own comment; test mode added the actor and then never asked for it to be drawn.
+        //
+        // So the capability existed and nothing invoked it, which is why 61 green gates said
+        // nothing about it: they all drive `play_ctl` and `play_mode` directly, and the one gate
+        // that would have caught it -- the live in-window gate -- never ran. Calling it here, per
+        // frame, mirrors what `film_tick` does for a recording's bodies.
+        self.update_actors();
+        // Keep frames coming: test mode is a game loop, not an editor that repaints on input.
+        ctx.request_repaint();
+        let _ = response;
+    }
+
+    /// #play-hud  TEST MODE's first-person HUD, drawn from the game's own `chud` tags.
+    ///
+    /// **This is the same painter Theater uses**, with one difference that is the whole point: in
+    /// a recording almost every value is `Absent`, and here test mode OWNS the player, so the
+    /// shield, the health, the magazine and the grenade counts are stated. `play_hud::PlayHud`
+    /// holds those; `reach_hud` draws them. Nothing about the widget layout, the state solver, the
+    /// colour resolution or the virtual screen is re-implemented.
+    ///
+    /// Returns the provenance report — one line per value saying where it came from — which `play
+    /// hud` prints. `&self`: the HUD reads state and paints, it never advances it. The advancing
+    /// is one call in `update_play`, so the magazine has exactly one writer.
+    ///
+    /// WHAT IS DELIBERATELY NOT DRAWN, and why each:
+    ///
+    /// * **The motion tracker.** Test mode has one body on the map and no other players, so every
+    ///   blip would be invented. It is not in `reach_hud::PLAYER_COLLECTIONS` and stays out.
+    /// * **A ridden vehicle's own shield and health meters.** See
+    ///   [`play_hud::PlayHud::vehicle_values`]: HMS keeps no vehicle vitality, and a vehicle
+    ///   `chud`'s `shield_meter` would otherwise be fed the DRIVER's shield.
+    /// * **The held weapon's ammo block while riding.** The engine stows your weapon in a driver
+    ///   or gunner seat, and HMS does not read the seat's own weapon flags, so rather than draw an
+    ///   ammo block for a gun that is not in your hands it draws none and says so here.
+    /// * **The respawn countdown.** Nothing damages the player yet (`play_damage` carries hits
+    ///   outward only), so there is no death to count from.
+    fn play_first_person_hud(&self, ui: &mut egui::Ui, viewport: egui::Rect) -> Vec<String> {
+        let Some(p) = self.play.as_ref() else { return Vec::new() };
+        if !(self.play_hud_on || self.play_crosshair_on) {
+            return vec!["The HUD and the reticule are both switched off (Theater strip ▸ HUD / Crosshair)".into()];
+        }
+        // The HUD is a FIRST-PERSON display. Third person is the "see your whole body" view and
+        // the engine draws no first-person HUD over it — the same split `film_first_person_hud`
+        // makes, for the same reason.
+        if !matches!(p.view, play_mode::PlayView::FirstPerson) {
+            return vec!["The HUD is a first-person display; this is the third-person view".into()];
+        }
+        let Some((native, cache)) =
+            self.scene_ctl.as_ref().and_then(|s| s.cache_handle().map(|c| (s.native_dll(), c)))
+        else {
+            return vec!["No map open, so no chud tags to draw from".into()];
+        };
+        let skin = reach_chud::globals_for(native, cache).and_then(|g| g.default_skin().cloned());
+        let vs = match &skin {
+            Some(s) => reach_hud::VirtualScreen::from_skin(viewport, s),
+            None => reach_hud::VirtualScreen::fallback(viewport),
+        };
+        let painter = ui.painter_at(viewport);
+        let mut lines: Vec<String> = Vec::new();
+
+        // #vehicle-hud  The seat's own `vehi` is the tag to ask, NOT the placement's: 18 of the 36
+        // vehicles in Forge are turret-typed and four of those are a Warthog's gunner positions,
+        // which live on the child attachment (`warthog_chaingun`). The placement is the fallback.
+        let riding = p.riding.as_ref();
+        let vehicle = riding.and_then(|r| {
+            reach_hud::vehicle_chud(native, cache, r.vehi_tag)
+                .or_else(|| reach_hud::vehicle_chud(native, cache, r.placement_tag))
+                .and_then(|t| native.tag_name(cache, t))
+                .map(|n| (n, r.seat.min(255) as u8))
+        });
+        let key = self.keys.label(keybinds::Action::PlayUseVehicle);
+        let weapon = if riding.is_some() { 0 } else { p.weapon_tag };
+        let v = self.play_hud.values(weapon, vehicle.clone(), Some(key));
+        let (mut drawn, mut skipped) = (0usize, 0usize);
+
+        // ---- the held weapon's reticule ---------------------------------------------------
+        //
+        // #vehicle-hud  NOT while riding: a vehicle's own `chud` carries its own `crosshair`
+        // collection, and drawing the player's as well would put two reticules on the screen at
+        // once (and, with the weapon stowed, the one it drew would be the UNARMED reticule).
+        if self.play_crosshair_on && riding.is_none() {
+            let art = (weapon != 0)
+                .then(|| reach_chud::crosshair_for(ui.ctx(), native, cache, weapon))
+                .flatten();
+            match (&art, &skin) {
+                (Some(a), Some(sk)) => {
+                    reach_chud::paint_crosshair(&painter, viewport, a, sk, vs.vpx);
+                    lines.push(format!(
+                        "Crosshair: {} authored part(s) from {}",
+                        a.crosshair.parts.len(),
+                        native.tag_name(cache, a.crosshair.chud_tag).unwrap_or_default()
+                    ));
+                }
+                _ => {
+                    // The engine's own empty-handed reticule, out of the player HUD — the same
+                    // fallback Theater takes for a body whose weapon it does not know.
+                    let path = if p.species.is_elite() {
+                        reach_hud::PLAYER_CHUD_ELITE
+                    } else {
+                        reach_hud::PLAYER_CHUD_SPARTAN
+                    };
+                    let drew = reach_hud::chud_by_path(native, cache, path)
+                        .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+                        .and_then(|a| {
+                            let i =
+                                a.chud.collections.iter().position(|c| c.base.name == "unarmed_crosshair")?;
+                            Some(reach_hud::paint_collection(
+                                ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, 0,
+                            ))
+                        });
+                    lines.push(match (weapon, drew) {
+                        (0, Some((d, _))) if d > 0 => {
+                            "Crosshair: empty hands, so the player HUD's own `unarmed_crosshair` is drawn".into()
+                        }
+                        (0, _) => "Crosshair: empty hands, and this HUD authors no unarmed reticule".into(),
+                        (_, _) => "Crosshair: this weapon authors no reticule that draws at rest".into(),
+                    });
+                }
+            }
+        }
+
+        if self.play_hud_on {
+            // ---- the player HUD: shields, health, grenades -------------------------------
+            let path = if p.species.is_elite() {
+                reach_hud::PLAYER_CHUD_ELITE
+            } else {
+                reach_hud::PLAYER_CHUD_SPARTAN
+            };
+            match reach_hud::chud_by_path(native, cache, path)
+                .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+            {
+                Some(a) => {
+                    for want in reach_hud::PLAYER_COLLECTIONS {
+                        let Some(i) = a.chud.collections.iter().position(|c| c.base.name == want) else {
+                            continue;
+                        };
+                        // The grenade block is datasource-driven: one repeat per grenade TYPE.
+                        let reps =
+                            if a.chud.collections[i].datasource == Some(reach_hud::DATASOURCE_GRENADES) { 2 } else { 1 };
+                        for r in 0..reps {
+                            let (d, s) = reach_hud::paint_collection(
+                                ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, r,
+                            );
+                            drawn += d;
+                            skipped += s;
+                        }
+                    }
+                }
+                None => lines.push(format!("Player HUD: this cache carries no '{path}'")),
+            }
+
+            // ---- the held weapon's own ammo block ----------------------------------------
+            //
+            // Matched by PREFIX: the shipped weapons are not consistent (`ammo_area` on the
+            // assault rifle, `ammo_area_right` on the magnum, `backpack_ammo_area` for a stowed
+            // one), which is why `reach_hud::WEAPON_AMMO_PREFIX` exists.
+            if weapon != 0 {
+                match reach_chud::weapon_chud(native, cache, weapon)
+                    .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+                {
+                    Some(a) => {
+                        let mut blocks = 0usize;
+                        for (i, c) in a.chud.collections.iter().enumerate() {
+                            if !c.base.name.starts_with(reach_hud::WEAPON_AMMO_PREFIX) {
+                                continue;
+                            }
+                            blocks += 1;
+                            let (d, s) = reach_hud::paint_collection(
+                                ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, 0,
+                            );
+                            drawn += d;
+                            skipped += s;
+                        }
+                        if blocks == 0 {
+                            lines.push("Ammo block: this weapon's chud authors no `ammo_area*` collection".into());
+                        }
+                    }
+                    None => lines.push("Ammo block: this weapon references no `chud interface`".into()),
+                }
+            } else if riding.is_some() {
+                lines.push(
+                    "Ammo block: not drawn while riding — the engine stows your weapon in a driver \
+                     or gunner seat and HMS does not read the seat's own weapon flags"
+                        .into(),
+                );
+            }
+
+            // ---- #vehicle-hud  the ridden vehicle's OWN chud ------------------------------
+            if let Some((vpath, seat)) = &vehicle {
+                match reach_hud::chud_by_path(native, cache, vpath)
+                    .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
+                {
+                    Some(a) => {
+                        // The vehicle's values, with the PLAYER's vitality and ammo cleared — see
+                        // `PlayHud::vehicle_values` for why that is not an omission.
+                        let vv = self.play_hud.vehicle_values(vehicle.clone(), Some(self.keys.label(keybinds::Action::PlayUseVehicle)));
+                        let (mut vd, mut vs_skip) = (0usize, 0usize);
+                        let mut names: Vec<String> = Vec::new();
+                        for i in 0..a.chud.collections.len() {
+                            let (d, s) =
+                                reach_hud::paint_collection(ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &vv, 0);
+                            if d > 0 {
+                                names.push(a.chud.collections[i].base.name.clone());
+                            }
+                            vd += d;
+                            vs_skip += s;
+                        }
+                        drawn += vd;
+                        skipped += vs_skip;
+                        lines.push(format!(
+                            "Vehicle HUD: {vpath} (seat {seat}) — {vd} widget(s) drawn from [{}], \
+                             {vs_skip} left out. The vehicle's own shield, health and ammunition \
+                             are NOT modelled, so its meters are not drawn.",
+                            names.join(", ")
+                        ));
+                    }
+                    None => lines.push(format!("Vehicle HUD: '{vpath}' did not decode")),
+                }
+                if let Some(r) = riding {
+                    lines.push(format!("Riding: {}", r.seat_caption()));
+                }
+            }
+            lines.push(format!("HUD: {drawn} authored widget(s) drawn, {skipped} left out for want of a value"));
+        }
+
+        // The motion tracker, named rather than silently missing.
+        lines.push(
+            "Motion tracker: NOT drawn. Test mode has one body on the map and no other players, so \
+             every blip would be invented; an empty radar frame would be a claim of its own."
+                .into(),
+        );
+        let unresolved = reach_hud::take_unresolved_strings();
+        if !unresolved.is_empty() {
+            lines.push(format!(
+                "Not drawn ({} authored string(s) HMS cannot resolve to a glyph): {}",
+                unresolved.len(),
+                unresolved.join(", ")
+            ));
+        }
+        lines.extend(self.play_hud.report());
+        lines.extend(v.report());
+        lines
+    }
+
+    /// #play  The only thing test mode draws over the viewport: the way out, and one line of
+    /// state.
+    ///
+    /// **The exit is on screen because the menu bar is not.** Hiding the editor chrome is what
+    /// the user asked for, and the cost of hiding a menu bar is that the only way out becomes
+    /// invisible — with a captured cursor, an invisible exit means force-quitting the app and
+    /// losing an unsaved variant. So the key is handled at the top of the frame (it cannot be
+    /// swallowed) and it is printed here (it cannot be forgotten). One without the other would
+    /// be a trap.
+    fn play_overlay(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let Some(p) = self.play.as_ref() else { return };
+        let esc = egui::RichText::new("Esc  leave play mode").size(13.0).strong().color(egui::Color32::WHITE);
+        let view = match p.view {
+            play_mode::PlayView::FirstPerson => "first person",
+            play_mode::PlayView::ThirdPerson => "third person",
+        };
+        // The view line names what the other view is FOR, not just that it exists: the user's
+        // complaint was "can't see my feet at all", and Reach draws no legs in first person, so
+        // "third person" on its own does not tell them that is where their body is.
+        let line = format!(
+            "{}  |  {}  |  {}  |  {}  {}",
+            p.species.label(),
+            view,
+            if p.weapon_tag == 0 {
+                "empty hands — Play ▸ Give weapon".to_string()
+            } else {
+                p.weapon_path.rsplit(['\\', '/']).next().unwrap_or("").to_string()
+            },
+            self.keys.label(keybinds::Action::PlayView),
+            match p.view {
+                play_mode::PlayView::FirstPerson => "third person (see your whole body)",
+                play_mode::PlayView::ThirdPerson => "back to first person",
+            }
+        );
+        let pad = 8.0;
+        let painter = ui.painter_at(rect);
+        let bg = egui::Color32::from_black_alpha(150);
+        // #aim  A biped whose graph has no aim overlay really is posed straight ahead, and that
+        // is exactly the symptom the overlay work was for ("stuck aiming straight ahead"), so the
+        // player is told which of the two they are looking at rather than left guessing.
+        let mut lines: Vec<(String, f32, egui::Color32)> =
+            vec![(line, 12.0f32, egui::Color32::from_gray(225))];
+        // #pickup #seat-entry  THE PROMPT HAS TO BE DRAWN HERE. Test mode hides both bottom bars,
+        // so an offer that only reaches `self.status` is invisible to the player it is for — and
+        // "walk up to it and nothing happens" is indistinguishable from "it does not work".
+        // Whichever offer the action key would act on is the one shown, in the same order the key
+        // uses, so the prompt can never name something the key would not do.
+        let prompt = if p.riding.is_some() {
+            None
+        } else if let Some(o) = p.offer.as_ref() {
+            Some(o.caption())
+        } else {
+            p.pickup.as_ref().map(|o| o.caption())
+        };
+        if let Some(t) = prompt {
+            lines.push((t, 15.0, egui::Color32::from_rgb(255, 245, 200)));
+        }
+        if p.aim_missing {
+            lines.push((
+                "this biped's graph has no aim overlay — the body is posed straight ahead".to_string(),
+                12.0,
+                egui::Color32::from_rgb(230, 190, 120),
+            ));
+        }
+        lines.push((esc.text().to_string(), 13.0, egui::Color32::WHITE));
+        // Bottom-left, out of the crosshair's way and out of the HUD's.
+        let mut y = rect.bottom() - pad;
+        for (text, size, colour) in lines {
+            let galley =
+                painter.layout_no_wrap(text, egui::FontId::proportional(size), colour);
+            let sz = galley.size();
+            let pos = egui::pos2(rect.left() + pad, y - sz.y);
+            painter.rect_filled(
+                egui::Rect::from_min_size(pos - egui::vec2(4.0, 2.0), sz + egui::vec2(8.0, 4.0)),
+                3.0,
+                bg,
+            );
+            painter.galley(pos, galley, colour);
+            y -= sz.y + 6.0;
+        }
+    }
+
+    /// #loadstatus  Which of the four load states this app is in, and one line about it.
+    ///
+    /// **Reads only.** Every input is state the app already holds, so asking does not perturb a
+    /// load — which matters, because the whole point is to be callable from a poll loop.
+    ///
+    /// `attempted` is "a map path has been chosen", `in_flight` covers EVERY game's load channel
+    /// (Reach, Halo 4 / H2A and Halo 3 each have their own), and `open` is the only question a
+    /// scene verb can answer today.
+    fn load_status_line(&self) -> String {
+        let attempted = !self.map_path.trim().is_empty() || self.selected_map.is_some();
+        let in_flight = self.load_rx.is_some()
+            || self.h4_load.is_some()
+            || self.h3_load.is_some()
+            || self.pending_mvar.is_some();
+        let open = self.objscene().map(|s| s.has_cache()).unwrap_or(false);
+        let state = load_status::classify(attempted, in_flight, open);
+        // `map_status` is the app's own human-readable account of the last load, which is where a
+        // failure's reason already lives; it is passed through rather than re-derived.
+        load_status::describe(state, &self.map_path, &self.map_status)
+    }
+
+    /// #play  The map's own weapon tags, `(tag, leaf name)`, sorted — what `Play ▸ Give weapon`
+    /// lists. The leaf is what a user recognises ("assault_rifle"), not the full tag path.
+    fn play_weapon_list(&self) -> Vec<(u32, String)> {
+        let Some(sc) = self.scene_ctl.as_ref() else { return Vec::new() };
+        let Some(cache) = sc.cache_handle() else { return Vec::new() };
+        let mut v: Vec<(u32, String)> = reach_actor::ActorScene::list_weapons(sc.native_dll(), cache)
+            .into_iter()
+            .map(|(t, p)| {
+                let leaf = p.rsplit(['\\', '/']).next().unwrap_or(&p).to_string();
+                (t, leaf)
+            })
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v.dedup_by(|a, b| a.1 == b.1);
+        v
+    }
+
+    /// #play  Put a weapon in the player's hands (`None` = empty them). One implementation, so
+    /// the menu and the `play weapon` verb cannot diverge.
+    fn play_give_weapon(&mut self, weapon: Option<u32>) -> String {
+        let Some(sc) = self.scene_ctl.as_ref() else { return "no map open".into() };
+        let Some(cache) = sc.cache_handle() else { return "no map open".into() };
+        let native = sc.native_dll();
+        let rows = sc.first_person_models();
+        let elite_of = |t: u32| sc.model_is_elite(t);
+        match self.play.as_mut() {
+            Some(p) => p.give_weapon(native, cache, weapon, &mut self.actor_scene, &rows, &elite_of),
+            None => "not in test mode".into(),
+        }
+    }
+
+    /// #play  The `play` script verb — the same entry points the menu uses, so a scripted or
+    /// headless run drives EXACTLY the production path and not a copy of it.
+    ///
+    /// `play spartan` / `play elite` enter, `play off` leaves, `play get` reports, `play view
+    /// first|third` switches, `play melee` swings, and `play step <n>` advances the controller by
+    /// `n` frames at the engine's own 60 Hz with the keys currently held — which is how a gate
+    /// walks the player without synthesising a single desktop event.
+    ///
+    /// #seat-entry  `play vehicle` reports the seat on offer (or the ride in progress),
+    /// `play enter` gets in and `play getout` gets out — the same functions the key calls.
+    fn play_command(&mut self, args: &[String]) -> Result<String, String> {
+        let what = args.first().map(|s| s.to_lowercase()).unwrap_or_else(|| "get".into());
+        match what.as_str() {
+            "get" | "status" | "" => Ok(match self.play.as_ref() {
+                Some(p) => format!(
+                    "{}\nfirst-person FOV {:.0} deg horizontal -> {:.2} deg vertical (camera {:.2})\n{}",
+                    p.status(),
+                    self.fp_fov_deg,
+                    film_play::reach_vertical_fov_for(self.fp_fov_deg).to_degrees(),
+                    self.camera.fov_y.to_degrees(),
+                    p.report()
+                ),
+                None => "not in test mode".into(),
+            }),
+            // #play-hud  `play hud` prints the provenance report the last drawn frame produced —
+            // every HUD value with where it came from — and `play hud on|off` / `play reload`
+            // drive the same two entry points the window does.
+            "hud" => {
+                if self.play.is_none() {
+                    return Err("not in test mode".into());
+                }
+                match args.get(1).map(|s| s.to_lowercase()).as_deref() {
+                    Some("on") | Some("off") => {
+                        let on = args[1].eq_ignore_ascii_case("on");
+                        reach_hud::save_hud_setting(on);
+                        self.play_hud_on = on;
+                        Ok(format!("test-mode HUD {}", if on { "on" } else { "off" }))
+                    }
+                    Some("crosshair") => {
+                        let on = !self.play_crosshair_on;
+                        reach_hud::save_crosshair_setting(on);
+                        self.play_crosshair_on = on;
+                        Ok(format!("reticule {}", if on { "on" } else { "off" }))
+                    }
+                    _ if self.play_hud_lines.is_empty() => Err(
+                        "the HUD has not drawn a frame yet (it draws only in the FIRST-PERSON view,                          and only in a window: a headless capture renders the 3D scene and no chud                          overlay at all)"
+                            .into(),
+                    ),
+                    _ => Ok(self.play_hud_lines.join("\n")),
+                }
+            }
+            // #play-hud  Force a reload. The engine reloads on its own when the magazine runs dry,
+            // which is what test mode does too; this is the manual one, and it is a script verb
+            // rather than a key because adding a key means a row in `keybinds::Action::ALL`, which
+            // belongs to whoever owns that table.
+            "reload" => {
+                if self.play.is_none() {
+                    return Err("not in test mode".into());
+                }
+                let started = self.play_hud.start_reload();
+                Ok(match (started, self.play_hud.ammo.as_ref()) {
+                    (true, Some(a)) => format!(
+                        "reloading ({:.2} s, clip '{}'): {} loaded of {}, reserve {:?}",
+                        self.play_hud.reload_duration,
+                        self.play_hud.reload_clip,
+                        a.loaded,
+                        a.mag.rounds_loaded_maximum,
+                        a.reserve
+                    ),
+                    (false, Some(a)) if a.loaded >= a.mag.rounds_loaded_maximum => {
+                        "the magazine is already full".into()
+                    }
+                    (false, Some(_)) => "nothing in reserve to reload from".into(),
+                    _ => format!("no magazine to reload: {}", self.play_hud.ammo_note),
+                })
+            }
+            "spartan" | "on" => Ok(self.enter_play(play_mode::Species::Spartan)),
+            "elite" => Ok(self.enter_play(play_mode::Species::Elite)),
+            "off" | "leave" | "exit" => Ok(self.leave_play()),
+            "view" => {
+                let v = match args.get(1).map(|s| s.to_lowercase()).as_deref() {
+                    Some("first") | Some("fp") | Some("1") => play_mode::PlayView::FirstPerson,
+                    Some("third") | Some("tp") | Some("3") => play_mode::PlayView::ThirdPerson,
+                    _ => return Err("play view first|third".into()),
+                };
+                match self.play.as_mut() {
+                    Some(p) => {
+                        p.view = v;
+                        Ok(format!("{:?}", v))
+                    }
+                    None => Err("not in test mode".into()),
+                }
+            }
+            // #play  `play weapon <name|none>` — the same executor the menu uses.
+            "weapon" | "give" => {
+                let want = args.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+                if want.is_empty() {
+                    let list = self.play_weapon_list();
+                    return Ok(format!(
+                        "play weapon <name|none> — {} weapon(s) in this map: {}",
+                        list.len(),
+                        list.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(", ")
+                    ));
+                }
+                if want == "none" || want == "empty" {
+                    return Ok(self.play_give_weapon(None));
+                }
+                let list = self.play_weapon_list();
+                let pick = list
+                    .iter()
+                    .find(|(_, l)| l.eq_ignore_ascii_case(&want))
+                    .or_else(|| list.iter().find(|(_, l)| l.to_lowercase().contains(&want)))
+                    .map(|(t, _)| *t)
+                    .ok_or_else(|| format!("no weapon matching '{want}' ({} in this map)", list.len()))?;
+                Ok(self.play_give_weapon(Some(pick)))
+            }
+            // #pickup  `play pickup` reports what is in reach and `play pickup take` picks it
+            // up — the SAME function the key calls.
+            "pickup" | "pick" => {
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let Some(cache) = sc.cache_handle() else { return Err("no map open".into()) };
+                let native = sc.native_dll();
+                let take = matches!(args.get(1).map(|s| s.to_lowercase()).as_deref(), Some("take") | Some("up") | Some("get"));
+                let rows = sc.first_person_models();
+                let elite_of = |t: u32| sc.model_is_elite(t);
+                let Some(pm) = self.play.as_mut() else { return Err("not in test mode".into()) };
+                if take {
+                    return pm.pick_up(native, cache, &mut self.actor_scene, &rows, &elite_of);
+                }
+                Ok(match pm.pickup.as_ref() {
+                    Some(o) => format!(
+                        "{} at {:.3} wu ({}) | prompt id '{}' -> {}{}",
+                        o.leaf(),
+                        o.distance,
+                        if o.swap { "would SWAP what you are holding" } else { "hands empty" },
+                        o.prompt_id,
+                        o.caption(),
+                        if o.substituted.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (substituted {} glyph(s))", o.substituted.len())
+                        }
+                    ),
+                    None => format!(
+                        "no weapon within the {:.2} wu reach ({} weapon tag(s) in this map)",
+                        play_pickup::PICKUP_REACH_WU,
+                        pm.map_weapons.len()
+                    ),
+                })
+            }
+            "fire" | "shoot" => {
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let scene = sc as &dyn objscene::ObjectScene;
+                // #play-hud  THE SECOND FIRE CALL SITE, gated exactly like the window's. Two
+                // entry points to one action is how an ammo count gets bypassed by whichever one
+                // nobody remembered; `play_hud_call_site_gates` asserts both are gated, which is
+                // a gate on the CALL SITE and not only on the function.
+                let allowed = self.play_hud.before_fire();
+                let mut dmg = self.play_damage.take();
+                let r = match self.play.as_mut() {
+                    Some(p) => {
+                        if allowed {
+                            p.fire(scene, dmg.as_deref_mut());
+                        }
+                        Ok(p.last_hit.clone().unwrap_or_default())
+                    }
+                    None => Err("not in test mode".into()),
+                };
+                self.play_damage = dmg;
+                // The SAME single accounting call the window makes, with no elapsed time: the
+                // magazine is spent by the shots delta and by nothing else.
+                let shots = self.play.as_ref().map(|p| p.shots).unwrap_or(0);
+                self.play_hud.tick(0.0, shots);
+                match (r, allowed) {
+                    (Ok(hit), true) => Ok(match self.play_hud.ammo.as_ref() {
+                        Some(a) => format!("{hit} | {} of {} loaded", a.loaded, a.mag.rounds_loaded_maximum),
+                        None => hit,
+                    }),
+                    (Ok(_), false) => Ok("the magazine is empty — reloading instead of firing".into()),
+                    (Err(e), _) => Err(e),
+                }
+            }
+            "melee" | "swing" => {
+                let objects = self.last_objects.clone();
+                let _ = objects;
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let scene = sc as &dyn objscene::ObjectScene;
+                let mut dmg = self.play_damage.take();
+                let r = match self.play.as_mut() {
+                    Some(p) => {
+                        p.melee(scene, dmg.as_deref_mut());
+                        Ok(p.last_hit.clone().unwrap_or_default())
+                    }
+                    None => Err("not in test mode".into()),
+                };
+                self.play_damage = dmg;
+                r
+            }
+            // #seat-entry  `play vehicle` reports the offer, `play enter` / `play exit` act on
+            // it — the SAME functions the key calls, so a scripted gate drives the production
+            // path and not a copy of it.
+            "vehicle" | "seat" => match self.play.as_ref() {
+                Some(p) => Ok(match &p.riding {
+                    Some(r) => format!(
+                        "riding {} seat {} '{}' mode '{}' | {} | at ({:.2},{:.2},{:.2}) yaw {:.3} vel {:.2} wu/s",
+                        r.vehi_path,
+                        r.seat,
+                        r.seat_label,
+                        if r.seat_mode.is_empty() { "<no seat animation>" } else { &r.seat_mode },
+                        match &r.drivable {
+                            Ok(()) => "drivable".to_string(),
+                            Err(why) => format!("NOT DRIVABLE: {why}"),
+                        },
+                        r.drive.pos.x,
+                        r.drive.pos.y,
+                        r.drive.pos.z,
+                        r.drive.yaw,
+                        glam::Vec3::new(r.drive.vel.x, r.drive.vel.y, 0.0).length()
+                    ),
+                    None => match &p.offer {
+                        Some(o) => format!(
+                            "offer: {} seat {} '{}' id '{}' -> {}\n  {}{}",
+                            o.vehi_path,
+                            o.seat,
+                            o.seat_label,
+                            o.prompt_id,
+                            o.prompt.as_deref().unwrap_or("<the prompt string did not resolve; nothing is drawn>"),
+                            o.test.describe(),
+                            if o.substituted.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n  substituted {:?} with the key bound to Enter / exit vehicle", o.substituted)
+                            }
+                        ),
+                        None => "no vehicle seat is in range".into(),
+                    },
+                }),
+                None => Err("not in test mode".into()),
+            },
+            "enter" => {
+                let objects = self.last_objects.clone();
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let Some(cache) = sc.cache_handle() else { return Err("no map open".into()) };
+                let native = sc.native_dll();
+                let Some(pm) = self.play.as_mut() else { return Err("not in test mode".into()) };
+                pm.enter_vehicle(native, cache, &objects)
+            }
+            // NOT `exit`: that already means "leave test mode" in the arm above, and shadowing
+            // it would make the only way out of test mode stop working from a script.
+            "getout" | "out" | "unseat" => {
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let Some(cache) = sc.cache_handle() else { return Err("no map open".into()) };
+                let native = sc.native_dll();
+                let Some(pm) = self.play.as_mut() else { return Err("not in test mode".into()) };
+                Ok(pm.exit_vehicle(native, cache))
+            }
+            "step" => {
+                let n: usize = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(1);
+                if n > 100_000 {
+                    return Err("play step: at most 100000 frames".into());
+                }
+                let objects = self.last_objects.clone();
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let Some(cache) = sc.cache_handle() else { return Err("no map open".into()) };
+                let native = sc.native_dll();
+                let scene = sc as &dyn objscene::ObjectScene;
+                let Some(pm) = self.play.as_mut() else { return Err("not in test mode".into()) };
+                // THE INPUT IS THE ONE THE WINDOW LAST READ through the binding table -- not a
+                // hand-made one. A gate holds a key with this app's own in-process injection
+                // (`preview key w down`), the window's next frame reads it through
+                // `keybinds::play_stick` exactly as a real keypress is read, and this advances
+                // the controller deterministically from there. That is what keeps the gate on
+                // the production path instead of beside it.
+                let mut input = pm.last_input;
+                let jump = input.jump;
+                for k in 0..n {
+                    // A jump is an EDGE, exactly as the window delivers it.
+                    input.jump = jump && k == 0;
+                    pm.tick(&input, 1.0 / 60.0, native, cache, scene, &objects, &mut self.actor_scene);
+                }
+                let (pos, yaw, pitch) = pm.camera();
+                let s = pm.status();
+                self.camera.pos = pos;
+                self.camera.yaw = yaw;
+                self.camera.pitch = pitch;
+                Ok(s)
+            }
+            // #fp-fov  The FIRST-PERSON field of view, in the number MCC's own slider shows
+            // (degrees of HORIZONTAL FOV at the engine's 4:3 reference). Persisted, so it is the
+            // same setting the window's own control writes, and test mode re-derives the camera's
+            // vertical FOV from it at once rather than on the next entry.
+            "fov" => {
+                let (lo, hi) = (film_play::FOV_MIN_DEG, film_play::FOV_MAX_DEG);
+                match args.get(1).and_then(|v| v.parse::<f32>().ok()) {
+                    Some(d) if (lo..=hi).contains(&d) => {
+                        self.fp_fov_deg = d;
+                        film_play::save_fov_setting(d);
+                        if self.play.is_some() {
+                            self.camera.fov_y = film_play::reach_vertical_fov_for(d);
+                        }
+                        Ok(format!(
+                            "first-person FOV {d:.0} deg horizontal (MCC's own number) -> {:.2} deg vertical",
+                            film_play::reach_vertical_fov_for(d).to_degrees()
+                        ))
+                    }
+                    Some(d) => Err(format!("play fov: {d} is outside the control's range {lo}..{hi}")),
+                    None => Ok(format!(
+                        "first-person FOV {:.0} deg horizontal -> {:.2} deg vertical",
+                        self.fp_fov_deg,
+                        film_play::reach_vertical_fov_for(self.fp_fov_deg).to_degrees()
+                    )),
+                }
+            }
+            "look" => {
+                let f = |i: usize| args.get(i).and_then(|v| v.parse::<f32>().ok());
+                let (Some(yaw), Some(pitch)) = (f(1), f(2)) else {
+                    return Err("play look <yaw deg> <pitch deg>".into());
+                };
+                match self.play.as_mut() {
+                    Some(p) => {
+                        p.st.yaw = yaw.to_radians();
+                        p.st.pitch = pitch.to_radians();
+                        Ok(format!("looking {yaw} / {pitch} deg"))
+                    }
+                    None => Err("not in test mode".into()),
+                }
+            }
+            "phys" | "constants" => {
+                let Some(sc) = self.scene_ctl.as_ref() else { return Err("no map open".into()) };
+                let Some(cache) = sc.cache_handle() else { return Err("no map open".into()) };
+                let native = sc.native_dll();
+                let mut out = play_phys::PlayerPhysics::describe_rows(native, cache);
+                for sp in [play_mode::Species::Spartan, play_mode::Species::Elite] {
+                    out += &format!("\n--- {} ---\n", sp.label());
+                    let bipeds = reach_actor::ActorScene::list_bipeds(native, cache);
+                    match play_mode::player_physics_for(native, cache, &bipeds, sp) {
+                        Ok((path, p)) => {
+                            out += &format!("{path}\n{}\n", p.describe());
+                            out += &format!(
+                                "step-up {:.4} wu (emergent, no authored step field) | ground probe {:.4} wu\n",
+                                play_ctl::max_step_height(&p),
+                                play_ctl::ground_probe_depth(&p)
+                            );
+                        }
+                        Err(e) => out += &format!("{e}\n"),
+                    }
+                }
+                Ok(out)
+            }
+            x => Err(format!(
+                "play: expected get | spartan | elite | off | view first|third | weapon <name|none> | fire | melee | step <n> | look <yaw> <pitch> | fov <deg> | phys, got '{x}'"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bg_throttle_tests {
+    use super::scene_due_after;
+    use crate::gfxsettings::{GfxSettings, BG_HIDDEN_HZ, BG_UNFOCUSED_HZ};
+    use std::time::Duration;
+
+    /// #bg-throttle  THE GATE on the timing half of the background throttle: the scene must be
+    /// drawn AT MOST once per budget while the window is in the background, and the very first
+    /// frame must always draw.
+    ///
+    /// The "always draw the first frame" case is the one worth a test of its own: an app that
+    /// starts minimised, or whose window is already behind the game, has `None` elapsed, and an
+    /// off-by-one there would leave a permanently black viewport that only fixed itself when the
+    /// user clicked on it.
+    ///
+    /// Sabotage check: changing `e >= budget` to `e > budget` still passes (it is the same
+    /// decision one nanosecond later), but returning `false` for `None`, or inverting the
+    /// comparison, each makes this fail.
+    #[test]
+    fn the_scene_is_drawn_at_most_once_per_background_budget() {
+        let budget = Duration::from_millis(100);
+        assert!(scene_due_after(None, budget), "a scene never yet drawn is always due");
+        assert!(!scene_due_after(Some(Duration::ZERO), budget), "just drawn: not due again");
+        assert!(!scene_due_after(Some(Duration::from_millis(99)), budget));
+        assert!(scene_due_after(Some(budget), budget), "exactly a budget later: due");
+        assert!(scene_due_after(Some(Duration::from_millis(5000)), budget));
+
+        // Over a simulated second of 60 Hz frames, the gate must let through about ten of them at
+        // the unfocused budget -- i.e. the throttle really is a throttle and not a rounding
+        // error. Counted through the same function the app calls.
+        let unfocused = GfxSettings::default()
+            .background_budget(false, false)
+            .expect("the shipped default throttles an unfocused window");
+        let mut last: Option<Duration> = None;
+        let mut drawn = 0;
+        let mut now = Duration::ZERO;
+        for _ in 0..60 {
+            now += Duration::from_micros(16_667);
+            let elapsed = last.map(|l| now - l);
+            if scene_due_after(elapsed, unfocused) {
+                drawn += 1;
+                last = Some(now);
+            }
+        }
+        assert!(
+            (BG_UNFOCUSED_HZ as i32 - drawn as i32).abs() <= 1,
+            "60 frames of a second should draw about {BG_UNFOCUSED_HZ}, drew {drawn}"
+        );
+        // and the hidden budget must draw fewer still
+        let hidden = GfxSettings::default().background_budget(false, true).expect("hidden throttles");
+        let mut last: Option<Duration> = None;
+        let mut drawn_hidden = 0;
+        let mut now = Duration::ZERO;
+        for _ in 0..60 {
+            now += Duration::from_micros(16_667);
+            if scene_due_after(last.map(|l| now - l), hidden) {
+                drawn_hidden += 1;
+                last = Some(now);
+            }
+        }
+        assert!(
+            drawn_hidden < drawn,
+            "minimised ({drawn_hidden} frames) must draw fewer than unfocused ({drawn})"
+        );
+        assert!((BG_HIDDEN_HZ as i32 - drawn_hidden as i32).abs() <= 1, "expected ~{BG_HIDDEN_HZ}, drew {drawn_hidden}");
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::import_material_texels;
+    use crate::modelimport::{AlphaMode, ImportImage, ImportMaterial, Wrap};
+
+    fn img(w: u32, h: u32, f: impl Fn(u32, u32) -> [u8; 4]) -> ImportImage {
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&f(x, y));
+            }
+        }
+        ImportImage { w, h, rgba, name: "t".into() }
+    }
+
+    /// A material with NO base-colour map must still carry its real colour, sRGB-ENCODED so the
+    /// shader's pow(x, 2.2) gives the linear factor back. That is what makes a material-less OBJ
+    /// and an untextured glTF material look sane instead of white.
+    #[test]
+    fn a_material_with_no_map_becomes_its_own_flat_colour() {
+        let mat = ImportMaterial { base_color: [0.25, 0.5, 1.0, 1.0], ..Default::default() };
+        let (px, w, h, uv, varying) = import_material_texels(&mat, None);
+        assert_eq!((w, h), (2, 2));
+        assert_eq!(px.len(), 16, "2x2 RGBA");
+        assert_eq!(uv, [1.0, 1.0]);
+        assert!(!varying);
+        // round-tripping the texel through the shader's pow(2.2) must return the linear factor
+        for (k, want) in [0.25f32, 0.5, 1.0].iter().enumerate() {
+            let got = (px[k] as f32 / 255.0).powf(2.2);
+            assert!((got - want).abs() < 0.02, "channel {k}: {got} != {want}");
+        }
+        // all four texels identical
+        assert_eq!(&px[0..4], &px[12..16]);
+    }
+
+    /// baseColorFactor must multiply the TEXTURE, in the shader's encoding.
+    #[test]
+    fn base_color_factor_multiplies_the_texture() {
+        let im = img(2, 2, |_, _| [255, 255, 255, 255]);
+        let mat = ImportMaterial { base_color: [0.25, 1.0, 1.0, 1.0], image: Some(0), ..Default::default() };
+        let (px, ..) = import_material_texels(&mat, Some(&im));
+        let lin = (px[0] as f32 / 255.0).powf(2.2);
+        assert!((lin - 0.25).abs() < 0.02, "white x 0.25 should read back 0.25 linear, got {lin}");
+        assert_eq!(px[1], 255, "an untouched channel must stay white");
+        // a factor of 1 must be an exact no-op on every texel
+        let mat = ImportMaterial { image: Some(0), ..Default::default() };
+        let (px, ..) = import_material_texels(&mat, Some(&im));
+        assert_eq!(px, im.rgba);
+    }
+
+    /// `alphaCutoff` is re-mapped onto the 0.5 the cutout pipeline clips at, so a MASK material
+    /// with a 0.1 or 0.9 cutoff keeps the silhouette the author drew.
+    #[test]
+    fn mask_cutoff_is_remapped_onto_the_pipeline_half() {
+        // a horizontal alpha ramp 0..255
+        let im = img(256, 1, |x, _| [255, 255, 255, x as u8]);
+        for cut in [0.1f32, 0.25, 0.5, 0.9] {
+            let mat = ImportMaterial {
+                image: Some(0),
+                alpha_mode: AlphaMode::Mask,
+                alpha_cutoff: cut,
+                ..Default::default()
+            };
+            let (px, ..) = import_material_texels(&mat, Some(&im));
+            for x in 0..256usize {
+                let a_in = x as f32 / 255.0;
+                let kept = px[x * 4 + 3] >= 128;
+                let want = a_in >= cut;
+                // allow the single texel straddling the cutoff
+                if (a_in - cut).abs() > 1.5 / 255.0 {
+                    assert_eq!(kept, want, "cutoff {cut}: alpha {a_in} kept={kept}");
+                }
+            }
+        }
+        // a 0.5 cutoff must leave the channel untouched
+        let mat = ImportMaterial { image: Some(0), alpha_mode: AlphaMode::Mask, alpha_cutoff: 0.5, ..Default::default() };
+        let (px, ..) = import_material_texels(&mat, Some(&im));
+        assert_eq!(px[200 * 4 + 3], 200);
+    }
+
+    /// MIRRORED_REPEAT is baked as a 2x mirror tile with the UVs halved — the renderer shares one
+    /// Repeat sampler, and repeat-sampling the tile is identical to mirror-sampling the original.
+    #[test]
+    fn mirrored_wrap_becomes_a_mirror_tile_and_halves_the_uvs() {
+        let im = img(4, 1, |x, _| [(x * 60) as u8, 0, 0, 255]);
+        let mat = ImportMaterial { image: Some(0), wrap: [Wrap::Mirror, Wrap::Repeat], ..Default::default() };
+        let (px, w, h, uv, _) = import_material_texels(&mat, Some(&im));
+        assert_eq!((w, h), (8, 1));
+        assert_eq!(uv, [0.5, 1.0]);
+        // left half is the original, right half is its mirror
+        let r: Vec<u8> = px.chunks_exact(4).map(|t| t[0]).collect();
+        assert_eq!(r, vec![0, 60, 120, 180, 180, 120, 60, 0]);
+        // CLAMP must NOT change the image (the UVs are clamped per vertex instead)
+        let mat = ImportMaterial { image: Some(0), wrap: [Wrap::Clamp, Wrap::Clamp], ..Default::default() };
+        let (px, w, h, uv, _) = import_material_texels(&mat, Some(&im));
+        assert_eq!((w, h, uv), (4, 1, [1.0, 1.0]));
+        assert_eq!(px, im.rgba);
+    }
+
+    /// #model-import: snapping / dropping an object onto an imported model reads ONE thing —
+    /// the world triangle soup `App::rebuild_import_tris` builds from every import's pose — via
+    /// `raycast_tris`. This exercises that exact pair: the soup is rebuilt the way the app
+    /// rebuilds it, and a downward ray must land on the model's top surface at EVERY pose, so a
+    /// moved / rotated / scaled / removed import moves what lands on it.
+    #[test]
+    fn the_raycast_soup_follows_an_imported_models_pose() {
+        use crate::extimport::ImportedModel;
+        use glam::Vec3;
+        // a 2x2 plate on z = 0 (what an object would be dropped onto)
+        let plate = || -> Vec<[Vec3; 3]> {
+            let (a, b, c, d) = (
+                Vec3::new(-1.0, -1.0, 0.0),
+                Vec3::new(1.0, -1.0, 0.0),
+                Vec3::new(1.0, 1.0, 0.0),
+                Vec3::new(-1.0, 1.0, 0.0),
+            );
+            vec![[a, b, c], [a, c, d]]
+        };
+        // `App::rebuild_import_tris` verbatim: the world triangles of every import, concatenated.
+        let soup = |imports: &[ImportedModel]| -> Vec<[Vec3; 3]> {
+            imports.iter().flat_map(|m| m.world_tris()).collect()
+        };
+        let down = Vec3::new(0.0, 0.0, -1.0);
+
+        let mut a = ImportedModel::at_identity(std::path::PathBuf::from("a.obj"), plate());
+        // (1) at the identity: a ray from 10 up hits the plate 10 below.
+        let t = super::raycast_tris(Vec3::new(0.0, 0.0, 10.0), down, &soup(&[a.clone()]))
+            .expect("the identity-posed import must be hit");
+        assert!((t - 10.0).abs() < 1e-3, "identity hit at {t}");
+
+        // (2) MOVED: the same ray misses, and a ray over the new position hits at the new height.
+        a.pos = [20.0, 0.0, 4.0];
+        let s = soup(&[a.clone()]);
+        assert!(super::raycast_tris(Vec3::new(0.0, 0.0, 10.0), down, &s).is_none(), "the soup did not move with the model");
+        let t = super::raycast_tris(Vec3::new(20.0, 0.0, 10.0), down, &s).expect("the moved import must be hit");
+        assert!((t - 6.0).abs() < 1e-3, "moved hit at {t}, expected 6 (10 -> z=4)");
+
+        // (3) SCALED: the plate widens, so a ray 1.5 off-centre now lands on it.
+        assert!(super::raycast_tris(Vec3::new(21.5, 0.0, 10.0), down, &s).is_none(), "unscaled, 1.5 off-centre must miss");
+        a.scale = 3.0;
+        let s = soup(&[a.clone()]);
+        let t = super::raycast_tris(Vec3::new(21.5, 0.0, 10.0), down, &s).expect("the scaled import must be hit 1.5 off-centre");
+        assert!((t - 6.0).abs() < 1e-3, "scaled hit at {t}");
+
+        // (4) ROTATED 90 deg of pitch: the plate stands on edge, so the downward ray misses it
+        // and a HORIZONTAL ray through it hits — the soup carries the full orientation.
+        a.set_euler_deg([0.0, 90.0, 0.0]);
+        let s = soup(&[a.clone()]);
+        assert!(super::raycast_tris(Vec3::new(21.5, 0.0, 10.0), down, &s).is_none(), "an edge-on plate must not be hit from above");
+        let t = super::raycast_tris(Vec3::new(10.0, 0.0, 4.0), Vec3::X, &s).expect("the edge-on plate must be hit side-on");
+        assert!((t - 10.0).abs() < 1e-3, "side-on hit at {t}");
+
+        // (5) TWO imports: both are in the soup, each at its own pose.
+        a.set_euler_deg([0.0; 3]);
+        let mut b = ImportedModel::at_identity(std::path::PathBuf::from("b.obj"), plate());
+        b.pos = [-20.0, 0.0, -7.0];
+        let s = soup(&[a.clone(), b.clone()]);
+        assert_eq!(s.len(), 4, "two 2-triangle models make a 4-triangle soup");
+        assert!(super::raycast_tris(Vec3::new(20.0, 0.0, 10.0), down, &s).is_some(), "import A must still be hit");
+        let t = super::raycast_tris(Vec3::new(-20.0, 0.0, 10.0), down, &s).expect("import B must be hit");
+        assert!((t - 17.0).abs() < 1e-3, "second import hit at {t}");
+
+        // (6) REMOVED: dropping one import takes its triangles out of the soup.
+        let s = soup(&[b]);
+        assert_eq!(s.len(), 2);
+        assert!(super::raycast_tris(Vec3::new(20.0, 0.0, 10.0), down, &s).is_none(), "a removed import must leave the soup");
+    }
+
+    /// The "does the alpha VARY" answer is what routes a BLEND material: a varying alpha map is
+    /// clipped like a cutout, a constant one draws solid rather than vanish.
+    #[test]
+    fn varying_alpha_is_detected() {
+        let flat = img(2, 2, |_, _| [255, 255, 255, 255]);
+        let holey = img(2, 2, |x, _| [255, 255, 255, if x == 0 { 0 } else { 255 }]);
+        let mat = ImportMaterial { image: Some(0), alpha_mode: AlphaMode::Blend, ..Default::default() };
+        assert!(!import_material_texels(&mat, Some(&flat)).4, "a solid alpha channel does not vary");
+        assert!(import_material_texels(&mat, Some(&holey)).4, "a holey alpha channel varies");
+        // A constant factor alpha below 1 is still "not varying" (the glass-pane case).
+        let mat = ImportMaterial { image: Some(0), alpha_mode: AlphaMode::Blend, base_color: [1.0, 1.0, 1.0, 0.25], ..Default::default() };
+        let (px, .., varying) = import_material_texels(&mat, Some(&flat));
+        assert!(!varying);
+        assert_eq!(px[3], 64, "factor alpha must still reach the texel");
     }
 }
 
@@ -14364,6 +22300,17 @@ mod mass_edit_tests {
         assert_eq!(other.flags.shadow, Some(true), "the toggled flag must propagate");
         assert_eq!(other.flags.scaled, Some(false), "an untouched flag keeps the target's own override");
         assert!(other.shadow_on() && !other.scaled_on());
+        // the DAMAGE state fans out the same way, and clearing it (back to default) does too
+        let mut after2 = after.clone();
+        after2.flags.damage = Some(4);
+        other.apply_changed_fields(&after, &after2);
+        assert_eq!(other.flags.damage, Some(4), "the chosen damage state must propagate");
+        assert_eq!(other.flags.damage_state(), 4);
+        let mut after3 = after2.clone();
+        after3.flags.damage = None;
+        other.apply_changed_fields(&after2, &after3);
+        assert_eq!(other.flags.damage, None, "clearing the damage state propagates");
+        assert_eq!(other.flags.damage_state(), 0);
 
         // derived defaults: label "scale" → scaled; green + "scale" → shadow; overrides beat both
         let mut m = sample();
@@ -14665,6 +22612,9 @@ mod save_stress {
         for d in [
             "/mnt/games/haloreach/map_variants",
             "/mnt/games/SteamLibrary/steamapps/common/Halo The Master Chief Collection/haloreach/map_variants",
+            // The install this box actually has (/mnt/games is not always mounted); without a
+            // reachable sample folder every save-stress gate below is vacuous.
+            "/mnt/990pro/SteamLibrary/steamapps/common/Halo The Master Chief Collection/haloreach/map_variants",
         ] {
             if let Ok(rd) = std::fs::read_dir(d) {
                 for e in rd.flatten() {
@@ -15330,5 +23280,255 @@ mod save_stress {
             checked += 1;
         }
         assert!(checked > 0);
+    }
+}
+
+// ===================== #seat-entry  HIDDEN-PLACEMENT FINGERPRINT GATES =====================
+//
+// The bug these exist for: entering a vehicle drew the vehicle TWICE. `hidden_datums()` named the
+// placement to suppress and the filter that applies it sits ~100 lines below an idle early-return
+// in `tick_scene`. Mounting changes nothing else the object-pipeline fingerprint reads, so the
+// early-return fired every tick and the filter was never reached.
+//
+// That is the "capability exists, nothing invokes it" shape, and a unit test on the fold alone
+// cannot see it -- the fold was always correct, it was just never called. So there are two gates:
+// one on the arithmetic, and one STRUCTURAL gate on the call site, which is the part that broke.
+#[cfg(test)]
+mod hidden_datum_fingerprint_gates {
+    use super::fold_hidden_datums;
+
+    const SEED: u64 = 0xcbf2_9ce4_8422_2325;
+
+    #[test]
+    fn hiding_a_placement_changes_the_fingerprint() {
+        // The property that matters: mounting a vehicle must move the fingerprint, or the idle
+        // early-return keeps serving the frame that still has the placement in it.
+        let nothing_hidden = fold_hidden_datums(SEED, &[]);
+        let one_hidden = fold_hidden_datums(SEED, &[0x1234]);
+        assert_ne!(
+            nothing_hidden, one_hidden,
+            "hiding a datum must change the object-pipeline fingerprint"
+        );
+        // And a DIFFERENT datum must be a different fingerprint, so swapping which vehicle you
+        // are riding also rebuilds.
+        assert_ne!(
+            one_hidden,
+            fold_hidden_datums(SEED, &[0x5678]),
+            "hiding a different datum must give a different fingerprint"
+        );
+    }
+
+    #[test]
+    fn the_fold_does_not_depend_on_the_order_returned() {
+        // `hidden_datums()` collects from an iterator; nothing promises a stable order, and an
+        // order-dependent fold would rebuild the whole object pipeline on its own every tick.
+        assert_eq!(
+            fold_hidden_datums(SEED, &[9, 7]),
+            fold_hidden_datums(SEED, &[7, 9]),
+            "the hidden-set fold must be order-independent"
+        );
+    }
+
+    #[test]
+    fn an_empty_set_is_distinct_from_a_datum_that_folds_to_zero() {
+        // Datum 0 shifted is still 0, so without the count mixed in separately, riding the object
+        // at datum 0 would be indistinguishable from riding nothing.
+        assert_ne!(
+            fold_hidden_datums(SEED, &[]),
+            fold_hidden_datums(SEED, &[0]),
+            "the count must be folded in, or datum 0 is invisible to the fingerprint"
+        );
+    }
+
+    #[test]
+    fn the_object_pipeline_fingerprint_actually_reads_the_hidden_set() {
+        // THE GATE FOR THE ACTUAL BUG. `App` is built from an `eframe` creation context and
+        // cannot be constructed in a test, so the call site is gated structurally: the body of
+        // `object_pipeline_sig` must consult the hidden set. Without this, every gate above stays
+        // green while the fold is never called and the vehicle is drawn twice.
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn object_pipeline_sig(&self) -> u64 {")
+            .expect("object_pipeline_sig must exist; if it was renamed, update this gate");
+        let body = &src[start..];
+        let end = body[1..]
+            .find("\n    fn ")
+            .map(|i| i + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("hidden_datums"),
+            "object_pipeline_sig must read the hidden-placement set, or the hide filter further \
+             down tick_scene is unreachable behind the idle early-return (vehicle drawn twice)"
+        );
+        assert!(
+            body.contains("fold_hidden_datums"),
+            "object_pipeline_sig must fold the hidden set through fold_hidden_datums, so the \
+             arithmetic gates above are gating the code that actually runs"
+        );
+    }
+}
+
+/// #play-hud  **GATES ON THE CALL SITE, not on the function.**
+///
+/// Every other gate for the test-mode HUD drives `play_hud` directly, and that is exactly how a
+/// module can be perfect and still draw nothing: this project has shipped "the capability exists
+/// but nothing invokes it" four times — a missing `update_actors` call that left test mode with no
+/// body at all, prompts sent to a hidden status bar, an empty trait default, and a fingerprint that
+/// never read its input. Unit gates stay green through all of those, because they never go through
+/// the host.
+///
+/// So these read `main.rs`'s own source and assert the wiring. They are coarse and they are
+/// deliberately coarse: a source-text gate cannot be fooled by a function that compiles, and it
+/// fails loudly when a line is deleted during a refactor, which is the failure mode worth catching.
+#[cfg(test)]
+mod play_hud_call_site_gates {
+    /// This file's own text, **with this gate module's own source cut off the end**.
+    ///
+    /// That cut is not tidiness, it is the gate's correctness. Every needle below is a line of
+    /// `main.rs` that this module also contains as a string literal, so a search over the whole
+    /// file finds the gate that is doing the searching and passes without ever reading the code
+    /// under test. The first version of these gates did exactly that: the draw-site assertion was
+    /// satisfied by its own literal, and it stayed green through a deliberate deletion of the real
+    /// call. (That is the first shape on this project's own list of vacuous gates — an expectation
+    /// satisfied by the thing doing the asserting.)
+    ///
+    /// The marker is assembled from two pieces so that it is not itself in the cut region's text.
+    fn src() -> &'static str {
+        static CUT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+        CUT.get_or_init(|| {
+            let whole = include_str!("main.rs");
+            let marker = concat!("mod ", "play_hud_call_site_gates {");
+            let at = whole.find(marker).expect("this gate module must be findable in main.rs");
+            let cut = &whole[..at];
+            // The cut must remove the gates and keep essentially all of the file, or the searches
+            // below are over the wrong text.
+            assert!(cut.len() > whole.len() * 9 / 10, "the cut removed too much of main.rs");
+            assert!(cut.len() < whole.len(), "the cut removed nothing — the gates are self-matching");
+            cut
+        })
+    }
+
+    /// The body of one method, from its signature to the next `    fn ` at the same indent.
+    fn method(sig: &str) -> &'static str {
+        let s = src();
+        let start = s.find(sig).unwrap_or_else(|| panic!("{sig} must exist; if it was renamed, update this gate"));
+        let body = &s[start..];
+        let end = body[1..].find("\n    fn ").map(|i| i + 1).unwrap_or(body.len());
+        &body[..end]
+    }
+
+    /// **THE DRAW SITE.** The HUD painter has to be CALLED from the viewport, in the test-mode
+    /// branch, and its report has to be kept — otherwise `play hud` answers from a stale frame.
+    #[test]
+    fn the_test_mode_hud_is_actually_drawn_from_the_viewport() {
+        let s = src();
+        let call = concat!("self.play_hud_lines = self.", "play_first_person_hud(ui, response.rect);");
+        let at = s.find(call).unwrap_or_else(|| {
+            panic!(
+                "nothing calls `play_first_person_hud` from the viewport, so test mode draws no \
+                 HUD however correct `play_hud` is"
+            )
+        });
+        // ...and in the TEST-MODE branch, beside the overlay rather than beside the editor's own
+        // floating toolbar: the toolbar branch is the `self.play.is_none()` one. The window is
+        // generous because the branch carries a comment, and narrow enough that an unrelated
+        // occurrence elsewhere in a 23,000-line file cannot satisfy it.
+        let before = &s[at.saturating_sub(1500)..at];
+        assert!(
+            before.contains(concat!("if self.play.", "is_none() {")),
+            "the HUD draw is not inside the test-mode branch of the viewport's overlay block"
+        );
+        assert!(
+            s[at..at + 1500].contains(concat!("self.", "play_overlay(ui, response.rect);")),
+            "the overlay must still be drawn after the HUD, so a vehicle or pickup prompt is \
+             never covered by a meter"
+        );
+        // The painter it must go through is the shared one, not a second HUD.
+        let f = method("fn play_first_person_hud(&self, ui: &mut egui::Ui, viewport: egui::Rect) -> Vec<String> {");
+        for want in [
+            "reach_hud::paint_collection(",
+            "reach_hud::PLAYER_COLLECTIONS",
+            "reach_hud::WEAPON_AMMO_PREFIX",
+            "reach_hud::vehicle_chud(",
+            "reach_chud::paint_crosshair(",
+            "vehicle_values(",
+        ] {
+            assert!(f.contains(want), "the draw site must go through `{want}` rather than reimplement it");
+        }
+        assert!(
+            !f.contains("Field::derived") && !f.contains("Field::recorded"),
+            "the draw site must not mint provenance of its own — every value comes from \
+             `play_hud::PlayHud::values`, which is where the discipline lives"
+        );
+    }
+
+    /// **THE FIRE GATE AT EVERY CALL SITE.** `PlayMode::fire` can be reached two ways — the key,
+    /// and the `play fire` verb — and an ungated one spends no ammunition, which looks exactly
+    /// like an infinite magazine.
+    #[test]
+    fn every_route_to_firing_goes_through_the_ammo_gate() {
+        let s = src();
+        // Two needles, each split so this gate's own text contains neither whole. They cannot
+        // match each other: `pm.fire(scene,` does not contain `p.fire(scene,`.
+        let n1 = concat!("pm", ".fire(scene,");
+        let n2 = concat!("p", ".fire(scene,");
+        let sites: Vec<usize> =
+            s.match_indices(n1).chain(s.match_indices(n2)).map(|(i, _)| i).collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "expected exactly two routes into `PlayMode::fire` (the key and the `play fire` \
+             verb), found {} — a new one must be gated too",
+            sites.len()
+        );
+        for at in sites {
+            let before = &s[at.saturating_sub(900)..at];
+            assert!(
+                before.contains(concat!("before_", "fire()")),
+                "a route into `PlayMode::fire` at byte {at} is not preceded by \
+                 `self.play_hud.before_fire()`, so that route fires with an empty magazine"
+            );
+        }
+        // And the magazine's single writer is wired: `tick` is what spends a round, from the
+        // shots delta, and it has to run on both routes.
+        assert_eq!(
+            s.matches(concat!("self.play_hud.", "tick(")).count(),
+            2,
+            "the shots-delta accounting must run on the window frame AND on the `play fire` verb"
+        );
+        // The BIND, without which the ammo model is never built at all.
+        let up = method("fn update_play(&mut self, ctx: &egui::Context, response: &egui::Response) {");
+        assert!(
+            up.contains(concat!("self.play_hud.", "bind(native, cache, biped);")),
+            "the HUD is never bound to the biped, so it has no vitality or grenade source"
+        );
+        assert!(
+            up.contains(concat!("self.play_hud.", "set_weapon(native, cache, weapon, shots);")),
+            "the HUD is never bound to the held weapon, so there is no magazine"
+        );
+        assert!(
+            up.contains(concat!("let fire_allowed = !fire || self.play_hud.", "before_fire();")),
+            "the fire gate must short-circuit on `fire`, or an un-pressed trigger counts a dry \
+             pull on every frame"
+        );
+    }
+
+    /// **THE RE DUMP IS REACHABLE.** The recovered magazine layout and the biped vitality are only
+    /// a finding if something prints them; `--dump-hud` is the headless route the measurement was
+    /// taken through, and it has to keep calling it.
+    #[test]
+    fn the_dump_verb_reaches_the_recovered_layout() {
+        assert!(
+            src().contains(concat!("reach_hud::", "dump_hud(n, c, &filter);")),
+            "--dump-hud must still run"
+        );
+        // reach_hud.rs holds no copy of these gates, so no cut is needed for it.
+        assert!(
+            include_str!("reach_hud.rs")
+                .contains("crate::play_hud::dump_ammo_and_vitality(native, cache, filter);"),
+            "`dump_hud` must print the recovered magazine layout and the biped vitality, or the \
+             map-backed half of the recovery has no route to run"
+        );
     }
 }

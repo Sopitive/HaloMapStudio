@@ -205,6 +205,7 @@ pub fn load_atlas(c: &H4Cache, lbsp_tag: usize) -> Result<H4LightmapAtlas> {
     // 0x2000 as "sun disabled" would drop the analytic sun of every 0x6202 BSP).
     let sun_on = flags & LBSP_FLAG_FLOATING_SUN != 0 && dir.iter().map(|v| v * v).sum::<f32>() >= 1e-7;
     let analytic_has_y = analytic_tag.and_then(|t| bitmap_info(c, t)).map_or(false, |i| i.format == FMT_DXN_MONO_ALPHA);
+    if std::env::var("HMS_H4_LMDIAG").is_ok() { eprintln!("  H4LM analytic tag {:?} fmt {:?} has_y {analytic_has_y}", analytic_tag.map(|t| c.tag_name(t).rsplit('\\').next().unwrap_or("").to_string()), analytic_tag.and_then(|t| bitmap_info(c, t)).map(|i| i.format)); }
     Ok(H4LightmapAtlas {
         lbsp_tag,
         dm_tag,

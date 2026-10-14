@@ -1166,6 +1166,21 @@ bool ParseLayoutTable(CacheHandle* cache) {
 // Forward decls.
 namespace { CacheHandle* OpenSharedHandle(const wchar_t* path); }
 
+namespace {
+// #shared-dirs Fallback directories for the shared resource caches (shared.map,
+// campaign.map, ...). The layout table names them by BARE filename, and the game
+// resolves that name against its own `haloreach\maps` folder -- a Steam Workshop
+// item keeps its maps in `<item>\maps\` and, unless its ModInfo.json says
+// `"HasSharedFiles": true`, inherits the stock shared caches ("InheritSharedFiles":
+// "FromMCC"). Sibling-only lookup therefore failed on EVERY Workshop map: each
+// render model whose geometry pages live in shared.map came back "decode failed",
+// and the editor's hidden-block rule then drew those objects as physics hulls.
+// The host sets this list (ZH_MBP_SetSharedCacheDirs) before opening a cache; the
+// sibling directory is always tried first, then these in order.
+std::mutex                 g_sharedDirsMutex;
+std::vector<std::wstring>  g_sharedDirs;
+} // namespace
+
 // Returns nullptr if the index is out-of-range, the open already failed, or
 // the open fails on this attempt. Must be called with cache->pageRouteMutex held
 // (so the per-shared open + cache populate is atomic).
@@ -1203,15 +1218,32 @@ static CacheHandle* GetOrOpenSharedCacheLocked(CacheHandle* cache, int sharedIdx
     } else {
         nameW.assign(nameUtf8.begin(), nameUtf8.end());
     }
-    std::wstring fullPath = parentDir + nameW;
+    // #shared-dirs Candidate paths: the sibling of the primary map first (the stock
+    // install layout), then every host-supplied fallback directory in order.
+    std::vector<std::wstring> candidates;
+    candidates.push_back(parentDir + nameW);
+    {
+        std::lock_guard<std::mutex> dl(g_sharedDirsMutex);
+        for (const std::wstring& d : g_sharedDirs) {
+            if (d.empty()) continue;
+            std::wstring p = d;
+            wchar_t last = p.back();
+            if (last != L'\\' && last != L'/') p += L'/';
+            p += nameW;
+            if (p != candidates.front()) candidates.push_back(p);
+        }
+    }
 
-    NativeDiag("Shared: opening idx=%d name='%s' fullPath='%ls'",
-        sharedIdx, nameUtf8.c_str(), fullPath.c_str());
-
-    CacheHandle* h = OpenSharedHandle(fullPath.c_str());
+    CacheHandle* h = nullptr;
+    for (const std::wstring& fullPath : candidates) {
+        NativeDiag("Shared: opening idx=%d name='%s' fullPath='%ls'",
+            sharedIdx, nameUtf8.c_str(), fullPath.c_str());
+        h = OpenSharedHandle(fullPath.c_str());
+        if (h) break;
+    }
     if (!h) {
-        NativeDiag("Shared: open FAILED idx=%d name='%s'",
-            sharedIdx, nameUtf8.c_str());
+        NativeDiag("Shared: open FAILED idx=%d name='%s' (%llu candidate path(s))",
+            sharedIdx, nameUtf8.c_str(), (unsigned long long)candidates.size());
         return nullptr;
     }
     // dataTableAddress is already populated by ParseSharedCacheHeader inside
@@ -1236,6 +1268,107 @@ static std::atomic<uint64_t> g_pcInflates{0};
 static std::atomic<uint64_t> g_pcInflateBytes{0};
 static std::atomic<uint64_t> g_pcInflateNs{0};
 static std::atomic<uint64_t> g_pcStores{0};
+// SKIN-2: GENERIC pageable-resource reader. A Gen3 "pageable resource" field in a tag meta
+// holds a resource id whose low 16 bits index the gestalt's resource-entry table (`zone` +100).
+// Each entry carries three things the caller needs:
+//   * DEFINITION DATA - the resource's own tag-struct bytes. They live in the gestalt's global
+//     fixup blob (`zone` FixupDataSize @+328 / FixupDataPointer @+340), sliced by
+//     entry.fixupOffset .. +entry.fixupSize. (This is the blob MapModelParser::ParseFixupRegion
+//     walks for render_model VertexBufferInfo[]; it is NOT render_model specific.)
+//   * FIXUPS - entry.ResourceFixups[], one per pointer inside the definition data, in
+//     definition order; `offset & 0x0FFFFFFF` is a byte offset into the PAYLOAD.
+//   * PAYLOAD - the decompressed page data (ReadResourceData).
+// Every out-buffer is malloc'd and freed with ZH_MMP_FreeBuffer. Used by the Reach actor
+// pipeline for `jmad` animation resources, which are shaped exactly like this.
+extern "C" __declspec(dllexport) bool __stdcall ZH_MBP_ReadResource(
+    uint64_t cacheHandle, int32_t resourceIdValue,
+    uint8_t** outDef, uint32_t* outDefLen,
+    uint32_t** outFixups, uint32_t* outFixupCount,
+    uint8_t** outData, uint32_t* outDataLen)
+{
+    if (outDef) *outDef = nullptr;
+    if (outDefLen) *outDefLen = 0;
+    if (outFixups) *outFixups = nullptr;
+    if (outFixupCount) *outFixupCount = 0;
+    if (outData) *outData = nullptr;
+    if (outDataLen) *outDataLen = 0;
+    CacheHandle* cache = LookupHandle(cacheHandle);
+    if (!cache) return false;
+    if (!ParseGestalt(cache)) return false;
+    int entryIndex = resourceIdValue & 0xFFFF;
+    if (entryIndex < 0 || entryIndex >= (int)cache->resourceEntries.size()) return false;
+    {
+        std::lock_guard<std::mutex> lk(cache->parseMutex);
+        if (!EnsureResourceFixups(cache, (size_t)entryIndex)) return false;
+    }
+    const ResourceEntry& entry = cache->resourceEntries[entryIndex];
+
+    // --- definition data (the gestalt fixup blob slice) ---
+    if (outDef && outDefLen && entry.fixupSize > 0) {
+        int zoneIdx = FindGlobalTag(cache, "zone");
+        if (zoneIdx >= 0) {
+            int64_t metaOff = TagMetaFileOff(cache, cache->tags[zoneIdx].metaPointerRaw);
+            if (metaOff >= 0 && (size_t)metaOff + 350 <= cache->size) {
+                const uint8_t* meta = cache->base + metaOff;
+                int32_t blobSize = R32(meta + 328);
+                int64_t blobOff = TagMetaFileOff(cache, RU32(meta + 340));
+                if (blobSize > 0 && blobOff >= 0 && (size_t)blobOff + (size_t)blobSize <= cache->size
+                    && entry.fixupOffset >= 0
+                    && (int64_t)entry.fixupOffset + entry.fixupSize <= blobSize) {
+                    uint8_t* d = (uint8_t*)malloc((size_t)entry.fixupSize);
+                    if (d) {
+                        memcpy(d, cache->base + blobOff + entry.fixupOffset, (size_t)entry.fixupSize);
+                        *outDef = d;
+                        *outDefLen = (uint32_t)entry.fixupSize;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- fixups (payload byte offsets, definition order) ---
+    if (outFixups && outFixupCount && !entry.fixups.empty()) {
+        size_t n = entry.fixups.size();
+        uint32_t* f = (uint32_t*)malloc(n * sizeof(uint32_t));
+        if (f) {
+            for (size_t i = 0; i < n; ++i) f[i] = (uint32_t)(entry.fixups[i].offset & 0x0FFFFFFF);
+            *outFixups = f;
+            *outFixupCount = (uint32_t)n;
+        }
+    }
+
+    // --- payload ---
+    if (outData && outDataLen) {
+        size_t sz = 0;
+        constexpr size_t kMaxRead = 64 * 1024 * 1024;
+        uint8_t* p = ReadResourceData(cache, resourceIdValue, kMaxRead, &sz);
+        if (p) { *outData = p; *outDataLen = (uint32_t)sz; }
+    }
+    return true;
+}
+
+// SKIN-1: resolve one STRING ID through the cache's own string table (the engine's
+// stringid -> text mapping, namespace-translated; see ResolveStringId above) into `out`.
+// Returns the written length (0 and an empty string when the sid is 0/-1 or unmapped).
+// Needed by the Reach actor pipeline, which addresses skeleton nodes, markers, animations and
+// animation modes/states BY NAME exactly as the engine's tags do.
+extern "C" __declspec(dllexport) int32_t __stdcall ZH_MBP_ResolveStringId(
+    uint64_t cacheHandle, uint32_t stringId, char* out, int32_t cap)
+{
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    CacheHandle* cache = LookupHandle(cacheHandle);
+    if (!cache) return 0;
+    const char* s = nullptr;
+    __try { s = ResolveStringId(cache, (int32_t)stringId); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { s = nullptr; }
+    if (!s) return 0;
+    int32_t n = 0;
+    while (s[n] && n < cap - 1) { out[n] = s[n]; ++n; }
+    out[n] = 0;
+    return n;
+}
+
 extern "C" __declspec(dllexport) void __stdcall ZH_MBP_GetPageStats(
     uint64_t* hits, uint64_t* inflates, uint64_t* inflateBytes, uint64_t* inflateNs, uint64_t* stores)
 {
@@ -1244,6 +1377,31 @@ extern "C" __declspec(dllexport) void __stdcall ZH_MBP_GetPageStats(
     if (inflateBytes) *inflateBytes = g_pcInflateBytes.exchange(0);
     if (inflateNs) *inflateNs = g_pcInflateNs.exchange(0);
     if (stores) *stores = g_pcStores.exchange(0);
+}
+
+// #shared-dirs Host-supplied fallback directories for the shared resource caches
+// (see g_sharedDirs). `list` is newline-separated (a path may legally contain ';'),
+// nullptr / empty clears the list. Applies to shared caches opened AFTER the call
+// (each parent cache opens its shared children lazily on the first cross-cache read,
+// so the host sets the list right before ZH_MBP_OpenCache).
+extern "C" __declspec(dllexport) void __stdcall ZH_MBP_SetSharedCacheDirs(const wchar_t* list)
+{
+    std::vector<std::wstring> dirs;
+    if (list) {
+        std::wstring cur;
+        for (const wchar_t* p = list; *p; ++p) {
+            if (*p == L'\n' || *p == L'\r') {
+                if (!cur.empty()) dirs.push_back(cur);
+                cur.clear();
+            } else {
+                cur += *p;
+            }
+        }
+        if (!cur.empty()) dirs.push_back(cur);
+    }
+    NativeDiag("Shared: search dirs set (%llu)", (unsigned long long)dirs.size());
+    std::lock_guard<std::mutex> dl(g_sharedDirsMutex);
+    g_sharedDirs.swap(dirs);
 }
 
 uint8_t* ReadResourceData(CacheHandle* cache, int resourceIdValue,

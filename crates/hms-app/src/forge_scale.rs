@@ -285,11 +285,40 @@ fn shadow_default(team: u8, label: &str) -> bool {
     team == TEAM_GREEN && is_scale_label(label)
 }
 
-/// The two per-object pseudo-flags as user overrides (`None` = follow the derived default).
+/// The per-object pseudo-flags as user overrides (`None` = follow the derived default).
+/// `damage` is the DISPLAYED model damage state (hlmt `model_state_enum`: 1 minor, 2 medium,
+/// 3 major, 4 destroyed; None = the regular undamaged state 0). A viewer/editor option like the
+/// other two: never written to the .mvar, kept in the project file, and it only changes which
+/// render_model permutations the object draws (physics / collision hulls are untouched).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct ObjFlags {
     pub scaled: Option<bool>,
     pub shadow: Option<bool>,
+    pub damage: Option<u8>,
+}
+
+/// The hlmt `model_state_enum_definition` names, indexed by state (0..=4).
+pub const DAMAGE_STATE_NAMES: [&str; 5] = ["default", "minor", "medium", "major", "destroyed"];
+
+/// Human label for a damage state (0 = the undamaged default).
+pub fn damage_state_name(state: u8) -> &'static str {
+    DAMAGE_STATE_NAMES.get(state as usize).copied().unwrap_or("?")
+}
+
+/// Parse a script/CLI damage state: `default|minor|medium|major|destroyed` (also `minor damage`,
+/// `medium_damage` ...) or the enum index 0..4. `default`/`0`/`auto`/`none` clears the override
+/// (returns `Ok(None)`).
+pub fn parse_damage_value(v: &str) -> Result<Option<u8>, String> {
+    let t = v.trim().to_ascii_lowercase();
+    let t = t.trim_end_matches("damage").trim_end_matches(['_', '-', ' ']);
+    match t {
+        "default" | "auto" | "none" | "undamaged" | "reset" | "0" | "normal" => Ok(None),
+        "minor" | "1" => Ok(Some(1)),
+        "medium" | "2" => Ok(Some(2)),
+        "major" | "3" => Ok(Some(3)),
+        "destroyed" | "destroy" | "dead" | "4" => Ok(Some(4)),
+        other => Err(format!("expected default|minor|medium|major|destroyed (or 0..4), got '{other}'")),
+    }
 }
 
 impl ObjFlags {
@@ -303,10 +332,15 @@ impl ObjFlags {
     pub fn shadow_on(&self, team: u8, label: &str) -> bool {
         self.shadow.unwrap_or_else(|| shadow_default(team, label))
     }
-    /// True when neither flag is overridden (nothing worth persisting).
+    /// The displayed damage state (0 = the regular undamaged model).
+    #[inline]
+    pub fn damage_state(&self) -> u8 {
+        self.damage.unwrap_or(0)
+    }
+    /// True when nothing is overridden (nothing worth persisting).
     #[inline]
     pub fn is_default(&self) -> bool {
-        self.scaled.is_none() && self.shadow.is_none()
+        self.scaled.is_none() && self.shadow.is_none() && self.damage.is_none()
     }
 }
 
@@ -429,7 +463,7 @@ mod obj_flag_tests {
 
     #[test]
     fn override_wins_and_clears() {
-        let mut f = ObjFlags { scaled: Some(false), shadow: Some(true) };
+        let mut f = ObjFlags { scaled: Some(false), shadow: Some(true), damage: None };
         assert!(!f.scaled_on("scale"), "explicit off beats the label default");
         assert!(f.shadow_on(0xFF, ""), "explicit on beats the rule default");
         assert!(!f.is_default());
@@ -443,7 +477,7 @@ mod obj_flag_tests {
 
     #[test]
     fn globals_gate_everything() {
-        let f = ObjFlags { scaled: Some(true), shadow: Some(true) };
+        let f = ObjFlags { scaled: Some(true), shadow: Some(true), damage: None };
         let on = GlobalFlags::default();
         assert_eq!(effective_flags(&on, &f, 0xFF, ""), (true, true));
         let off = GlobalFlags { scaled: false, shadowcasters: false };
@@ -459,6 +493,27 @@ mod obj_flag_tests {
         assert_eq!(parse_flag_value("1"), Ok(Some(true)));
         assert_eq!(parse_flag_value("default"), Ok(None));
         assert!(parse_flag_value("maybe").is_err());
+    }
+
+    /// The damage-state override: names and enum indices, `default` clears, and a fresh
+    /// `ObjFlags` with only a damage state set is no longer "default" (so it persists).
+    #[test]
+    fn parse_damage_value_names_and_indices() {
+        assert_eq!(parse_damage_value("default"), Ok(None));
+        assert_eq!(parse_damage_value("0"), Ok(None));
+        assert_eq!(parse_damage_value("minor"), Ok(Some(1)));
+        assert_eq!(parse_damage_value("Medium Damage"), Ok(Some(2)));
+        assert_eq!(parse_damage_value("major_damage"), Ok(Some(3)));
+        assert_eq!(parse_damage_value("DESTROYED"), Ok(Some(4)));
+        assert_eq!(parse_damage_value("4"), Ok(Some(4)));
+        assert!(parse_damage_value("5").is_err());
+        assert!(parse_damage_value("broken").is_err());
+        let f = ObjFlags { damage: Some(4), ..Default::default() };
+        assert!(!f.is_default());
+        assert_eq!(f.damage_state(), 4);
+        assert_eq!(ObjFlags::default().damage_state(), 0);
+        assert_eq!(damage_state_name(4), "destroyed");
+        assert_eq!(damage_state_name(0), "default");
     }
 
     /// The globals are REAL persisted settings (no env needed): save → load round-trips, and an

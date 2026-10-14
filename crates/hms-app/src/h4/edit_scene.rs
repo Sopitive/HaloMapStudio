@@ -44,7 +44,7 @@ use super::geometry::Part;
 use super::materials::H4Material;
 use super::mvar::{H4PaletteEntry, H4Variant};
 use super::objects::H4Placement;
-use super::scene::{decode_model_geom, decode_object_geom, upload_model_parts, H4EditorAssets, H4GeomMesh, H4ModelGeom, H4Stats, Lane, NEUTRAL_CC, ObjectLightField, TexCtx};
+use super::scene::{decode_model_geom, decode_object_geom, decode_object_state_geom, upload_model_parts, H4EditorAssets, H4GeomMesh, H4ModelGeom, H4Stats, Lane, NEUTRAL_CC, ObjectLightField, TexCtx};
 use crate::objscene::{ObjectScene, RebuiltLanes};
 use crate::scene::{object_matrix, ray_aabb, raycast_mesh_local, signature, transform_aabb};
 
@@ -98,6 +98,9 @@ pub struct H4ObjectScene {
     /// #h4-veh Decoded hlmt-variant CHILD object models, keyed by (child obje, child mode, child
     /// hlmt variant) so each turret keeps its own materials / permutations.
     att_models: HashMap<(usize, usize, Option<usize>), Option<Arc<H4ModelGeom>>>,
+    /// #damage Models decoded in a DAMAGE display state, keyed by (obje, mode, hlmt variant,
+    /// state 1..4) - objects and child objects alike (state 0 lives in `models` / `att_models`).
+    state_models: HashMap<(usize, usize, Option<usize>, u8), Option<Arc<H4ModelGeom>>>,
     tex: TexCtx,
     obj_mats: HashMap<usize, H4Material>,
     stats: H4Stats,
@@ -113,6 +116,13 @@ pub struct H4ObjectScene {
     light: ObjectLightField,
     obj_scales: HashMap<u32, f32>,
     casters: HashSet<u32>,
+    /// #damage per-datum displayed damage state (the DAMAGE pseudo-flag; only non-default).
+    obj_damage: HashMap<u32, u8>,
+    /// #damage The authored damage states per (obje, hlmt variant). Reading them LOADS the
+    /// render model (the permutation names a state entry resolves against), so the answer is
+    /// memoised: the object panel asks for the selected object's list every frame, and the
+    /// rebuild asks once per damaged placement. `&self` query -> `RefCell`, like `hulls`.
+    dmg_states: RefCell<HashMap<(usize, Option<usize>), Vec<u8>>>,
     last_signature: u64,
     rebuild_pending: bool,
     world_bounds: ([f32; 3], [f32; 3]),
@@ -136,6 +146,7 @@ impl H4ObjectScene {
         H4ObjectScene {
             cache, palette, variant, placements, models, tex,
             att_models: HashMap::new(),
+            state_models: HashMap::new(),
             obj_mats: HashMap::new(),
             stats: H4Stats::default(),
             shading_on: super::scene::shading_requested(),
@@ -147,6 +158,8 @@ impl H4ObjectScene {
             light: collect.light,
             obj_scales: HashMap::new(),
             casters: HashSet::new(),
+            obj_damage: HashMap::new(),
+            dmg_states: RefCell::new(HashMap::new()),
             last_signature: 0,
             rebuild_pending: false,
             world_bounds,
@@ -196,11 +209,11 @@ impl H4ObjectScene {
     /// entry's tag is null (the record then occupies a slot invisibly, like Reach's unresolved).
     /// Unlike `edit::resolve_palette_item` an obje tag the cache does not know still resolves,
     /// with mode tag 0.
-    pub fn resolve_item(&self, quota: u8, variant: Option<u8>) -> Option<(usize, u32, String)> {
+    pub fn resolve_item(&self, quota: u8, variant: Option<u8>) -> Option<(usize, u32, u32, String)> {
         let entry = self.palette.get(quota as usize)?;
         let pv = entry.variants.get(variant.unwrap_or(0) as usize)?;
         let tag = pv.tag?;
-        Some((tag, self.mode_tag_of_obje(tag), format!("{}:{}", entry.name, pv.name)))
+        Some((tag, self.mode_tag_of_obje(tag), pv.variant_sid, format!("{}:{}", entry.name, pv.name)))
     }
 
     /// The loaded variant's objects as editor `ObjectInfo`s (datum `0xD000_0000 + i`, tags
@@ -213,11 +226,11 @@ impl H4ObjectScene {
         let Some((_, v)) = &self.variant else { return (objects, colors) };
         for (i, o) in v.objects.iter().enumerate() {
             let Some(q) = o.quota else { continue };
-            let Some((obje, mode_tag, _)) = self.resolve_item(q, o.variant) else { continue };
+            let Some((obje, mode_tag, variant_sid, _)) = self.resolve_item(q, o.variant) else { continue };
             let datum = 0xD000_0000u32 + i as u32;
             objects.push(ObjectInfo {
                 datum, type_sig: 0, sig0: 0, sig1: 0, pos: o.pos, health: 1.0, shield: 1.0,
-                mode_tag, fwd: o.fwd, up: o.up, attached: [0; 8], primary_tag: h4_tag(obje), variant_name_sid: 0,
+                mode_tag, fwd: o.fwd, up: o.up, attached: [0; 8], primary_tag: h4_tag(obje), variant_name_sid: variant_sid,
             });
             colors.insert(datum, (o.team as u8, o.color.unwrap_or(0xFF)));
         }
@@ -465,6 +478,33 @@ fn marker_geom() -> H4ModelGeom {
     }
 }
 
+impl H4ObjectScene {
+    /// #damage The damage states a placement can be displayed in: those its hlmt variant
+    /// authors a permutation for, plus its variant attachments' (each child follows its own
+    /// hlmt). Ascending, without 0; empty = default only.
+    pub fn object_damage_states(&self, o: &ObjectInfo) -> Vec<u8> {
+        let Some(ot) = h4_tag_index(o.primary_tag) else { return Vec::new() };
+        let pv = super::objects::object_variant_index(&self.cache, ot, o.variant_name_sid);
+        let mut out = self.variant_damage_states(ot, pv);
+        for a in super::attach::expand_attachments(&self.cache, ot, pv, Mat4::IDENTITY) {
+            for st in self.variant_damage_states(a.obje, a.variant) {
+                if !out.contains(&st) { out.push(st); }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// #damage `objects::variant_damage_states` through the per-(obje, variant) memo (that call
+    /// loads the render model, and both the panel and the rebuild ask repeatedly).
+    pub fn variant_damage_states(&self, obje: usize, variant: Option<usize>) -> Vec<u8> {
+        if let Some(v) = self.dmg_states.borrow().get(&(obje, variant)) { return v.clone(); }
+        let v = super::objects::variant_damage_states(&self.cache, obje, variant);
+        self.dmg_states.borrow_mut().insert((obje, variant), v.clone());
+        v
+    }
+}
+
 impl ObjectScene for H4ObjectScene {
     fn has_cache(&self) -> bool { true }
     fn invalidate(&mut self) { self.last_signature = 0; }
@@ -481,7 +521,9 @@ impl ObjectScene for H4ObjectScene {
         // Fold the scale / caster maps into the signature (order-independent) - scene.rs.
         let scale_sig = self.obj_scales.iter().fold(0u64, |acc, (d, s)| acc ^ (*d as u64).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(s.to_bits() as u64));
         let caster_sig = self.casters.iter().fold(0u64, |acc, d| acc ^ (*d as u64 ^ 0xA5A5_5A5A).wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
-        let sig = signature(objects, colors) ^ scale_sig ^ caster_sig;
+        // #damage a displayed damage state swaps the object's permutations -> rebuild.
+        let damage_sig = self.obj_damage.iter().fold(0u64, |acc, (d, s)| acc ^ ((*d as u64) << 3 | *s as u64).wrapping_mul(0x94D0_49BB_1331_11EB));
+        let sig = signature(objects, colors) ^ scale_sig ^ caster_sig ^ damage_sig;
         if sig == self.last_signature && !self.rebuild_pending { return None; }
         self.last_signature = sig;
         let n_failed = self.failed.len();
@@ -495,15 +537,19 @@ impl ObjectScene for H4ObjectScene {
         // kept in the signature only so a change still triggers a rebuild.
         // #h4-veh the key carries the object's PRIMARY change colour (a per-mesh instance lane, so
         // two placements may only share a draw when it matches - the same rule as the static path).
-        let mut by_mode: HashMap<(u32, bool, [i32; 4]), (Vec<Mat4>, Vec<[f32; 4]>, [f32; 4])> = HashMap::new();
+        // #damage the 4th key component selects the geometry: 0 = the mode tag's lod0 model
+        // (`models`), else a (obje, variant, state) entry of `state_models` (`geom_by_key`).
+        let mut by_mode: HashMap<(u32, bool, [i32; 4], u64), (Vec<Mat4>, Vec<[f32; 4]>, [f32; 4])> = HashMap::new();
+        let mut geom_by_key: HashMap<(u32, bool, [i32; 4], u64), Arc<H4ModelGeom>> = HashMap::new();
         let sun_to = self.sun_to;
-        let mut order: Vec<(u32, bool, [i32; 4])> = Vec::new();
-        let mut lanes_by_key: HashMap<(u32, bool, [i32; 4]), Vec<[u32; 4]>> = HashMap::new();
+        let mut order: Vec<(u32, bool, [i32; 4], u64)> = Vec::new();
+        let mut lanes_by_key: HashMap<(u32, bool, [i32; 4], u64), Vec<[u32; 4]>> = HashMap::new();
         // #h4-veh hlmt-variant CHILD objects of the placed objects: (child obje, child mode, child
         // variant, colour) -> world matrices + the parent datum (so a pick on the turret selects
         // the vehicle).
-        let mut att: HashMap<(usize, usize, Option<usize>, [i32; 4]), (Vec<Mat4>, [f32; 4], u32)> = HashMap::new();
-        let mut att_order: Vec<(usize, usize, Option<usize>, [i32; 4])> = Vec::new();
+        // #damage ... + the child's displayed damage state (0 = its regular model).
+        let mut att: HashMap<(usize, usize, Option<usize>, [i32; 4], u8), (Vec<Mat4>, [f32; 4], u32)> = HashMap::new();
+        let mut att_order: Vec<(usize, usize, Option<usize>, [i32; 4], u8)> = Vec::new();
         self.picks.clear();
         self.blocker_tris.clear();
         self.blocker_lines.clear();
@@ -519,15 +565,42 @@ impl ObjectScene for H4ObjectScene {
                 Some(ot) => super::tint::primary_change_color(&self.cache, ot, o.variant_name_sid, mp.or(Some((crate::mvar::TEAM_NEUTRAL as i8, None)))),
                 None => NEUTRAL_CC,
             };
-            let key = (o.mode_tag, true, super::tint::color_key(cc));
+            // #damage the DAMAGE pseudo-flag: when the object's hlmt variant authors the state,
+            // this placement draws the state's permutations from its own decoded model.
+            let st = self.obj_damage.get(&o.datum).copied().unwrap_or(0);
+            let mut sk = 0u64;
+            let mut sgeom: Option<Arc<H4ModelGeom>> = None;
+            if st > 0 {
+                if let (Some(ot), Some(mi)) = (obje, h4_tag_index(o.mode_tag)) {
+                    let pv = super::objects::object_variant_index(&self.cache, ot, o.variant_name_sid);
+                    if self.variant_damage_states(ot, pv).contains(&st) {
+                        let cache = &self.cache;
+                        let failed = &mut self.failed;
+                        let entry = self.state_models.entry((ot, mi, pv, st)).or_insert_with(|| match decode_object_state_geom(cache, ot, mi, pv, st) {
+                            Ok(g) if !g.meshes.is_empty() => Some(Arc::new(g)),
+                            Ok(_) => None,
+                            Err(e) => { failed.push(format!("{} (damage state {st}): {e}", cache.tag_name(mi))); None }
+                        });
+                        if let Some(g) = entry {
+                            sgeom = Some(g.clone());
+                            sk = (ot as u64) << 24 | (pv.map_or(0, |v| v as u64 + 1)) << 8 | st as u64;
+                        }
+                    }
+                }
+            }
+            let geom: &H4ModelGeom = sgeom.as_deref().unwrap_or(geom);
+            let key = (o.mode_tag, true, super::tint::color_key(cc), sk);
             let (mats, cols, _) = by_mode.entry(key).or_insert_with(|| { order.push(key); (Vec::new(), Vec::new(), cc) });
             mats.push(m);
+            if let Some(g) = &sgeom { geom_by_key.entry(key).or_insert_with(|| g.clone()); }
             if let Some(ot) = obje {
                 let pv = super::objects::object_variant_index(&self.cache, ot, o.variant_name_sid);
                 for a in super::attach::expand_attachments(&self.cache, ot, pv, m) {
                     let vsid = super::objects::default_variant_sid(&self.cache, a.obje);
                     let acc = super::tint::primary_change_color(&self.cache, a.obje, vsid, mp);
-                    let akey = (a.obje, a.mode, a.variant, super::tint::color_key(acc));
+                    // #damage a child follows the parent's displayed state when its own hlmt authors it
+                    let ast = if st > 0 && self.variant_damage_states(a.obje, a.variant).contains(&st) { st } else { 0 };
+                    let akey = (a.obje, a.mode, a.variant, super::tint::color_key(acc), ast);
                     att.entry(akey).or_insert_with(|| { att_order.push(akey); (Vec::new(), acc, o.datum) }).0.push(a.world);
                 }
             }
@@ -554,8 +627,9 @@ impl ObjectScene for H4ObjectScene {
 
         let mut lanes = RebuiltLanes { opaque: Vec::new(), cutout: Vec::new(), holo: Vec::new(), holo_solid: Vec::new(), blend: Vec::new() };
         for key in order {
-            let (tag, casts, _) = key;
-            let Some(Some(geom)) = self.models.get(&tag).cloned() else { continue };
+            let (tag, casts, _, sk) = key;
+            let geom = if sk == 0 { self.models.get(&tag).cloned().flatten() } else { geom_by_key.get(&key).cloned() };
+            let Some(geom) = geom else { continue };
             let (mats, cols, cc) = &by_mode[&key];
             let cc = *cc;
             let shading_on = self.shading_on;
@@ -566,13 +640,16 @@ impl ObjectScene for H4ObjectScene {
                     Lane::AlphaTest => lanes.cutout.push(gm),
                     Lane::Blend => lanes.blend.push(gm),
                     Lane::Additive => lanes.holo.push(gm),
+                    Lane::Water => {} // objects have no water surfaces; drop (editor has no water lane)
                     Lane::Sky => {}
                 }
             };
             if tag == H4_MARKER_TAG {
-                // the marker cube: translucent, untextured, on the alpha-blend object lane
+                // the marker cube: translucent, untextured, on the alpha-blend object lane. Tinted
+                // by the object's TEAM / colour change-colour (`cc`) so a marker-only object (spawn
+                // point, kill zone, ...) recolours when its team or colour is changed, like the game.
                 let mesh = &geom.meshes[0];
-                let gm = super::scene::upload_part(mr, &self.tex.device, &self.tex.queue, &mesh.verts, &mesh.indices, mats, None, super::materials::H4MatKind::AlphaBlend, 0.35, None);
+                let gm = super::scene::upload_part_tinted(mr, &self.tex.device, &self.tex.queue, &mesh.verts, &mesh.indices, mats, None, super::materials::H4MatKind::AlphaBlend, 0.5, None, Some([cc[0], cc[1], cc[2]]));
                 out(Lane::Blend, gm);
                 continue;
             }
@@ -585,15 +662,30 @@ impl ObjectScene for H4ObjectScene {
         // a turret selects its vehicle.
         for akey in att_order {
             let (mats, cc, parent) = att[&akey].clone();
-            if !self.att_models.contains_key(&(akey.0, akey.1, akey.2)) {
-                let dec = match decode_object_geom(&self.cache, akey.0, akey.1, akey.2) {
-                    Ok(g) if !g.meshes.is_empty() => Some(Arc::new(g)),
-                    Ok(_) => None,
-                    Err(e) => { self.failed.push(format!("{}: {e}", self.cache.tag_name(akey.1))); None }
-                };
-                self.att_models.insert((akey.0, akey.1, akey.2), dec);
-            }
-            let Some(Some(geom)) = self.att_models.get(&(akey.0, akey.1, akey.2)).cloned() else { continue };
+            let geom = if akey.4 == 0 {
+                if !self.att_models.contains_key(&(akey.0, akey.1, akey.2)) {
+                    let dec = match decode_object_geom(&self.cache, akey.0, akey.1, akey.2) {
+                        Ok(g) if !g.meshes.is_empty() => Some(Arc::new(g)),
+                        Ok(_) => None,
+                        Err(e) => { self.failed.push(format!("{}: {e}", self.cache.tag_name(akey.1))); None }
+                    };
+                    self.att_models.insert((akey.0, akey.1, akey.2), dec);
+                }
+                self.att_models.get(&(akey.0, akey.1, akey.2)).cloned().flatten()
+            } else {
+                // #damage the child in the parent's displayed damage state
+                let skey = (akey.0, akey.1, akey.2, akey.4);
+                if !self.state_models.contains_key(&skey) {
+                    let dec = match decode_object_state_geom(&self.cache, akey.0, akey.1, akey.2, akey.4) {
+                        Ok(g) if !g.meshes.is_empty() => Some(Arc::new(g)),
+                        Ok(_) => None,
+                        Err(e) => { self.failed.push(format!("{} (damage state {}): {e}", self.cache.tag_name(akey.1), akey.4)); None }
+                    };
+                    self.state_models.insert(skey, dec);
+                }
+                self.state_models.get(&skey).cloned().flatten()
+            };
+            let Some(geom) = geom else { continue };
             let mut cols = Vec::with_capacity(mats.len());
             let mut olanes = Vec::with_capacity(mats.len());
             for m in &mats {
@@ -612,6 +704,7 @@ impl ObjectScene for H4ObjectScene {
                     Lane::AlphaTest => lanes.cutout.push(gm),
                     Lane::Blend => lanes.blend.push(gm),
                     Lane::Additive => lanes.holo.push(gm),
+                    Lane::Water => {} // objects have no water surfaces; drop (editor has no water lane)
                     Lane::Sky => {}
                 }
             };
@@ -622,6 +715,8 @@ impl ObjectScene for H4ObjectScene {
 
     fn set_object_scales(&mut self, scales: HashMap<u32, f32>) { self.obj_scales = scales; }
     fn set_object_casters(&mut self, casters: HashSet<u32>) { self.casters = casters; }
+    fn set_object_damage(&mut self, states: HashMap<u32, u8>) { self.obj_damage = states; }
+    fn damage_states_of(&self, o: &ObjectInfo) -> Vec<u8> { self.object_damage_states(o) }
 
     fn pick(&self, origin: Vec3, dir: Vec3) -> Option<u32> {
         self.nearest_hit(origin, dir, &[], f32::NEG_INFINITY).map(|(_, d)| d)
@@ -680,50 +775,41 @@ impl ObjectScene for H4ObjectScene {
     /// #wire-attach Every pick entry of this datum contributes its own geometry: the object's
     /// model (or, for a hidden block, its physics hull) PLUS each attachment's child model at the
     /// pose `h4::attach` computed, so the wireframe wraps a Wraith's mortar and a rocket Warthog's
-    /// turret. The whole set shares one line budget, so a big turret cannot blow the buffer.
+    /// turret. #wire-cover Every mesh's UNIQUE edges (`objscene::push_wire_edges`); the line budget
+    /// thins the whole set evenly (`fit_wire_budget`) instead of cutting the tail meshes off - the
+    /// Mantis' legs and guns went missing under the old first-come cap.
     fn selection_wireframe(&self, datum: u32) -> Option<Vec<[f32; 3]>> {
-        const MAX_LINES: usize = 60_000; // 2 verts each
-        // #wire-attach ATTACHMENTS FIRST, with half the budget reserved for them: a dense parent
-        // mesh would otherwise eat the whole budget and leave its turret out of the outline.
-        const ATT_LINES: usize = MAX_LINES / 2;
+        let diag = crate::objscene::wire_diag();
         let mut out: Vec<[f32; 3]> = Vec::new();
         let mut saw_entry = false;
-        let mut order: Vec<&PickEntry> = self.picks.iter().filter(|p| p.datum == datum).collect();
-        order.sort_by_key(|p| p.att.is_none()); // attachments first
-        for p in order {
+        for p in self.picks.iter().filter(|p| p.datum == datum) {
             saw_entry = true;
-            let cap = if p.att.is_some() { ATT_LINES } else { MAX_LINES };
-            if out.len() >= cap * 2 { continue; }
-            // #h4-phys a hidden block's wireframe IS its physics hull (the nub is 2 triangles).
+            let before = out.len();
             if let Some(h) = &p.hull {
+                // #h4-phys a hidden block's wireframe IS its physics hull (the nub is 2 triangles).
                 for (a, b) in h.world_edges(&p.xform) {
-                    if out.len() >= cap * 2 { break; }
                     out.push(a);
                     out.push(b);
                 }
-                continue;
-            }
-            let geom = match &p.att {
-                Some(k) => self.att_models.get(k),
-                None => self.models.get(&p.mode_tag),
-            };
-            let Some(Some(g)) = geom else { continue };
-            'meshes: for m in &g.meshes {
-                let n = m.indices.len() / 3 * 3;
-                let mut i = 0;
-                while i < n {
-                    if out.len() >= cap * 2 { break 'meshes; }
-                    let (a, b, c) = (m.indices[i] as usize, m.indices[i + 1] as usize, m.indices[i + 2] as usize);
-                    i += 3;
-                    let (Some(va), Some(vb), Some(vc)) = (m.verts.get(a), m.verts.get(b), m.verts.get(c)) else { continue };
-                    let wa = p.xform.transform_point3(Vec3::from(va.pos)).to_array();
-                    let wb = p.xform.transform_point3(Vec3::from(vb.pos)).to_array();
-                    let wc = p.xform.transform_point3(Vec3::from(vc.pos)).to_array();
-                    out.extend_from_slice(&[wa, wb, wb, wc, wc, wa]);
+            } else {
+                let geom = match &p.att {
+                    Some(k) => self.att_models.get(k),
+                    None => self.models.get(&p.mode_tag),
+                };
+                let Some(Some(g)) = geom else { continue };
+                for m in &g.meshes {
+                    crate::objscene::push_wire_edges(&mut out, &m.indices, &p.xform, |i| m.verts.get(i).map(|v| Vec3::from(v.pos)));
                 }
+            }
+            if diag {
+                let kind = if p.hull.is_some() { "hull" } else if p.att.is_some() { "attachment" } else { "model" };
+                eprintln!("  WIRE {datum:#010x} {kind}: {} edge(s)", (out.len() - before) / 2);
             }
         }
         if !saw_entry { return None; }
+        let total = out.len() / 2;
+        crate::objscene::fit_wire_budget(&mut out, crate::objscene::WIRE_MAX_LINES);
+        if diag { eprintln!("  WIRE {datum:#010x}: {total} unique edge(s), {} drawn", out.len() / 2); }
         (!out.is_empty()).then_some(out)
     }
 
@@ -818,6 +904,28 @@ impl ObjectScene for H4ObjectScene {
         }
     }
 
+    /// #settle The settle body: phmo rigid bodies (else the coll hull) at the editor scale.
+    fn physics_body(&self, o: &ObjectInfo) -> Option<crate::physics_settle::PhysBody> {
+        let ot = h4_tag_index(o.primary_tag)?;
+        let body = collision::object_physics_body(&self.cache, ot)?;
+        let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
+        Some(body.scaled(s))
+    }
+
+    /// #settle The posed, scaled physics hull (else collision hull) as static-collider triangles.
+    fn physics_world_tris(&self, o: &ObjectInfo) -> Vec<[Vec3; 3]> {
+        let Some(ot) = h4_tag_index(o.primary_tag) else { return Vec::new() };
+        let (coll, phmo) = self.obj_hulls(ot);
+        match phmo.or(coll) {
+            Some(h) => h.world_tris(&self.overlay_matrix(o)),
+            None => Vec::new(),
+        }
+    }
+
+    fn static_tris_in_aabb(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+        self.soup.tris_in_aabb(mn, mx, out);
+    }
+
     fn pick_entry_counts(&self, datum: u32) -> (usize, usize) {
         let all: Vec<&PickEntry> = self.picks.iter().filter(|p| p.datum == datum).collect();
         (all.len(), all.iter().filter(|p| p.att.is_some()).count())
@@ -836,6 +944,8 @@ impl ObjectScene for H4ObjectScene {
         // starting locations / spawn placements / cinematic camera - stood off the geometry.
         super::spawncam::spawn_camera(self).map(|c| (c.pos, c.yaw, c.pitch))
     }
+
+    fn spawn_camera(&self) -> Option<crate::spawn_camera::Pose> { super::spawncam::spawn_camera(self) }
 }
 
 #[cfg(test)]
@@ -1032,15 +1142,84 @@ mod tests {
             let mut wmn = Vec3::splat(f32::MAX);
             let mut wmx = Vec3::splat(f32::MIN);
             for v in &w { wmn = wmn.min(Vec3::from(*v)); wmx = wmx.max(Vec3::from(*v)); }
-            let truncated = w.len() / 2 >= 60_000; // the shared line budget
-            eprintln!("  wireframe {} lines{}, bounds {wmn:?}..{wmx:?}", w.len() / 2, if truncated { " (budget reached)" } else { "" });
-            // within a hair of the union box (the wireframe IS the geometry the boxes come from)
-            // - unless the line budget cut it short, which is the point of the budget.
-            if !truncated {
-                assert!((wmn - umn).abs().max_element() < 0.02 && (wmx - umx).abs().max_element() < 0.02,
-                        "{suffix}: wireframe bounds {wmn:?}..{wmx:?} vs union {umn:?}..{umx:?}");
+            // #wire-cover the wireframe is EVERY unique edge of every entry (the Mantis' 28 059
+            // triangles used to hit the 60 000-line cap two thirds of the way through its meshes,
+            // leaving its last five meshes - a leg, the guns - without an outline). Counted here
+            // independently: unique (min,max) index pairs over every mesh of every entry.
+            let mut want = 0usize;
+            for p in es.picks.iter().filter(|p| p.datum == datum) {
+                let g = match &p.att { Some(k) => es.att_models.get(k), None => es.models.get(&p.mode_tag) };
+                let Some(Some(g)) = g else { continue };
+                for m in &g.meshes {
+                    let mut e = std::collections::HashSet::new();
+                    for t in m.indices.chunks_exact(3) {
+                        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] { if a != b { e.insert((a.min(b), a.max(b))); } }
+                    }
+                    want += e.len();
+                }
             }
+            let tris: usize = es.picks.iter().filter(|p| p.datum == datum).filter_map(|p| match &p.att { Some(k) => es.att_models.get(k), None => es.models.get(&p.mode_tag) }).flatten().map(|g| g.tri_count()).sum();
+            eprintln!("  wireframe {} lines ({tris} triangles, {want} unique edges), bounds {wmn:?}..{wmx:?}", w.len() / 2);
+            assert!(want <= crate::objscene::WIRE_MAX_LINES, "{suffix}: {want} edges exceed the budget - the even thinning would kick in");
+            assert_eq!(w.len() / 2, want, "{suffix}: the wireframe must carry every unique edge of every mesh");
+            // within a hair of the union box (the wireframe IS the geometry the boxes come from)
+            assert!((wmn - umn).abs().max_element() < 0.02 && (wmx - umx).abs().max_element() < 0.02,
+                    "{suffix}: wireframe bounds {wmn:?}..{wmx:?} vs union {umn:?}..{umx:?}");
         }
+    }
+
+    /// #settle A scaled object's collision / physics hull overlays AND its settle body are at the
+    /// editor scale: x2 doubles the physics-hull edge extent, the collision-hull edge extent and
+    /// the settle body's box, about the object's origin; other objects are untouched.
+    #[test]
+    fn settler_scaled_object_hulls_and_settle_body_scale_with_it() {
+        let Some(mut es) = settler_scene() else { return };
+        let (objects, _colors) = es.variant_editor_objects();
+        // an object with a physics model and a collision model (the first that has both)
+        let o = objects.iter().find(|o| {
+            let Some(ot) = h4_tag_index(o.primary_tag) else { return false };
+            let (c, p) = es.obj_hulls(ot);
+            c.is_some() && p.is_some()
+        }).expect("an object with coll + phmo");
+        let other = objects.iter().find(|q| q.datum != o.datum && h4_tag_index(q.primary_tag).map_or(false, |t| es.obj_hulls(t).1.is_some())).expect("another object with a phmo");
+        let extent = |edges: &[([f32; 3], [f32; 3])]| -> (Vec3, Vec3) {
+            let mut mn = Vec3::splat(f32::MAX);
+            let mut mx = Vec3::splat(f32::MIN);
+            for (a, b) in edges { mn = mn.min(Vec3::from(*a)).min(Vec3::from(*b)); mx = mx.max(Vec3::from(*a)).max(Vec3::from(*b)); }
+            (mn, mx)
+        };
+        let (p1n, p1x) = extent(&es.physics_world_edges(o));
+        let (c1n, c1x) = extent(&es.collision_world_edges(o));
+        let (o1n, o1x) = extent(&es.physics_world_edges(other));
+        let b1 = es.physics_body(o).expect("settle body");
+        es.set_object_scales(HashMap::from([(o.datum, 2.0)]));
+        let (p2n, p2x) = extent(&es.physics_world_edges(o));
+        let (c2n, c2x) = extent(&es.collision_world_edges(o));
+        let (o2n, o2x) = extent(&es.physics_world_edges(other));
+        let b2 = es.physics_body(o).expect("settle body x2");
+        eprintln!("{}: physics hull {:?} -> {:?}; collision hull {:?} -> {:?}; body {} scale {} -> {}", es.tag_name_of(o.primary_tag), p1x - p1n, p2x - p2n, c1x - c1n, c2x - c2n, b1.desc, b1.scale, b2.scale);
+        let pos = Vec3::from(o.pos);
+        for k in 0..3 {
+            assert!(((p2x - p2n)[k] - 2.0 * (p1x - p1n)[k]).abs() < 1e-3, "physics hull extent x2: {:?} vs {:?}", p2x - p2n, p1x - p1n);
+            assert!(((c2x - c2n)[k] - 2.0 * (c1x - c1n)[k]).abs() < 1e-3, "collision hull extent x2: {:?} vs {:?}", c2x - c2n, c1x - c1n);
+            // scaled about the object's origin: every bound moves away from it by its distance
+            assert!(((p2n[k] - pos[k]) - 2.0 * (p1n[k] - pos[k])).abs() < 1e-3, "physics min about the origin");
+            assert!(((p2x[k] - pos[k]) - 2.0 * (p1x[k] - pos[k])).abs() < 1e-3, "physics max about the origin");
+        }
+        assert_eq!((o1n, o1x), (o2n, o2x), "the other object's hull is untouched");
+        let (a1, z1) = b1.aabb();
+        let (a2, z2) = b2.aabb();
+        assert!(((z2 - a2) - 2.0 * (z1 - a1)).abs().max_element() < 1e-3, "settle body box x2: {:?} vs {:?}", z2 - a2, z1 - a1);
+        assert!((b2.scale - 2.0).abs() < 1e-6 && (b1.scale - 1.0).abs() < 1e-6);
+        assert!((b2.mass - b1.mass).abs() < 1e-6, "mass unchanged by scale");
+        // the static-collider triangles of the scaled object are the scaled hull
+        let tris = es.physics_world_tris(o);
+        let mut tmn = Vec3::splat(f32::MAX);
+        let mut tmx = Vec3::splat(f32::MIN);
+        for t in &tris { for v in t { tmn = tmn.min(*v); tmx = tmx.max(*v); } }
+        assert!((tmn - p2n).abs().max_element() < 1e-3 && (tmx - p2x).abs().max_element() < 1e-3, "world tris {tmn:?}..{tmx:?} vs edges {p2n:?}..{p2x:?}");
+        // (the offline scene carries no level soup; `static_tris_in_aabb` is exercised by the
+        // headless settle runs and the Reach path shares the TriSoup query)
     }
 
     #[test]

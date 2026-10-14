@@ -4,7 +4,7 @@
 # an in-place rewrite crashes it (SIGSEGV/SIGBUS). Rename swaps the directory entry instead.
 set -euo pipefail
 cd "$(dirname "$0")"
-for d in ../target/release ../target/debug; do
+for d in ../target/release ../target/debug ../target/quick; do
   [ -d "$d" ] || continue
   cp build-linux/libhalomapstudio.so "$d/libhalomapstudio.so.tmp.$$" && mv -f "$d/libhalomapstudio.so.tmp.$$" "$d/libhalomapstudio.so"
   echo "installed -> $d/libhalomapstudio.so"

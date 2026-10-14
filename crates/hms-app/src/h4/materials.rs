@@ -70,6 +70,8 @@ pub const OFF_MATS_MTSB: usize = 0x24;
 pub const OFF_MATS_VS_ENTRIES: usize = 0x34;
 pub const OFF_MATS_PS_ENTRIES: usize = 0x40;
 pub const MATS_FLAG_VOLUME_FOG: u32 = 1 << 4;
+/// `mats` +0x00 flag bit 5: the surface is water (a `shader_water` material). #h2a-water
+pub const MATS_FLAG_WATER: u32 = 1 << 5;
 pub const MATS_FLAG_ALPHA_CLIP: u32 = 1 << 12;
 // ---- `mtsb` ----------------------------------------------------------------------------------
 #[cfg(test)]
@@ -138,6 +140,9 @@ pub enum H4MatKind {
     /// Holograms, plasma, boundaries, light shafts, energy: additive glow.
     Additive,
     Multiply,
+    /// A `shader_water` surface (mats flag bit 5): drawn through the renderer's water pass
+    /// (transparent + sky reflection) instead of the flat opaque lane. #h2a-water
+    Water,
     /// Not a rendered surface (volume fog / explicit effect shaders / null material).
     Invisible,
 }
@@ -199,7 +204,12 @@ impl H4Material {
     /// Diffuse / albedo bitmap. Falls back to texture parameter 0 (the diffuse on every
     /// wraparound material, the blend map on layered terrain).
     pub fn diffuse(&self) -> Option<usize> {
-        self.find_tex(&["color_map", "diffuseMap", "diffuse_map", "base_map", "baseMap", "layer0_coMap", "color1_map"])
+        // `color_combo_map` last: the srf_ca_skybox_terrain vista family (H2A Ascension's ring
+        // tiles / mountains) has NO color_map - its albedo is a tiled terrain colour atlas that
+        // mix_map selects from. Without it the giant sunlit ring drew with a WHITE albedo and
+        // read as a solid white shell around the whole map. Tiling the atlas by its own xform is
+        // the right average colour; per-quadrant mix_map selection is the engine-exact follow-up.
+        self.find_tex(&["color_map", "diffuseMap", "diffuse_map", "base_map", "baseMap", "layer0_coMap", "color1_map", "color_combo_map", "cloud_alpha_map", "texture_01_map"])
             .or_else(|| self.textures.first().and_then(|t| t.bitm))
     }
     /// `*_vertmask` shaders (srf_ca_color_warp_vertmask: the Ravine foam sheets) fade by the
@@ -226,6 +236,15 @@ pub fn classify(mats_name: &str, blend_mode: u8, mats_flags: u32) -> H4MatKind {
     let has = |s: &str| n.contains(s);
     if mats_flags & MATS_FLAG_VOLUME_FOG != 0 || has("explicit_shaders\\") || has("volume_fog") {
         return H4MatKind::Invisible;
+    }
+    // Water is flagged in the mats record (bit 5) or named by its shader family (`srf_ca_water_*`,
+    // `shader_water`, ...). Route the water SURFACE to the water pass before the blend-mode / name
+    // heuristics claim it as a plain transparent - but leave the foam / waterfall / wet-decal
+    // sheets on the blend/additive lanes (they are overlays, not a reflective surface). #h2a-water
+    if mats_flags & MATS_FLAG_WATER != 0
+        || ((has("shader_water") || has("water_templates") || has("water")) && !has("foam") && !has("waterfall") && !has("underwater") && !has("wet"))
+    {
+        return H4MatKind::Water;
     }
     match blend_mode {
         1 | 6 | 7 | 8 | 9 | 24 => return H4MatKind::Additive,

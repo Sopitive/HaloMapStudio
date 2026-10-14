@@ -42,6 +42,10 @@ pub type SharedTex = std::sync::Arc<(Vec<u8>, u32, u32)>;
 /// Models decoded per parallel batch before the allocator is asked to return the batch's
 /// freed decode temporaries (see `predecode_tags` / `start_background_predecode`).
 const PREDECODE_BATCH: usize = 48;
+/// #iscale The synthetic datum `build_actor_meshes` stamps on the one-object set it pushes
+/// through `maybe_rebuild` for a POSED ACTOR (a biped, its held weapon, the first-person arms).
+/// `object_scale` keys off it, so it lives here rather than inside that function.
+const ACTOR_DATUM: u32 = 0xF2F1_0000;
 /// BSP texture-prewarm tags uploaded between two queue submits (bounds the staging in flight).
 const PREWARM_CHUNK: usize = 24;
 
@@ -65,17 +69,25 @@ fn obj_tex_ensure(
     kind: u8,
     tex: &(Vec<u8>, u32, u32),
 ) {
+    // #gpu-build  Print-only accounting: how many slots a model asks for, how many were already
+    // on the GPU (either for this very model or for another that interned the same source), and
+    // how many really uploaded. A low upload:call ratio means the sharing is working.
+    GB_TEX_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if cache.contains_key(&key) {
+        GB_TEX_HIT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
     let sk = (ident, kind);
     if let Some((v, t)) = by_src.get(&sk) {
+        GB_TEX_HIT_SRC.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         cache.insert(key, (v.clone(), t.clone()));
         return;
     }
     if tex.0.is_empty() {
+        GB_TEX_EMPTY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return; // bytes already released: only possible once every user of them was uploaded
     }
+    GB_TEX_UPLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let up = if kind == OBJ_TEX_RGBA16F {
         hms_render::upload_texture_rgba16f_nomip(device, queue, &tex.0, tex.1, tex.2)
     } else {
@@ -172,6 +184,11 @@ struct ObjPart {
     /// like rmgl, so the tag class is the reliable signal; route it to the additive holo pass
     /// instead of the opaque pass (which rendered it as a solid BLACK cone).
     is_halo: bool,
+    /// #elite-knife This part's material is switched on only by an ANIMATION EVENT, so a body at
+    /// rest does not have it (see `shader_animation_event_gated`). The Elite's two energy
+    /// daggers, which are baked into its body mesh and have no node, marker or region of their
+    /// own to hide them with.
+    event_gated: bool,
     /// Glass material (RE docs/hrek_re/09_re_glass.md): the REAL rmgl constants.
     /// Forge forerunner glass is authored with albedo_color≈[0,0,0] (BLACK diffuse body)
     /// — its visible colour is entirely REFLECTION, tinted by env_tint_color (dominant)
@@ -398,10 +415,25 @@ fn decode_glass_op(native: &NativeDll, cache: CacheHandle, bmp: Option<&BitmapCa
 /// detail_map (x4.59), no bump_map / bump_detail_map, and `obj_matte` zeroed the env reflection even
 /// though every Covenant/UNSC paint authors env DYNAMIC (per-cluster cube) with contribution 0.5-1.0.
 /// Fields follow cook_torrance_core.hlsl_include / environment_mapping.hlsl_include (see mesh_shade).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ObjMat {
-    /// The lane is live for this part (rmsh, opaque/alpha-test blend, a lit material_model).
+    /// The FULL lane is live for this part (rmsh, opaque blend, a lit material_model) -- constants,
+    /// env AND the authored detail / bump / bump_detail maps. Unit/item objects only.
     valid: bool,
+    /// #objmat The per-part material CONSTANTS + ENVIRONMENT lane is live for this part (same rmsh /
+    /// opaque / lit-material_model test as `valid`, but for EVERY object class -- scenery, crates and
+    /// machines, i.e. every Forge piece). `valid` implies `mat`; `mat && !valid` is a Forge piece, which
+    /// takes its own specular_coefficient / roughness / environment_map but keeps the legacy albedo and
+    /// normal lanes (no detail / bump map is bound, so albedo and normals stay byte-identical).
+    ///
+    /// Forge pieces used to take SHADER 0's constants for every part. `ff_plat_3x4`'s shader 0 is the
+    /// `for_forge_glass` rmgl pane, which authors no `specular_coefficient` at all, so all five of its
+    /// panel parts read mat_spec = 0 and fell into mesh_shade's `spec_mask = base.a` fallback at FULL
+    /// strength -- the "forge blocks look too shiny" report. In the other direction the whole class was
+    /// denied an environment reflection, although `heh_gravlift_catwalk` authors
+    /// `environment_mapping = per_pixel` with `environment_map_specular_contribution = 5.0` on four of
+    /// its six parts -- the "gravlift catwalk should have some reflectivity" report.
+    mat: bool,
     /// rmt2 material_model digit (0 diffuse_only, 1 cook_torrance, 2 two_lobe_phong, 3 foliage, 4 none, ...).
     mm: u8,
     /// `mm` was read from the part's rmt2 (EVERY object type, opaque/alpha-test rmsh only), even when
@@ -437,15 +469,124 @@ struct ObjMat {
     bump_detail: Option<(u32, [f32; 4])>,
     /// specular_mask digit 1/2 (from diffuse): the base map's alpha is the per-texel specular mask.
     spec_mask_diffuse: bool,
+    /// #objmask `albedo_color.a` -- the third factor of the engine's composed albedo ALPHA
+    /// (albedo.hlsl_include:121 `albedo.w = base.w * detail.w * albedo_color.w`), which
+    /// `calc_specular_mask_from_diffuse_ps` reads verbatim as the specular mask. 1.0 = no-op.
+    /// Forge panels author 0.1 / 0.15 / 0.4 / 0.5 / 1.0 / 2.0 here.
+    albedo_a: f32,
     /// An alpha_blend part whose authored opacity is 0 at rest (albedo_alpha source x albedo_color.a = 0):
     /// the Warthog/Mongoose `*_tire_blur` motion-blur wheel skins. The engine animates albedo_color.a
     /// from wheel speed; a parked vehicle never shows them -- HMS drew them OPAQUE over the treads.
     hidden_at_rest: bool,
 }
 
-/// Decode `ObjMat` for shader `sh` of an open render model. `obj_type` = obje +0 type
-/// (the lane is enabled for 0 biped / 1 vehicle / 2 weapon / 3 equipment; Forge scenery/crates keep the
-/// existing object lane untouched).
+impl Default for ObjMat {
+    /// Every lane off, except `albedo_a` -- an UNDECODED material contributes no `albedo_color.a`
+    /// factor to the engine specular mask, so its neutral value is 1.0, not 0.0.
+    fn default() -> Self {
+        Self {
+            valid: false, mat: false, mm: 0, mm_set: false, spec: 0.0, rough: 0.0, rough_lut: 0.0,
+            spec2: [0.0; 4], spec_rgb: [0.0; 4], fres_rgb: [0.0; 4], env_ctl: [0.0; 4], menv: 0.0,
+            area: 0.0, env_opt: 0, env_cube: 0, env_lod: 0.0, detail: None, bump: None,
+            bump_detail: None, spec_mask_diffuse: false, albedo_a: 1.0, hidden_at_rest: false,
+        }
+    }
+}
+
+/// Decode `ObjMat` for shader `sh` of an open render model. `obj_type` = obje +0 type.
+///
+/// #objmat The material CONSTANTS and the ENVIRONMENT lane are decoded for EVERY object class: the
+/// engine links one `calc_material_<model>_ps` + one `calc_environment_map_<option>_ps` per SHADER
+/// TEMPLATE and never consults the object's class, so a crate's panel and a vehicle's panel running the
+/// same template are shaded by the same code. The authored detail / bump / bump_detail MAPS stay on the
+/// unit/item lane (0 biped / 1 vehicle / 2 weapon / 3 equipment) so a Forge piece's albedo and normals
+/// are untouched by this decode.
+#[cfg(test)]
+mod obj_specular_mask_tests {
+    use super::*;
+
+    /// The authored numbers this law was derived from (`forge_halo.map`, read off the render
+    /// models' own `ZhShaderConstants` + bitmaps):
+    ///   `for_forge_gen_panel_02_dark` (the coliseum wall / every Forge block panel) —
+    ///   specular_mask option = from_diffuse, base `for_forge_gen_panel_02_diffuse` mean a = 0.512,
+    ///   detail `for_metal_scratch_detail` mean a = 0.434, albedo_color.a = 1.0.
+    /// HMS used the BASE alpha alone, so its environment reflection and its analytical lobe both
+    /// ran 1/0.434 = 2.3x the engine's. Over the 46 Forge-shader population the dropped factor
+    /// (detail.a x albedo_color.a) averages 0.439.
+    #[test]
+    fn composed_albedo_alpha_is_base_times_detail_times_albedo_color() {
+        let engine = engine_albedo_alpha(0.512, 0.434, 1.0);
+        assert!((engine - 0.2222).abs() < 1e-3, "coliseum wall mask {engine}");
+        // The defect: the base alpha on its own is 2.3x that.
+        assert!((0.512 / engine - 2.304).abs() < 0.01, "ratio {}", 0.512 / engine);
+        // albedo_color.a is the third factor, not an afterthought: a panel that authors 0.1 is a
+        // tenth as glossy as its base alpha alone would say.
+        assert!((engine_albedo_alpha(0.5, 0.975, 0.1) - 0.04875).abs() < 1e-5);
+        // ...and the engine's own saturate caps the four Forge panels that author 2.0.
+        assert_eq!(engine_albedo_alpha(0.8, 0.9, 2.0), 1.0);
+        // A material with no detail map and no albedo tint is unchanged (1x1 white detail, a = 1).
+        assert_eq!(engine_albedo_alpha(0.37, 1.0, 1.0), 0.37);
+    }
+
+    /// The instance lanes that carry it. A Forge panel must come out as `spec_from_alpha == 2`
+    /// (from_diffuse + alpha-only detail) with its real albedo_color.a; the unit/item lane must
+    /// stay exactly as it was, because it still passes a blanket from_diffuse flag.
+    #[test]
+    fn object_mask_lanes_route_each_class_the_way_the_engine_reads_it() {
+        // Forge panel: from_diffuse, detail map bound, albedo_color.a = 1.
+        assert_eq!(obj_mask_lanes(true, false, true, true, 1.0), (2.0, 1.0));
+        // Forge panel that authors albedo_color.a = 2 (ff_plat tech panels).
+        assert_eq!(obj_mask_lanes(true, false, true, true, 2.0), (2.0, 2.0));
+        // from_diffuse but no detail_map authored -> plain from_diffuse, no alpha-only flag (so
+        // mesh_shade leaves `detail_c` alone and the albedo is untouched).
+        assert_eq!(obj_mask_lanes(true, false, true, false, 0.4), (1.0, 0.4));
+        // no_specular_mask: the engine mask is a flat 1.0 and the detail alpha is irrelevant.
+        assert_eq!(obj_mask_lanes(true, false, false, true, 0.5), (0.0, 0.5));
+        // Unit/item (vehicle, weapon, equipment) and the no-material-lane fallback: unchanged.
+        assert_eq!(obj_mask_lanes(true, true, true, true, 0.0), (1.0, 1.0));
+        assert_eq!(obj_mask_lanes(false, false, true, true, 0.25), (1.0, 1.0));
+    }
+
+    /// An undecoded material contributes NO albedo_color.a factor, so its neutral value is 1.0.
+    /// (A derived `Default` would have made it 0.0 and killed the specular mask of every part
+    /// whose shader HMS cannot decode.)
+    #[test]
+    fn undecoded_material_has_a_neutral_albedo_alpha() {
+        assert_eq!(ObjMat::default().albedo_a, 1.0);
+        assert_eq!(engine_albedo_alpha(0.6, 1.0, ObjMat::default().albedo_a), 0.6);
+    }
+}
+
+/// #objmask The engine's composed albedo ALPHA — `albedo.hlsl_include:121`
+/// `albedo.w = base.w * detail.w * albedo_color.w`, clamped by `entry_points.hlsl_include:102`
+/// `albedo = saturate(albedo)` — which `specular_mask.hlsl_include`
+/// `calc_specular_mask_from_diffuse_ps` returns VERBATIM as the material's `specular_mask`. That
+/// mask scales the analytical Cook-Torrance lobe (`calc_analytical_specular_multiplier`) and the
+/// environment reflection (`cook_torrance_core.hlsl_include:269`
+/// `envmap_specular_reflectance_and_roughness.xyz = svmp.b * specular_mask * svmp.r`) alike, so
+/// dropping either of the last two factors over-reflects the whole object by their product. The
+/// CPU mirror of mesh_shade's `albedo_w`; kept here so the law can be pinned without a GPU.
+fn engine_albedo_alpha(base_a: f32, detail_a: f32, albedo_color_a: f32) -> f32 {
+    (base_a * detail_a * albedo_color_a).clamp(0.0, 1.0)
+}
+
+/// #objmask The two instance lanes that carry that mask to `mesh_shade` for one object part:
+/// `(spec_from_alpha, fine_xform.y)`.
+///
+/// * `spec_from_alpha` — 0 = `no_specular_mask` (engine mask is a flat 1.0), 1 = `from_diffuse`,
+///   2 = `from_diffuse` AND the bound `detail_tex` is to be read for its ALPHA only (the part's
+///   albedo is composed CPU-side and must not pick up the detail colour).
+/// * `fine_xform.y` — the authored `albedo_color.a`. Held at 1.0 on the unit/item lane, which
+///   still passes a BLANKET `from_diffuse` flag rather than the part's own `specular_mask` option:
+///   multiplying an unknown-option mask by `albedo_color.a` would wrongly kill the plasma grenade
+///   body, which authors a = 0 (and whose real option is not known to that lane).
+fn obj_mask_lanes(mat_lane: bool, veh_lane: bool, spec_mask_diffuse: bool, detail_bound: bool, albedo_a: f32) -> (f32, f32) {
+    if !mat_lane { return (1.0, 1.0); }
+    if veh_lane { return (1.0, 1.0); }
+    let sfa = if !spec_mask_diffuse { 0.0 } else if detail_bound { 2.0 } else { 1.0 };
+    (sfa, albedo_a)
+}
+
 fn decode_obj_mat(native: &NativeDll, cache: CacheHandle, model: hms_native::ModelHandle, sh: i32, obj_type: u32) -> ObjMat {
     let mut m = ObjMat::default();
     if native.model_shader_class(model, sh) != "rmsh" { return m; }
@@ -469,7 +610,9 @@ fn decode_obj_mat(native: &NativeDll, cache: CacheHandle, model: hms_native::Mod
         m.hidden_at_rest = a <= 1e-4;
         return m;
     }
-    if !matches!(obj_type, 0 | 1 | 2 | 3) { return m; }
+    // #objmat `valid` (the full lane, maps included) stays unit/item-only; the constants + env lane
+    // below is decoded for every object class.
+    let unit_item = matches!(obj_type, 0 | 1 | 2 | 3);
     let Some(sc) = native.model_shader_constants(model, sh) else { return m };
     let g = |n: &str| sc.real(n).map(|v| v[0]).or_else(|| sc.scalar(n)).filter(|v| v.is_finite());
     let xf = |n: &str| sc.real(n).filter(|v| v.iter().all(|x| x.is_finite()) && v[0].abs() > 1e-6 && v[1].abs() > 1e-6);
@@ -478,14 +621,28 @@ fn decode_obj_mat(native: &NativeDll, cache: CacheHandle, model: hms_native::Mod
     // material_model digit 4: 1 cook_torrance / 2 two_lobe_phong / 5 organism carry the specular lanes;
     // 0 diffuse_only / 4 none get albedo + bump only.
     let mm = dg(4);
-    m.valid = true;
+    m.valid = unit_item;
+    m.mat = true; // #objmat per-part constants + env for every object class
     m.mm = mm.clamp(0, 15) as u8;
     m.spec_mask_diffuse = matches!(dg(3), 1 | 2);
+    // #objmask The engine's specular mask for a `specular_mask_from_diffuse` material is the COMPOSED
+    // albedo alpha, `base.a * detail.a * albedo_color.a` (albedo.hlsl_include:121), saturated
+    // (entry_points.hlsl_include:102) -- not the base alpha alone. Both of the missing factors are
+    // decoded for EVERY object class, like the rest of the #objmat constant lane.
+    m.albedo_a = sc.real("albedo_color").map(|v| v[3]).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(1.0);
+    // #objmat The authored detail/bump/bump_detail MAPS stay on the unit/item lane as COLOUR layers:
+    // binding a Forge piece's detail_map would move its albedo (x4.59 detail multiply) and its bump_map
+    // would move its normals, neither of which is what the specular / environment defect is about.
+    // #objmask the detail map is bound for every class all the same, because its ALPHA is half the
+    // engine's specular mask (`for_metal_scratch_detail` averages 0.434 over its texels); the upload
+    // flags it ALPHA-ONLY for the non-unit/item classes so their albedo stays exactly as it was.
     m.detail = { let t = bm("detail_map"); (t != 0).then(|| (t, xf("detail_map").unwrap_or([1.0, 1.0, 0.0, 0.0]))) };
-    if dg(1) != 0 {
-        m.bump = { let t = bm("bump_map"); (t != 0).then(|| (t, xf("bump_map").unwrap_or([1.0, 1.0, 0.0, 0.0]))) };
-        if matches!(dg(1), 2 | 3 | 4 | 6) {
-            m.bump_detail = { let t = bm("bump_detail_map"); (t != 0).then(|| (t, xf("bump_detail_map").unwrap_or([1.0, 1.0, 0.0, 0.0]))) };
+    if unit_item {
+        if dg(1) != 0 {
+            m.bump = { let t = bm("bump_map"); (t != 0).then(|| (t, xf("bump_map").unwrap_or([1.0, 1.0, 0.0, 0.0]))) };
+            if matches!(dg(1), 2 | 3 | 4 | 6) {
+                m.bump_detail = { let t = bm("bump_detail_map"); (t != 0).then(|| (t, xf("bump_detail_map").unwrap_or([1.0, 1.0, 0.0, 0.0]))) };
+            }
         }
     }
     if matches!(mm, 1 | 2 | 5 | 6) {
@@ -602,6 +759,231 @@ struct AnimParam { ty: i32, arg: String, period: f32, f: MapFn, colors: Option<(
 /// ends in lo3/hi3. Only single-sub periodic records reduce; anything else stays static.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct AnimPeriodic { kind: i32, period: f32, freq: f32, phase: f32, lo: f32, hi: f32, lo3: [f32; 3], hi3: [f32; 3] }
+
+/// #blade-anim The engine animated-parameter TYPE enum (render_method postprocess overlay
+/// `Type` @+0): the driven property of the rmt2 argument the +0x50 routing block names.
+const ANIM_TY_VALUE: i32 = 0;
+const ANIM_TY_COLOR: i32 = 1;
+const ANIM_TY_ALPHA: i32 = 8;
+
+/// #blade-anim HMS's assumed value for the engine OBJECT FUNCTION that drives an animated
+/// shader parameter (the overlay record's input string id; id 0 = driven by TIME, handled by the
+/// scroll/periodic lanes instead).
+///
+/// The shipped tag constants correspond to EVERY object function sitting at 0 — verified on the
+/// energy sword, where `sword_illum`'s `self_illum_intensity` is authored 10.0 and its mapping
+/// function gives f(`holstered` = 0) = 10.0, while `channel_a`'s alpha is authored 0.0 and gives
+/// f(`blade_activate` = 0) = 0.0. So the constants are the object's INERT state, and a viewer
+/// that only reads them draws a sword with its blades switched off, which is not how one ever
+/// appears in the game. The one function pinned here is the blade's activation: a Reach energy
+/// sword, lying in the world or carried, has both blades lit (`holstered` stays 0 = not stowed,
+/// which is what keeps that same intensity at its authored 10, and `fx_camo` stays 0 = the
+/// blade's camo-only colour ramp stays at its un-camouflaged end).
+fn object_function_state(imports: &HashMap<String, String>, name: &str) -> f32 {
+    // The object's own block maps the EXPORT the shader names to the engine INPUT that drives
+    // it; a name that is not in the block is a BUILT-IN object function and is its own input.
+    object_function_input_state(imports.get(name).map(String::as_str).unwrap_or(name))
+}
+
+/// #blade-anim The value HMS gives an engine object-function INPUT. A viewer draws objects
+/// present, intact, powered and UNUSED — nobody is driving them, nothing is stowed, nothing is
+/// camouflaged — so only the inputs that describe "this object exists and works" are 1.
+/// Everything else is 0, which is also the state the shipped shader constants were snapshotted
+/// in. Each entry below is a real import read out of a shipped object's function block
+/// (HMS_VEHMAT prints them as `objfn[]`).
+fn object_function_input_state(import: &str) -> f32 {
+    match import {
+        // `one` is the engine's literal constant-one input (the pickup's `color`, a truck's
+        // `blip1`/`scanner`, the drop shield's `random_pulse`).
+        "one" => 1.0,
+        // the object is intact and operable: an energy sword in the world is turned on
+        // (`blade_activate` <- `turned_on`), an armour-ability pickup is charged (`energy`).
+        "turned_on" | "ready" | "alive" | "electrical_power" | "energy" => 1.0,
+        // `active_camouflage` is the camo system's VISIBILITY, not the amount of camo: 1 for an
+        // object in plain sight, falling to 0 as it cloaks. The sword's own function block is
+        // what says so -- it exports `blade_effects` and `turning_on_effects` SCALED BY
+        // `fx_camo` (which imports `active_camouflage`), and scaling a sword's normal blade
+        // effects by "how camouflaged am I" would show them only while cloaked. Reading it the
+        // other way round left all three of the blade's halogram layers switched off, i.e. a
+        // sword with no blade.
+        "active_camouflage" => 1.0,
+        // Everything else is the UNUSED state, and it is what the tags describe: `stowed` (not on
+        // someone's back), `active_camouflage` (no camo, so a sword's camo-only blade layers stay
+        // dark), `driver_seat_power` / `driver_seat_occupied` / `engine_power` / `jump` /
+        // `in_reverse` / `compass` (nobody is driving, so a parked Forge truck's headlights,
+        // brake lights and dash are off, which is what one looks like in Forge).
+        //
+        // `turn_off_with` and `scale_by` are NOT applied: resolving them needs the other
+        // function's value and they agree with the import on every shipped case checked here
+        // (the sword's blade gates on `electrical_power`, which is on).
+        _ => 0.0,
+    }
+}
+
+/// #blade-anim The object's FUNCTION BLOCK (obje +0xEC, 64 B entries) as `export -> import`.
+/// A render_method's animated parameter names an EXPORT as its input; the IMPORT is the engine
+/// input behind it, and that is what decides whether HMS should draw the effect on or off.
+fn object_function_imports(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    if obj_tag == 0 || obj_tag == 0xFFFF_FFFF { return out; }
+    let rd = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let Some(m) = native.tag_meta(cache, obj_tag, 0xEC, 8) else { return out };
+    let (cnt, ptr) = (rd(&m, 0), rd(&m, 4));
+    if cnt == 0 || cnt > 256 { return out; }
+    let Some(b) = native.tag_ptr_bytes(cache, ptr, cnt * 64) else { return out };
+    for i in 0..cnt as usize {
+        let e = &b[i * 64..i * 64 + 64];
+        let (imp, exp) = (rd(e, 4), rd(e, 8));
+        if let (Some(i), Some(x)) = (native.string_id(cache, imp), native.string_id(cache, exp)) {
+            if !x.is_empty() { out.insert(x, i); }
+        }
+    }
+    out
+}
+
+/// #elite-knife The object function block and the event-gate test, reachable from a test or an
+/// offline audit so a gate scores the SAME code the renderer runs.
+pub(crate) fn object_function_imports_of(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> HashMap<String, String> {
+    object_function_imports(native, cache, obj_tag)
+}
+
+/// See [`shader_animation_event_gated`].
+pub(crate) fn shader_animation_event_gated_of(
+    native: &NativeDll,
+    cache: CacheHandle,
+    imports: &HashMap<String, String>,
+    model: hms_native::ModelHandle,
+    sh: i32,
+) -> bool {
+    shader_animation_event_gated(native, cache, imports, model, sh)
+}
+
+/// #blade-anim The EFFECTIVE value of the animated parameter of type `ty` driving the rmt2
+/// argument `arg`: the decoded mapping function sampled at its driving object function's state
+/// (`object_function_state`). `None` when the parameter is not animated, or is driven by time
+/// (input sid 0) — a time-driven parameter is a scroll / periodic and has its own lanes.
+///
+/// (`c_function_definition::evaluate`, reach_tag_test 0x1403F2C50: value = f(input), and the
+/// function's own output range already carries the authored magnitude, so the result REPLACES
+/// the constant rather than scaling it.)
+fn anim_param_at_state(native: &NativeDll, cache: CacheHandle, imports: &HashMap<String, String>, params: &[AnimParam], arg: &str, ty: i32) -> Option<f32> {
+    let p = params.iter().find(|p| p.ty == ty && p.arg == arg)?;
+    if p.input == 0 { return None; }
+    let name = native.string_id(cache, p.input).unwrap_or_default();
+    let v = p.f.eval(object_function_state(imports, &name));
+    v.is_finite().then_some(v)
+}
+
+/// #blade-anim Print-only: every animated shader parameter of an object's render model, with the
+/// OBJECT FUNCTION that drives it, the import behind that function and the value HMS gives it at
+/// rest. This is the whole "is this glow on or off" decision in one dump, and it needs no GPU --
+/// which is how the Elite's wrist blade was settled.
+pub(crate) fn dump_object_anim_params(native: &NativeDll, cache: CacheHandle, obj_tag: u32) {
+    let mode = native.resolve_mode(cache, obj_tag);
+    let imports = object_function_imports(native, cache, obj_tag);
+    println!("ANIMPARAM obj={obj_tag:#x} '{}' mode={mode:#x}", native.tag_name(cache, obj_tag).unwrap_or_default());
+    let mut fns: Vec<(&String, &String)> = imports.iter().collect();
+    fns.sort();
+    for (exp, imp) in fns {
+        println!("   objfn export='{exp}' import='{imp}' -> state {:.3}", object_function_input_state(imp));
+    }
+    let Ok(model) = native.open_model(cache, mode) else { println!("   (no model)"); return };
+    let mut shaders: Vec<i32> = Vec::new();
+    for i in 0..native.model_submesh_count(model) {
+        if let Some(x) = native.model_submesh(model, i) {
+            if !shaders.contains(&x.shader_index) { shaders.push(x.shader_index); }
+        }
+    }
+    shaders.sort();
+    for sh in shaders {
+        let stag = native.model_shader_tag(model, sh);
+        if stag < 0 { continue }
+        let names: Vec<String> = native.model_shader_constants(model, sh)
+            .map(|c| c.dump_args().into_iter().map(|a| a.1).collect()).unwrap_or_default();
+        let params = shader_animated_params(native, cache, stag as u32, &names);
+        if params.is_empty() { continue }
+        let tm = native.model_shader_template_tag(model, sh);
+        println!("   shader[{sh}] class={} '{}'", native.model_shader_class(model, sh), native.tag_name(cache, stag as u32).unwrap_or_default());
+        println!("      template '{}'", if tm >= 0 { native.tag_name(cache, tm as u32).unwrap_or_default() } else { String::new() });
+        if let Some(sc) = native.model_shader_constants(model, sh) {
+            for (i, n, v, _) in sc.dump_args() {
+                if n.is_empty() { continue }
+                if !(n.starts_with("channel_") || n.contains("self_illum") || n.contains("albedo_color") || n.contains("alpha")) { continue }
+                println!("      const arg[{i:2}] {n:<28} = [{:.4},{:.4},{:.4},{:.4}]", v[0], v[1], v[2], v[3]);
+            }
+        }
+        for pm in &params {
+            let input = native.string_id(cache, pm.input).unwrap_or_default();
+            let (label, state) = if pm.input == 0 {
+                ("<time>".to_string(), f32::NAN)
+            } else {
+                (input.clone(), object_function_state(&imports, &input))
+            };
+            let val = if state.is_finite() { pm.f.eval(state) } else { f32::NAN };
+            println!("      anim type={} arg='{}' input='{label}' (import='{}') state={state:.3} -> value={val:.4} period={:.3}",
+                pm.ty, pm.arg, imports.get(&input).cloned().unwrap_or_else(|| input.clone()), pm.period);
+        }
+    }
+    native.close_model(model);
+}
+
+/// #elite-knife Is this material switched on only by an ANIMATION EVENT, and therefore not
+/// drawn at rest?
+///
+/// A render_method's animated parameters name one of the OBJECT's exported functions as their
+/// input, and the object's own function block (`object_function_imports`) says which engine
+/// INPUT drives that export. When every non-time parameter of a material resolves to
+/// `animation_event_function_*` -- the engine's per-animation EVENT channel, raised by a frame
+/// event inside a clip and zero at every other moment -- the material is an effect that exists
+/// only while such an event is up.
+///
+/// The Elite's two energy daggers are exactly that, and nothing else about them is hideable:
+/// they are six halogram submeshes baked into the Elite's single `body` mesh, so there is no
+/// knife node, no knife marker, no region, no permutation and no attached prop to switch off
+/// (the Spartan's knife, by contrast, IS a prop at a `knife` marker). Every animated parameter
+/// on all six -- `self_illum_intensity`, `self_illum_color` and the activation gradient's U
+/// translation -- is driven by the Elite's `blade_left_on` / `blade_right_on` functions, which
+/// its function block imports from `animation_event_function_a` / `_b`. The blades ignite for
+/// the `eve_*` / `evs_*` stab-and-swipe sync actions and are not there the rest of the time.
+///
+/// A parameter driven by TIME is a scroll, not a gate, and is ignored here; a material with any
+/// other non-time driver is NOT event-gated, so this can never hide a shield, a visor or a
+/// vehicle light.
+fn shader_animation_event_gated(
+    native: &NativeDll,
+    cache: CacheHandle,
+    imports: &HashMap<String, String>,
+    model: hms_native::ModelHandle,
+    sh: i32,
+) -> bool {
+    let stag = native.model_shader_tag(model, sh);
+    if stag < 0 { return false; }
+    let names: Vec<String> = native
+        .model_shader_constants(model, sh)
+        .map(|c| c.dump_args().into_iter().map(|a| a.1).collect())
+        .unwrap_or_default();
+    let params = shader_animated_params(native, cache, stag as u32, &names);
+    let mut gated = 0usize;
+    for p in &params {
+        if p.input == 0 { continue; } // time-driven: a scroll, not a gate
+        let export = native.string_id(cache, p.input).unwrap_or_default();
+        let import = imports.get(&export).cloned().unwrap_or(export);
+        if import.starts_with("animation_event_function") { gated += 1; } else { return false; }
+    }
+    gated > 0
+}
+
+/// #blade-anim The colour form of `anim_param_at_state`: a COLOR record carries a c0 -> c3 ramp
+/// that the function's output interpolates.
+fn anim_color_at_state(native: &NativeDll, cache: CacheHandle, imports: &HashMap<String, String>, params: &[AnimParam], arg: &str) -> Option<[f32; 3]> {
+    let p = params.iter().find(|p| p.ty == ANIM_TY_COLOR && p.arg == arg)?;
+    if p.input == 0 { return None; }
+    let (c0, c1) = p.colors?;
+    let name = native.string_id(cache, p.input).unwrap_or_default();
+    let t = p.f.eval(object_function_state(imports, &name)).clamp(0.0, 1.0);
+    let c = [c0[0] + (c1[0] - c0[0]) * t, c0[1] + (c1[1] - c0[1]) * t, c0[2] + (c1[2] - c0[2]) * t];
+    c.iter().all(|v| v.is_finite()).then_some(c)
+}
 
 /// Reduce the animated parameter of type `ty` (0 = value, 1 = colour) driving `param`
 /// to its periodic spec (see AnimPeriodic). The Forge flashing lights animate self_illum_color (red ->
@@ -796,6 +1178,29 @@ fn halogram_function_driven(native: &NativeDll, cache: CacheHandle, model: hms_n
     let shader_tag = native.model_shader_tag(model, sh);
     let params = shader_animated_params(native, cache, if shader_tag >= 0 { shader_tag as u32 } else { 0 }, &names);
     params.iter().any(|p| p.input != 0 && matches!(p.ty, 0 | 1) && (p.arg == "self_illum_intensity" || p.arg == "self_illum_color"))
+}
+
+/// #blade-anim The authored UV SCROLL of one model shader's `param` map, in uv/s, from that
+/// shader tag's own animated-parameter records (TranslationX/Y with a TIME input).
+///
+/// The engine lanes that already consume a scroll (the forcefield / palettized-plasma family)
+/// read it through `decode_forcefield_extra`; a plain halogram has no `FfExtra` and was getting
+/// nothing, so the energy sword's blade — whose `energy_sword_blade_activation` layer authors a
+/// **5 s TranslationY on `base_map`** and whose plasma layer authors four more on its noise and
+/// overlay maps — drew frozen. Same decode, same `anim_scroll_rate`, just reachable without the
+/// forcefield record.
+fn model_shader_anim_scroll(
+    native: &NativeDll,
+    cache: CacheHandle,
+    model: hms_native::ModelHandle,
+    sh: i32,
+    param: &str,
+) -> [f32; 2] {
+    let Some(sc) = native.model_shader_constants(model, sh) else { return [0.0, 0.0] };
+    let names: Vec<String> = sc.dump_args().into_iter().map(|a| a.1).collect();
+    let shader_tag = native.model_shader_tag(model, sh);
+    let params = shader_animated_params(native, cache, if shader_tag >= 0 { shader_tag as u32 } else { 0 }, &names);
+    anim_scroll_rate(&params, param)
 }
 
 /// The RESTING value of an object's exported function `export_sid` (obje +0xEC functions
@@ -1271,6 +1676,182 @@ fn rmsh_template_alpha_test_off(shader_class: &str, template: Option<&str>) -> b
         && template.map_or(false, |n| (n.contains("shader_templates") || n.contains("custom_templates")) && rm_template_digits(n).get(2) == Some(&0))
 }
 
+/// The `shield` / `one_way` / `oneway` TAG-PATH hint routes energy panels (shield doors, one-way
+/// doors) to the alpha-blend pass. It is a NAME heuristic, so it may only ever confirm what the
+/// tag already says: a part whose authored `blend_mode` is `opaque` (0) stays opaque whatever its
+/// path spells. Every genuine Reach energy panel is an rmhg halogram/forcefield (`ff_shield_door_*`,
+/// `ff_one_way_door_*`, `dlc_hangar_shield*`, the `cov_portable_shield` pane: blend = additive) and
+/// is routed by `uff`/`uhalo` before this is even consulted; the only models the bare name rule ever
+/// reached were SOLID rmsh geometry that merely has "shield" in its path — the Forge heavy barrier
+/// (`dlc_invasion_heavy_shield`, seven opaque parts) and the solid base/emitter housing of
+/// `cov_portable_shield` — which it drew see-through.
+fn shield_name_hint(model_tag_name: &str) -> bool {
+    model_tag_name.contains("shield") || model_tag_name.contains("one_way") || model_tag_name.contains("oneway")
+}
+
+fn shield_name_forces_blend(model_tag_name: &str, part_blend: u32) -> bool {
+    shield_name_hint(model_tag_name) && part_blend != 0
+}
+
+/// #sword-blade Which of the five DRAW LANES one decoded object part takes. `Opaque` and `Cutout`
+/// are solid, depth-writing passes; `Additive`, `HoloSolid` and `Blend` are the transparent
+/// passes, drawn after the opaque scene, depth-tested but never depth-written, sorted
+/// back-to-front.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartLane {
+    Opaque,
+    Cutout,
+    /// One/One additive glow (fs_holo) — energy blades, force fields, hill globes, glow overlays.
+    Additive,
+    /// Alpha-blended "solid" marker holo (fs_holo_solid) — spawn/hill/kill-safe SHAPES.
+    HoloSolid,
+    /// Alpha-blend family (fs_blend*), routed further by the authored BLEND_TYPE — glass panes.
+    Blend,
+}
+
+impl PartLane {
+    /// True for the three lanes that need a transparent pipeline. A build that cannot offer one
+    /// has to fold these into `Opaque`, which is exactly what drew a held energy sword's five
+    /// additive blade layers as a solid grey blade.
+    pub fn is_transparent(self) -> bool {
+        matches!(self, PartLane::Additive | PartLane::HoloSolid | PartLane::Blend)
+    }
+}
+
+/// #sword-blade Everything the lane rule reads about ONE decoded object part. Gathered into a
+/// struct so the rule has a single definition that both the rebuild and the gates use — it used
+/// to be two inline expressions ~500 lines apart inside `maybe_rebuild`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PartLaneIn {
+    /// Authored render_method BLEND_TYPE (0 opaque, 1 add, 2 mul, 3 dbl_mul, 4 alpha, 5
+    /// add_src×srca, 6 premul, 7 max, 8 add_src×dsta).
+    pub blend: u32,
+    /// The part alpha-tests (foliage cutout).
+    pub alpha_test: bool,
+    /// The part has a self-illum / emissive map.
+    pub has_emissive: bool,
+    /// Its self-illum is CHANGE-COLOUR driven (team-tinted marker lane).
+    pub emis_cc: bool,
+    /// Its shader is an `rmhg` shader_halogram.
+    pub is_halo: bool,
+    /// It decoded through the engine FORCEFIELD lane.
+    pub is_ff: bool,
+    /// Its shader is an `rmgl` glass tag.
+    pub is_glass: bool,
+    /// The forcefield lane decoded its full engine record (`FfExtra`).
+    pub ff_extra: bool,
+    /// rmt2 `self_illumination` option (2 = 3_channel composite, 4 = from_diffuse, 10 = the
+    /// forcefield/palettized lane).
+    pub si_mode: u8,
+    /// This object is a NAMED marker (spawn point, hill beacon, objective holo).
+    pub name_holo: bool,
+    /// A forced-colour marker (kill volume, safe volume, hill marker).
+    pub marker_forced: bool,
+    /// The `shield` / `one_way` tag-path hint fires AND the part is not authored opaque.
+    pub shield_name_blend: bool,
+}
+
+impl PartLaneIn {
+    /// The engine halogram lane decoded a full record for this part.
+    pub fn ff_engine(&self) -> bool { self.is_ff && self.ff_extra }
+    /// Holographic: an additive-blend emissive overlay, a change-colour self-illum part of a
+    /// MARKER object, an `rmhg` halogram, a forcefield, or a forced-colour marker shape.
+    pub fn unit_holo(&self) -> bool {
+        self.is_ff
+            || (self.has_emissive && matches!(self.blend, 1 | 4 | 5 | 6 | 7 | 8))
+            || (self.emis_cc && self.name_holo)
+            || self.is_halo
+            || self.marker_forced
+    }
+    /// A MARKER SHAPE (spawn, hill/objective beacon, kill/safe shell) whose translucent
+    /// silhouette must stay readable at every angle.
+    pub fn solid_marker(&self) -> bool { self.name_holo || self.marker_forced }
+    /// A glass pane (`rmgl`, or a non-opaque part the shield/one_way path hint confirms).
+    pub fn unit_glass(&self) -> bool {
+        !self.unit_holo() && (self.is_glass || self.shield_name_blend)
+    }
+    /// fs_holo lane 9: an `rmsh` part authored ADDITIVE whose self-illum is a 3-channel composite
+    /// (`sword_illum`). Its albedo_color is 0, so the part IS its self-illum composite.
+    pub fn lane_illum_only(&self) -> bool {
+        self.unit_holo() && !self.is_halo && !self.is_ff && !self.emis_cc && !self.solid_marker()
+            && matches!(self.blend, 1 | 5) && self.si_mode == 2 && self.has_emissive
+    }
+    /// fs_holo lane 10: an `rmhg` HALOGRAM whose self_illumination option is from_diffuse and for
+    /// which no engine halogram lane was decoded.
+    pub fn lane_halo_from_diffuse(&self) -> bool {
+        self.unit_holo() && self.is_halo && self.si_mode == 4 && !self.ff_engine()
+    }
+    /// The lane this part is drawn in. `ff_engine_marker` and `forced_cc` are the two facts that
+    /// are only known once the forcefield record's lanes have been read (an option-11 engine
+    /// marker keeps the additive pass; a forced-colour marker keeps the solid one).
+    pub fn lane(&self, ff_engine_marker: bool, forced_cc: bool) -> PartLane {
+        if self.unit_holo() {
+            if (self.solid_marker() && !(ff_engine_marker && !forced_cc))
+                || (!self.ff_engine() && matches!(self.blend, 4 | 6))
+            {
+                PartLane::HoloSolid
+            } else {
+                PartLane::Additive
+            }
+        } else if self.unit_glass() {
+            PartLane::Blend
+        } else if self.alpha_test {
+            PartLane::Cutout
+        } else {
+            PartLane::Opaque
+        }
+    }
+}
+
+#[cfg(test)]
+mod shield_name_hint_tests {
+    use super::*;
+
+    // The real Reach render-model tag paths (forge_halo palette, `--dump-parts`).
+    const HEAVY_BARRIER: &str = "levels\\multi\\dlc\\objects\\dlc_invasion_heavy_shield\\dlc_invasion_heavy_shield";
+    const COV_PORTABLE: &str = "objects\\props\\covenant\\cov_portable_shield\\cov_portable_shield";
+    const SHIELD_DOOR: &str = "objects\\levels\\forge\\ff_shield_door_large\\ff_shield_door_large";
+    const ONE_WAY_DOOR: &str = "objects\\levels\\forge\\ff_one_way_door_garage\\ff_one_way_door_garage";
+    const HANGAR_SHIELD: &str = "objects\\levels\\multi\\dlc\\dlc_slayer\\dlc_hangar_shield\\dlc_hangar_shield";
+    const JERSEY_BARRIER: &str = "objects\\gear\\human\\industrial\\jersey_barrier\\jersey_barrier";
+
+    #[test]
+    fn the_heavy_barrier_never_reaches_the_blend_pass() {
+        // `dlc_invasion_heavy_shield` is the Forge "heavy barrier": seven plain opaque rmsh parts
+        // (`_0_2_0_1_1_0_…` / `_7_2_0_1_1_1_…`, blend_mode = opaque 0) over real concrete / wire /
+        // bolt / metal-tile / metal-trim / frigate-panel diffuse maps. It matches "shield" by tag
+        // path, which used to push every part into the alpha-blend lane -> almost invisible.
+        assert!(shield_name_hint(HEAVY_BARRIER), "the path really does contain 'shield'");
+        for (part, blend) in [0u32; 7].iter().enumerate() {
+            assert!(!shield_name_forces_blend(HEAVY_BARRIER, *blend),
+                "heavy-barrier part {part} is authored opaque and must stay on the opaque lane");
+        }
+        // Same class of bug: the SOLID base / emitter housing of the covenant portable shield
+        // (parts 0..2, blend_mode = opaque). Its energy pane (parts 3..5) is rmhg and is routed
+        // by the halogram/forcefield lane long before this rule is consulted.
+        assert!(!shield_name_forces_blend(COV_PORTABLE, 0));
+    }
+
+    #[test]
+    fn authored_translucent_shield_panes_still_blend() {
+        // Every genuine energy panel is an rmhg halogram authored ADDITIVE (blend 1).
+        for nm in [SHIELD_DOOR, ONE_WAY_DOOR, HANGAR_SHIELD, COV_PORTABLE] {
+            assert!(shield_name_forces_blend(nm, 1), "{nm} pane must keep its translucent route");
+        }
+        // alpha_blend (4) / pre-multiplied (6) / the 0xFF "unresolved" sentinel keep it too.
+        assert!(shield_name_forces_blend(SHIELD_DOOR, 4));
+        assert!(shield_name_forces_blend(SHIELD_DOOR, 6));
+        assert!(shield_name_forces_blend(SHIELD_DOOR, 0xFF));
+    }
+
+    #[test]
+    fn a_model_without_the_name_hint_is_never_routed_by_this_rule() {
+        assert!(!shield_name_hint(JERSEY_BARRIER));
+        assert!(!shield_name_forces_blend(JERSEY_BARRIER, 0));
+        assert!(!shield_name_forces_blend(JERSEY_BARRIER, 4));
+    }
+}
+
 #[cfg(test)]
 mod foliage_alpha_tests {
     // The engine alpha-test rule on the real template names seen in the caches.
@@ -1386,10 +1967,21 @@ struct DecodedModel {
     obj_parts: Vec<ObjPart>,
     /// The object's hlmt model-variant Name sids in block order (index = the bit in
     /// `ObjPart::vbits`; [0] = the engine default). Empty for models without hlmt variants.
+    /// #damage Entries past the real variants are the (variant, damage state) SYNTHETIC entries
+    /// (same sid, `variant_states[i]` = 1..4) - see `hlmt_variants`.
     variant_sids: Vec<u32>,
+    /// #damage Parallel to `variant_sids`: the damage state of each entry (0 = the variant itself).
+    variant_states: Vec<u8>,
+    /// #skin #load-scope True when this decode's part split DEPENDS on the per-player armour
+    /// variant list — i.e. at least one player variant actually changes a region of this model.
+    /// Only the player bipeds do. Changing the list therefore invalidates these models and
+    /// nothing else; see `SceneController::set_player_variants`.
+    uses_player_variants: bool,
     /// whole-model shader_halogram flag (single-material holograms — e.g. the armor-ability
     /// equipment holo funnel). Routes the single `tex` path to the translucent additive holo pass.
     is_halo: bool,
+    /// #elite-knife whole-model form of `ObjPart::event_gated`.
+    event_gated: bool,
     /// whole-model FORCEFIELD (single-material shield wall/door: rmhg palettized_plasma). The
     /// per-part forcefield detection only runs for MULTI-material models; a single-material shield
     /// needs these dec-level fields or it renders as an opaque, static, wrongly-textured surface.
@@ -1574,6 +2166,11 @@ struct DecodedModel {
     mat_rough: f32,
     /// env-cubemap reflection weight (`environment_map_specular_contribution`). 0 = none.
     mat_env: f32,
+    /// Authored `diffuse_coefficient`: the engine multiplies the whole DIFFUSE light (lightmap +
+    /// analytical + simple lights) by it before the albedo multiply — 435 of the 565 lightmapped
+    /// BSP pixel shaders in the Sapien capture read it, and Ivory authors 2.0 on its wood/marble
+    /// floors and 0.0 on the recessed light panels. 1.0 = the templates that do not declare it.
+    mat_dcoef: f32,
     /// MAT-31: the `material_texture` bitmap tag (usage "material_texture") when the material's rmt2
     /// binds one (= `use_material_texture` compiled for that variant). 0 / 0xFFFFFFFF = none → no
     /// per-texel override. When resolved, its view binds at material_bgl binding 14 and mesh_shade
@@ -2136,6 +2733,16 @@ struct ProbeVmf {
 /// Engine defaults when the map has no chmt tag / the type is out of range
 /// (sub_1407E9430: v7 = -1 min luminance, v9 = 0 max contrast, 2.0 bounce-to-ambient, 1.0 bounce scale).
 const CHMT_DEFAULT: [f32; 5] = [-1.0, 0.0, 0.0, 2.0, 1.0];
+/// #fp-light Every CONCRETE tag group that derives from `obje`, i.e. every group whose first 16
+/// meta bytes really are `object_struct_definition` (runtime object type, secondary flags, flags,
+/// bounding radius). Read out of the engine's own reflection data (`reverseme tagdefs
+/// reach_tag_test.exe`, the `parent` column: `bipd`/`gint` <- `unit`, `vehi` <- `unit`,
+/// `weap`/`eqip` <- `item`, `ctrl`/`mach`/`term` <- `devi`, the rest directly off `obje`); the
+/// abstract parents `obje`/`unit`/`item`/`devi` are never cache tags themselves.
+const OBJECT_TAG_CLASSES: [&str; 14] = [
+    "bipd", "vehi", "weap", "eqip", "term", "proj", "scen", "mach", "ctrl", "ssce", "bloc", "crea",
+    "gint", "efsc",
+];
 impl Default for ProbeVmf {
     fn default() -> Self {
         ProbeVmf { dom_dir: [0.0; 3], dom_rgb: [0.0; 3], fill_rgb: [0.0; 3], bandwidth: 0.0, mask: 0.0, fill_dir: [0.0; 3],
@@ -3618,6 +4225,13 @@ mod bsp_warn_tests {
     }
 }
 
+/// #unresolved Models whose decode failure was already reported (per process, by mode tag).
+static UNRESOLVED_WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<u32>>> = std::sync::OnceLock::new();
+/// #unresolved Overlay colours of an object whose render model could not be decoded: magenta, so it
+/// can never be mistaken for the orange hidden-block hull (which the game really hides).
+const UNRESOLVED_SOLID: [f32; 4] = [0.95, 0.20, 0.95, 0.28];
+const UNRESOLVED_LINE: [f32; 3] = [1.0, 0.30, 1.0];
+
 pub struct SceneController {
     native: Arc<NativeDll>,
     cache: Option<CacheHandle>,
@@ -3662,6 +4276,50 @@ pub struct SceneController {
     /// per-datum visual scale multiplier for offline objects (forge "scale" label →
     /// X330 spawn_seq). Applied in maybe_rebuild's object matrix; default 1.0 when absent.
     obj_scales: HashMap<u32, f32>,
+    /// #vehicle-ride  Per-datum WORLD TRANSFORM OVERRIDE: draw this placement somewhere other
+    /// than where the variant puts it, without touching the variant.
+    ///
+    /// **This is the lane that lets a RIDDEN vehicle be the real object.** Test mode used to hide
+    /// the placement and draw a fresh actor built from the tag in its place, which threw away
+    /// everything that lives on the PLACEMENT rather than the tag — reported as *"it gets in it
+    /// and it's basically spawning a new one so it doesn't keep the colors and everything of the
+    /// original vehicle at all"*, and the colour is only the visible one of six (team, variant,
+    /// scale, shadow and damage were wrong too). With an override the same instance is simply
+    /// drawn elsewhere, so there is nothing to copy and nothing to forget.
+    ///
+    /// It is a RENDER-TIME displacement and nothing else: `last_objects`, selection, the panels
+    /// and the collision gather all keep seeing the object where the user put it, and the user's
+    /// unsaved variant is never written. Empty on every frame but a ride, and an empty map is
+    /// bit-for-bit the old behaviour.
+    ///
+    /// # NOT YET WIRED TO THE RIDE, and the reason is a real finding
+    ///
+    /// **An instance in this pipeline is a STATIC mesh.** The ride's actor lane is the only path
+    /// that poses a vehicle's own animation — the wheels rolling, the steering turning, the
+    /// vehicle's `any:idle` — because posing needs a skinned palette per frame and this pipeline
+    /// emits none. So moving the ride onto this lane would fix the appearance and silently
+    /// un-animate the vehicle, which trades one report for a worse one. The lane is kept because
+    /// it is the right shape, it is inert while the map is empty, and it is what a per-datum
+    /// POSED instance would be built on; the ride's appearance is carried on the actor instead.
+    /// See the ride report for the exact wiring on both routes.
+    obj_transform: HashMap<u32, Mat4>,
+    /// #iscale per-TAG engine GROUND SCALE for the item tags of this cache (`weap` / `eqip`),
+    /// built once at `open_cache`. An item lying in the world is drawn at `item +0x1D0
+    /// ground scale` (1.3 on nearly every Reach weapon, 2.0 on the bomb and the skull): the
+    /// engine applies it in `item_update_scale(item, NONE)` the moment the object is placed.
+    /// Absent = 1.0. INDEPENDENT of `obj_scales`, which is the community SCALED label — the
+    /// two multiply, so turning "Scaled objects" off does not shrink a weapon back below the
+    /// size the tag asks for.
+    item_ground_scale: HashMap<u32, f32>,
+    /// #skin The change colours to draw the NEXT `build_actor_meshes` with: `[primary, secondary]`
+    /// LINEAR RGB. A recorded Theater player wore two colours out of Reach's armoury
+    /// (`matg` "profile colors"); they ride the same `four_change_color` masks the tag's own
+    /// authored defaults do, so setting this replaces `DecodedModel::cc_default` for that one
+    /// build. `None` = the model's authored default colours (every other object).
+    actor_cc: Option<[[f32; 3]; 2]>,
+    /// #damage per-datum DISPLAYED damage state (1 minor .. 4 destroyed; absent = default), the
+    /// DAMAGE pseudo-flag. Selects the (variant, state) draw-part bit in maybe_rebuild.
+    obj_damage: HashMap<u32, u8>,
     /// Datums FORCED into the sun shadow map (per-object SHADOW pseudo-flag / the
     /// green+scale gametype rule, after the global "Shadow casters (Forge)" switch). Only ADDS
     /// casters: engine-default casters (obje lightmap_shadow_mode: vehicles etc.) always cast.
@@ -3681,6 +4339,12 @@ pub struct SceneController {
     /// spreads the main-thread model decode across frames so a large forge-object set pops
     /// in progressively instead of FREEZING the window while every model decodes at once.
     rebuild_pending: bool,
+    /// #gpu-build  The object tail, as the owner experiences it: how many FRAMES it spans and how
+    /// many models it builds. A frame counts only when it actually built a new GPU tag, so this
+    /// is the length of the trickle rather than the length of the load.
+    gpu_tail_frames: usize,
+    gpu_tail_models: usize,
+    gpu_tail_ms: f64,
     /// Baked airprobe grid + per-BSP scene brightness (primed on map load).
     probe: LightProbeGrid,
     /// Global fallback brightness (for objects, which aren't tied to one BSP).
@@ -3749,6 +4413,9 @@ pub struct SceneController {
     /// [min luminance, max contrast, max contrast distant, bounce to ambient, bounce scale] x 14 object
     /// types. Outer None = not scanned yet; inner None = the cache has no chmt tag (engine defaults).
     chmt_cache: std::sync::Mutex<Option<Option<Vec<[f32; 5]>>>>,
+    /// #fp-light `render_model` tag -> the OBJECT tag the engine lights that model as
+    /// (see [`SceneController::lighting_object_tag`]). None = not built yet.
+    light_owner_cache: std::sync::Mutex<Option<HashMap<u32, u32>>>,
     /// `bitmap_mean` results by (tag, linear) — the bounce albedo of every object-lighting
     /// sample decoded up to 8 bitmaps per object per rebuild (dlc_medium: 441 objects = 3.4 s per pass).
     bitmap_mean_cache: std::sync::Mutex<HashMap<(u32, bool), Option<[f32; 4]>>>,
@@ -3843,6 +4510,21 @@ pub struct SceneController {
     /// (once per map) whose particle systems are simulated every frame by `build_particle_meshes`.
     particle_sources_obj: Vec<ParticleSource>,
     particle_sources_efsc: Option<Vec<ParticleSource>>,
+    /// #armour-fx The POSED-ACTOR lane's own particle sources (a player's armour effect — the
+    /// flaming helmet — on a Theater body or a scripted actor), written every frame by
+    /// `reach_actor::ActorScene::particle_sources` because their origin is a marker on a bone and
+    /// so moves with the pose rather than with a placement.
+    ///
+    /// Its own list, like the actor's own five mesh lanes: `build_actor_meshes` deliberately
+    /// SAVES AND RESTORES `particle_sources_obj` around an actor build so an actor can never
+    /// disturb the Forge scene's particles, which also means an actor could never contribute one.
+    particle_sources_actor: Vec<ParticleSource>,
+    /// #projectile  The FILM lane: a Theater clip's muzzle flashes, projectile trails and
+    /// detonations. Written every frame by `film_play::install_film_effects` from what
+    /// `ActorDriver::sync` decided, for the same reason the actor lane is its own list -- these
+    /// sources are ONE-SHOT (`ParticleSource::birth`) and some of them MOVE
+    /// (`ParticleSource::path`), neither of which a placed-object source ever is.
+    particle_sources_film: Vec<ParticleSource>,
     particle_warned: std::collections::HashSet<u32>,
     /// Emission accumulators keyed by emitter seed
     particle_emit_state: HashMap<u64, EmitState>,
@@ -4358,10 +5040,18 @@ impl Default for EmitState {
 #[derive(Clone, Debug)]
 pub struct ParticleSystemDef {
     pub prt3: u32,
-    pub location: i16,
+    /// Index into the owning effe's `locations` block (-1 = the effect origin). `long block
+    /// index` in the tag, so `i32`.
+    pub location: i32,
     /// resolved effe location marker sid (0 = effect origin)
     pub loc_sid: u32,
     pub coord_sys: i16,
+    /// #armour-fx `camera mode` (+0x1E, `effect_camera_modes`): **0 = either view, 1 = FIRST
+    /// person only, 2 = THIRD person only.** Measured off the energy sword, whose `sword_on`
+    /// effect authors one event called `1st_person` (both its systems carry 1) and one called
+    /// `3rd_person` (both carry 2) over the same two markers — so a view that ignores this draws
+    /// the blade's glow twice. Every armour-effect system carries 2.
+    pub camera_mode: i16,
     pub flags: u32,
     pub near_range: f32,
     pub near_cutoff: f32,
@@ -4378,10 +5068,26 @@ pub struct ParticleSystemDef {
     pub effect: std::sync::Arc<EffectDef>,
 }
 
+/// #armour-fx Size of one `effect_locations_block` entry (`effe` +0x20): marker name string id
+/// @0x00, flags u16 @0x04, priority @0x06, one pad byte. **EIGHT bytes** — the engine's own
+/// reflection data says `sizeof(struct effect_location_definition)` = 8.
+///
+/// This was read with a stride of 12, which gets location 0 right (byte 0) and everything after
+/// it wrong, so an effect with several locations resolved garbage marker names: on
+/// `fx\armor_fx\armor_fx`, whose six locations are the armour effects, index 2 came back as
+/// `armor_fx_03` and indices 1, 3, 4 and 5 as nothing at all. Effects with a single location —
+/// every one HMS drew before — are unaffected either way, which is why it survived.
+pub const EFFECT_LOCATION_SIZE: usize = 8;
+
 /// One effe event's timing fields (event element 0x40; spec (b)).
 #[derive(Clone, Debug, Default)]
 pub struct EffectEventDef {
     pub index: usize,
+    /// #armour-fx The event's own NAME string id (@0x00). Reach names the armour-effect events
+    /// `legendary_flame` / `eternal_flame` / `heart_attack` / `pestilence` / `storm`, which is
+    /// what lets a measurement say WHICH effect a body resolved instead of printing a prt3 tag.
+    /// Never used to select anything — the selection is the location marker.
+    pub name_sid: u32,
     /// event flags u16 @0x04 (bit0 = particles die when event ends)
     pub flags: u16,
     /// chance that the whole event is skipped, re-rolled every time it comes up (@0x08; <= 0 = always play)
@@ -4447,6 +5153,19 @@ pub struct EventClock {
     pub chains: Vec<EventChain>,
     /// played duration windows, oldest first (pruned to the recent past)
     pub windows: std::collections::VecDeque<EventWindow>,
+    /// #projectile  A BORN instance: the scene time the effect started.
+    ///
+    /// `None` is the persistent instance (pre-rolled 300 s before scene time 0), which is right
+    /// for an ambient placement or an armour glow — they have been running since before the first
+    /// frame. A muzzle flash, an explosion or a rocket's trail starts at a MOMENT, and with a
+    /// birth time the clock starts there instead and has nothing alive before it.
+    pub birth: Option<f32>,
+    /// #projectile  Whether the event walk WRAPS when it runs off the last event.
+    ///
+    /// `true` is the old unconditional behaviour and stays the default: every instance HMS
+    /// simulated before this was a looping one. A one-shot effect (`loop start` -1 and no
+    /// force-looping flag) must be allowed to finish, or an explosion replays for ever.
+    pub looping: bool,
 }
 impl EventClock {
     /// Windows older than this behind the clock are dropped (must exceed any emitter lifespan).
@@ -4459,7 +5178,21 @@ impl EventClock {
     const MAX_WINDOWS: usize = 4096;
 
     pub fn new(seed: u64) -> Self {
-        EventClock { t_last: f32::NAN, rng: SplitMix64::new(seed ^ 0xE7E7_0000_0000_0001), chains: Vec::new(), windows: std::collections::VecDeque::new() }
+        EventClock { t_last: f32::NAN, rng: SplitMix64::new(seed ^ 0xE7E7_0000_0000_0001), chains: Vec::new(), windows: std::collections::VecDeque::new(), birth: None, looping: true }
+    }
+
+    /// #projectile  An instance BORN at scene time `t0` (no pre-roll), looping or not.
+    pub fn new_at(seed: u64, t0: f32, looping: bool) -> Self {
+        let mut c = Self::new(seed);
+        c.birth = Some(t0);
+        c.looping = looping;
+        c
+    }
+
+    /// #projectile  This instance has played out: every chain is done. A looping instance never
+    /// is, because its event walk wraps.
+    pub fn finished(&self) -> bool {
+        !self.chains.is_empty() && self.chains.iter().all(|c| c.done)
     }
 
     fn range(&mut self, b: [f32; 2]) -> f32 {
@@ -4474,9 +5207,16 @@ impl EventClock {
         let n = def.events.len() as isize;
         if n == 0 { return 0; }
         let loop_start: isize = if def.loop_start < 0 { 0 } else { (def.loop_start as isize).min(n - 1) };
+        // #projectile  A ONE-SHOT instance does NOT wrap: running off the last event finishes it.
+        // `loop_start` is -1 on a muzzle flash and the persistent-instance walk still wraps to 0
+        // there (that is the rule for a placed ambient effect), so a one-shot needs its own exit
+        // or an explosion would replay for ever.
         let mut i = cur;
         for _ in 0..256 {
-            if i == n - 1 { i = loop_start; } else { i += 1; }
+            if i == n - 1 {
+                if !self.looping { return n as usize; }
+                i = loop_start;
+            } else { i += 1; }
             if i >= n { return n as usize; }
             let skip = def.events[i as usize].skip;
             if !(skip > 0.0) { return i as usize; }
@@ -4575,10 +5315,22 @@ impl EventClock {
     /// runs backwards; the schedule is a pure function of the seed, so HMS_TIME shots reproduce).
     pub fn advance(&mut self, def: &EffectDef, t: f32) {
         if !t.is_finite() { return; }
+        // #projectile  A one-shot starts at its BIRTH, with no pre-roll; before that moment it has
+        // nothing alive at all (which is what makes scrubbing backwards past a muzzle flash put
+        // the flash away again).
+        let t0_base = self.birth.unwrap_or(-Self::PREROLL_S);
+        if let Some(b) = self.birth {
+            if t < b {
+                self.chains.clear();
+                self.windows.clear();
+                self.t_last = f32::NAN;
+                return;
+            }
+        }
         if self.t_last.is_nan() || t < self.t_last {
-            self.t_last = -Self::PREROLL_S;
+            self.t_last = t0_base;
             self.rng = SplitMix64::new(self.rng.0);
-            self.start(def, -Self::PREROLL_S);
+            self.start(def, t0_base);
         }
         let dt = t - self.t_last;
         let t0 = self.t_last;
@@ -4588,7 +5340,7 @@ impl EventClock {
         // parallel + looping: once EVERY chain has finished, all restart together (from the last
         // finish); a long jump can span many such cycles, so repeat until the restart would be in
         // the future (or the cycle stops consuming time).
-        if def.parallel() && !self.chains.is_empty() {
+        if def.parallel() && !self.chains.is_empty() && self.looping {
             let mut last_restart = f32::NEG_INFINITY;
             let mut stall = 0u32;
             while self.chains.iter().all(|c| c.done) {
@@ -4627,7 +5379,7 @@ impl EventClock {
 #[cfg(test)]
 mod fx_event_clock_tests {
     use super::*;
-    fn ev(skip: f32, delay: [f32; 2], duration: [f32; 2]) -> EffectEventDef { EffectEventDef { index: 0, flags: 0, skip, delay, duration } }
+    fn ev(skip: f32, delay: [f32; 2], duration: [f32; 2]) -> EffectEventDef { EffectEventDef { index: 0, name_sid: 0, flags: 0, skip, delay, duration } }
     fn def(flags: u32, loop_start: i16, mut events: Vec<EffectEventDef>) -> EffectDef {
         for (i, e) in events.iter_mut().enumerate() { e.index = i; }
         EffectDef { flags, fixed_seed: 0, loop_start, events }
@@ -4816,6 +5568,37 @@ pub struct ParticleSource {
     pub systems: std::sync::Arc<Vec<ParticleSystemDef>>,
     /// per system: (local marker pos, local marker rot)
     pub locs: Vec<(Vec3, glam::Quat)>,
+    /// #projectile  A ONE-SHOT instance, born at this SCENE TIME.
+    ///
+    /// `None` is the persistent instance every other lane uses: pre-rolled 300 s and walked as a
+    /// LOOPING effect, which is right for an ambient placement or an armour glow but wrong for a
+    /// muzzle flash or an explosion — those would already be over before the first frame, and
+    /// then start again. With a birth time the clock starts THERE and the event walk is allowed
+    /// to run off the end and finish ([`EventClock::new_one_shot`]).
+    pub birth: Option<f32>,
+    /// #projectile  A MOVING source: `(scene seconds, world position)` samples, oldest first.
+    ///
+    /// Without it a particle is placed through the source's world matrix AS IT IS NOW, so a
+    /// projectile's trail would be dragged along behind the projectile instead of being left in
+    /// the air. With it, a particle born at time `t` is placed through the source's position AT
+    /// `t`, which for a RECORDED projectile is exactly the path the recording states.
+    pub path: Option<std::sync::Arc<Vec<(f32, Vec3)>>>,
+}
+
+impl ParticleSource {
+    /// Where this source was at scene time `tau` — the sampled path when it has one, else the
+    /// current world origin. Linear between samples, clamped at both ends.
+    pub fn origin_at(&self, tau: f32) -> Vec3 {
+        let Some(p) = self.path.as_deref() else { return self.world.w_axis.truncate() };
+        if p.is_empty() { return self.world.w_axis.truncate(); }
+        if tau <= p[0].0 { return p[0].1; }
+        if tau >= p[p.len() - 1].0 { return p[p.len() - 1].1; }
+        let i = p.partition_point(|&(s, _)| s <= tau).max(1).min(p.len() - 1);
+        let (ta, a) = p[i - 1];
+        let (tb, b) = p[i];
+        let u = if tb > ta { ((tau - ta) / (tb - ta)).clamp(0.0, 1.0) } else { 0.0 };
+        a + (b - a) * u
+    }
 }
 
 /// SplitMix64 — deterministic per-particle randoms so HMS_TIME renders are reproducible.
@@ -4863,13 +5646,21 @@ fn fourcc(c: &[u8; 4]) -> u32 { u32::from_be_bytes(*c) }
 
 impl SceneController {
     pub fn new(native: NativeDll) -> Self {
+        Self::new_shared(Arc::new(native))
+    }
+
+    /// #armour-fx The same constructor over an ALREADY-LOADED native library. The map-backed
+    /// gates share one `dlopen`ed copy and one cache handle (the native page cache is not built
+    /// for several), so a gate that needs a `SceneController` attaches to that one with
+    /// [`SceneController::attach_cache`] instead of opening a second library and a second cache.
+    pub fn new_shared(native: Arc<NativeDll>) -> Self {
         // Ask the DLL to bake the ABSOLUTE per-vertex airprobe ambient into runtime
         // decorator geometry (DecoColorGateEnabled reads MMS_DECO_COLOR); without it
         // the per-vertex colours are dropped and foliage falls back to the centroid
         // airprobe sample. Either way foliage now lands in the terrain's toned range.
         std::env::set_var("MMS_DECO_COLOR", "1");
         Self {
-            native: Arc::new(native),
+            native,
             cache: None,
             geom_cache: HashMap::new(),
             obj_tex_cache: HashMap::new(),
@@ -4885,10 +5676,17 @@ impl SceneController {
             cluster_cube_cache: HashMap::new(),
             structure_bsps: Vec::new(),
             obj_scales: HashMap::new(),
+            obj_transform: HashMap::new(),
+            item_ground_scale: HashMap::new(),
+            actor_cc: None,
+            obj_damage: HashMap::new(),
             obj_casters: std::collections::HashSet::new(),
             obj_vbuf_cache: HashMap::new(),
             obj_ibuf_cache: HashMap::new(),
             rebuild_pending: false,
+            gpu_tail_frames: 0,
+            gpu_tail_models: 0,
+            gpu_tail_ms: 0.0,
             picks: Vec::new(),
             bsp_picks: Vec::new(),
             last_signature: 0,
@@ -4914,6 +5712,7 @@ impl SceneController {
             obj_foliage_cache: std::sync::Mutex::new(HashMap::new()),
             obj_meta_cache: std::sync::Mutex::new(HashMap::new()),
             chmt_cache: std::sync::Mutex::new(None),
+            light_owner_cache: std::sync::Mutex::new(None),
             obj_ray_targets: Vec::new(),
             obj_probe_deps: std::sync::Mutex::new(HashMap::new()),
             obj_pose_sig: HashMap::new(),
@@ -4954,6 +5753,8 @@ impl SceneController {
             particle_tex_cache: HashMap::new(),
             particle_sources_obj: Vec::new(),
             particle_sources_efsc: None,
+            particle_sources_actor: Vec::new(),
+            particle_sources_film: Vec::new(),
             particle_warned: std::collections::HashSet::new(),
             particle_emit_state: HashMap::new(),
             particle_event_clocks: HashMap::new(),
@@ -4987,6 +5788,9 @@ impl SceneController {
         self.structure_bsps.clear();
         self.cluster_cube_cache.clear();
         self.obj_scales.clear();
+        self.obj_transform.clear();
+        self.item_ground_scale.clear();
+        self.obj_damage.clear();
         self.obj_casters.clear();
         self.obj_vbuf_cache.clear();
         self.obj_ibuf_cache.clear();
@@ -5017,6 +5821,7 @@ impl SceneController {
         self.obj_foliage_cache.lock().unwrap().clear();
         self.obj_meta_cache.lock().unwrap().clear();
         *self.chmt_cache.lock().unwrap() = None;
+        *self.light_owner_cache.lock().unwrap() = None;
         self.obj_ray_targets.clear();
         self.obj_probe_deps.lock().unwrap().clear();
         self.obj_pose_sig.clear();
@@ -5035,8 +5840,33 @@ impl SceneController {
 
     pub fn open_cache(&mut self, path: &str) -> anyhow::Result<()> {
         self.close_cache(); // The former inline prelude, byte-for-byte the same statements
+        // #shared-dirs A Workshop map's shared resource caches (shared.map / campaign.map) are
+        // not beside it: tell the native where the game would look (the item's own or the stock
+        // `haloreach\maps`) before the open, or every render model paged into shared.map fails to
+        // decode and the editor draws the object as a hidden-block hull.
+        {
+            let dirs = crate::mapcat::shared_cache_dirs(std::path::Path::new(path));
+            let supported = self.native.set_shared_cache_dirs(&dirs);
+            if !dirs.is_empty() {
+                log::info!("shared cache search dirs for '{path}': {:?} (native support: {supported})", dirs);
+            }
+        }
         let cache = self.native.open_cache(path)?;
         self.cache = Some(cache);
+        // #iscale The authored GROUND SCALE of every item tag, read once per map (about 70 tag
+        // reads). Only a value that looks authored is kept: a tag whose meta does not reach
+        // +0x1F4, or whose ground scale is not a sane positive multiplier, stays at 1.0 rather
+        // than scaling an object by whatever those bytes happened to be.
+        self.item_ground_scale.clear();
+        for group in ["weap", "eqip"] {
+            for t in self.native.tags_by_group(cache, group) {
+                let Some(sc) = crate::reach_actor::item_scales(&self.native, cache, t) else { continue };
+                let g = crate::reach_actor::item_scale_for(&sc, None, false);
+                if g.is_finite() && (0.1..=4.0).contains(&g) && (g - 1.0).abs() > 1e-4 {
+                    self.item_ground_scale.insert(t, g);
+                }
+            }
+        }
         // A new map has a new forge palette — drop the cached mode_tag→name map so it
         // repopulates against this cache on the next rebuild.
         self.palette_names.clear();
@@ -5051,6 +5881,8 @@ impl SceneController {
         self.particle_tex_cache.clear();
         self.particle_sources_obj.clear();
         self.particle_sources_efsc = None;
+        self.particle_sources_actor.clear();
+        self.particle_sources_film.clear();
         self.particle_warned.clear();
         self.particle_emit_state.clear();
         self.particle_event_clocks.clear();
@@ -5348,7 +6180,35 @@ impl SceneController {
     /// Free the native inflate-once page cache (the big default budget that makes loads fast by
     /// inflating each deflate page ONCE). Call ONLY from the POST-load trim — NOT the periodic
     /// during-load trims — so steady memory returns to ~200MB after the load settles.
+    ///
+    /// #load-pagecache  **THE GATE LIVES HERE**, at the one chokepoint every caller goes through,
+    /// rather than at each call site. `ZH_MBP_ClearPageCache` does two things — it frees the
+    /// cache AND it permanently caps the budget at 256 MB ("the load is over, keep it small from
+    /// here on") — so calling it while the OBJECT TAIL is still building is not a trim, it is a
+    /// permanent handicap on every model that has not been built yet. A Reach shared-atlas page
+    /// is tens to hundreds of MB decompressed, so past the cap each model re-inflates whole pages
+    /// and throws them away again.
+    ///
+    /// This was found once before and fixed at the predecode-drain site; a SECOND caller (the
+    /// post-load trim, scheduled 3 s after the BSP load) still landed mid-tail. Measured on a
+    /// 651-object stock Forge World variant, either side of that trim's own log line:
+    /// **18 MB inflated and 167.5 page-cache hits per model before it, 103 MB and 2.3 hits
+    /// after** — a 6x rise in bytes inflated and a 73x collapse in hit rate, for 3.6 GB and 6.0 s
+    /// of zlib across the tail. Gating the chokepoint is what stops a third instance appearing.
+    ///
+    /// While the tail is pending this degrades to [`Self::trim_load_transients`], which gives
+    /// back the heap and the map's resident file pages — the memory this really wants — without
+    /// touching the cache the next model is about to need. The page cache is still freed, by
+    /// whichever caller runs once `rebuild_pending` is clear (the settle site and the 30-second
+    /// idle release both do).
     pub fn clear_page_cache(&self) {
+        if self.rebuild_pending {
+            if ev("HMS_LOADPROF").is_ok() {
+                eprintln!("HMS_LOADPROF   clear_page_cache DEFERRED: the object tail is still building");
+            }
+            self.trim_load_transients();
+            return;
+        }
         if let Some(c) = self.cache {
             self.native.clear_page_cache(c);
         }
@@ -5495,6 +6355,13 @@ impl SceneController {
     /// loaded"), and to stamp the true fully-settled load time.
     pub fn rebuild_pending(&self) -> bool {
         self.rebuild_pending
+    }
+
+    /// #gpu-build  `(frames the object tail spanned, models built, ms spent building them)`.
+    /// The frame count is the number the owner actually perceives: one model per frame is a
+    /// visible trickle however short the total is.
+    pub fn gpu_tail_stats(&self) -> (usize, usize, f64) {
+        (self.gpu_tail_frames, self.gpu_tail_models, self.gpu_tail_ms)
     }
 
     /// DIRECT-VB VERIFICATION (HMS_VBPROBE): prove the .map's raw compressed VB de-quantizes
@@ -5651,7 +6518,8 @@ impl SceneController {
         if verts.len() < 9 || indices.len() < 3 {
             return vec![];
         }
-        let m = object_matrix(o);
+        // #settle posed AND scaled: a scaled block's collision hull scales with it (h4 parity)
+        let m = self.overlay_matrix(o);
         let vpos = |i: usize| -> Vec3 {
             let p = Vec3::new(verts[i * 3], verts[i * 3 + 1], verts[i * 3 + 2]);
             m.transform_point3(p)
@@ -5685,7 +6553,7 @@ impl SceneController {
         if verts.len() < 9 || indices.len() < 3 {
             return vec![];
         }
-        let m = object_matrix(o);
+        let m = self.overlay_matrix(o); // #settle scaled like the collision hull
         let n = verts.len() / 3;
         let vpos = |i: usize| -> Vec3 {
             m.transform_point3(Vec3::new(verts[i * 3], verts[i * 3 + 1], verts[i * 3 + 2]))
@@ -5702,6 +6570,181 @@ impl SceneController {
             out.push(([pc.x, pc.y, pc.z], [pa.x, pa.y, pa.z]));
         }
         out
+    }
+
+    /// #settle The placement matrix the hull overlays and the settle colliders use: the object
+    /// pose times its editor scale (the same matrix the drawn mesh and the pick entry get), so a
+    /// scaled object's collision / physics hull is drawn and simulated at that scale.
+    pub fn overlay_matrix(&self, o: &ObjectInfo) -> Mat4 {
+        self.object_world(o)
+    }
+
+    /// The OBJECT tag the hlmt chain starts from (`primary_tag`, else the render model).
+    fn object_tag_of(o: &ObjectInfo) -> u32 {
+        if o.primary_tag != 0 && o.primary_tag != 0xFFFF_FFFF { o.primary_tag } else { o.mode_tag }
+    }
+
+    /// #iscale The uniform scale a PLACED object is drawn, picked, settled and lit at.
+    ///
+    /// Two independent multipliers, and they multiply:
+    ///   * the community Forge SCALED label (`obj_scales`, per datum), which the "Scaled
+    ///     objects" switch can empty; and
+    ///   * the engine's own `item` **ground scale** (`item_ground_scale`, per tag), which a
+    ///     weapon or a piece of equipment lying in the world always gets — Reach authors 1.3
+    ///     on nearly every weapon, 2.0 on the assault bomb and the skull. A weapon IN A UNIT'S
+    ///     HANDS takes a different column of the same table and is drawn by the actor pipeline
+    ///     (`reach_actor::HeldWeapon::scale`), which never reaches this function.
+    pub fn object_scale(&self, o: &ObjectInfo) -> f32 {
+        let forge = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
+        // A POSED ACTOR is not an item lying in the world. `build_actor_meshes` runs the biped
+        // AND its held weapon through this same rebuild as a one-object set, so without this the
+        // weapon's mesh would be baked at the GROUND scale and then posed by an attach matrix
+        // that already carries the ARMED scale — the sword came out 1.3x too big AND left the
+        // hand, because the palette folds `anchor^-1 * world` against the anchor the mesh was
+        // built at. The actor pipeline owns its own scale (`reach_actor::HeldWeapon::scale`).
+        if o.datum == ACTOR_DATUM {
+            return forge;
+        }
+        forge * self.item_ground_scale.get(&Self::object_tag_of(o)).copied().unwrap_or(1.0)
+    }
+
+    /// #settle The raw phmo blocks through the native DLL's tag reads (count i32 / pointer u32
+    /// tag-block refs in the meta, elements via `tag_ptr_bytes`).
+    fn phmo_blocks(&self, phmo: u32) -> Option<crate::phmo_shapes::PhmoBlocks> {
+        let cache = self.cache?;
+        let meta = self.native.tag_meta(cache, phmo, 0, 0x19C)?;
+        let rd = |o: usize| u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]);
+        Some(crate::phmo_shapes::PhmoBlocks::read(&crate::phmo_shapes::REACH, |off, elem| {
+            let n = rd(off) as i32;
+            let ptr = rd(off + 4);
+            if n <= 0 || n > 0x10000 || ptr == 0 || ptr == 0xFFFF_FFFF { return Vec::new(); }
+            self.native.tag_ptr_bytes(cache, ptr, (n as usize * elem) as u32).unwrap_or_default()
+        }))
+    }
+
+    /// #settle The object's `mode` node -> model matrices (rigid bodies are in node space).
+    fn mode_node_xforms(&self, obj_tag: u32) -> Vec<Mat4> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let mode = self.native.resolve_mode(cache, obj_tag);
+        if mode == 0 || mode == 0xFFFF_FFFF { return Vec::new(); }
+        let Some(h) = self.native.tag_meta(cache, mode, crate::phmo_shapes::OFF_MODE_NODES as u32, 12) else { return Vec::new() };
+        let n = i32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+        let ptr = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+        if n <= 0 || n > 1024 || ptr == 0 || ptr == 0xFFFF_FFFF { return Vec::new(); }
+        let elem = crate::phmo_shapes::REACH_MODE_NODE_ELEM;
+        match self.native.tag_ptr_bytes(cache, ptr, (n as usize * elem) as u32) {
+            Some(b) => crate::phmo_shapes::node_xforms(&b, elem),
+            None => Vec::new(),
+        }
+    }
+
+    /// #settle The settle body of a placed object: its phmo rigid bodies welded (node-posed,
+    /// tag mass / friction / restitution / centre of mass) at the editor scale; a coll-only
+    /// object gets a convex hull of its collision model. None = no physics model.
+    pub fn physics_body(&self, o: &ObjectInfo) -> Option<crate::physics_settle::PhysBody> {
+        let cache = self.cache?;
+        let otag = Self::object_tag_of(o);
+        let s = self.object_scale(o);
+        let nodes = self.mode_node_xforms(otag);
+        let phmo = self.native.resolve_phmo(cache, otag);
+        if phmo != 0 && phmo != 0xFFFF_FFFF {
+            if let Some(b) = self.phmo_blocks(phmo) {
+                let (defs, counts) = crate::phmo_shapes::rigid_bodies(&b, &crate::phmo_shapes::REACH, &nodes);
+                let desc = crate::phmo_shapes::describe(&defs, &counts);
+                if std::env::var("HMS_SETTLE_TRACE").is_ok() {
+                    eprintln!("settle body {} ({} mode nodes): {desc}", self.native.tag_name(cache, otag).unwrap_or_default(), nodes.len());
+                    eprintln!("  support spheres (model space): {:?}", self.vehicle_support_spheres(otag));
+                    for d in &defs {
+                        let m = nodes.get(d.node.max(0) as usize).copied().unwrap_or(Mat4::IDENTITY);
+                        let (sc, rot, tr) = m.to_scale_rotation_translation();
+                        let ext: Vec<String> = d.shapes.iter().map(|sh| { let (a, z) = sh.aabb(); format!("{:.3}x{:.3}x{:.3}@z[{:.3},{:.3}]", z.x - a.x, z.y - a.y, z.z - a.z, a.z, z.z) }).collect();
+                        eprintln!("  rb node {} motion {} mass {:.1} com {:?} tag inertia {:?} scale {:?} | node xform scale {:?} rot {:?} tr {:?} | shapes {:?}", d.node, d.motion_type, d.mass, d.com, d.inertia.map(|i| (i.x_axis, i.y_axis, i.z_axis)), d.inertia_scale, sc, rot, tr, ext);
+                    }
+                }
+                if let Some(mut body) = crate::physics_settle::PhysBody::from_rigid_bodies(&defs, desc) {
+                    body.add_support_spheres(&self.vehicle_support_spheres(otag));
+                    return Some(body.scaled(s));
+                }
+            }
+        }
+        let coll = self.native.resolve_coll(cache, otag);
+        if coll == 0 || coll == 0xFFFF_FFFF { return None; }
+        let (verts, _) = self.native.coll_geometry(cache, coll)?;
+        let pts: Vec<[f32; 3]> = verts.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+        crate::physics_settle::collision_fallback_body(&pts).map(|b| b.scaled(s))
+    }
+
+    /// #settle A `vehi`'s ground-contact spheres in MODEL space: (marker position, radius, hover)
+    /// for every friction point (tyre) / anti-gravity point (hover pad), at every instance of its
+    /// marker group. Empty for a non-vehicle.
+    fn vehicle_support_spheres(&self, obj_tag: u32) -> Vec<(Vec3, f32, bool)> {
+        use crate::phmo_shapes::{vehicle_support_points, REACH_VEHI_ANTIGRAV, REACH_VEHI_FRICTION};
+        let mut out = Vec::new();
+        let Some(cache) = self.cache else { return out };
+        if self.native.tag_class(cache, obj_tag).as_deref() != Some("vehi") { return out; }
+        let mode = self.native.resolve_mode(cache, obj_tag);
+        if mode == 0 || mode == 0xFFFF_FFFF { return out; }
+        let blk = |(off, elem): (usize, usize)| -> Vec<u8> {
+            let Some(h) = self.native.tag_meta(cache, obj_tag, off as u32, 8) else { return Vec::new() };
+            let n = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+            let ptr = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+            if n == 0 || n > 64 || ptr == 0 || ptr == 0xFFFF_FFFF { return Vec::new(); }
+            self.native.tag_ptr_bytes(cache, ptr, n * elem as u32).unwrap_or_default()
+        };
+        let (fr, ag) = (blk(REACH_VEHI_FRICTION), blk(REACH_VEHI_ANTIGRAV));
+        for p in vehicle_support_points(&fr, REACH_VEHI_FRICTION.1, &ag) {
+            for pos in self.model_marker_positions(mode, p.marker) {
+                out.push((pos, p.radius, p.hover));
+            }
+        }
+        out
+    }
+
+    /// #settle MODEL-space position of EVERY instance of marker group `sid` (a Warthog's four
+    /// `wheel` markers), node chain applied - `model_marker_pick` for each index.
+    fn model_marker_positions(&self, mode: u32, sid: u32) -> Vec<Vec3> {
+        let mut out = Vec::new();
+        for i in 0..64usize {
+            // the picker clamps to the last instance: stop once `i` is past the group's count
+            let count = std::cell::Cell::new(usize::MAX);
+            let r = self.model_marker_pick(mode, sid, |mks| { count.set(mks.len() / 0x30); i });
+            match r {
+                Some((p, _)) if i < count.get() => out.push(p),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// #settle The object's physics hull (else collision hull) as posed, scaled world triangles -
+    /// what another object settles against.
+    pub fn physics_world_tris(&self, o: &ObjectInfo) -> Vec<[Vec3; 3]> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let otag = Self::object_tag_of(o);
+        let phmo = self.native.resolve_phmo(cache, otag);
+        let geo = if phmo != 0 && phmo != 0xFFFF_FFFF { self.native.phmo_geometry(cache, phmo) } else { None }
+            .filter(|(v, i)| v.len() >= 9 && i.len() >= 3)
+            .or_else(|| {
+                let coll = self.native.resolve_coll(cache, otag);
+                if coll != 0 && coll != 0xFFFF_FFFF { self.native.coll_geometry(cache, coll) } else { None }
+            });
+        let Some((verts, indices)) = geo else { return Vec::new() };
+        let m = self.overlay_matrix(o);
+        let n = verts.len() / 3;
+        let mut out = Vec::with_capacity(indices.len() / 3);
+        for t in indices.chunks_exact(3) {
+            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            if a >= n || b >= n || c >= n { continue; }
+            let p = |i: usize| m.transform_point3(Vec3::new(verts[i * 3], verts[i * 3 + 1], verts[i * 3 + 2]));
+            let (pa, pb, pc) = (p(a), p(b), p(c));
+            if pa.is_finite() && pb.is_finite() && pc.is_finite() { out.push([pa, pb, pc]); }
+        }
+        out
+    }
+
+    /// #settle Level triangles overlapping a world box (the BSP raycast soup).
+    pub fn static_tris_in_aabb(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+        self.bsp_soup.tris_in_aabb(mn, mx, out);
     }
 
     /// always-on overlay geometry for HIDDEN forge blocks (render model present but
@@ -5769,6 +6812,16 @@ impl SceneController {
 
     /// Resolve an object tag (scenery/weapon/vehicle/etc.) to its render_model (mode)
     /// tag id via the game's own tag graph. 0 if unresolved.
+    /// #reach-skin The open cache handle (None before a map is opened) and the native DLL —
+    /// the Reach actor pipeline reads tags through these.
+    /// #armour-fx Adopt an already-open cache handle (the shared one the map-backed gates use).
+    /// TAG READS ONLY — none of the per-map state `open_cache` builds (BSP, palette, lightmaps)
+    /// is set up, so this is for a gate that asks the tags a question, never for drawing.
+    pub(crate) fn attach_cache(&mut self, cache: CacheHandle) { self.cache = Some(cache); }
+
+    pub fn cache_handle(&self) -> Option<CacheHandle> { self.cache }
+    pub fn native_dll(&self) -> &NativeDll { &self.native }
+
     pub fn resolve_object_mode(&self, obj_tag: u32) -> u32 {
         match self.cache {
             Some(c) => self.native.resolve_mode(c, obj_tag),
@@ -5800,6 +6853,394 @@ impl SceneController {
     /// model's decode is still in flight (background predecode: the caller retries next frame), `Err(false)`
     /// when there is nothing to show (no model / empty decode).
     #[allow(clippy::type_complexity)]
+    /// #reach-skin Build one ACTOR's GPU meshes: the full object material path (the same
+    /// `decode_model` -> per-part upload the viewport objects use, so a Spartan gets its real
+    /// shaders, change colours and self-illum) at an arbitrary placement, with every SKINNED part
+    /// bound to `palette`. Returns `(lanes, min, max)` — ALL FIVE lanes of the object path
+    /// (`RebuiltLanes`: opaque, cutout, holo, holo_solid, blend), every mesh bound to `palette`.
+    ///
+    /// #sword-blade The three transparent lanes used to be folded into `opaque`, which drew an
+    /// energy sword's five additive blade layers through the solid opaque pipeline: a grey,
+    /// opaque blade. They are now handed back separately and the renderer draws them through the
+    /// SKINNED transparent pipelines, in the same sorted sequence a world-placed object uses.
+    ///
+    /// `fwd` / `up` are the placement axes (the same convention as `ObjectInfo`), so the caller
+    /// controls the actor's facing. Returns `Err(true)` while the decode is still streaming
+    /// (call again next frame), `Err(false)` when the object has no drawable model.
+    /// #film  The model VARIANT to draw a biped (or any object) with. Passing variant 0 to
+    /// `build_actor_meshes` means "no variant", and a Reach `hlmt` variant is exactly what picks
+    /// ONE permutation per render-model region — so without it a Spartan is drawn wearing every
+    /// helmet, shoulder and chest piece at once.
+    ///
+    /// Returns the first REAL variant (damage state 0) with its name, preferring one called
+    /// `default` when the model has one.
+    pub fn default_model_variant(&mut self, obj_tag: u32) -> Option<(u32, String)> {
+        let cache = self.cache_handle()?;
+        let mode = self.resolve_object_mode(obj_tag);
+        if mode == 0 || mode == 0xFFFF_FFFF {
+            return None;
+        }
+        let hv = hlmt_variants(&self.native, cache, obj_tag, mode)?;
+        let named = |sid: u32| self.native.string_id(cache, sid).unwrap_or_default();
+        let mut first: Option<(u32, String)> = None;
+        for (i, &sid) in hv.sids.iter().enumerate() {
+            if hv.states.get(i).copied().unwrap_or(0) != 0 {
+                continue; // a synthetic (variant, damage state) entry, not a real variant
+            }
+            let n = named(sid);
+            if n.eq_ignore_ascii_case("default") {
+                return Some((sid, n));
+            }
+            if first.is_none() {
+                first = Some((sid, n));
+            }
+        }
+        first
+    }
+
+    /// Every real model variant of an object, as `(sid, name)` — the choices a film's armour
+    /// data would select between.
+    pub fn model_variants(&mut self, obj_tag: u32) -> Vec<(u32, String)> {
+        let Some(cache) = self.cache_handle() else { return Vec::new() };
+        let mode = self.resolve_object_mode(obj_tag);
+        if mode == 0 || mode == 0xFFFF_FFFF {
+            return Vec::new();
+        }
+        let Some(hv) = hlmt_variants(&self.native, cache, obj_tag, mode) else { return Vec::new() };
+        hv.sids
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| hv.states.get(*i).copied().unwrap_or(0) == 0)
+            .map(|(_, &sid)| (sid, self.native.string_id(cache, sid).unwrap_or_default()))
+            .collect()
+    }
+
+    /// `skin` = the actor's `[primary, secondary]` change colours (LINEAR RGB) — a recorded
+    /// Theater player's two armoury colours. `None` draws the model's AUTHORED default colours.
+    #[allow(clippy::too_many_arguments)]
+    /// #fp Reach's FIRST-PERSON ARM models, as `(name, hands obj/model tag, body tag)` per
+    /// species — what the engine draws when you are looking through a player's own eyes, instead
+    /// of the third-person biped seen from inside its own helmet.
+    ///
+    /// NOT on the biped: there is no `first_person_model` field anywhere in Reach's `unit` or
+    /// `biped` block (checked against the engine's own tag definitions). It lives on the GLOBALS:
+    /// `matg` +0x474 `@player representation`, a 108-byte block with up to 3 entries (one per
+    /// playable species), whose +0x14 is `first person hands` and +0x24 `first person body`.
+    /// A scenario may override the whole block at `scnr` +0x794 `override player representations`,
+    /// which is checked first. Tag references are Reach's usual shape: group tag BIG-endian at
+    /// +0x00, tag datum at +0x0C (`& 0xFFFF`, 0xFFFFFFFF = null).
+    ///
+    /// Returns one row per representation, empty when the cache has neither block.
+    pub fn first_person_models(&self) -> Vec<(String, u32, u32)> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let u = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        // a Reach tagref -> tag index, or 0xFFFF_FFFF
+        let tagref = |b: &[u8], o: usize| -> u32 {
+            if o + 16 > b.len() { return 0xFFFF_FFFF }
+            let d = u(b, o + 0x0C);
+            if d == 0xFFFF_FFFF { 0xFFFF_FFFF } else { d & 0xFFFF }
+        };
+        const REP_ELEM: u32 = 108;
+        const FP_HANDS: usize = 0x14;
+        const FP_BODY: usize = 0x24;
+        // the scenario's override wins over the globals default
+        let mut block: Option<Vec<u8>> = None;
+        if self.scnr != 0 && self.scnr != 0xFFFF_FFFF {
+            if let Some(h) = self.native.tag_meta(cache, self.scnr, 0x794, 8) {
+                let (c, p) = (u(&h, 0), u(&h, 4));
+                if c > 0 && c <= 3 { block = self.native.tag_ptr_bytes(cache, p, c * REP_ELEM); }
+            }
+        }
+        if block.is_none() {
+            let mut matg = None;
+            for t in 0..0x400u32 {
+                if self.native.tag_class(cache, t).as_deref() == Some("matg") { matg = Some(t); break; }
+            }
+            if let Some(m) = matg {
+                if let Some(h) = self.native.tag_meta(cache, m, 0x474, 8) {
+                    let (c, p) = (u(&h, 0), u(&h, 4));
+                    if c > 0 && c <= 3 { block = self.native.tag_ptr_bytes(cache, p, c * REP_ELEM); }
+                }
+            }
+        }
+        let Some(b) = block else { return Vec::new() };
+        (0..b.len() / REP_ELEM as usize)
+            .map(|i| {
+                let e = &b[i * REP_ELEM as usize..(i + 1) * REP_ELEM as usize];
+                let hands = tagref(e, FP_HANDS);
+                let body = tagref(e, FP_BODY);
+                let name = self.native.tag_name(cache, hands).unwrap_or_default();
+                (name, hands, body)
+            })
+            .filter(|(_, h, bd)| *h != 0xFFFF_FFFF || *bd != 0xFFFF_FFFF)
+            .collect()
+    }
+
+    /// #fp-arms  Is this RENDER MODEL the Elite's?
+    ///
+    /// The same tag-derived discriminator `variant_section_bits` uses for a body, exposed so the
+    /// first-person rig can tell the two `@player representation` rows apart: a model carrying
+    /// one of the regions the globals' own `elite selections` block overrides (`armor_pieces`) is
+    /// the Elite's. Never a tag-path match — a path heuristic once routed a solid barricade down
+    /// the glass lane.
+    pub fn model_is_elite(&self, mode_tag: u32) -> bool {
+        let Some(cache) = self.cache else { return false };
+        let er = elite_customization_regions(&self.native, cache);
+        if er.is_empty() {
+            return false;
+        }
+        let u = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let Some(meta) = self.native.tag_meta(cache, mode_tag, 0, 0x70) else { return false };
+        let (rcnt, rptr) = (u(&meta, 12), u(&meta, 16));
+        if rcnt == 0 || rcnt > 0x1000 {
+            return false;
+        }
+        let Some(rb) = self.native.tag_ptr_bytes(cache, rptr, rcnt * 16) else { return false };
+        (0..rcnt as usize).any(|r| er.contains(&u(&rb[r * 16..r * 16 + 16], 0)))
+    }
+
+    /// #fp Install an explicit per-section draw mask for a render model that has no `hlmt`
+    /// (see [`SECTION_PICK`]), and drop that model's cached decode so the mask takes effect.
+    ///
+    /// No-op when the mask for this model is already the one asked for, so it is safe to call
+    /// every frame.
+    pub fn set_section_pick(&mut self, mode_tag: u32, mask: Vec<bool>) {
+        let cur = SECTION_PICK.read().ok().and_then(|g| g.clone());
+        if cur.as_ref().and_then(|m| m.get(&mode_tag)) == Some(&mask) {
+            return;
+        }
+        let mut next: HashMap<u32, Vec<bool>> = cur.as_deref().cloned().unwrap_or_default();
+        next.insert(mode_tag, mask);
+        *SECTION_PICK.write().unwrap() = Some(std::sync::Arc::new(next));
+        self.geom_cache.remove(&mode_tag);
+    }
+
+    /// #skin Install the synthetic per-player armour variants for the open film and drop every
+    /// cached decode that depends on the variant list.
+    ///
+    /// The part split is keyed by `(shader, variant membership)`, so changing the variant list
+    /// changes the PART INDICES of a model — which is the exact shape of the "white chaingun"
+    /// bug: the per-part GPU texture cache is keyed by `(tag, part index, slot)`, so a stale
+    /// entry would hand a piece of armour somebody else's texture (or none at all). Everything
+    /// keyed that way is cleared here, not just the geometry.
+    ///
+    /// No-op when the set is unchanged, so this is safe to call every frame.
+    pub fn set_player_variants(&mut self, variants: Vec<PlayerVariant>) {
+        let now = player_variants();
+        let same = match (&now, variants.is_empty()) {
+            (None, true) => true,
+            (Some(cur), false) => ***cur == variants,
+            _ => false,
+        };
+        if same { return; }
+        *PLAYER_VARIANTS.write().unwrap() = if variants.is_empty() { None } else { Some(std::sync::Arc::new(variants)) };
+        // #load-scope Drop ONLY the models whose decode depends on the player variant list.
+        //
+        // This used to clear every cache in the scene. A player variant can change the `flair_*`
+        // regions of a player BIPED and nothing else, but the old `hlmt_variants` appended a copy
+        // of the default variant to EVERY model with hlmt variants, which changed its variant
+        // count, which changed its part split - so the blunt clear was self-inflicted. The
+        // synthetic entries are now only appended where a pick actually lands (see
+        // `HlmtVariants::player_entries`), so the set below is the player bipeds and nothing else.
+        //
+        // Measured before this: opening a film on a 638-object Forge scene re-decoded and
+        // re-uploaded every one of them - 42 GPU builds, 3.0 s, immediately after the load had
+        // just built them, which is the "loading forge objects takes WAY too long in theater".
+        let drop: std::collections::HashSet<u32> = self
+            .geom_cache
+            .iter()
+            .filter(|(_, d)| d.as_ref().map_or(true, |d| d.uses_player_variants))
+            .map(|(k, _)| *k)
+            .collect();
+        self.geom_cache.retain(|t, _| !drop.contains(t));
+        self.obj_tex_cache.retain(|(t, _, _), _| !drop.contains(t));
+        self.obj_vbuf_cache.retain(|t, _| !drop.contains(t));
+        self.obj_ibuf_cache.retain(|(t, _), _| !drop.contains(t));
+        // Keyed by the CPU texture Arc POINTER, and the Arcs that died above took their addresses
+        // with them, so this one is cleared outright rather than filtered - a stale pointer key
+        // could alias a newly allocated Arc. It costs nothing on the models that were kept:
+        // `obj_tex_ensure` finds those in `obj_tex_cache` first and never consults this map.
+        self.obj_tex_by_src.clear();
+        self.predecode_inflight.clear();
+        self.last_signature = 0;
+        self.rebuild_pending = true;
+    }
+
+    /// #skin Turn one recorded player's ten appearance option indices into the
+    /// `(region, permutation)` picks a render model can wear. Slot `k` indexes block `k` of
+    /// `globals\player_model_customization`; an index past the end of its block contributes
+    /// nothing (the piece is simply not worn) rather than guessing.
+    ///
+    /// `which` selects the species' slots -- see `film::SPARTAN_APPEARANCE_SLOTS`.
+    pub fn appearance_picks(&self, slots: &[u8], which: &[usize]) -> Vec<(u32, u32)> {
+        appearance_picks_from(&self.player_customization(), slots, which)
+    }
+
+    /// #elite One recorded player's whole appearance as the synthetic variant the model wears:
+    /// BOTH species' pick lists, because a player has a Spartan loadout and an Elite loadout and
+    /// the body being drawn decides which applies.
+    pub fn player_variant(&self, sid: u32, slots: &[u8]) -> PlayerVariant {
+        let table = self.player_customization();
+        PlayerVariant {
+            sid,
+            picks: appearance_picks_from(&table, slots, &crate::film::SPARTAN_APPEARANCE_SLOTS),
+            elite_picks: appearance_picks_from(&table, slots, &crate::film::ELITE_APPEARANCE_SLOTS),
+        }
+    }
+
+    /// #skin Reach's ARMOURY COLOUR TABLE — `matg` "profile colors", the 30 colours the player
+    /// picks their primary and secondary armour colour from in the Armoury.
+    ///
+    /// PROVEN, not guessed: the field is named `profile colors` in the engine's own reflection
+    /// data (`reach_tag_test.exe` tag definitions, `globals_struct_definition` +0x498 →
+    /// `multiplayer_color_block`, 12 bytes = one `real_rgb_color`). `forge_halo.map` holds 30
+    /// entries there. The next field, +0x4A4 `emblem colors`, is a second 30-entry table of the
+    /// same colours used for the EMBLEM, and +0x4D4 `forge colors` is the separate 8-entry
+    /// team/Forge palette `change_colors()` already reads — three different tables that must not
+    /// be confused.
+    ///
+    /// Returned in LINEAR RGB (the tag stores linear floats), empty when the cache has no
+    /// readable block.
+    pub fn profile_colors(&self) -> Vec<[f32; 3]> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let mut matg = None;
+        for t in 0..0x400u32 {
+            if self.native.tag_class(cache, t).as_deref() == Some("matg") { matg = Some(t); break; }
+        }
+        let Some(matg) = matg else { return Vec::new() };
+        const PROFILE_COLORS_OFF: u32 = 0x498;
+        let Some(h) = self.native.tag_meta(cache, matg, PROFILE_COLORS_OFF, 8) else { return Vec::new() };
+        let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+        let (cnt, ptr) = (u(&h, 0), u(&h, 4));
+        if cnt == 0 || cnt > 32 { return Vec::new(); }
+        let Some(b) = self.native.tag_ptr_bytes(cache, ptr, cnt * 12) else { return Vec::new() };
+        (0..cnt as usize)
+            .map(|i| {
+                let f = |k: usize| f32::from_le_bytes([b[i * 12 + k * 4], b[i * 12 + k * 4 + 1], b[i * 12 + k * 4 + 2], b[i * 12 + k * 4 + 3]]);
+                let c = [f(0), f(1), f(2)];
+                if c.iter().all(|v| v.is_finite() && *v >= 0.0) { c } else { [1.0; 3] }
+            })
+            .collect()
+    }
+
+    /// #skin Resolve one recorded player's `(primary, secondary)` armoury colour INDICES to the
+    /// `[primary, secondary]` linear RGB pair `build_actor_meshes` takes. An index outside the
+    /// table (or an unreadable table) yields `None`, which draws the model's authored defaults
+    /// rather than inventing a colour.
+    pub fn armour_colors(&self, primary: u8, secondary: u8) -> Option<[[f32; 3]; 2]> {
+        let t = self.profile_colors();
+        if t.is_empty() { return None; }
+        let pick = |i: u8| t.get(i as usize).copied();
+        Some([pick(primary)?, pick(secondary)?])
+    }
+
+    pub fn build_actor_meshes(
+        &mut self,
+        obj_tag: u32,
+        variant_sid: u32,
+        at: Vec3,
+        fwd: Vec3,
+        up: Vec3,
+        skin: Option<[[f32; 3]; 2]>,
+        damage: u8,
+        palette: Option<&std::sync::Arc<hms_render::SkinPalette>>,
+        mesh: &MeshRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(crate::objscene::RebuiltLanes, Vec3, Vec3), bool> {
+        if self.cache.is_none() { return Err(false); }
+        // #fp `obj_tag` may itself BE a render model: Reach's first-person arm models are bare
+        // `mode` tags with no object wrapper, so `resolve_mode` (obj -> hlmt -> mode) has nothing
+        // to walk and returns 0xFFFFFFFF for them.
+        let mut mode = self.resolve_object_mode(obj_tag);
+        if (mode == 0 || mode == 0xFFFF_FFFF) && self.raw_tag_class(obj_tag).as_deref() == Some("mode") {
+            mode = obj_tag;
+        }
+        if mode == 0 || mode == 0xFFFF_FFFF { return Err(false); }
+        let objects = [ObjectInfo {
+            datum: ACTOR_DATUM, type_sig: 0, sig0: 0, sig1: 0,
+            pos: [at.x, at.y, at.z], health: 1.0, shield: 1.0,
+            mode_tag: mode, fwd: [fwd.x, fwd.y, fwd.z], up: [up.x, up.y, up.z],
+            attached: [0; 8], primary_tag: obj_tag, variant_name_sid: variant_sid,
+        }];
+        // Snapshot everything maybe_rebuild rewrites for the VIEWPORT's object set (exactly as
+        // build_preview_meshes does) so the actor build cannot disturb the Forge scene.
+        let saved_picks = std::mem::take(&mut self.picks);
+        let saved_tris = std::mem::take(&mut self.blocker_tris);
+        let saved_lines = std::mem::take(&mut self.blocker_lines);
+        let saved_psrc = std::mem::take(&mut self.particle_sources_obj);
+        let saved_lens = std::mem::take(&mut self.lens_sources_obj);
+        let saved_lights = std::mem::take(&mut self.forge_lights);
+        let saved_sig = self.last_signature;
+        let saved_pending = self.rebuild_pending;
+        // #vehicle-damage  The DAMAGE state goes in through the same per-datum lane a placed
+        // object's DAMAGE dropdown uses (`obj_damage` -> `DecodedModel::state_variant_index`), so
+        // a Theater wreck selects the model's authored `destroyed` permutations through the
+        // renderer's own variant walk rather than a second, parallel selection path. Saved and
+        // restored around the build like every other piece of viewport state here, so an actor
+        // can never leave a damage state on the editor's scene.
+        let saved_damage = self.obj_damage.remove(&ACTOR_DATUM);
+        if damage > 0 {
+            self.obj_damage.insert(ACTOR_DATUM, damage);
+        }
+        // A biped is NOT a variant-placed Forge object: it must not go down the Forge
+        // change-colour lane (which overwrites the primary change colour with the engine's
+        // neutral 0.5 grey and the secondary with the tag default). An EMPTY map leaves
+        // `forge_tint_index` at -1, so the shader reads the authored / `actor_cc` colours
+        // through the model's own `four_change_color` masks — which is where a recorded
+        // player's armoury colours belong.
+        let empty: HashMap<u32, (u8, u8)> = HashMap::new();
+        self.actor_cc = skin;
+        self.rebuild_pending = true;
+        let mut out = None;
+        for _ in 0..8 {
+            out = self.maybe_rebuild(&objects, &empty, mesh, device, queue).or(out);
+            if !self.rebuild_pending { break; }
+        }
+        let complete = !self.rebuild_pending;
+        self.actor_cc = None;
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in &self.picks { mn = mn.min(p.min); mx = mx.max(p.max); }
+        self.picks = saved_picks;
+        self.blocker_tris = saved_tris;
+        self.blocker_lines = saved_lines;
+        self.particle_sources_obj = saved_psrc;
+        self.lens_sources_obj = saved_lens;
+        self.forge_lights = saved_lights;
+        self.last_signature = saved_sig;
+        self.rebuild_pending = saved_pending;
+        self.obj_damage.remove(&ACTOR_DATUM);
+        if let Some(d) = saved_damage {
+            self.obj_damage.insert(ACTOR_DATUM, d);
+        }
+        if !complete { return Err(true); }
+        let Some(t) = out else { return Err(false) };
+        // #sword-blade Hand back ALL FIVE lanes. Folding holo / holo_solid / blend into `opaque`
+        // here is what drew a held energy sword as a solid grey blade: its five blade layers are
+        // additive (two of them `rmhg` halograms) and the opaque pipeline has no blend at all.
+        let mut lanes = crate::objscene::RebuiltLanes::from_tuple(t);
+        if lanes.opaque.is_empty() && lanes.cutout.is_empty()
+            && lanes.holo.is_empty() && lanes.holo_solid.is_empty() && lanes.blend.is_empty()
+        {
+            return Err(false);
+        }
+        if let Some(pal) = palette {
+            // EVERY lane rides the actor's bone palette: a held weapon is rigid, but it is posed
+            // by the same palette (every entry the attach matrix), so a transparent part that
+            // missed `set_skin` would draw at the bind pose, in the wrong place.
+            for m in lanes.opaque.iter_mut()
+                .chain(lanes.cutout.iter_mut())
+                .chain(lanes.holo.iter_mut())
+                .chain(lanes.holo_solid.iter_mut())
+                .chain(lanes.blend.iter_mut())
+            {
+                m.set_skin(pal.clone());
+            }
+        }
+        if mn.x > mx.x { mn = at; mx = at; }
+        Ok((lanes, mn, mx))
+    }
+
     pub fn build_preview_meshes(
         &mut self,
         obj_tag: u32,
@@ -5991,6 +7432,158 @@ impl SceneController {
     /// (A + B section ranges per permutation, the hlmt default-variant override per region) plus every
     /// submesh's section -> shader -> diffuse. Used to find where the vehicle DAMAGE decal submeshes
     /// (charred holes / blast marks / ripped-open tech) live relative to the resting-state mask.
+    /// #film  Reach's armour customisation table, `globals\player_model_customization`.
+    ///
+    /// Layout (read off `forge_halo.map` with the GPU-free `--model-regions` dumps):
+    ///   tag   +0x20: ten consecutive 12-byte blocks {count u32, ptr u32, 0 u32}, one per armour
+    ///         SLOT, in the same order as the ten slot bytes of a recorded player
+    ///   opt   16 B: {name string_id @0, overrides block (count @4, ptr @8), 0 @0xC}
+    ///   ovr   12 B: {render-model REGION string_id @0, PERMUTATION string_id @4, 0 @8}
+    ///
+    /// Returns, per slot, per option, the (region sid, permutation sid) overrides that option
+    /// applies -- the same region/permutation selection an `hlmt` model variant performs, so a
+    /// recorded player is dressed by applying their ten options on top of the resolved variant.
+    pub fn player_customization(&self) -> Vec<Vec<Vec<(u32, u32)>>> {
+        match self.cache {
+            Some(c) => player_customization_table(&self.native, c),
+            None => Vec::new(),
+        }
+    }
+
+    /// #skin The same table, from a bare `(native, cache)` pair, so an offline audit can resolve a
+    /// recorded appearance exactly the way the renderer does instead of a re-implementation of it.
+    #[allow(dead_code)]
+    pub fn player_customization_of(native: &NativeDll, cache: CacheHandle) -> Vec<Vec<Vec<(u32, u32)>>> {
+        player_customization_table(native, cache)
+    }
+
+    #[allow(dead_code)]
+    fn player_customization_inner(&self) -> Vec<Vec<Vec<(u32, u32)>>> { Vec::new() }
+}
+
+/// #skin The ten armour slots of `globals\player_model_customization`: per slot, per option, the
+/// `(region sid, permutation sid)` overrides that option applies. Free of `SceneController` so an
+/// offline audit resolves a recorded appearance through the SAME code the renderer uses.
+pub(crate) fn player_customization_table(native: &NativeDll, cache: CacheHandle) -> Vec<Vec<Vec<(u32, u32)>>> {
+    let mut out = Vec::new();
+    {
+        // The tag is a singleton; find it by name rather than hard-coding an index, which differs
+        // between caches.
+        let mut tag = None;
+        for t in 0..0x10000u32 {
+            if native.tag_name(cache, t).as_deref() == Some("globals\\player_model_customization") {
+                tag = Some(t);
+                break;
+            }
+        }
+        let Some(tag) = tag else { return out };
+        let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+        let Some(m) = native.tag_meta(cache, tag, 0, 0xC0) else { return out };
+        for slot in 0..10usize {
+            let at = 0x20 + slot * 12;
+            let (cnt, ptr) = (u(&m, at), u(&m, at + 4));
+            let mut opts: Vec<Vec<(u32, u32)>> = Vec::new();
+            if cnt > 0 && cnt <= 256 {
+                if let Some(ob) = native.tag_ptr_bytes(cache, ptr, cnt * 16) {
+                    for o in 0..cnt as usize {
+                        let e = &ob[o * 16..o * 16 + 16];
+                        let (ocnt, optr) = (u(e, 4), u(e, 8));
+                        let mut ovr = Vec::new();
+                        if ocnt > 0 && ocnt <= 64 {
+                            if let Some(vb) = native.tag_ptr_bytes(cache, optr, ocnt * 12) {
+                                for v in 0..ocnt as usize {
+                                    let ve = &vb[v * 12..v * 12 + 12];
+                                    ovr.push((u(ve, 0), u(ve, 4)));
+                                }
+                            }
+                        }
+                        opts.push(ovr);
+                    }
+                }
+            }
+            out.push(opts);
+        }
+    }
+    out
+}
+
+/// #skin One recorded player's option indices turned into the `(region, permutation)` picks a
+/// render model can wear. The offline audit and the renderer share this.
+///
+/// `which` names the slots to read, which is how the SPECIES split is applied: a Spartan body
+/// wears `film::SPARTAN_APPEARANCE_SLOTS` and an Elite body `film::ELITE_APPEARANCE_SLOTS`.
+pub(crate) fn appearance_picks_from(table: &[Vec<Vec<(u32, u32)>>], slots: &[u8], which: &[usize]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for &k in which {
+        let Some(&opt) = slots.get(k) else { continue };
+        let Some(block) = table.get(k) else { continue };
+        let Some(overrides) = block.get(opt as usize) else { continue };
+        out.extend(overrides.iter().copied());
+    }
+    out
+}
+
+/// #elite The render-model REGIONS the customisation table's Elite blocks override
+/// (`armor_pieces`), memoised per cache.
+///
+/// This is the species discriminator, and it is read out of the tag rather than guessed from a
+/// model path: a render model that carries one of these regions is the Elite's, every other
+/// player model is the Spartan's. The pmcg tag's own `spartan render model` / `elite render
+/// model` references would say so directly but are NULL in a shipped cache (the tag definition
+/// marks them "used for string list generation", so the build strips them).
+fn elite_customization_regions(native: &NativeDll, cache: CacheHandle) -> std::sync::Arc<Vec<u32>> {
+    static CACHED: std::sync::RwLock<Option<(u64, std::sync::Arc<Vec<u32>>)>> = std::sync::RwLock::new(None);
+    if let Ok(g) = CACHED.read() {
+        if let Some((k, v)) = g.as_ref() {
+            if *k == cache.0 { return v.clone(); }
+        }
+    }
+    let table = player_customization_table(native, cache);
+    let mut out: Vec<u32> = Vec::new();
+    for &k in crate::film::ELITE_APPEARANCE_SLOTS.iter() {
+        // Slot 9 (the Elite armour EFFECT) shares `armor_fx` with the Spartan's slot 8, so it
+        // cannot discriminate; only the regions the Elite alone carries are kept.
+        if k != 7 { continue; }
+        if let Some(block) = table.get(k) {
+            for o in block { for (r, _) in o { if !out.contains(r) { out.push(*r); } } }
+        }
+    }
+    let arc = std::sync::Arc::new(out);
+    if let Ok(mut g) = CACHED.write() { *g = Some((cache.0, arc.clone())); }
+    arc
+}
+
+impl SceneController {
+    /// Print the customisation table, names resolved. GPU-free diag.
+    pub fn dump_player_customization(&self) {
+        let Some(cache) = self.cache else { println!("no cache"); return };
+        let name = |sid: u32| self.native.string_id(cache, sid).unwrap_or_default();
+        let table = self.player_customization();
+        println!("CUSTOMIZATION {} slots", table.len());
+        for (si, opts) in table.iter().enumerate() {
+            // Which regions this whole slot ever touches -- that is what identifies the slot.
+            let mut regions: Vec<u32> = opts.iter().flatten().map(|(r, _)| *r).collect();
+            regions.sort_unstable();
+            regions.dedup();
+            println!(
+                "  slot[{si}] {} options, regions: {}",
+                opts.len(),
+                regions.iter().map(|r| format!("{} ({r:#x})", name(*r))).collect::<Vec<_>>().join(", ")
+            );
+            for (oi, ovr) in opts.iter().enumerate().take(4) {
+                println!(
+                    "    option[{oi}]: {}",
+                    ovr.iter().map(|(r, p)| format!("{}={}", name(*r), name(*p))).collect::<Vec<_>>().join(" ")
+                );
+            }
+        }
+    }
+
+    /// Raw meta bytes of a tag, for the GPU-free `--model-regions @<tag>` dump.
+    pub fn tag_meta_bytes(&self, tag: u32, offset: u32, len: usize) -> Option<Vec<u8>> {
+        self.native.tag_meta(self.cache?, tag, offset, len as u32)
+    }
+
     pub fn dump_model_regions(&self, obj_tag: u32) {
         let Some(cache) = self.cache else { println!("no cache"); return };
         let nm = |t: u32| self.native.tag_name(cache, t).unwrap_or_default();
@@ -6007,12 +7600,13 @@ impl SceneController {
             for r in 0..rcnt.min(64) as usize {
                 let e = &rb[r * 16..r * 16 + 16];
                 let (pcnt, pptr) = (u(e, 4), u(e, 8));
-                println!("  region[{r}] name_sid={:#x} perms={pcnt}", u(e, 0));
+                let sname = |sid: u32| self.native.string_id(cache, sid).unwrap_or_default();
+                println!("  region[{r}] name_sid={:#x} '{}' perms={pcnt}", u(e, 0), sname(u(e, 0)));
                 // permutation entries are 0x18 B: name sid @0, mesh_index i16 @4, mesh_count i16 @6.
                 if let Some(pb) = self.native.tag_ptr_bytes(cache, pptr, pcnt.min(64) * 0x18) {
                     for p in 0..pcnt.min(64) as usize {
                         let pe = &pb[p * 0x18..p * 0x18 + 0x18];
-                        println!("    perm[{p}] name_sid={:#x} sections=[{}..+{}] tail={:02x?}", u(pe, 0), i16at(pe, 4), i16at(pe, 6), &pe[8..0x18]);
+                        println!("    perm[{p}] name_sid={:#x} '{}' sections=[{}..+{}]", u(pe, 0), sname(u(pe, 0)), i16at(pe, 4), i16at(pe, 6));
                     }
                 }
             }
@@ -6075,6 +7669,20 @@ impl SceneController {
         let nm = |t: u32| self.native.tag_name(cache, t).unwrap_or_default();
         let mode = self.native.resolve_mode(cache, obj_tag);
         println!("VEHMAT obj={obj_tag:#x} '{}' mode={mode:#x} '{}'", nm(obj_tag), nm(mode));
+        // #armour-fx  The object's own `effe` ATTACHMENTS (obje +0x104), which is where a looping
+        // effect on a model lives — a lift beam, and the question this was added for: whether a
+        // player biped's armour effect (the flaming helmet) is one. Printed beside the hlmt
+        // variant attachments below because the two are different blocks and "no attachments" on
+        // one says nothing about the other.
+        let effs = self.object_effects(obj_tag);
+        println!("  effe attachments: {}", effs.len());
+        for (effe, marker, scale_sid) in &effs {
+            println!(
+                "    effe={effe:#x} '{}' marker={marker:#x} '{}' scale_sid={scale_sid:#x}",
+                nm(*effe),
+                self.native.string_id(cache, *marker).unwrap_or_default(),
+            );
+        }
         // The hlmt variant attachments (child OBJECT + its render model), so an attached
         // turret / gun can be dumped by its own obj tag.
         let cmk = hlmt_variant_child_markers(&self.native, cache, obj_tag);
@@ -6098,6 +7706,28 @@ impl SceneController {
                         println!("    child_marker={cms:#x} child-space pos=[{:.3},{:.3},{:.3}] -> child origin(model)=[{:.3},{:.3},{:.3}] rot=[{:.3},{:.3},{:.3},{:.3}] | hitch delta before={d_before:.3} wu after={d_after:.4} wu", cpos.x, cpos.y, cpos.z, t.x, t.y, t.z, rq.x, rq.y, rq.z, rq.w);
                     }
                     None => println!("    child_marker={cms:#x} (absent from the child model: child origin on the parent marker)"),
+                }
+            }
+        }
+        // #blade-anim The object's own FUNCTION block (obje +0xEC, 64 B entries: flags @0,
+        // import name @4, export name @8, turn-off-with @0xC, ranged interpolation @0x10, min
+        // value @0x14, default mapping function @0x18, scale-by @0x2C). The EXPORT names are
+        // what a render_method's animated parameters name as their input, so this is what says
+        // whether a glow is switched on, what switches it off, and what scales it.
+        {
+            let rd = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let sid = |v: u32| if v == 0 { "-".to_string() } else { self.native.string_id(cache, v).unwrap_or_else(|| format!("{v:#x}")) };
+            if let Some(m) = self.native.tag_meta(cache, obj_tag, 0xEC, 8) {
+                let (cnt, ptr) = (rd(&m, 0), rd(&m, 4));
+                if cnt > 0 && cnt <= 256 {
+                    if let Some(b) = self.native.tag_ptr_bytes(cache, ptr, cnt * 64) {
+                        for i in 0..cnt as usize {
+                            let e = &b[i * 64..i * 64 + 64];
+                            println!("  objfn[{i}] export='{}' import='{}' turn_off_with='{}' scale_by='{}' min={:.3} flags={:#x}",
+                                sid(rd(e, 8)), sid(rd(e, 4)), sid(rd(e, 0x0C)), sid(rd(e, 0x2C)),
+                                f32::from_le_bytes([e[0x14], e[0x15], e[0x16], e[0x17]]), rd(e, 0));
+                        }
+                    }
                 }
             }
         }
@@ -6161,6 +7791,18 @@ impl SceneController {
             for (ty, name, period, omin, omax, ft) in self.native.model_shader_overlays(model, sh) {
                 println!("    overlay type={ty} arg='{name}' period={period:.3} out=[{omin:.3},{omax:.3}] func={ft}");
             }
+            // ...and the SAME records with their mapping functions decoded in Rust
+            // (`shader_animated_params`), which is what actually drives a parameter: the native
+            // walker only bakes a linear ramp from a header field that is 0 for scalars.
+            {
+                let (c, stag) = (cache, self.native.model_shader_tag(model, sh).max(0) as u32);
+                let names: Vec<String> = self.native.model_shader_constants(model, sh)
+                    .map(|k| k.dump_args().into_iter().map(|a| a.1).collect()).unwrap_or_default();
+                for p in shader_animated_params(&self.native, c, stag, &names) {
+                    println!("    anim type={} arg='{}' period={:.3} input={:#x} f(0)={:.4} f(.5)={:.4} f(1)={:.4} colors={:?}",
+                        p.ty, p.arg, p.period, p.input, p.f.eval(0.0), p.f.eval(0.5), p.f.eval(1.0), p.colors);
+                }
+            }
         }
         self.native.close_model(model);
     }
@@ -6201,15 +7843,15 @@ impl SceneController {
             println!("    coll=0x{coll:08X} tris={} extent={}", cg.as_ref().map(|(_,i)|i.len()/3).unwrap_or(0), ext(&cg));
         }
         for (i, p) in dec.obj_parts.iter().enumerate() {
-            println!("    part[{i}] blend={} emis_change_color={} is_halo={} is_forcefield={} tex={} emis={} ff_color={:?}",
-                p.blend, p.emis_change_color, p.is_halo, p.is_forcefield, p.tex.is_some(), p.emissive.is_some(), p.ff_color);
+            println!("    part[{i}] blend={} emis_change_color={} is_halo={} is_forcefield={} tex={} emis={} cc_map={} ff_color={:?}",
+                p.blend, p.emis_change_color, p.is_halo, p.is_forcefield, p.tex.is_some(), p.emissive.is_some(), p.cc_map.is_some(), p.ff_color);
             // per-part OBJECT-SPACE bounds + variant bits (print-only; measures e.g. the
             // armor-ability drop_holo field against the icon sprite's marker height / size).
             let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
             for &ix in &p.indices { if let Some(v) = dec.verts.get(ix as usize) { let q = Vec3::from(v.pos); mn = mn.min(q); mx = mx.max(q); } }
             if mn.x <= mx.x {
-                println!("      bounds min=[{:.3},{:.3},{:.3}] max=[{:.3},{:.3},{:.3}] size=[{:.3} x {:.3} x {:.3}] vbits={:#x} diffuse={:#x} tris={}",
-                    mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, mx.x - mn.x, mx.y - mn.y, mx.z - mn.z, p.vbits, p.diffuse_tag, p.indices.len() / 3);
+                println!("      bounds min=[{:.3},{:.3},{:.3}] max=[{:.3},{:.3},{:.3}] size=[{:.3} x {:.3} x {:.3}] vbits={:#x} diffuse={:#x} '{}' tris={}",
+                    mn.x, mn.y, mn.z, mx.x, mx.y, mx.z, mx.x - mn.x, mx.y - mn.y, mx.z - mn.z, p.vbits, p.diffuse_tag, nm(p.diffuse_tag), p.indices.len() / 3);
                 // z-band radial profile (max xy distance from the object z axis per 1/8 of the height):
                 // a cone vs cylinder vs disc reads straight off it.
                 if p.is_halo && mx.z - mn.z > 1e-4 {
@@ -6241,6 +7883,7 @@ impl SceneController {
                     let cls = self.native.model_shader_class(model, sh);
                     let tmpl = self.native.model_shader_template_tag(model, sh);
                     let tname = if tmpl >= 0 { nm(tmpl as u32) } else { String::new() };
+                    println!("    shader[{sh}] template_tag={tmpl} digits={:?}", if tmpl >= 0 { rm_template_digits(&tname) } else { Vec::new() });
                     let (opt, halo) = self_illum_option(&tname);
                     let sc = self.native.model_shader_constants(model, sh);
                     let sic = sc.as_ref().and_then(|c| c.real("self_illum_color"));
@@ -6266,6 +7909,10 @@ impl SceneController {
             }
             self.native.close_model(model);
         }
+        // #sword-blade print-only: the ANIMATED parameters of every one of this object's
+        // materials with the object function that drives each one, so "is this glow on or off,
+        // and what switches it" is answerable with no GPU (`HMS_ANIMPARAM=1 --dump-parts`).
+        if ev("HMS_ANIMPARAM").is_ok() { dump_object_anim_params(&self.native, cache, obj_tag); }
     }
 
     /// The full sandbox forge palette (offline) with (paletteIndex, entryWithin,
@@ -6312,6 +7959,135 @@ impl SceneController {
 
     /// obje base block: (object type @0, flags @4, bounding radius @0x0C). Verified on forge_halo:
     /// ff_wall_2x2 = (10 crate, 0, 1.418), initial_spawn_point = (6 scenery, 1, 0.4725).
+    /// #fp-light **THE OBJECT THE ENGINE LIGHTS THIS MODEL AS** — the one place the actor /
+    /// first-person lanes turn a bare `render_model` tag into the `obje` whose type, flags and
+    /// bounding radius drive [`SceneController::object_probe_for_uncached`].
+    ///
+    /// **The engine's law (measured in `reach_tag_test.exe`, not inferred).** Reach has NO
+    /// first-person lighting rig. `first_person_weapons.cpp` collects up to 4 first-person models
+    /// into a flat array (`sub_1408CCE10` -> `sub_1408CCBE0`, which writes `entry+0 = mode tag`,
+    /// `entry+4 = OBJECT INDEX`), and `render_visibility_collection.cpp:333` (`sub_140855370`)
+    /// submits each one as an ordinary render object carrying THAT object index
+    /// (`sub_140471E40(slot, object_index, item)`, item+0xC0 = the object). The first-person pass
+    /// `render_first_person_static_lighting` (0x1408362F0) then reaches the one and only per-object
+    /// static-lighting constants function `sub_14087E910` (0x1408362F0 -> `sub_140884BF0` ->
+    /// `sub_140882B90` -> `sub_140885320`, which hands it `*(item+0x98)+0x10` = that object's cached
+    /// `c_lightmap_sample`). So the viewmodel is lit by its OWNER's ordinary
+    /// `object_get_lighting_sample` result, post-processed by the `chmt` row of the OWNER's obje
+    /// type — and which owner is spelled out in `sub_1408CCE10`:
+    ///
+    /// | first-person model | owner object (`entry+4`) | obje type -> chmt row |
+    /// |---|---|---|
+    /// | arms (`matg @player representation` +0x14 `first person hands`) | the player's UNIT (`a2`, at `first_person_weapons.cpp` +0x4C row) | 0 biped |
+    /// | legs (`@player representation` +0x24 `first person body`) | the player's UNIT (`+0x04`) | 0 biped |
+    /// | the gun (`weap` `player interface` -> `first person model`) | the WEAPON object (`+0x3C`) | 2 weapon |
+    ///
+    /// **Why this function exists.** `ActorDef::read_model` sets `obj_tag = mode_tag`, so every
+    /// render-model actor (both first-person arm models, the first-person legs, the first-person
+    /// gun, an imported model) handed `obj_meta` a `render_model` header to read as an `obje`
+    /// header. MEASURED on `forge_halo`, `objects\characters\spartans\fp\fp` (0x303d): the first
+    /// 16 meta bytes are `86 59 00 00 | 00 00 01 00 | 17 0b 1e 18 | 02 00 00 00`, i.e. the
+    /// `render_model` fields `name` (string id 0x5986), `flags`+`version`, `import info checksum`
+    /// and the `regions` block COUNT — read as an obje that is object type **22918**, flags
+    /// **0x10000** and bounding radius **f32::from_bits(2) = 2.8e-45**. Type 22918 is outside the
+    /// 14-row `chmt` block, so the arms, the legs and the first-person gun all took
+    /// [`CHMT_DEFAULT`] (`[-1, 0, 0, 2, 1]`) instead of forge_halo's authored row 0 / row 2
+    /// (`[0.4, 1.7, 1.0, 2.0, 1.0]`, measured): no min-luminance floor and no max-contrast fill
+    /// lift, while the SAME weapon held by the third-person biped got both. `fp_body` (0x307c)
+    /// additionally read flags `0x10004`.
+    ///
+    /// Mapping, in priority order:
+    /// 1. not a `mode` tag -> returned unchanged (it is already the object);
+    /// 2. a `@player representation` row's `first person hands` / `first person body` -> that
+    ///    row's `third person unit` (+0x34), which is the engine's own pairing of the two;
+    /// 3. any other `mode` -> an object tag whose `hlmt` resolves to it. This is what covers the
+    ///    first-person GUN, because a Reach weapon's `first person model` IS its ordinary render
+    ///    model (see `reach_actor::first_person_weapon`), so the weapon's own `weap` tag is found
+    ///    here;
+    /// 4. no owner found -> `0xFFFF_FFFF`, which makes `obj_meta` return `None` and the caller
+    ///    fall back to (type 10, flags 0, model-bounds radius). LABELLED INFERENCE: nothing in the
+    ///    cache says what an orphan render model is; what matters is that the flags and the radius
+    ///    are then deterministic zeros rather than a render_model's bytes.
+    pub fn lighting_object_tag(&self, tag: u32) -> u32 {
+        if tag == 0 || tag == 0xFFFF_FFFF { return tag; }
+        let mut g = self.light_owner_cache.lock().unwrap();
+        if g.is_none() { *g = Some(self.build_light_owner_map()); }
+        let m = g.as_mut().expect("just built");
+        // The map's KEYS are render-model tag indices, and a tag index belongs to exactly one tag,
+        // so an `obje` tag can never collide with one: a miss means "not a model with an owner".
+        if let Some(v) = m.get(&tag) { return *v; }
+        let v = if self.raw_tag_class(tag).as_deref() == Some("mode") { 0xFFFF_FFFF } else { tag };
+        m.insert(tag, v); // memoised, so the per-object lanes cost one lookup after the first call
+        v
+    }
+
+    /// #fp-light Build the `render_model -> owning object` map `lighting_object_tag` answers from.
+    /// One walk of the tag table per cache; the result is cached until the next map opens.
+    fn build_light_owner_map(&self) -> HashMap<u32, u32> {
+        let mut m: HashMap<u32, u32> = HashMap::new();
+        let Some(cache) = self.cache else { return m };
+        // (3) every object's own render model -> that object. FIRST writer wins (`or_insert`), so
+        // two objects sharing one render model resolve to the lower tag index; the first-person
+        // gun's model is its own weapon's model, and nothing else in a shipped cache claims it.
+        for t in 0..0x10000u32 {
+            let Some(cls) = self.native.tag_class(cache, t) else { continue };
+            if !OBJECT_TAG_CLASSES.contains(&cls.as_str()) { continue; }
+            let mode = self.native.resolve_mode(cache, t);
+            if mode == 0 || mode == 0xFFFF_FFFF { continue; }
+            m.entry(mode).or_insert(t);
+        }
+        // (2) the first-person arms / legs belong to no object at all: the engine lights them as
+        // the UNIT of the same `@player representation` row (+0x34 `third person unit`).
+        for (hands, body, unit) in self.player_representation_units() {
+            if unit == 0 || unit == 0xFFFF_FFFF { continue; }
+            for mdl in [hands, body] {
+                if mdl != 0 && mdl != 0xFFFF_FFFF { m.insert(mdl, unit); }
+            }
+        }
+        m
+    }
+
+    /// #fp-light `(first person hands, first person body, third person unit)` per
+    /// `@player representation` row — the same block [`SceneController::first_person_models`]
+    /// reads (scenario override `scnr` +0x794 first, else `matg` +0x474, 108-byte elements), with
+    /// the row's `third person unit` at +0x34 as well.
+    fn player_representation_units(&self) -> Vec<(u32, u32, u32)> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let u = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let tagref = |b: &[u8], o: usize| -> u32 {
+            if o + 16 > b.len() { return 0xFFFF_FFFF }
+            let d = u(b, o + 0x0C);
+            if d == 0xFFFF_FFFF { 0xFFFF_FFFF } else { d & 0xFFFF }
+        };
+        const REP_ELEM: u32 = 108;
+        let mut block: Option<Vec<u8>> = None;
+        if self.scnr != 0 && self.scnr != 0xFFFF_FFFF {
+            if let Some(h) = self.native.tag_meta(cache, self.scnr, 0x794, 8) {
+                let (c, p) = (u(&h, 0), u(&h, 4));
+                if c > 0 && c <= 3 { block = self.native.tag_ptr_bytes(cache, p, c * REP_ELEM); }
+            }
+        }
+        if block.is_none() {
+            let mut matg = None;
+            for t in 0..0x400u32 {
+                if self.native.tag_class(cache, t).as_deref() == Some("matg") { matg = Some(t); break; }
+            }
+            if let Some(mt) = matg {
+                if let Some(h) = self.native.tag_meta(cache, mt, 0x474, 8) {
+                    let (c, p) = (u(&h, 0), u(&h, 4));
+                    if c > 0 && c <= 3 { block = self.native.tag_ptr_bytes(cache, p, c * REP_ELEM); }
+                }
+            }
+        }
+        let Some(b) = block else { return Vec::new() };
+        (0..b.len() / REP_ELEM as usize)
+            .map(|i| {
+                let e = &b[i * REP_ELEM as usize..(i + 1) * REP_ELEM as usize];
+                (tagref(e, 0x14), tagref(e, 0x24), tagref(e, 0x34))
+            })
+            .collect()
+    }
+
     fn obj_meta(&self, obj_tag: u32) -> Option<(u32, u32, f32)> {
         if obj_tag == 0 || obj_tag == 0xFFFF_FFFF { return None; }
         if let Some(v) = self.obj_meta_cache.lock().unwrap().get(&obj_tag) { return *v; }
@@ -6881,7 +8657,7 @@ impl SceneController {
         let meta = self.obj_meta(o.primary_tag);
         let radius = meta.map(|m| m.2).unwrap_or(0.0);
         if radius > 0.0 { return radius; }
-        let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
+        let s = self.object_scale(o);
         self.geom_cache.get(&o.mode_tag).and_then(|d| d.as_ref()).map(|d| (d.max - d.min).length() * 0.5 * s).unwrap_or(0.4)
     }
 
@@ -7232,13 +9008,24 @@ impl SceneController {
     /// The per-object probe used by the object passes: the ENGINE raycast sample (above) with the
     /// object's obje type/flags/radius, or the legacy 4-nearest-airprobe blend when
     /// `HMS_OBJ_LIGHT_LEGACY=1` / when the engine path yields nothing.
+    /// #model-import: the ambient irradiance an EXTERNALLY IMPORTED model standing at `p` should
+    /// be lit by — the same absolute airprobe DC the engine lights a placed Forge object with, so
+    /// an import sits in the map's own light instead of glowing flat white.
+    ///
+    /// `None` when the map carries no baked airprobe grid (nothing loaded yet, or an
+    /// import-only session): the caller then keeps the neutral white the mesh ships with rather
+    /// than render a near-black model, which is what `sample_absolute`'s no-grid floor would do.
+    pub fn import_ambient(&self, p: Vec3) -> Option<[f32; 3]> {
+        (self.probe.valid && !self.probe.points.is_empty()).then(|| self.probe.sample_absolute(p))
+    }
+
     fn object_probe_for(&self, o: &ObjectInfo, diag: bool) -> (Option<ProbeVmf>, String) {
         self.object_probe_for_depth(o, diag, 0)
     }
     fn object_probe_for_depth(&self, o: &ObjectInfo, diag: bool, depth: u8) -> (Option<ProbeVmf>, String) {
         if diag { return self.object_probe_for_uncached(o, diag, depth); }
         // Key: identity + pose + scale (any change → re-sample)
-        let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
+        let s = self.object_scale(o);
         let mut key = 0xcbf2_9ce4_8422_2325u64;
         let mut mix = |v: u64| { key ^= v; key = key.wrapping_mul(0x0100_0000_01b3); };
         mix(o.datum as u64); mix(o.primary_tag as u64); mix(o.mode_tag as u64); mix(s.to_bits() as u64);
@@ -7270,12 +9057,14 @@ impl SceneController {
             // 6 SCENERY, 7 MACHINE, 12 GIANT. Crates (10 = every Forge piece), vehicles, bipeds, weapons
             // are never hit, so a block resting on another block samples the GROUND through it and never
             // adopts its neighbour's sample (the per-block steps in stacked / mixed-height builds).
-            if !obj_ray_target_type(self.obj_meta(o.primary_tag).map(|m| m.0)) { continue; }
-            let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
+            // #fp-light same owner resolution as `object_probe_for_uncached`, so a render-model
+            // actor is classified by the object it belongs to and not by its mode header.
+            if !obj_ray_target_type(self.obj_meta(self.lighting_object_tag(o.primary_tag)).map(|m| m.0)) { continue; }
+            let s = self.object_scale(o);
             sig.insert(o.datum, obj_pose_hash(o, s));
             let Some(Some(d)) = self.geom_cache.get(&o.mode_tag) else { continue };
             if d.indices.len() < 3 { continue; }
-            let m = if (s - 1.0).abs() > 1e-4 { object_matrix(o) * Mat4::from_scale(Vec3::splat(s)) } else { object_matrix(o) };
+            let m = self.object_world(o);
             let (wmin, wmax) = transform_aabb(d.min, d.max, &m);
             let inv = m.inverse();
             if !inv.is_finite() { continue; }
@@ -7305,11 +9094,14 @@ impl SceneController {
             return (self.probe.sample_vmf(origin), String::from("legacy 4-nearest airprobes"));
         }
         let up = Vec3::from(o.up);
-        let meta = self.obj_meta(o.primary_tag);
+        // #fp-light The lighting sample is the OWNING OBJECT's, never the render model's: an actor
+        // built from a bare `mode` (both first-person arm models, the first-person legs, the
+        // first-person gun) would otherwise read a `render_model` header as an `obje` header.
+        let meta = self.obj_meta(self.lighting_object_tag(o.primary_tag));
         let (ty, flags, mut radius) = meta.unwrap_or((10, 0, 0.0));
         if !(radius > 0.0) {
             // no obje radius → model bounds half-diagonal (× forge scale)
-            let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
+            let s = self.object_scale(o);
             radius = self.geom_cache.get(&o.mode_tag).and_then(|d| d.as_ref()).map(|d| (d.max - d.min).length() * 0.5 * s).unwrap_or(0.4);
         }
         let (pv, mut log) = self.object_lighting_sample_obj(origin, up, radius, ty, flags, diag, Some(o.datum), depth);
@@ -7319,6 +9111,93 @@ impl SceneController {
         match pv {
             Some(mut v) => { v.chmt = chmt; (Some(v), log) }
             None => { log.push_str("  → legacy 4-nearest fallback\n"); (self.probe.sample_vmf(origin).map(|mut v| { v.chmt = chmt; v }), log) }
+        }
+    }
+
+    /// #objshine print-only: `HMS_OBJMETA=<tag-name substring>` -> for every tag whose name
+    /// contains the substring, the tag CLASS, what `obj_meta` reads out of its first 16 meta bytes
+    /// (object type / flags / bounding radius) and the `chmt` block that type resolves to.
+    ///
+    /// The object type is read RAW from meta+0, so this also says what a tag that is NOT an object
+    /// yields: Reach's first-person arms are bare `mode` render models with no obje wrapper, and
+    /// the actor pipeline hands that `mode` tag straight to `obj_meta` as the object tag.
+    pub fn scan_obj_meta(&self, needle: &str) {
+        let Some(c) = self.cache else { return };
+        let nl = needle.to_lowercase();
+        let mut n = 0;
+        for t in 0..0x10000u32 {
+            let Some(name) = self.native.tag_name(c, t) else { continue };
+            if !name.to_lowercase().contains(&nl) { continue }
+            let cls = self.native.tag_class(c, t).unwrap_or_default();
+            // #fp-light print BOTH: what the tag's own bytes say, and what the lighting lane
+            // really uses (the owning object resolved by `lighting_object_tag`).
+            let meta = self.obj_meta(t);
+            let (ty, flags, radius) = meta.unwrap_or((10, 0, 0.0));
+            let own = self.lighting_object_tag(t);
+            let ometa = self.obj_meta(own);
+            let (oty, oflags, oradius) = ometa.unwrap_or((10, 0, 0.0));
+            eprintln!("OBJMETA {t:#06x} class={cls} name={name} meta={} type={ty} flags={flags:#x} radius={radius:e} chmt={:?}\n    lighting owner={own:#06x} [{}] '{}' type={oty} flags={oflags:#x} radius={oradius:.3} chmt={:?}",
+                if meta.is_some() { "read" } else { "MISSING" }, self.chmt_params(ty),
+                self.raw_tag_class(own).unwrap_or_default(), self.native.tag_name(c, own).unwrap_or_default(),
+                self.chmt_params(oty));
+            n += 1;
+            if n >= 200 { eprintln!("OBJMETA ... (stopped at 200)"); break }
+        }
+        if n == 0 { eprintln!("OBJMETA no tag name contains '{needle}'"); }
+    }
+
+    /// #objmat print-only: `HMS_OBJMAT_SWEEP=1` (or a palette-entry / variant / category substring) ->
+    /// the per-PART engine material of every Forge-palette object, decoded the way the draw path decodes
+    /// it, alongside SHADER 0's constants (what every part used to be shaded with). It is a DECODE-time
+    /// census, so it covers the whole palette without placing a single object and without a GPU.
+    ///
+    /// One `OBJMAT` line per opaque/cutout part: `spec0`/`rough0` are shader 0's legacy values, `spec`/
+    /// `rough` this part's own, and `menv`/`env_opt`/`cube` its authored environment reflection.
+    pub fn scan_obj_mat(&self, filter: &str) {
+        let Some(cache) = self.cache else { return };
+        let f = filter.to_ascii_lowercase();
+        let all = f == "1" || f.is_empty();
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for p in self.forge_palette_full() {
+            let obj = p.tag_short;
+            if obj == 0 || obj == 0xFFFF_FFFF || !seen.insert(obj) { continue; }
+            if !all {
+                let hay = format!("{} {} {}", p.category_name, p.name, p.variant_name).to_ascii_lowercase();
+                if !hay.contains(&f) { continue; }
+            }
+            let mode = self.native.resolve_mode(cache, obj);
+            if mode == 0 || mode == 0xFFFF_FFFF { continue; }
+            let obj_type = self.obj_meta(obj).map(|(t, _, _)| t).unwrap_or(0xFFFF_FFFF);
+            let Ok(model) = self.native.open_model(cache, mode) else { continue };
+            // Shader 0's constants are what the legacy object lane applied to EVERY part.
+            let s0 = decode_obj_mat(&self.native, cache, model, 0, obj_type);
+            let (mut l_spec, mut l_rough) = (0.0f32, -1.0f32);
+            if let Some(sc) = self.native.model_shader_constants(model, 0) {
+                let rx = |n: &str| sc.real(n).map(|v| v[0]).filter(|v| v.is_finite() && *v > 0.0);
+                if let Some(coef) = rx("specular_coefficient") {
+                    l_spec = (coef * rx("analytical_specular_contribution").unwrap_or(1.0)).clamp(0.0, 4.0);
+                    l_rough = rx("analytical_roughness").or_else(|| rx("roughness"))
+                        .or_else(|| rx("specular_power").map(|q| 0.553773 * q.clamp(0.01, 2000.0).powf(-0.4551)))
+                        .unwrap_or(0.5).clamp(0.04, 1.0);
+                }
+            }
+            let mut shaders: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+            for si in 0..self.native.model_submesh_count(model) {
+                if let Some(sm) = self.native.model_submesh(model, si) { shaders.insert(sm.shader_index.max(0)); }
+            }
+            if shaders.is_empty() { shaders.insert(0); }
+            for sh in shaders {
+                let m = decode_obj_mat(&self.native, cache, model, sh, obj_type);
+                let cls = self.native.model_shader_class(model, sh);
+                let tm = self.native.model_shader_template_tag(model, sh);
+                let tname = if tm >= 0 { self.native.tag_name(cache, tm as u32).unwrap_or_default() } else { String::new() };
+                eprintln!("OBJMAT obj={obj:#x} type={obj_type} cat='{}' name='{}' var='{}' part={sh} cls={cls} mat={} valid={} mm_set={} mm={} spec0={l_spec:.3} spec={:.3} rough0={l_rough:.3} rough={:.3} rough_lut={:.3} area={:.3} menv={:.3} env_opt={} cube={:#x} smd={} s0_mat={} tmpl='{}'",
+                    p.category_name, p.name, p.variant_name, m.mat, m.valid, m.mm_set, m.mm,
+                    m.spec, m.rough, m.rough_lut, m.area, m.menv, m.env_opt, m.env_cube, m.spec_mask_diffuse, s0.mat,
+                    tname.rsplit('\\').next().unwrap_or(""));
+            }
+            self.native.close_model(model);
+            self.native.drop_map_pages(cache);
         }
     }
 
@@ -7493,6 +9372,133 @@ impl SceneController {
         out
     }
 
+    /// #armour-fx The value of the OBJECT FUNCTION an `effe` / `ligh` / `lens` attachment is
+    /// scaled by (`primary scale`, obje attachment +0x18), evaluated the way every other animated
+    /// object parameter in HMS is: through the object's own function block (`obje` +0xEC, export →
+    /// import) and [`object_function_input_state`]. `> 0` means the engine would have this
+    /// attachment live; `0` means it is switched off.
+    ///
+    /// This REPLACES the old `scale_sid == 0` test for the actor lane, and the Spartan biped is
+    /// why. All four of its `effe` attachments name a scale function, so `scale_sid == 0` turned
+    /// NONE of them on and `HMS_LIFT_FX_ALL` turned ALL FOUR on. Read as functions they separate
+    /// exactly: `shield_down` → `shield_depleted` = 0 (shields up), the damage-feedback distortion
+    /// → `body_vitality` = 0 (undamaged), `out_of_bounds` = 0 (in bounds) — and the armour effect
+    /// → **`alive` = 1**. One attachment live, and it is the one the user is missing.
+    ///
+    /// An attachment that names no function at all is unconditional (1.0); the armour-ability
+    /// pickup icons are that case, which is what the old test was really detecting.
+    pub fn object_attachment_scale(&self, obj_tag: u32, scale_sid: u32) -> f32 {
+        if scale_sid == 0 || scale_sid == 0xFFFF_FFFF { return 1.0; }
+        let Some(c) = self.cache else { return 0.0 };
+        let name = self.native.string_id(c, scale_sid).unwrap_or_default();
+        if name.is_empty() { return 0.0; }
+        object_function_state(&object_function_imports(&self.native, c, obj_tag), &name)
+    }
+
+    /// A string id as text ("" when it resolves to nothing) — for the diagnostics and the gates.
+    pub fn string_of(&self, sid: u32) -> String {
+        match self.cache {
+            Some(c) if sid != 0 && sid != 0xFFFF_FFFF => self.native.string_id(c, sid).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// #armour-fx The marker of group `sid` that render model `mode` shows for hlmt variant
+    /// `vsid`, as `(skeleton node, node-LOCAL translation, node-local rotation)` — unposed, so a
+    /// caller with an animated skeleton can carry it through its own `pose.model[node]`.
+    ///
+    /// STRICT where [`SceneController::model_marker_v`] is lenient: when the group exists but NO
+    /// marker in it belongs to a (region, permutation) this variant shows, this returns `None`
+    /// instead of falling back to the first entry. **That difference IS Reach's armour-effect
+    /// selection rule**, read off the shipped tag rather than guessed:
+    ///
+    /// * the player render model's `armor_fx` region has six permutations `armor_fx_00..05`, every
+    ///   one of them carrying NO geometry (`sections=[-1..+0]`) — they exist only to name a
+    ///   permutation;
+    /// * the model carries one marker GROUP per permutation (`armor_fx_00` .. `armor_fx_05`, plus
+    ///   `armor_fx_03_shoulders` / `armor_fx_04_chest`), and each marker is tagged with that
+    ///   permutation: `'armor_fx_01'[0] region=0 perm=1 node=42 'b_helmet'`;
+    /// * the one attached effect `fx\armor_fx\armor_fx` has five EVENTS — `legendary_flame`,
+    ///   `eternal_flame`, `heart_attack`, `pestilence`, `storm` — whose ten particle systems are
+    ///   located at those six markers;
+    /// * `globals\player_model_customization`'s armour-effect block has seven options: option 0
+    ///   overrides nothing and options 1..6 set `armor_fx` to permutation 0..5.
+    ///
+    /// So a body's armour-effect byte picks a permutation, the permutation makes exactly one set
+    /// of those markers resolvable, and the events whose markers do not resolve create nothing.
+    /// The hlmt default variant names `armor_fx` with permutation **-1** (hidden), which is how
+    /// "no armour effect" is authored — and `HlmtVariants::shows` returns false for every
+    /// permutation there, so a body with no choice gets no event at all. A lenient lookup would
+    /// hand all five events the first marker and set every player on fire.
+    pub fn model_marker_node_for_variant(
+        &self, mode: u32, sid: u32, obj_tag: u32, vsid: u32,
+    ) -> Option<(Option<usize>, Vec3, glam::Quat)> {
+        let c = self.cache?;
+        if mode == 0 || mode == 0xFFFF_FFFF || sid == 0 || sid == 0xFFFF_FFFF { return None; }
+        let rd32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let rdf = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let h = self.native.tag_meta(c, mode, 0x3C, 8)?;
+        let (gcnt, gptr) = (rd32(&h, 0), rd32(&h, 4));
+        if gcnt == 0 || gcnt > 4096 { return None; }
+        let g = self.native.tag_ptr_bytes(c, gptr, gcnt * 0x10)?;
+        let ge = (0..gcnt as usize).find(|&i| rd32(&g, i * 0x10) == sid)?;
+        let (mcnt, mptr) = (rd32(&g, ge * 0x10 + 4), rd32(&g, ge * 0x10 + 8));
+        if mcnt == 0 || mcnt > 4096 { return None; }
+        let mks = self.native.tag_ptr_bytes(c, mptr, mcnt * 0x30)?;
+        // A model with no hlmt variant list has no selection to make: its only marker is the one.
+        let mi = match hlmt_variants(&self.native, c, obj_tag, mode) {
+            Some(hv) => {
+                let v = hv.index_of(vsid, object_default_variant_sid(&self.native, c, obj_tag));
+                (0..mcnt as usize).find(|&i| {
+                    let e = &mks[i * 0x30..i * 0x30 + 0x30];
+                    let (r, p) = (e[0] as i8, e[1] as i8);
+                    r < 0 || hv.shows(v, r as usize, p as i32)
+                })?
+            }
+            None => 0,
+        };
+        let mk = &mks[mi * 0x30..mi * 0x30 + 0x30];
+        let node = if mk[2] == 0xff { None } else { Some(mk[2] as usize) };
+        let pos = Vec3::new(rdf(mk, 4), rdf(mk, 8), rdf(mk, 12));
+        let rot = glam::Quat::from_xyzw(rdf(mk, 0x10), rdf(mk, 0x14), rdf(mk, 0x18), rdf(mk, 0x1c)).normalize();
+        Some((node, pos, rot))
+    }
+
+    /// #armour-fx Install the posed-actor lane's particle sources for this frame (see
+    /// [`SceneController::particle_sources_actor`]). Cheap: a handful of `Arc` clones.
+    pub fn set_actor_particle_sources(&mut self, v: Vec<ParticleSource>) {
+        self.particle_sources_actor = v;
+    }
+
+    /// How many posed-actor particle sources are installed (the gates and the status line).
+    pub fn actor_particle_source_count(&self) -> usize { self.particle_sources_actor.len() }
+
+    /// #projectile  Install the FILM lane (muzzle flashes, projectile trails, detonations).
+    ///
+    /// Replaces the whole lane, like the actor lane, because the film driver recomputes it every
+    /// frame. The per-instance state (`EventClock`, `EmitState`) is keyed by the source SEED and
+    /// survives, which is what lets a one-shot keep playing across frames; the state of a source
+    /// that has gone away is dropped here so a two-hour clip does not accumulate a clock per shot
+    /// fired. Only FILM seeds are pruned -- the other lanes' state is untouched.
+    pub fn set_film_particle_sources(&mut self, v: Vec<ParticleSource>) {
+        let live: std::collections::HashSet<u64> = v.iter().map(|s| s.seed).collect();
+        // The gone sources are still in hand here, with their `systems` -- which is what makes it
+        // possible to drop exactly the emitter keys they own instead of guessing at the seed
+        // composition. The key is built here by the SAME expression `build_particle_meshes` uses.
+        let old = std::mem::replace(&mut self.particle_sources_film, v);
+        for src in old.iter().filter(|s| !live.contains(&s.seed)) {
+            self.particle_event_clocks.remove(&src.seed);
+            for (si, sys) in src.systems.iter().enumerate() {
+                for ei in 0..sys.emitters.len() {
+                    let seed = src.seed ^ ((si as u64) << 48) ^ ((ei as u64) << 40) ^ (sys.prt3 as u64);
+                    self.particle_emit_state.remove(&seed);
+                }
+            }
+        }
+    }
+
+    pub fn film_particle_source_count(&self) -> usize { self.particle_sources_film.len() }
+
     /// Every light_volume_system part of an effect → (ltvl tag, location marker sid).
     fn effect_light_volumes(&self, effe: u32) -> Vec<(u32, u32, bool)> {
         let Some(c) = self.cache else { return Vec::new() };
@@ -7504,7 +9510,7 @@ impl SceneController {
         let (lcnt, lptr) = (rd32(&m, 0x20), rd32(&m, 0x24));
         let (ecnt, eptr) = (rd32(&m, 0x2c), rd32(&m, 0x30));
         let locs: Vec<u32> = if lcnt > 0 && lcnt <= 64 {
-            self.native.tag_ptr_bytes(c, lptr, lcnt * 12).map(|b| (0..lcnt as usize).map(|i| rd32(&b, i * 12)).collect()).unwrap_or_default()
+            self.native.tag_ptr_bytes(c, lptr, lcnt * EFFECT_LOCATION_SIZE as u32).map(|b| (0..lcnt as usize).map(|i| rd32(&b, i * EFFECT_LOCATION_SIZE)).collect()).unwrap_or_default()
         } else { Vec::new() };
         let mut out = Vec::new();
         if ecnt == 0 || ecnt > 32 { return out; }
@@ -7546,7 +9552,7 @@ impl SceneController {
         let (lcnt, lptr) = (rd32(&m, 0x20), rd32(&m, 0x24));
         let (ecnt, eptr) = (rd32(&m, 0x2c), rd32(&m, 0x30));
         let locs: Vec<u32> = if lcnt > 0 && lcnt <= 64 {
-            self.native.tag_ptr_bytes(c, lptr, lcnt * 12).map(|b| (0..lcnt as usize).map(|i| rd32(&b, i * 12)).collect()).unwrap_or_default()
+            self.native.tag_ptr_bytes(c, lptr, lcnt * EFFECT_LOCATION_SIZE as u32).map(|b| (0..lcnt as usize).map(|i| rd32(&b, i * EFFECT_LOCATION_SIZE)).collect()).unwrap_or_default()
         } else { Vec::new() };
         let mut out = Vec::new();
         if ecnt == 0 || ecnt > 32 { return out; }
@@ -7794,7 +9800,7 @@ impl SceneController {
     }
 
     /// Marker `sid` of render model `mode` → MODEL-space (pos, rot) (node chain ∘ marker).
-    fn model_marker(&self, mode: u32, sid: u32) -> Option<(Vec3, glam::Quat)> {
+    pub(crate) fn model_marker(&self, mode: u32, sid: u32) -> Option<(Vec3, glam::Quat)> {
         self.model_marker_pick(mode, sid, |_| 0)
     }
 
@@ -8103,6 +10109,7 @@ impl SceneController {
                         sway: [0.0; 3],
                         uv2: [0.0, 0.0],
                         tangent: [axis.x, axis.y, axis.z, cx * th],
+                        bone: [0, 0],
                     });
                 }
             }
@@ -8219,7 +10226,7 @@ impl SceneController {
         let looping = loop_start >= 0 || (rd32(&m, 0x00) & 0x100) != 0;
         let (lcnt, lptr) = (rd32(&m, 0x20), rd32(&m, 0x24));
         let locs: Vec<u32> = if lcnt > 0 && lcnt <= 64 {
-            self.native.tag_ptr_bytes(c, lptr, lcnt * 12).map(|b| (0..lcnt as usize).map(|i| rd32(&b, i * 12)).collect()).unwrap_or_default()
+            self.native.tag_ptr_bytes(c, lptr, lcnt * EFFECT_LOCATION_SIZE as u32).map(|b| (0..lcnt as usize).map(|i| rd32(&b, i * EFFECT_LOCATION_SIZE)).collect()).unwrap_or_default()
         } else { Vec::new() };
         let (ecnt, eptr) = (rd32(&m, 0x2c), rd32(&m, 0x30));
         if ecnt == 0 || ecnt > 32 { return out; }
@@ -8234,6 +10241,7 @@ impl SceneController {
             let eb = &ev[e * 0x40..e * 0x40 + 0x40];
             EffectEventDef {
                 index: e,
+                name_sid: rd32(eb, 0x00),
                 flags: u16::from_le_bytes([eb[4], eb[5]]),
                 skip: fin(rdf(eb, 0x08)),
                 delay: [fin(rdf(eb, 0x0c)).max(0.0), fin(rdf(eb, 0x10)).max(0.0)],
@@ -8256,7 +10264,17 @@ impl SceneController {
                 let sb = &pb[s * 0x70..s * 0x70 + 0x70];
                 let datum = rd32(sb, 0x10);
                 if datum == 0 || datum == 0xFFFF_FFFF { continue; }
-                let location = rdi16(sb, 0x16);
+                // #armour-fx The particle system's effect LOCATION (`c_particle_system_definition`
+                // +0x14, a `long block index` into the effe's own locations block — a FOUR-byte
+                // field, not two). This read was `i16 @0x16`, which is that index's HIGH half and
+                // therefore **0 for every particle system in the game**: every system of every
+                // effect was located at the effect's FIRST marker. Invisible on the effects HMS
+                // already drew, because they author one location each — and the whole of the
+                // armour-effect bug, because `fx\armor_fx\armor_fx` authors SIX (`armor_fx_00` ..
+                // `armor_fx_04`) and the location is what says which armour effect a system
+                // belongs to. The neighbouring `coordinate system` enum at +0x18 is what pins the
+                // offset: it decodes correctly as an `i16` there, so +0x14 is four bytes wide.
+                let location = i32::from_le_bytes([sb[0x14], sb[0x15], sb[0x16], sb[0x17]]);
                 let loc_sid = if location >= 0 { locs.get(location as usize).copied().unwrap_or(0) } else { 0 };
                 let (emc, emp) = (rd32(sb, 0x5c), rd32(sb, 0x60));
                 let mut emitters = Vec::new();
@@ -8333,6 +10351,7 @@ impl SceneController {
                     prt3: datum & 0xFFFF,
                     location, loc_sid,
                     coord_sys: rdi16(sb, 0x18),
+                    camera_mode: rdi16(sb, 0x1e),
                     flags: rd32(sb, 0x24),
                     near_range: rdf(sb, 0x34), near_cutoff: rdf(sb, 0x38), near_override: rdf(sb, 0x3c),
                     lod_in: rdf(sb, 0x40), lod_feather_in: rdf(sb, 0x44), inv_feather_in: rdf(sb, 0x48),
@@ -8749,6 +10768,8 @@ impl SceneController {
                 world: s, effe,
                 label: format!("efsc {:#x}", o.obj_tag),
                 systems, locs,
+                birth: None,
+                path: None,
             });
         }
         if ev("HMS_LIFTFX_DIAG").is_ok() {
@@ -8791,6 +10812,21 @@ impl SceneController {
         None
     }
 
+    /// #projectile  Where a moving source was at scene time `tau`: linear between `(time, position)`
+    /// samples, clamped at both ends. One implementation, shared by the emitter and by
+    /// [`ParticleSource::origin_at`]'s callers, so a trail and its source can never disagree.
+    pub fn path_at(p: &[(f32, Vec3)], tau: f32) -> Vec3 {
+        if p.is_empty() { return Vec3::ZERO; }
+        if tau <= p[0].0 { return p[0].1; }
+        let last = p[p.len() - 1];
+        if tau >= last.0 { return last.1; }
+        let i = p.partition_point(|&(s, _)| s <= tau).max(1).min(p.len() - 1);
+        let (ta, a) = p[i - 1];
+        let (tb, b) = p[i];
+        let u = if tb > ta { ((tau - ta) / (tb - ta)).clamp(0.0, 1.0) } else { 0.0 };
+        a + (b - a) * u
+    }
+
     /// Simulate one emitter at scene time `t` (deterministic: particle k of the emitter is
     /// born at k/rate, its randoms come from SplitMix64(seed, k)) and return the live particles in
     /// WORLD space. `emit` = (world origin, world rotation of the emitter's marker).
@@ -8798,7 +10834,7 @@ impl SceneController {
     fn simulate_emitter(
         e: &ParticleEmitterDef, sys: &ParticleSystemDef, def: &ParticleDef, seed: u64, world: &Mat4, marker: (Vec3, glam::Quat),
         t: f32, cam_pos: Vec3, cam_fwd: Vec3, stats: &mut (usize, usize), out: &mut Vec<LiveParticle>, es: &mut EmitState,
-        clock: Option<&EventClock>,
+        clock: Option<&EventClock>, path: Option<&[(f32, Vec3)]>,
     ) {
         let cap: usize = ev("HMS_PARTICLE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
         // System-level states (particle terms zero): system age, system random, game time, location lod.
@@ -9020,10 +11056,27 @@ impl SceneController {
             // the Forge World fall sheets (gravity 0.65, friction 0.45, life 12 s) reached a terminal speed of
             // 1.4 wu/s and never left the crest — faint streaks bunched at the top. With the scale their terminal
             // speed is 4.6 wu/s ≈ the authored 5 wu/s launch, i.e. a 60 wu drop in the 12 s lifespan.
+            // #gravity  **DELIBERATELY NOT the engine's world gravity, and not to be "unified".**
+            // The engine authors 4.1712594 (`crate::reach_physics::WORLD_GRAVITY`) and a falling
+            // body measures 10.4576, but neither belongs here: a `prt3` emitter's `gravity` is an
+            // authored FRACTION and this is only the scale it multiplies. The value is Earth at
+            // 1 wu = 3.048 m, and this lane was tuned against the Forge World waterfall sheets
+            // with it (gravity 0.65, friction 0.45, 12 s lifespan -> a terminal 4.6 wu/s against
+            // an authored 5 wu/s launch). Changing it moves every particle in the game, so it
+            // needs its own measurement against those sheets, not a constant from another lane.
             static PARTICLE_G: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
             let g = *PARTICLE_G.get_or_init(|| ev("HMS_PARTICLE_GRAVITY").ok().and_then(|v| v.parse().ok()).unwrap_or(3.2174));
             let a_w = wrot * (mrot * accel_l) + Vec3::new(0.0, 0.0, -e.gravity * g);
-            let p0_w = world.transform_point3(pos_l0);
+            // #projectile  A MOVING source (a projectile in flight) spawns each particle where it
+            // WAS when that particle was born, not where it is now: the engine leaves a trail in
+            // the air, and placing every live particle through the current matrix drags the whole
+            // trail along with the rocket. `path` is the recorded flight, so this is a sample of
+            // the recording rather than a model of it. A stationary source has no path and the
+            // expression is the old one exactly.
+            let p0_w = match path {
+                None => world.transform_point3(pos_l0),
+                Some(p) => world.transform_point3(pos_l0) + (Self::path_at(p, t_k) - world.w_axis.truncate()),
+            };
             let (pos, vel) = if e.air_friction > 1e-4 {
                 let kf = e.air_friction;
                 let ex = (-kf * age_t).exp();
@@ -9141,6 +11194,7 @@ impl SceneController {
                 sway: [0.0; 3],
                 uv2: fuv(f1),
                 tangent: [uvb[0], uvb[1], p.black_point, p.palette_v],
+                bone: [0, 0],
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
@@ -9181,7 +11235,7 @@ impl SceneController {
                         let seed = src.seed ^ ((si as u64) << 48) ^ ((ei as u64) << 40) ^ (sys.prt3 as u64);
                         let es = states.entry(seed).or_default();
                         let mut live = Vec::new();
-                        Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, es, Some(&*clock));
+                        Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, es, Some(&*clock), src.path.as_deref().map(|v| v.as_slice()));
                         let nl = live.len().max(1) as f32;
                         let ms = live.iter().map(|q| q.vel.length()).sum::<f32>() / nl;
                         let mf = live.iter().map(|q| q.frame0 as f32).sum::<f32>() / nl;
@@ -9208,6 +11262,13 @@ impl SceneController {
         let t0 = std::time::Instant::now();
         let mut sources = self.particle_sources_obj.clone();
         sources.extend(self.efsc_particle_sources());
+        // #armour-fx The posed-actor lane (see `particle_sources_actor`): a Theater body's armour
+        // effect rides a bone, so its source is rebuilt every frame from the live pose instead of
+        // once per object rebuild. It is simulated by exactly this code, with the same clock.
+        sources.extend(self.particle_sources_actor.iter().cloned());
+        // #projectile  The FILM lane: one-shot muzzle flashes / detonations and moving projectile
+        // trails. Same simulator, same clock -- only `birth` and `path` differ.
+        sources.extend(self.particle_sources_film.iter().cloned());
         if sources.is_empty() { return Vec::new(); }
         // HMS_PARTICLE_TIMELINE=<effe hex[,effe...]>:<t0>:<t1>:<step> (print-only diag, runs
         // once): walks the matching sources' event clocks + emitters through scene time and prints per
@@ -9233,7 +11294,20 @@ impl SceneController {
             let fx = systems.first().map(|s| s.effect.clone());
             let clock = fx.as_ref().map(|fx| {
                 let cseed = if fx.fixed_seed != 0 { fx.fixed_seed as u32 as u64 ^ 0xF1AE_D5EE_D000_0000 } else { src.seed };
-                let mut c = self.particle_event_clocks.remove(&src.seed).unwrap_or_else(|| EventClock::new(cseed));
+                // #projectile  A source with a BIRTH time gets a clock started THERE instead of
+                // pre-rolled, and a NON-looping effect is allowed to run off its event list and
+                // finish. The looping test is the effect's own (`effe` loop start, or the
+                // force-looping flag) -- the same one the attachment lanes use to decide whether
+                // an attachment is persistent.
+                let looping = systems.first().map_or(true, |s| s.looping);
+                let mk = || match src.birth {
+                    Some(t0) => EventClock::new_at(cseed, t0, looping),
+                    None => EventClock::new(cseed),
+                };
+                let mut c = self.particle_event_clocks.remove(&src.seed).unwrap_or_else(mk);
+                // The lane may re-issue the same seed with a NEW birth (a weapon fired again from
+                // the same marker); re-arm rather than keep the spent clock.
+                if c.birth != src.birth { c = mk(); }
                 c.advance(fx, t);
                 c
             });
@@ -9264,7 +11338,7 @@ impl SceneController {
                     let mut live = Vec::new();
                     let seed = src.seed ^ ((si as u64) << 48) ^ ((ei as u64) << 40) ^ (sys.prt3 as u64);
                     let mut es = self.particle_emit_state.remove(&seed).unwrap_or_default();
-                    Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, &mut es, clock.as_ref());
+                    Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, &mut es, clock.as_ref(), src.path.as_deref().map(|v| v.as_slice()));
                     let n_births = es.births.len();
                     self.particle_emit_state.insert(seed, es);
                     if tracing {
@@ -9655,6 +11729,13 @@ impl SceneController {
         }
     }
     /// Tag path for diagnostics (empty when the cache is closed / tag unknown).
+    /// #film-action  The path of the `.map` this controller opened, which is the only place the
+    /// cache's per-tag datum SALTS live — the sort key the engine's network tag-reference table
+    /// uses. `None` before a map is open.
+    pub fn open_map_path(&self) -> Option<&std::path::Path> {
+        self.map_path.as_deref()
+    }
+
     pub fn tag_name_of(&self, tag: u32) -> String {
         self.cache.and_then(|c| self.native.tag_name(c, tag)).unwrap_or_default()
     }
@@ -9793,12 +11874,16 @@ impl SceneController {
         tags.dedup();
         let t0 = std::time::Instant::now();
         let _ = obj_decode_timers_ms(); let _ = obj_shcall_ms(); let _ = bmp_cache_stats();
-        let ps0 = self.native.page_stats();
+        // `page_stats()` READS AND RESETS the native counters (ZH_MBP_GetPageStats uses
+        // `exchange(0)`), so the delta is the second read ALONE — subtracting the first read
+        // underflowed every field (the log showed `hits=18446744073709551225`), which made the
+        // one instrument that could prove a page-inflate storm useless. Clear, then read.
+        let _ = self.native.page_stats();
         let n = self.predecode_tags(&tags);
         if ev("HMS_LOADPROF").is_ok() {
-            let ps1 = self.native.page_stats();
+            let ps = self.native.page_stats();
             eprintln!("HMS_LOADPROF   predecode page stats: hits={} inflates={} inflated={:.0} MB inflate={:.0} ms stores={}",
-                ps1.0 - ps0.0, ps1.1 - ps0.1, (ps1.2 - ps0.2) as f64 / 1048576.0, (ps1.3 - ps0.3) as f64 / 1e6, ps1.4 - ps0.4);
+                ps.0, ps.1, ps.2 as f64 / 1048576.0, ps.3 as f64 / 1e6, ps.4);
         }
         if ev("HMS_LOADPROF").is_ok() {
             let (g, m, pp) = obj_decode_timers_ms(); let (sh, sub) = obj_shcall_ms(); let (bc, bm, bd) = bmp_cache_stats();
@@ -9942,7 +12027,27 @@ impl SceneController {
             }
         }
         if got > 0 && self.predecode_inflight.is_empty() {
-            self.release_burst_memory();
+            // #load-pagecache  This used to call `release_burst_memory()`, which calls
+            // `clear_page_cache()` — and `ZH_MBP_ClearPageCache` does TWO things: it frees the
+            // inflate-once page cache AND it permanently caps that cache's budget at 256 MB
+            // ("the load is over -- keep the cache small from here on").
+            //
+            // The load is NOT over here. This fires every time a background predecode BATCH
+            // drains, which on a variant load happens several times before the object tail has
+            // finished; from the first one onward the page budget was 256 MB, and a Reach
+            // `shared.map` atlas page is 155-325 MB decompressed. So every subsequent bitmap read
+            // re-inflated an entire ~155 MB page and then evicted it again. Measured on
+            // forge_halo_modded + the RCC Outskirts variant (DLC / Anniversary Forge pieces, whose
+            // bitmaps all live in shared.map): ONE render model's texture upload inflated 3.26 GB
+            // across 21 pages in 3.8 s, page-cache hits = 0, and the object tail took 41 s with
+            // single 13.6 s / 9.2 s / 5.6 s frames. Stock forge_halo with a 629-object variant
+            // takes 8 s, because its pieces come out of the base map's own smaller pages.
+            //
+            // What this site actually wants is the TRANSIENT memory back (decode heap + the map's
+            // resident file pages), not the page cache the next tag is about to need. The page
+            // cache is still freed — by the app's post-load trim and by the 30-second idle
+            // release, both of which run when the load really is over.
+            self.trim_load_transients();
             for d in self.geom_cache.values_mut().flatten() {
                 if d.tex_uploaded { release_model_texture_bytes(d); }
             }
@@ -9950,43 +12055,84 @@ impl SceneController {
         got > 0 || !self.predecode_inflight.is_empty()
     }
 
-    /// A camera pose that lands IN the playable area on load, so testing doesn't
-    /// require flying to the map every time. Stands at a spawn-like placement (prefers a
-    /// biped/player-spawn, category 1; else the object nearest the playable centroid) at
-    /// eye height, looking toward the centroid (into the map). Returns (pos, yaw_rad,
-    /// pitch_rad), or None when the map has no placed objects (fall back to auto-frame).
+    /// A camera pose that lands IN the playable area on load / on the teleport action: the
+    /// shared rule (`spawn_camera.rs`) over this map's spawn placements, `player starting
+    /// locations`, cameras, soft ceilings and playable bounds. Returns (pos, yaw_rad, pitch_rad);
+    /// None only when the map has none of those (fall back to auto-frame).
     pub fn spawn_camera_pose(&self) -> Option<(Vec3, f32, f32)> {
+        self.spawn_camera().map(|p| p.tuple())
+    }
+
+    /// The full spawn-camera pose (with its source, for the load log). Candidates: the
+    /// scenario's spawn-family placements classified by obje tag path (initial_spawn_point /
+    /// respawn_point / respawn_point_invisible / spawning_camera, the same paths `map_spawns`
+    /// hides), then the scnr `player starting locations` block; volumes: the structure-design
+    /// soft ceilings and the playable BSPs' world bounds. Stood off the BSP + objects.
+    pub fn spawn_camera(&self) -> Option<crate::spawn_camera::Pose> {
+        use crate::spawn_camera::{Candidate, Kind, Volumes};
+        let mut cands: Vec<Candidate> = Vec::new();
         let objs = self.scenario_objects();
-        if objs.is_empty() {
-            return None;
+        for o in &objs {
+            // "not automatically placed" / "never placed" markers are not spawns the game uses
+            if o.placement_flags & (1 | (1 << 6)) != 0 { continue; }
+            if let Some(kind) = crate::spawn_camera::classify_tag_path(&self.tag_name_of(o.obj_tag)) {
+                cands.push(Candidate::new(kind, Vec3::from(o.pos), Vec3::from(o.fwd)));
+            }
         }
-        let n = objs.len() as f32;
-        let centroid = objs.iter().fold(Vec3::ZERO, |a, o| a + Vec3::from(o.pos)) / n;
-        let d2 = |o: &hms_native::ScnrObject| (Vec3::from(o.pos) - centroid).length_squared();
-        // Prefer a biped placement (player-spawn proxy) nearest the centre; else any object.
-        let anchor = objs
-            .iter()
-            .filter(|o| o.category == 1)
-            .min_by(|a, b| d2(a).total_cmp(&d2(b)))
-            .or_else(|| objs.iter().min_by(|a, b| d2(a).total_cmp(&d2(b))))?;
-        let spawn = Vec3::from(anchor.pos);
-        let eye = spawn + Vec3::Z * 2.5; // ~player eye height above the spawn marker
-        let to = centroid - eye;
-        // Yaw: face the playable centre (else the spawn's own forward for a centre spawn).
-        let yaw = if to.x.hypot(to.y) > 1.0 {
-            to.y.atan2(to.x)
-        } else {
-            let f = Vec3::from(anchor.fwd);
-            if f.x.hypot(f.y) > 0.1 { f.y.atan2(f.x) } else { 0.0 }
-        };
-        // Pitch: gentle eye-level → slightly-down. Looking straight AT the centroid's
-        // HEIGHT gives absurd angles (Forge spawn sits below the centre → +54° at the sky;
-        // Countdown above the pit → −48° at the floor). Clamp to [−32°, +3°] so it reads
-        // as "standing in the map looking across it" on every map.
-        let len = to.length().max(1e-3);
-        let raw_pitch = (to.z / len).clamp(-1.0, 1.0).asin();
-        let pitch = raw_pitch.clamp(-0.56, 0.05);
-        Some((eye, yaw, pitch))
+        for (pos, yaw, pitch) in self.player_starting_locations() {
+            let fwd = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+            cands.push(Candidate::new(Kind::StartingLocation, pos, fwd).pitch(pitch));
+        }
+        let mut vols = Volumes::default();
+        if cands.is_empty() {
+            for sc in self.soft_ceilings() {
+                let tris = sc.tris.iter().map(|t| [Vec3::from(t[0]), Vec3::from(t[1]), Vec3::from(t[2])]);
+                if sc.kind == 1 { vols.kill_ceilings.extend(tris) } else { vols.other_ceilings.extend(tris) }
+            }
+            let playable = crate::hard_floor::floor_bsps(self.structure_bsp_flags());
+            if !playable.is_empty() {
+                let (mut mn, mut mx) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                for b in playable { mn = mn.min(b.min); mx = mx.max(b.max); }
+                vols.playable_bounds = Some((mn, mx));
+            }
+            vols.scene_bounds = self.scene_bounds().map(|(a, b)| (Vec3::from(a), Vec3::from(b)));
+            // last resort before the volumes: any designer object is inside the map (the
+            // previous behaviour - a biped placement, else the object nearest the centroid)
+            if vols.kill_ceilings.is_empty() && vols.other_ceilings.is_empty() && vols.playable_bounds.is_none() && !objs.is_empty() {
+                let n = objs.len() as f32;
+                let centroid = objs.iter().fold(Vec3::ZERO, |a, o| a + Vec3::from(o.pos)) / n;
+                let d2 = |o: &hms_native::ScnrObject| (Vec3::from(o.pos) - centroid).length_squared();
+                if let Some(o) = objs.iter().filter(|o| o.category == 1).min_by(|a, b| d2(a).total_cmp(&d2(b))).or_else(|| objs.iter().min_by(|a, b| d2(a).total_cmp(&d2(b)))) {
+                    cands.push(Candidate::new(Kind::RespawnPoint, Vec3::from(o.pos), centroid - Vec3::from(o.pos)));
+                }
+            }
+        }
+        let rc = |o: Vec3, d: Vec3, m: f32| self.raycast_solid(o, d, m);
+        crate::spawn_camera::choose(&cands, &vols, if self.soup_len() > 0 { Some(&rc) } else { None })
+    }
+
+    /// The scnr `player starting locations` block (+0x274, `scenario_players_block`, 28 B:
+    /// real point 3d position @0, angle facing @0xC, angle pitch @0x10, insertion point i16
+    /// @0x14, flags u16 @0x16 - reach_tag_test tagdefs). Radians as stored; non-finite / absurd
+    /// elements dropped. Empty on most MP maps (their spawns are placements).
+    pub fn player_starting_locations(&self) -> Vec<(Vec3, f32, f32)> {
+        let mut out = Vec::new();
+        let Some(c) = self.cache else { return out };
+        if self.scnr == 0xFFFF_FFFF { return out; }
+        let Some(hdr) = self.native.tag_meta(c, self.scnr, 0x274, 8) else { return out };
+        let n = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]).min(256);
+        let ptr = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if n == 0 || ptr == 0 { return out; }
+        let Some(b) = self.native.tag_ptr_bytes(c, ptr, n * 28) else { return out };
+        let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        for i in 0..n as usize {
+            let e = i * 28;
+            let pos = Vec3::new(f(e), f(e + 4), f(e + 8));
+            let (yaw, pitch) = (f(e + 0xC), f(e + 0x10));
+            if !pos.is_finite() || pos.abs().max_element() > 5000.0 || !yaw.is_finite() || !pitch.is_finite() || yaw.abs() > 7.0 || pitch.abs() > 2.0 { continue; }
+            out.push((pos, yaw, pitch));
+        }
+        out
     }
 
     /// The structure-design soft ceilings (kill floor / acceleration / slip
@@ -10188,56 +12334,39 @@ impl SceneController {
         Some(crate::construct::Obb::from_local(&p.xform, lmin, lmax))
     }
 
-    /// world-space LINE-LIST of the selected object's MESH edges — a wireframe that
-    /// hugs the actual geometry instead of a bounding box. Each triangle contributes its 3
-    /// edges (verts transformed by the object's world matrix). None if the mesh isn't decoded.
-    /// Line count is capped so a very dense model can't stall the upload.
+    /// world-space LINE-LIST of the selected object's MESH edges - a wireframe that
+    /// hugs the actual geometry instead of a bounding box (verts transformed by the object's
+    /// world matrix). None if the mesh isn't decoded.
     /// #wire-attach Every pick entry of this datum contributes its own geometry: the object's
     /// render mesh (or, for a hidden block, its collision / physics hull) PLUS each attachment's
     /// child model at the pose the attachment path computed, so the wireframe wraps a rocket
-    /// Warthog's turret or a Revenant's gun. One shared line budget, so a dense turret set cannot
-    /// blow the buffer.
+    /// Warthog's turret or a Revenant's gun.
+    /// #wire-cover Each mesh's UNIQUE edges (`objscene::push_wire_edges`); the line budget thins
+    /// the whole set evenly (`fit_wire_budget`) instead of cutting off whatever came last - the
+    /// Revenant's own mesh alone (over 20 000 triangles) used to hit the first-come cap.
     pub fn selection_wireframe(&self, datum: u32) -> Option<Vec<[f32; 3]>> {
-        const MAX_LINES: usize = 60_000; // 2 verts each
-        // #wire-attach ATTACHMENTS FIRST, with half the budget reserved for them: a dense parent
-        // (the Revenant's own mesh alone is over the cap) would otherwise eat the whole budget and
-        // its turret would be left out of the outline - the very bug this fixes.
-        const ATT_LINES: usize = MAX_LINES / 2;
+        let diag = crate::objscene::wire_diag();
         let mut out: Vec<[f32; 3]> = Vec::new();
         let mut saw_entry = false;
-        let mut order: Vec<&PickEntry> = self.picks.iter().filter(|p| p.datum == datum).collect();
-        order.sort_by_key(|p| !p.att); // attachments (att = true) first
-        for p in order {
+        for p in self.picks.iter().filter(|p| p.datum == datum) {
             saw_entry = true;
-            let cap = if p.att { ATT_LINES } else { MAX_LINES };
-            if out.len() >= cap * 2 { continue; }
-            // A hidden blocker's wireframe is its physics hull (the nub is 2 tris).
+            let before = out.len();
             if let Some((hv, hi)) = self.pick_hull(p) {
-                let at = |i: u32| hv.get(i as usize * 3..i as usize * 3 + 3).map(|c| p.xform.transform_point3(Vec3::new(c[0], c[1], c[2])).to_array());
-                for tri in hi.chunks_exact(3) {
-                    if out.len() >= cap * 2 { break; }
-                    let (Some(a), Some(b), Some(c)) = (at(tri[0]), at(tri[1]), at(tri[2])) else { continue };
-                    out.extend_from_slice(&[a, b, b, c, c, a]);
-                }
-                continue;
+                // A hidden blocker's wireframe is its physics hull (the nub is 2 tris).
+                crate::objscene::push_wire_edges(&mut out, hi, &p.xform, |i| hv.get(i * 3..i * 3 + 3).map(|c| Vec3::new(c[0], c[1], c[2])));
+            } else {
+                let Some(Some(dec)) = self.geom_cache.get(&p.mode_tag) else { continue };
+                crate::objscene::push_wire_edges(&mut out, &dec.indices, &p.xform, |i| dec.verts.get(i).map(|v| Vec3::from(v.pos)));
             }
-            let Some(Some(dec)) = self.geom_cache.get(&p.mode_tag) else { continue };
-            if dec.indices.is_empty() { continue; }
-            let mut i = 0;
-            let n = dec.indices.len() / 3 * 3;
-            while i < n && out.len() < cap * 2 {
-                let (a, b, c) = (dec.indices[i] as usize, dec.indices[i + 1] as usize, dec.indices[i + 2] as usize);
-                i += 3;
-                let (Some(va), Some(vb), Some(vc)) = (dec.verts.get(a), dec.verts.get(b), dec.verts.get(c)) else { continue };
-                let wa = p.xform.transform_point3(Vec3::from(va.pos)).to_array();
-                let wb = p.xform.transform_point3(Vec3::from(vb.pos)).to_array();
-                let wc = p.xform.transform_point3(Vec3::from(vc.pos)).to_array();
-                out.push(wa); out.push(wb);
-                out.push(wb); out.push(wc);
-                out.push(wc); out.push(wa);
+            if diag {
+                let kind = if p.hull.is_some() { "hull" } else if p.att { "attachment" } else { "model" };
+                eprintln!("  WIRE {datum:#010x} {kind}: {} edge(s)", (out.len() - before) / 2);
             }
         }
         if !saw_entry { return None; }
+        let total = out.len() / 2;
+        crate::objscene::fit_wire_budget(&mut out, crate::objscene::WIRE_MAX_LINES);
+        if diag { eprintln!("  WIRE {datum:#010x}: {total} unique edge(s), {} drawn", out.len() / 2); }
         (!out.is_empty()).then_some(out)
     }
 
@@ -10384,6 +12513,7 @@ impl SceneController {
                             sway: [0.0; 3],
                             uv2: [0.0, 0.0],
                             tangent: [0.0; 4],
+                            bone: [0, 0],
                         });
                     }
                 }
@@ -11409,12 +13539,24 @@ impl SceneController {
     /// stand-off uses: `raycast_scene` alone walks straight through Forge geometry, which is
     /// exactly the geometry a camera gets buried in.
     pub fn raycast_solid(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
+        self.raycast_solid_excluding(origin, dir, max, &[])
+    }
+
+    /// #vehicle-suspension  `raycast_solid`, but able to ignore some placements.
+    ///
+    /// **A vehicle's own collision hull is solid to a ray cast from inside it**, and
+    /// `raycast_solid` excluded nothing — so a RIDDEN vehicle's per-wheel ground ray could hit the
+    /// vehicle itself and report a "ground" surface above its own wheel. The ride hides the
+    /// placement from the RENDER set, which is deliberately not the pick set the ray walks: the
+    /// editor's table must keep seeing the vehicle where the user put it. So the exclusion has to
+    /// be passed in, which is what this is for.
+    pub fn raycast_solid_excluding(&self, origin: Vec3, dir: Vec3, max: f32, exclude: &[u32]) -> Option<f32> {
         let d = dir.normalize_or_zero();
         if d == Vec3::ZERO {
             return None;
         }
         let mut best = self.bsp_soup.raycast(origin, d, max).map(|(t, _n)| t);
-        if let Some(p) = self.raycast_objects_excluding(origin, d, &[]) {
+        if let Some(p) = self.raycast_objects_excluding(origin, d, exclude) {
             let t = (p - origin).length();
             if t <= max && best.map_or(true, |b| t < b) {
                 best = Some(t);
@@ -11725,6 +13867,7 @@ impl SceneController {
                     sway: [0.0; 3],
                     uv2: [0.0, 0.0],
                     tangent: [0.0; 4],
+                    bone: [0, 0],
                 };
                 verts.push(corner(-1.0, -1.0, 0.0, 1.0));
                 verts.push(corner(1.0, -1.0, 1.0, 1.0));
@@ -11974,10 +14117,74 @@ impl SceneController {
         self.obj_scales = scales;
     }
 
+    /// #vehicle-ride  Set the per-datum world-transform overrides used by the next rebuild.
+    ///
+    /// An empty map is the default and restores every placement to its authored pose. A change
+    /// re-signatures the scene, so the instance really is re-emitted at the new transform.
+    pub fn set_object_transforms(&mut self, transforms: HashMap<u32, Mat4>) {
+        self.obj_transform = transforms;
+    }
+
+    /// #vehicle-ride  **THE one world transform of a placement**: its override if it has one,
+    /// else its authored pose, times its editor scale either way.
+    ///
+    /// Every site that draws, picks, lights, ray-targets or overlays an object goes through this,
+    /// so a displaced object cannot be drawn in one place and picked in another.
+    pub fn object_world(&self, o: &ObjectInfo) -> Mat4 {
+        let s = self.object_scale(o);
+        let base = self.obj_transform.get(&o.datum).copied().unwrap_or_else(|| object_matrix(o));
+        if (s - 1.0).abs() > 1e-4 { base * Mat4::from_scale(Vec3::splat(s)) } else { base }
+    }
+
+    /// The world POSITION a placement is drawn at — the override's translation when it has one.
+    /// Used for the ambient probe lookup so a displaced object is lit where it is drawn.
+    pub fn object_world_pos(&self, o: &ObjectInfo) -> Vec3 {
+        match self.obj_transform.get(&o.datum) {
+            Some(m) => m.w_axis.truncate(),
+            None => Vec3::from(o.pos),
+        }
+    }
+
     /// Set the datums forced to cast a sun shadow at the next rebuild (in addition to
     /// the engine-default casters). A change re-signatures the scene so the shadow map follows.
     pub fn set_object_casters(&mut self, casters: std::collections::HashSet<u32>) {
         self.obj_casters = casters;
+    }
+
+    /// #damage Set the per-datum displayed damage states used by the next rebuild (only
+    /// non-default entries). A change re-signatures the scene so the parts are re-instanced.
+    pub fn set_object_damage(&mut self, states: HashMap<u32, u8>) {
+        self.obj_damage = states;
+    }
+
+    /// #damage The damage states a placement can be displayed in: the union, over its hlmt
+    /// variant's regions, of the states with an authored permutation (`HlmtVariants` synthetic
+    /// entries), plus those of its variant attachments (a child follows its own hlmt). Ascending,
+    /// without 0. Empty for plain props.
+    pub fn object_damage_states(&self, o: &ObjectInfo) -> Vec<u8> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let mut out: Vec<u8> = Vec::new();
+        let mut add = |obj: u32, mode: u32, vsid: u32| {
+            if let Some(hv) = hlmt_variants(&self.native, cache, obj, mode) {
+                let dsid = object_default_variant_sid(&self.native, cache, obj);
+                let base = hv.index_of(vsid, dsid);
+                let sid = hv.sids[base];
+                for (i, &st) in hv.states.iter().enumerate() {
+                    if st > 0 && hv.sids[i] == sid && !out.contains(&st) { out.push(st); }
+                }
+            }
+        };
+        add(o.primary_tag, o.mode_tag, o.variant_name_sid);
+        // attachments: the same walk the rebuild uses (child obje + child mode), default variant
+        if let Some(list) = self.attach_cache.get(&o.primary_tag) {
+            for (cm, _, _, _, co) in list { add(*co, *cm, 0); }
+        } else if o.primary_tag != 0 && o.primary_tag != 0xFFFF_FFFF {
+            for a in self.native.enumerate_attachments(cache, o.primary_tag) {
+                if a.child_mode != 0 && a.child_mode != 0xFFFF_FFFF { add(a.child_obj, a.child_mode, 0); }
+            }
+        }
+        out.sort_unstable();
+        out
     }
 
     /// Does this placed object go into the sun shadow map? Engine default (obje
@@ -12030,7 +14237,22 @@ impl SceneController {
         let caster_sig = self.obj_casters.iter().fold(0u64, |acc, d| {
             acc ^ (*d as u64 ^ 0xA5A5_5A5A).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
         });
-        let sig = signature(objects, forge_colors) ^ scale_sig ^ caster_sig;
+        // #damage a displayed damage state picks other draw parts -> rebuild.
+        let damage_sig = self.obj_damage.iter().fold(0u64, |acc, (d, s)| {
+            acc ^ ((*d as u64) << 3 | *s as u64).wrapping_mul(0x94D0_49BB_1331_11EB)
+        });
+        // #vehicle-ride  A transform OVERRIDE moves an instance, so it has to be in the
+        // fingerprint or the idle early-return below serves a frame with the vehicle still parked
+        // -- the same failure the hidden set had. Every component of the matrix is mixed, not just
+        // the translation, because a ride rotates as well as moves.
+        let transform_sig = self.obj_transform.iter().fold(0u64, |acc, (d, m)| {
+            let mut h = (*d as u64).wrapping_mul(0x8EBC_6AF0_9C88_C6E3);
+            for c in m.to_cols_array() {
+                h = h.rotate_left(7) ^ (c.to_bits() as u64).wrapping_mul(0x589F_5B9D_F944_1E45);
+            }
+            acc ^ h
+        });
+        let sig = signature(objects, forge_colors) ^ scale_sig ^ caster_sig ^ damage_sig ^ transform_sig;
         // Take delivery of any background-decoded variant models first; while a burst is in
         // flight the rebuild keeps re-running (like the budgeted decode) so arrivals pop in.
         if self.poll_background_predecode() {
@@ -12112,23 +14334,24 @@ impl SceneController {
         // Rebuilt below for objects whose render model yields no visible geometry.
         self.blocker_tris.clear();
         self.blocker_lines.clear();
+        // HMS_HIDDEN_DIAG per-pass summary: objects still waiting for their decode vs classified.
+        let (mut n_deferred, mut n_classified) = (0usize, 0usize);
+        // #load-hitch walkable-hull resolve budget state (see MAX_HULL_MS below).
+        let mut hull_resolved_any = false;
+        let mut hull_deferred = false;
         for o in objects {
             if o.mode_tag == 0 || o.mode_tag == 0xFFFF_FFFF {
                 continue;
             }
             // Local scale (forge "scale" label → X330) applied before rotate+translate.
-            let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
-            let m = if (s - 1.0).abs() > 1e-4 {
-                object_matrix(o) * Mat4::from_scale(Vec3::splat(s))
-            } else {
-                object_matrix(o)
-            };
+            let s = self.object_scale(o);
+            let m = self.object_world(o);
             let change_color = forge_tint(forge_colors.get(&o.datum).copied());
             let change_color_idx = forge_tint_index(forge_colors.get(&o.datum).copied());
             // Baked lighting (RE #2/#5): light objects on the SAME ABSOLUTE basis as
             // terrain — the toned nearest-probe airprobe ambient — so placed objects sit
             // in the ground's light instead of reading ~2× brighter ("pasted-on").
-            let amb = self.probe.sample_absolute(Vec3::from(o.pos));
+            let amb = self.probe.sample_absolute(self.object_world_pos(o));
             let b = if self.brightness.is_finite() && self.brightness > 0.001 { self.brightness } else { 1.0 };
             let lm = (crate::lightprobe::LIGHTMAP_K / b).clamp(0.5, 3.5);
             let eff = b * lm / crate::lightprobe::LIGHTMAP_K;
@@ -12178,9 +14401,26 @@ impl SceneController {
             let obj_default_variant = self.object_default_variant(o.primary_tag);
             let cached = self.geom_cache.get(&o.mode_tag);
             // Not decoded yet → defer (rebuild_pending handles the retry).
-            let Some(rmodel) = cached else { continue };
+            let Some(rmodel) = cached else { n_deferred += 1; continue };
+            n_classified += 1;
             let rmodel = rmodel.as_ref();
-            let render_empty = rmodel.map_or(true, |d| d.indices.is_empty());
+            // #unresolved A cache entry of None = the render model FAILED to decode (the native could
+            // not open the mode tag or read its resource pages, e.g. a Workshop map whose shared.map
+            // was not found). That is NOT an empty render model: the object DOES draw in game, so it
+            // must never take the hidden-block path. Logged once per model; drawn below as a distinct
+            // magenta "unresolved" hull (or box) that stays pickable.
+            let decode_failed = rmodel.is_none();
+            let render_empty = rmodel.map_or(false, |d| d.indices.is_empty());
+            let hidden_diag = ev("HMS_HIDDEN_DIAG").is_ok();
+            let render_tris = rmodel.map_or(0, |d| d.indices.len() / 3);
+            if decode_failed {
+                let first = UNRESOLVED_WARNED.get_or_init(Default::default).lock().map(|mut w| w.insert(o.mode_tag)).unwrap_or(false);
+                if first {
+                    let nm = self.native.tag_name(cache, o.mode_tag).unwrap_or_default();
+                    log::warn!("render model DECODE FAILED: mode={:#x} obj={:#x} '{nm}' -- drawn as an unresolved (magenta) hull, not a hidden block", o.mode_tag, o.primary_tag);
+                    eprintln!("UNRESOLVED render model: mode={:#x} obj={:#x} '{nm}' (decode failed: drawn as a magenta hull / box, never a hidden block)", o.mode_tag, o.primary_tag);
+                }
+            }
             // VISIBLE render extent = the render model's bounds (dec.max-dec.min). Verified via
             // --dump-parts: an INVISIBLE object (nut_blocker: objects\multi\nut_blockers\*, or any
             // ported/renamed equivalent) decodes to a DEGENERATE render mesh — bounds ≈[0.10,0.10,0.00]
@@ -12221,6 +14461,8 @@ impl SceneController {
                     let cs = self.object_is_caster(o);
                     // The placement's hlmt variant (palette /.mvar variant_name_sid) -> part filter
                     let vi = d.variant_index(o.variant_name_sid, obj_default_variant);
+                    // #damage the DAMAGE pseudo-flag: the (variant, state) entry when the model authors it
+                    let vi = match self.obj_damage.get(&o.datum) { Some(&st) if st > 0 => d.state_variant_index(vi, st), _ => vi };
                     by_tag.entry((o.mode_tag, cs, vi, o.primary_tag)).or_default().push((m, tint, change_color, change_color_idx, oprobe));
                 }
             }
@@ -12237,6 +14479,10 @@ impl SceneController {
                 if ev("HMS_DIAG").is_ok() {
                     eprintln!("REDFIX: skipped always-on boundary shell '{}' (datum {:#x})", pnm, o.datum);
                 }
+                if hidden_diag {
+                    eprintln!("HIDDEN_DIAG datum={:#x} mode={:#x} obj={:#x} name='{}' decode={} tris={} render_ext={:.2} hull=- hull_ext=- class=boundary",
+                        o.datum, o.mode_tag, o.primary_tag, pnm, if decode_failed { "FAILED" } else { "ok" }, render_tris, render_ext);
+                }
                 continue;
             }
             // The hidden-blocker (orange phmo) overlay is ONLY for FORGE-PLACED objects
@@ -12247,6 +14493,11 @@ impl SceneController {
             // non-forge object here — its normal render mesh was already picked + drawn above; we only
             // suppress the physics overlay. Forge blocks (0xD/0xF) still get it.
             if !matches!(o.datum >> 28, 0xD | 0xF) {
+                if hidden_diag {
+                    eprintln!("HIDDEN_DIAG datum={:#x} mode={:#x} obj={:#x} name='{}' decode={} tris={} render_ext={:.2} hull=- hull_ext=- class={}",
+                        o.datum, o.mode_tag, o.primary_tag, pnm, if decode_failed { "FAILED" } else { "ok" }, render_tris, render_ext,
+                        if decode_failed { "scenario-UNRESOLVED (not drawn)" } else { "scenario-visible" });
+                }
                 continue;
             }
             // resolve+cache the WALKABLE hull (collision preferred — it's the surface
@@ -12256,18 +14507,45 @@ impl SceneController {
             // the render model (a small visible nub with a big invisible walkable volume — the user's
             // "hidden" structure blocks). Normal blocks (render≈coll≈phmo, e.g. block_5x5) never trigger.
             let otag = o.primary_tag;
-            if !self.coll_cache.contains_key(&otag) {
+            // #load-hitch  Resolving an object's walkable hull is a NATIVE tag walk
+            // (object -> hlmt -> coll / phmo) that reads paged geometry, so on a map whose object
+            // resources live in `shared.map` it costs real time per object TYPE. It is cached, but
+            // it was unbudgeted: the first rebuild pass after a variant load resolved every unique
+            // type in ONE frame — measured at 13.9 s on forge_halo_modded + RCC Outskirts (the
+            // pass's own probe raycasts were 9 ms of that). Budget it in wall time like the model
+            // decode and the GPU build: whatever is left is picked up next frame, because
+            // `rebuild_pending` already re-runs this pass until nothing is outstanding. At least
+            // one object's hull is always resolved, so the set still drains quickly.
+            const MAX_HULL_MS: u128 = 10;
+            let hull_budget_left = !hull_resolved_any || t_objloop.elapsed().as_millis() < MAX_HULL_MS;
+            if hull_budget_left && !self.coll_cache.contains_key(&otag) {
                 let coll = self.native.resolve_coll(cache, otag);
                 let g = if coll != 0 && coll != 0xFFFF_FFFF { self.native.coll_geometry(cache, coll) } else { None };
                 self.coll_cache.insert(otag, g);
+                hull_resolved_any = true;
             }
-            if !self.phmo_cache.contains_key(&otag) {
+            if hull_budget_left && !self.phmo_cache.contains_key(&otag) {
                 let phmo = self.native.resolve_phmo(cache, otag);
                 let g = if phmo != 0 && phmo != 0xFFFF_FFFF { self.native.phmo_geometry(cache, phmo) } else { None };
                 self.phmo_cache.insert(otag, g);
+                hull_resolved_any = true;
+            }
+            if !self.coll_cache.contains_key(&otag) || !self.phmo_cache.contains_key(&otag) {
+                // Out of budget for this frame: this object's overlay classification waits a
+                // frame. Keep the pass re-running so it is picked up.
+                hull_deferred = true;
             }
             let hull = self.coll_cache.get(&otag).cloned().flatten()
                 .or_else(|| self.phmo_cache.get(&otag).cloned().flatten());
+            let hull_src = if self.coll_cache.get(&otag).map_or(false, |g| g.is_some()) { "coll" }
+                else if self.phmo_cache.get(&otag).map_or(false, |g| g.is_some()) { "phmo" } else { "none" };
+            // #unresolved set when a failed decode got its hull drawn below; else a box stands in.
+            let mut unresolved_drawn = false;
+            if hull.is_none() && hidden_diag {
+                eprintln!("HIDDEN_DIAG datum={:#x} mode={:#x} obj={:#x} name='{}' decode={} tris={} render_ext={:.2} hull=none hull_ext=- class={}",
+                    o.datum, o.mode_tag, o.primary_tag, pnm, if decode_failed { "FAILED" } else { "ok" }, render_tris, render_ext,
+                    if decode_failed { "UNRESOLVED (box)" } else { "visible" });
+            }
             if let Some((hv, hi)) = hull {
                 if hv.len() >= 9 && hi.len() >= 3 {
                     // Model-space hull extent, to compare against the render model's extent.
@@ -12282,12 +14560,26 @@ impl SceneController {
                     // and normal blocks read their true 1-5 size, so a 0.25 cutoff cleanly separates. This is
                     // engine-behaviour-based (how it renders), NOT a name/category match — robust to ports.
                     // Guard with hull_ext so we only flag things that actually HAVE a physics volume to show.
-                    let is_blocker = (render_empty || render_ext < 0.25) && hull_ext > 0.25;
+                    // #unresolved a FAILED decode is excluded here: with no model its extent reads
+                    // 0 and it would pass as "invisible in game" -- it is drawn as an unresolved hull.
+                    let is_blocker = !decode_failed && (render_empty || render_ext < 0.25) && hull_ext > 0.25;
+                    let is_unresolved = decode_failed;
                     if ev("HMS_DIAG").is_ok() && is_blocker {
                         eprintln!("BLOCKERHIT pnm='{}' empty={} render_ext={:.2} hull_ext={:.2}",
                             pnm, render_empty, render_ext, hull_ext);
                     }
-                    if is_blocker {
+                    if hidden_diag {
+                        eprintln!("HIDDEN_DIAG datum={:#x} mode={:#x} obj={:#x} name='{}' decode={} tris={} render_ext={:.2} hull={} hull_ext={:.2} class={}",
+                            o.datum, o.mode_tag, o.primary_tag, pnm, if decode_failed { "FAILED" } else { "ok" }, render_tris, render_ext, hull_src, hull_ext,
+                            if is_unresolved { "UNRESOLVED (hull)" } else if is_blocker { "hidden-block" } else { "visible" });
+                    }
+                    // orange translucent = walkable/physics volume of a hidden block; MAGENTA = the
+                    // hull of an object whose render model could not be decoded (#unresolved).
+                    const SOLID: [f32; 4] = [1.0, 0.55, 0.15, 0.28];
+                    const LINE: [f32; 3] = [1.0, 0.62, 0.20];
+                    let (solid, line) = if is_unresolved { (UNRESOLVED_SOLID, UNRESOLVED_LINE) } else { (SOLID, LINE) };
+                    if is_blocker || is_unresolved {
+                        unresolved_drawn = is_unresolved;
                         let wpts: Vec<Vec3> = hv
                             .chunks_exact(3)
                             .map(|c| m.transform_point3(Vec3::new(c[0], c[1], c[2])))
@@ -12305,22 +14597,39 @@ impl SceneController {
                             self.picks.pop();
                         }
                         self.picks.push(PickEntry { datum: o.datum, min: mn, max: mx, mode_tag: o.mode_tag, xform: m, hull: Some(otag), att: false });
-                        const SOLID: [f32; 4] = [1.0, 0.55, 0.15, 0.28]; // orange translucent = walkable/physics volume
-                        const LINE: [f32; 3] = [1.0, 0.62, 0.20];
                         for tri in hi.chunks_exact(3) {
                             let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
                             if a >= wpts.len() || b >= wpts.len() || c >= wpts.len() { continue; }
                             let (pa, pb, pc) = (wpts[a], wpts[b], wpts[c]);
-                            self.blocker_tris.push(([pa.x, pa.y, pa.z], SOLID));
-                            self.blocker_tris.push(([pb.x, pb.y, pb.z], SOLID));
-                            self.blocker_tris.push(([pc.x, pc.y, pc.z], SOLID));
-                            self.blocker_lines.push(([pa.x, pa.y, pa.z], [pb.x, pb.y, pb.z], LINE));
-                            self.blocker_lines.push(([pb.x, pb.y, pb.z], [pc.x, pc.y, pc.z], LINE));
-                            self.blocker_lines.push(([pc.x, pc.y, pc.z], [pa.x, pa.y, pa.z], LINE));
+                            self.blocker_tris.push(([pa.x, pa.y, pa.z], solid));
+                            self.blocker_tris.push(([pb.x, pb.y, pb.z], solid));
+                            self.blocker_tris.push(([pc.x, pc.y, pc.z], solid));
+                            self.blocker_lines.push(([pa.x, pa.y, pa.z], [pb.x, pb.y, pb.z], line));
+                            self.blocker_lines.push(([pb.x, pb.y, pb.z], [pc.x, pc.y, pc.z], line));
+                            self.blocker_lines.push(([pc.x, pc.y, pc.z], [pa.x, pa.y, pa.z], line));
                         }
                     }
                 }
             }
+            // #unresolved A failed decode with no collision / physics hull either: a 1 wu magenta
+            // box at the placement keeps the object visible and pickable instead of vanishing.
+            if decode_failed && !unresolved_drawn {
+                let h = 0.5f32;
+                let corners: Vec<Vec3> = (0..8).map(|k| m.transform_point3(Vec3::new(
+                    if k & 1 != 0 { h } else { -h }, if k & 2 != 0 { h } else { -h }, if k & 4 != 0 { 2.0 * h } else { 0.0 }))).collect();
+                let mut mn = Vec3::splat(f32::MAX);
+                let mut mx = Vec3::splat(f32::MIN);
+                for c in &corners { mn = mn.min(*c); mx = mx.max(*c); }
+                self.picks.push(PickEntry { datum: o.datum, min: mn, max: mx, mode_tag: o.mode_tag, xform: m, hull: None, att: false });
+                const EDGES: [(usize, usize); 12] = [(0,1),(1,3),(3,2),(2,0),(4,5),(5,7),(7,6),(6,4),(0,4),(1,5),(2,6),(3,7)];
+                for (a, b) in EDGES {
+                    self.blocker_lines.push((corners[a].to_array(), corners[b].to_array(), UNRESOLVED_LINE));
+                }
+            }
+        }
+        if ev("HMS_HIDDEN_DIAG").is_ok() {
+            eprintln!("HIDDEN_DIAG pass: objects={} classified={n_classified} deferred(not decoded yet)={n_deferred} inflight={} pending={}",
+                objects.len(), self.predecode_inflight.len(), self.rebuild_pending);
         }
 
         // ATTACHMENTS (turrets etc.): draw each object's hlmt DEFAULT-variant child models at
@@ -12383,13 +14692,9 @@ impl SceneController {
                 if list.is_empty() {
                     continue;
                 }
-                let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
-                let pm = if (s - 1.0).abs() > 1e-4 {
-                    object_matrix(o) * Mat4::from_scale(Vec3::splat(s))
-                } else {
-                    object_matrix(o)
-                };
-                let amb = self.probe.sample_absolute(Vec3::from(o.pos));
+                let s = self.object_scale(o);
+                let pm = self.object_world(o);
+                let amb = self.probe.sample_absolute(self.object_world_pos(o));
                 let b = if self.brightness.is_finite() && self.brightness > 0.001 { self.brightness } else { 1.0 };
                 let lm = (crate::lightprobe::LIGHTMAP_K / b).clamp(0.5, 3.5);
                 let eff = b * lm / crate::lightprobe::LIGHTMAP_K;
@@ -12438,6 +14743,11 @@ impl SceneController {
                 budget -= 1;
             }
             for (cm, cs, mat, tint, cc, cci, oprobe, _, parent) in attach_instances {
+                // #damage a child follows the parent's displayed damage state when its own hlmt authors it
+                let vi = match self.obj_damage.get(&parent) {
+                    Some(&st) if st > 0 => self.geom_cache.get(&cm).and_then(|d| d.as_ref()).map_or(0, |d| d.state_variant_index(0, st)),
+                    _ => 0,
+                };
                 // #wire-attach the child's world box becomes a pick entry under the PARENT datum:
                 // clicking the turret selects the vehicle, and aabb_of / object_obb /
                 // selection_wireframe (which union every entry of a datum) now cover it.
@@ -12447,7 +14757,7 @@ impl SceneController {
                         self.picks.push(PickEntry { datum: parent, min: wmin, max: wmax, mode_tag: cm, xform: mat, hull: None, att: true });
                     }
                 }
-                by_tag.entry((cm, cs, 0, 0)).or_default().push((mat, tint, cc, cci, oprobe));
+                by_tag.entry((cm, cs, vi, 0)).or_default().push((mat, tint, cc, cci, oprobe));
             }
         }
 
@@ -12468,7 +14778,30 @@ impl SceneController {
         // so without this ALL texture uploads landed in one rebuild → the brief freeze right before
         // the variant popped in. Spreading them (a few tags/frame, rest deferred via rebuild_pending)
         // keeps every frame short; objects pop in over ~1s and the window stays responsive.
-        const MAX_GPU_NEW_PER_FRAME: usize = 4;
+        const MAX_GPU_NEW_PER_FRAME: usize = 8;
+        // ...and a WALL-TIME budget on top of the count. #load-hitch: the count alone assumed
+        // every tag's GPU build costs about the same, which is false — a model whose bitmaps sit
+        // in a big `shared.map` atlas page can take over a second on its own, so "four per frame"
+        // was measured at 5.3 s, 4.6 s, 3.7 s frames during the object tail of a modded Forge
+        // World load. The decode loop above has had a time budget for exactly this reason; the
+        // build loop needs the same one. At least one tag always goes through, so progress is
+        // guaranteed even when a single tag exceeds the budget by itself.
+        //
+        // #gpu-build  The budget is a TARGET FOR THE WHOLE FRAME, and the check below is
+        // PREDICTIVE rather than a bare threshold. It used to be a flat 12 ms, which looks
+        // conservative and was in fact a stall: the check happens BEFORE a model is started, so
+        // it can only limit how many are started, never truncate one — and with a measured
+        // MEDIAN per-model build of 195 ms, the first model of every frame blew a 12 ms budget
+        // outright and the second was always refused. ~90 models therefore took ~90 frames
+        // instead of ~23, which is the "objects trickle in one at a time" the owner reported;
+        // the total CPU had barely moved. A budget four times smaller than the median item is
+        // not a budget.
+        //
+        // Predicting instead — "would starting another probably blow the target?", using this
+        // frame's own mean so far — packs cheap models properly while still giving an expensive
+        // one a frame to itself, which is all anyone can do without preempting mid-model.
+        const GPU_FRAME_TARGET_MS: u128 = 80;
+        let t_gpu_budget = std::time::Instant::now();
         let mut gpu_new = 0usize;
         let mut gpu_remaining = false;
         // Diagnostic: HMS_TRACE_TAG=0x209c traces one mode tag through mesh-building.
@@ -12513,15 +14846,46 @@ impl SceneController {
             // terrain-shaded objects build their own terrain meshes (not obj_vbuf_cache); once
             // built they must NOT count as new GPU work every frame — that skipped them on alternate frames
             // (Forge rocks blinking in and out) and kept rebuild_pending set forever.
+            // Dropped at the end of this loop iteration -> reports the tag's whole GPU build.
+            let mut _tp: Option<TagBuildProf> = None;
             if !self.obj_vbuf_cache.contains_key(&tag) && !self.obj_terrain_ready.contains(&tag) {
                 if ev("HMS_REBUILD_DIAG").is_ok() {
                     eprintln!("REBUILD_DIAG new GPU tag {tag:#x} '{}' inst={} (gpu_new={gpu_new})", self.native.tag_name(cache, tag).unwrap_or_default(), instances.len());
                 }
-                if gpu_new >= MAX_GPU_NEW_PER_FRAME {
+                // Predictive budget: `spent / gpu_new` is what a model has cost SO FAR THIS
+                // FRAME, so `spent + mean` is what the frame would come to if another is started.
+                // The first model of a frame is always allowed, so progress is guaranteed even
+                // when one model exceeds the target by itself.
+                let over_budget = gpu_new > 0 && {
+                    let spent = t_gpu_budget.elapsed().as_millis();
+                    spent + spent / gpu_new as u128 > GPU_FRAME_TARGET_MS
+                };
+                if gpu_new >= MAX_GPU_NEW_PER_FRAME || over_budget {
                     gpu_remaining = true;
                     continue;
                 }
                 gpu_new += 1;
+                // HMS_LOADPROF: time THIS tag's GPU build (buffers + texture upload with mip
+                // generation) and report the native page-cache work it caused. The guard has to
+                // live in the LOOP BODY's scope, not this `if`'s, or it is dropped before the
+                // build it is supposed to be timing even happens.
+                if ev("HMS_LOADPROF").is_ok() {
+                    let _ = self.native.page_stats(); // clear (read-and-reset)
+                    // Clear the per-tag breakdown counters too, so the line below accounts for
+                    // THIS model only. All of these are read-and-reset.
+                    let _ = hms_render::upprof::take();
+                    let _ = hms_native::bmpprof::take();
+                    use std::sync::atomic::Ordering::Relaxed;
+                    for c in [&GB_TEX_CALLS, &GB_TEX_HIT_KEY, &GB_TEX_HIT_SRC, &GB_TEX_EMPTY, &GB_TEX_UPLOAD, &GB_BUF_NS, &GB_BUF_BYTES] {
+                        c.store(0, Relaxed);
+                    }
+                    _tp = Some(TagBuildProf {
+                        t: std::time::Instant::now(),
+                        name: self.native.tag_name(cache, tag).unwrap_or_default(),
+                        tag,
+                        nat: self.native.clone(),
+                    });
+                }
             }
             // From here every unit of this model either uploads its textures below or has no
             // use for them (empty / terrain-shaded units) -> its CPU texture bytes can go after the loop.
@@ -12647,10 +15011,6 @@ impl SceneController {
                 || nm.contains("cinematic_camera")
                 || nm.contains("multi\\models\\mp_")
                 || nm.contains("multi/models/mp_");
-            // Shield doors / shield walls / one-way doors are ENERGY panels — render them
-            // semi-transparent (alpha-blend) instead of as solid white panels. Routed to the
-            // blend pass (non-glass branch: base texture × tint with a fresnel opacity floor).
-            let door_translucent = nm.contains("shield") || nm.contains("one_way") || nm.contains("oneway");
             let is_holo = name_holo || (dec.emissive.is_some() && matches!(dec.blend, 1 | 4 | 5 | 6 | 7 | 8));
             if ev("HMS_HOLODIAG").is_ok() {
                 eprintln!("HOLO tag={:#x} name={} blend={} emis={} is_holo={} cutout={} n={}",
@@ -12700,6 +15060,15 @@ impl SceneController {
                     (&p.indices, &p.tex, &p.emissive, &p.emissive_hdr, p.blend, p.alpha_test, p.is_glass, p.glass_mat, p.emis_change_color, p.is_halo, p.is_forcefield, p.ff_scroll, p.ff_color, &p.ff_extra, &p.glass_op, p.glass_detail.as_ref().map(|t| (t, p.glass_detail_xform, p.glass_albedo_a)), p.glass_env, p.glass_env_opt)
                 };
                 let uglass_dyn_lod: f32 = if single { 0.0 } else { dec.obj_parts[ui].glass_dyn_lod };
+                // #elite-knife An effect that only an ANIMATION EVENT switches on is not drawn on
+                // a body at rest. This is a part-VISIBILITY rule, the same shape as the
+                // `hidden_at_rest` motion-blur wheel skins below: the Elite's two energy daggers
+                // are halogram submeshes baked into its body mesh with no node, marker, region or
+                // prop of their own, so nothing else can hide them, and they belong to the
+                // stab-and-swipe sync actions rather than to a standing Elite.
+                if (if single { dec.event_gated } else { dec.obj_parts[ui].event_gated }) {
+                    continue;
+                }
                 // LIT-SI-3 (object side): this unit's self_illum MODE + cmul (single-material → dec;
                 // multi-material → per-part). Only from_albedo (4) is routed in mesh_shade.
                 let (usi_mode, usi_cmul) = if single {
@@ -12815,22 +15184,63 @@ impl SceneController {
                 // part additive: their halogram parts are caught by uff/uhalo (engine lane), and the
                 // powerup's rmsh core (cook-torrance body + simple self-illum, blend opaque) renders
                 // through the lit opaque path like the engine (it was an additive star in fs_holo).
-                let unit_holo = uff || (uemis.is_some() && matches!(ublend, 1 | 4 | 5 | 6 | 7 | 8)) || (uemis_cc && name_holo) || uhalo || marker_forced;
+                // #sword-blade The lane rule has ONE definition (`PartLaneIn`), shared by the
+                // five booleans below and by the push at the end of this loop — and gated by test
+                // against the shipped energy sword, whose five additive blade layers are the
+                // reason a transparent lane exists on the actor path at all.
+                let lane_in = PartLaneIn {
+                    blend: ublend,
+                    alpha_test: ualpha,
+                    has_emissive: uemis.is_some(),
+                    emis_cc: uemis_cc,
+                    is_halo: uhalo,
+                    is_ff: uff,
+                    is_glass: uglass,
+                    ff_extra: uff_extra.is_some(),
+                    si_mode: usi_mode,
+                    name_holo,
+                    marker_forced,
+                    shield_name_blend: shield_name_forces_blend(&nm, ublend),
+                };
+                let unit_holo = lane_in.unit_holo();
                 // Route MARKER SHAPES (spawns, hill/objective beacons, kill/safe boundary shells)
                 // to the alpha-blended SOLID holo pass so their translucent silhouette is always
                 // readable. Glowing overlays (killballs, forge-light glow, powerups, additive
                 // particle/effect emissives, halogram funnels) stay on the ADDITIVE holo pass.
-                let solid_marker = name_holo || marker_forced;
+                let solid_marker = lane_in.solid_marker();
+                // #sword-blade Two ADDITIVE self-illum authoring patterns that fs_holo's generic
+                // billboard fallback (radial vignette + rim glow + sine pulse + 8-bit emissive)
+                // got wrong. The energy sword's blade is BOTH of them at once, which is why it
+                // drew as a pale white smear instead of a bright blue blade.
+                //   `lane_illum_only` (fs_holo lane 9): an rmsh GEOMETRY part authored
+                //     blend_mode ADDITIVE whose self-illum is a 3_channel composite
+                //     (`sword_illum`: channel_a/b/c x self_illum_intensity 10). Every shipped
+                //     material of this shape authors albedo_color = 0, so the engine's lit-albedo
+                //     term is zero and the part IS its self-illum composite -- no sprite
+                //     heuristics, and the composite must stay HDR so intensity > 1 reaches bloom.
+                //   `lane_halo_from_diffuse` (fs_holo lane 10): an rmhg HALOGRAM part whose
+                //     self_illumination option is from_diffuse and for which no engine halogram
+                //     lane was decoded. A halogram's material_model is NONE, so the engine emits
+                //     `albedo x self_illum_color x self_illum_intensity x ILLUM_SCALE` and
+                //     nothing else -- never its diffuse map as a white additive sprite. The
+                //     sword's two blade halograms author that product as ZERO at rest (the blade
+                //     shimmer is driven by the `blade_activate` object function, which HMS does
+                //     not evaluate), so they correctly contribute nothing.
+                let lane_illum_only = lane_in.lane_illum_only();
+                let lane_halo_from_diffuse = lane_in.lane_halo_from_diffuse();
                 // Forge glass panes (window/cover_glass/window_double/window_coliseum) are an
                 // rmgl (glass) submesh whose blend mode resolves to the 0xFF "unresolved" sentinel
                 // (the resolver reads the rmsh layout; rmgl is a different tag class). The reliable
                 // signal is the SHADER TAG CLASS = rmgl, captured in ObjPart.is_glass at decode.
                 // Route it to the alpha-blend pass so the pane is see-through (was opaque). Emissive
                 // additive markers are already caught by unit_holo above.
-                let unit_glass = !unit_holo && (uglass || door_translucent);
+                // The "shield"/"one_way" PATH hint may only confirm what the tag says: an
+                // authored-OPAQUE part never joins the blend pass (shield_name_forces_blend).
+                let unit_glass = lane_in.unit_glass();
                 if ev("HMS_GLASSDIAG").is_ok() {
-                    eprintln!("GLASSDIAG tag={:#x} name={} part={}/{} blend={} alpha={} emis={} halo={} ff={} -> holo={} glass={}",
-                        tag, nm, ui, unit_count, ublend, ualpha, uemis.is_some(), uhalo, uff, unit_holo, unit_glass);
+                    eprintln!("GLASSDIAG tag={:#x} name={} part={}/{} blend={} alpha={} emis={} halo={} ff={} si_mode={} -> holo={} glass={} illum_lane={}",
+                        tag, nm, ui, unit_count, ublend, ualpha, uemis.is_some(), uhalo, uff, usi_mode, unit_holo, unit_glass,
+                        if lane_illum_only { 9 } else if lane_halo_from_diffuse { 10 } else { 0 });
                 }
                 // This unit's engine material lanes (per part; shader 0 for single-material models).
                 let umat: &ObjMat = if single { &dec.obj_mat } else { &dec.obj_parts[ui].mat };
@@ -12839,6 +15249,30 @@ impl SceneController {
                 // invisible on a parked vehicle in the engine; they used to draw OPAQUE over the treads.
                 if opaque_route && umat.hidden_at_rest { continue; }
                 let veh_lane = opaque_route && umat.valid;
+                // #objmat The per-part material CONSTANTS + ENVIRONMENT lane, live for EVERY object
+                // class (Forge scenery/crates included). `veh_lane` (unit/item) is the subset that also
+                // binds the authored detail / bump / bump_detail MAPS, so a Forge piece's albedo and
+                // normals are untouched and only its specular / roughness / env lanes move.
+                // `HMS_LEGACY_OBJMAT` restores the pre-#objmat lane for A/B comparison (the Forge
+                // classes go back to shader 0's constants with no object environment reflection, while
+                // the unit/item lane stays exactly as it was), in the same idiom as HMS_NO_ENV_DYNAMIC /
+                // HMS_NO_RMGL_ENV / HMS_LEGACY_FF. The DEFAULT needs no env var.
+                let mat_lane = if ev("HMS_LEGACY_OBJMAT").is_ok() { veh_lane } else { opaque_route && umat.mat };
+                // #objshine print-only: the shading lanes EVERY opaque object part is uploaded with
+                // (not just the unit/item `veh_lane` ones), so "does this Forge piece get a specular
+                // or an environment term, and which authored value turned it on" can be answered for
+                // the whole palette in one run instead of pixel-probing each piece.
+                // mm_set/mm = the rmt2 material_model (0 diffuse_only kills both lobes in mesh_shade);
+                // spec = shader 0's specular_coefficient x analytical_specular_contribution.
+                if opaque_route && ev("HMS_OBJLANE_DIAG").is_ok() {
+                    eprintln!("OBJLANE tag={tag:#x} name={nm} part={ui}/{unit_count} veh_lane={veh_lane} mat_lane={mat_lane} mm_set={} mm={} matmodel={:.1} spec={:.3} spec0={:.3} rough={:.3} sfa={:.1} menv={:.3} env_opt={} cube={} albedo_a={:.3} detail_a_map={:#x}",
+                        umat.mm_set, umat.mm,
+                        if mat_lane || (opaque_route && umat.mm_set) { (umat.mm as f32) + 1.0 } else { 0.0 },
+                        if mat_lane { umat.spec } else { dec.mat_spec }, dec.mat_spec,
+                        if mat_lane { umat.rough } else { dec.mat_rough },
+                        if mat_lane && !veh_lane { if umat.spec_mask_diffuse { if umat.detail.is_some() { 2.0 } else { 1.0 } } else { 0.0 } } else { 1.0 },
+                        umat.menv, umat.env_opt, umat.env_cube != 0, umat.albedo_a, umat.detail.map_or(0, |d| d.0));
+                }
                 if veh_lane && ev("HMS_VEHMAT_DIAG").is_ok() {
                     eprintln!("VEHLANE tag={tag:#x} part={ui} spec={:.3} rough={:.3} rough_lut={:.3} area={:.3} menv={:.3} env_opt={} env_lod={:.2} env_ctl={:?} detail={:?} bump={:?} bump_detail={:?} spec_mask_diffuse={} cc={}",
                         umat.spec, umat.rough, umat.rough_lut, umat.area, umat.menv, umat.env_opt, umat.env_lod, umat.env_ctl, umat.detail, umat.bump, umat.bump_detail, umat.spec_mask_diffuse, if single { dec.cc_map.is_some() } else { dec.obj_parts[ui].cc_map.is_some() });
@@ -12856,6 +15290,12 @@ impl SceneController {
                     p.cc_map.as_ref().map(|m| (m, p.cc_map_xform))
                 };
                 let has_cc_map = ucc.is_some() && !unit_holo && !unit_glass && uglass_op.is_none();
+                // #skin the [primary, secondary] change colours this part is drawn with: the
+                // ACTOR override when one is set (a recorded Theater player's two armoury
+                // colours), else the object's own authored defaults. Both ride the model's
+                // `four_change_color` masks, so the colour only lands where the artist painted
+                // the mask — the armour plates, not the undersuit.
+                let u_cc: [[f32; 3]; 2] = self.actor_cc.unwrap_or(dec.cc_default);
                 // Every slot goes through obj_tex_ensure -- one GPU texture per decoded source
                 // (shared across the parts/models that intern it) and, once a model's slots are all
                 // uploaded, its CPU texture bytes are released after the loop.
@@ -12875,7 +15315,10 @@ impl SceneController {
                     // self-illum HDR upload. Holo/marker/glass/change_color/forcefield parts route
                     // elsewhere (unit_holo/unit_glass) and keep the legacy u8 (Bgra8) texture — and
                     // the HDR buffer is only ever built for the fixed opaque bake anyway.
-                    let use_hdr = !unit_holo && !unit_glass && uemis_hdr.is_some();
+                    // #sword-blade lane 9 (additive 3-channel self-illum geometry) takes the
+                    // FLOAT emissive too: its whole look is the over-1.0 range (the sword blade
+                    // composites to 2.5 before the 8-bit clamp normalised it to 1.0).
+                    let use_hdr = (!unit_holo || lane_illum_only) && !unit_glass && uemis_hdr.is_some();
                     if let (true, Some(t)) = (use_hdr, uemis_hdr.as_ref()) {
                         obj_tex_ensure(&mut self.obj_tex_cache, &mut self.obj_tex_by_src, device, queue, (tag, ui, 1), std::sync::Arc::as_ptr(t) as usize, OBJ_TEX_RGBA16F, t);
                     } else if let Some(t) = uemis.as_ref() {
@@ -12925,7 +15368,7 @@ impl SceneController {
                 // An OPAQUE unit/item part with env DYNAMIC (vehicle paint: Ghost/Banshee contribution
                 // 0.5-1.0, Warthog/Mongoose 0.5) reflects the same per-cluster cube (environment_mapping.hlsl_include
                 // calc_environment_map_dynamic_ps) -- it used to be killed outright by mesh_shade's `obj_matte`.
-                let veh_cluster_env = veh_lane && umat.env_opt == 2 && umat.menv > 0.0;
+                let veh_cluster_env = mat_lane && umat.env_opt == 2 && umat.menv > 0.0;
                 let wants_cluster_cube = (unit_glass && !uff && uglass_env.0 == 0
                     && (uglass_mat.is_some() || (uglass_op.is_some() && uglass_envopt == 2))) || veh_cluster_env;
                 let cluster_key: Option<(u32, u32)> = if wants_cluster_cube && !instances.is_empty() {
@@ -12943,9 +15386,13 @@ impl SceneController {
                 // The lane's detail_map (colour: Linear curve pre-encoded, else raw BC / decode),
                 // bump_map + bump_detail_map (raw BC5_SNORM when DXN -> sampled signed, xctl.w bits like the BSP
                 // path) once per bitmap tag, and the authored per_pixel env cube when the part binds one.
-                if veh_lane {
+                // #objmask the DETAIL map is uploaded for every `mat_lane` class (its alpha is half the
+                // engine specular mask); bump / bump_detail stay unit/item-only.
+                if mat_lane {
                     if let Some(c) = self.cache {
-                        for (t, color) in [(umat.detail.map(|d| d.0), true), (umat.bump.map(|b| b.0), false), (umat.bump_detail.map(|b| b.0), false)] {
+                        for (t, color) in [(umat.detail.map(|d| d.0), true),
+                                           (if veh_lane { umat.bump.map(|b| b.0) } else { None }, false),
+                                           (if veh_lane { umat.bump_detail.map(|b| b.0) } else { None }, false)] {
                             let Some(t) = t else { continue };
                             if self.obj_mat_tex.contains_key(&t) { continue; }
                             // The detail map's ALPHA is part of the engine spec mask (albedo.w = base.a x detail.a),
@@ -12955,7 +15402,14 @@ impl SceneController {
                                 .or_else(|| if color { self.native.decode_bitmap_keep_alpha(c, t, 0, 0) } else { self.native.decode_bitmap(c, t, 0, 0) }.map(|b| hms_render::upload_texture_bgra(device, queue, &b.0, b.1, b.2)));
                             if let Some(u) = up { self.obj_mat_tex.insert(t, u); }
                         }
-                        if umat.env_cube != 0 && !self.obj_env_cube_cache.contains_key(&umat.env_cube) {
+                    }
+                }
+                // #objmat The AUTHORED per_pixel environment cube, for every object class: a Forge
+                // piece binds one too (`heh_gravlift_catwalk` -> `ca_heh_cube_center`, the generic
+                // `for_forge_gen_panel_*` -> `d_cubemap_vertical_noise`).
+                if mat_lane && umat.env_cube != 0 {
+                    if let Some(c) = self.cache {
+                        if !self.obj_env_cube_cache.contains_key(&umat.env_cube) {
                             let mut faces: Vec<(Vec<u8>, u32, u32)> = Vec::with_capacity(6);
                             for f in 0..6u32 {
                                 match self.native.decode_bitmap_face(c, umat.env_cube, 0, 0, f, 1) { Some(face) => faces.push(face), None => { faces.clear(); break; } }
@@ -12975,6 +15429,15 @@ impl SceneController {
                     }
                 }
                 let tex_view = self.obj_tex_cache.get(&(tag, ui, 0)).map(|(v, _)| v);
+                // #damage print-only: which parts a DAMAGE display state draws and whether their
+                // GPU textures are bound (an unbound diffuse renders the part plain white).
+                if ev("HMS_DMGDIAG").is_ok() {
+                    eprintln!("DMGDIAG tag={tag:#x} vi={grp_variant} part={ui} vbits={:#x} tex_bound={} tex_some={} tex_bytes={} tex_ptr={:?} emis_bound={} blend={ublend} halo={uhalo} ff={uff} tris={}",
+                        if single { u64::MAX } else { dec.obj_parts[ui].vbits }, tex_view.is_some(),
+                        utex.is_some(), utex.as_ref().map_or(0, |t| t.0.len()),
+                        utex.as_ref().map(|t| std::sync::Arc::as_ptr(t)),
+                        self.obj_tex_cache.contains_key(&(tag, ui, 1)), uidx.len() / 3);
+                }
                 let gop_view = uglass_op.as_ref().and_then(|g| g.tex.as_ref()).and_then(|_| self.obj_tex_cache.get(&(tag, ui, 4)).map(|(v, _)| v))
                     .or_else(|| if has_cc_map { self.obj_tex_cache.get(&(tag, ui, 5)).map(|(v, _)| v) } else { None }); // change_color_map in the MAT-30 slot
                 // Object halogram authored alpha_mask_map -> MAT-30 at_tex (+ its xform, fine_xform.y = -1),
@@ -12996,15 +15459,19 @@ impl SceneController {
                 let g_env_lod: f32 = if gcluster_view.is_some() && uglass_env.0 == 0 { if uglass_mat.is_some() { uglass_dyn_lod } else { uglass_op.as_ref().map_or(0.0, |g| g.dyn_lod) } } else { uglass_op.as_ref().map_or(0.0, |g| g.env_lod) };
                 if (uglass_env.0 != 0 || unit_glass) && ev("HMS_GLASSDIAG").is_ok() { eprintln!("GLASSUPLOAD tag={tag:#x} part={ui} env_tag={:#x} contrib={} cube_bound={} cluster={:?} glass_mat={} det={} det_view={} envopt={} lod={g_env_lod:.2} lanes={:?}", uglass_env.0, uglass_env.1, gcube_view.is_some(), cluster_key, uglass_mat.is_some(), uglass_det.is_some(), gdet_view.is_some(), uglass_envopt, g_env_ctl); }
                 let veh_tex = |o: Option<(u32, [f32; 4])>| -> Option<&wgpu::TextureView> { if veh_lane { o.and_then(|(t, _)| self.obj_mat_tex.get(&t).map(|(v, _)| v)) } else { None } };
-                let veh_detail_view = veh_tex(umat.detail);
+                // #objmask every mat_lane class binds the detail map; off the unit/item lane it is
+                // taken for its ALPHA alone (spec_from_alpha == 2), so the part's albedo is unmoved.
+                let veh_detail_view: Option<&wgpu::TextureView> = if mat_lane { umat.detail.and_then(|(t, _)| self.obj_mat_tex.get(&t).map(|(v, _)| v)) } else { None };
+                let (obj_sfa_lane, obj_alb_a_lane) = obj_mask_lanes(mat_lane, veh_lane, umat.spec_mask_diffuse, veh_detail_view.is_some(), umat.albedo_a);
+                let det_alpha_only = obj_sfa_lane > 1.5;
                 let veh_bump_view = veh_tex(umat.bump);
                 let veh_bd_view = veh_tex(umat.bump_detail);
                 let veh_snorm = |o: Option<(u32, [f32; 4])>| -> bool { o.map_or(false, |(t, _)| self.obj_mat_tex.get(&t).map(|(_, x)| x.format() == wgpu::TextureFormat::Bc5RgSnorm).unwrap_or(false)) };
-                let veh_cube_view: Option<&wgpu::TextureView> = if !veh_lane { None }
+                let veh_cube_view: Option<&wgpu::TextureView> = if !mat_lane { None }
                     else if umat.env_cube != 0 { self.obj_env_cube_cache.get(&umat.env_cube).and_then(|o| o.as_ref()).map(|(_, v)| v) }
                     else if veh_cluster_env { gcluster_view } else { None };
                 // xctl.w = BC5_SNORM bits (1 bump, 2 bump_detail) | (round(env_lod x 4) << 4); xctl.z = 1 cube bound.
-                let veh_xctl: [f32; 4] = if veh_lane {
+                let veh_xctl: [f32; 4] = if mat_lane {
                     let bits = (if veh_bump_view.is_some() && veh_snorm(umat.bump) { 1u32 } else { 0 }) | (if veh_bd_view.is_some() && veh_snorm(umat.bump_detail) { 2u32 } else { 0 });
                     [0.0, 0.0, if veh_cube_view.is_some() { 1.0 } else { 0.0 }, (bits | (((umat.env_lod * 4.0).round().clamp(0.0, 24.0) as u32) << 4)) as f32]
                 } else { [0.0; 4] };
@@ -13044,11 +15511,21 @@ impl SceneController {
                 // and shows full-surface energy. Forcefields never carry glass_mat, so g_bump_xform is
                 // [0;4] here and this override is safe.
                 let g_bump_xform = if let Some(l) = ffl { l[2] } else if uff { [0.0, 0.0, 0.0, 2.0] } else { g_bump_xform };
+                // #sword-blade fs_holo lane id in .w (9 / 10; see `lane_illum_only` above).
+                let g_bump_xform = if lane_illum_only || lane_halo_from_diffuse {
+                    [g_bump_xform[0], g_bump_xform[1], g_bump_xform[2], if lane_illum_only { 9.0 } else { 10.0 }]
+                } else { g_bump_xform };
                 // rmsh object glass carries its authored opacity-fresnel triplet (w=2) in fine_xform.
                 let g_fine_xform = match (uglass_mat.is_none(), uglass_op.as_ref()) { (true, Some(g)) if g.fres[3] > 1.5 => g.fres, _ => g_fine_xform };
                 // The engine noise SCROLL rate animates the shield's plasma; feed it into the holo
                 // pass's scroll channel (markers keep the default [0,0] + fs_holo's tiny drift).
-                let u_scroll = if let Some(l) = ffl { [l[8][0], l[8][1]] } else if uff { uff_scroll } else { [0.0, 0.0] };
+                // #blade-anim  The two fs_holo self-illum lanes carry their authored scroll too
+                // (decoded above into the part's `ff_scroll`): lane 10 scrolls the base map it
+                // samples, lane 9 its self-illum map. Without this the sword's blade was drawn
+                // from a frozen UV — "it needs the effect/animation that was playing on it".
+                let u_scroll = if let Some(l) = ffl { [l[8][0], l[8][1]] }
+                    else if uff || lane_illum_only || lane_halo_from_diffuse { uff_scroll }
+                    else { [0.0, 0.0] };
                 // The OPAQUE/CUTOUT lane's mesh tile = the part's authored base_map xform scale
                 // (decoded in object_base_tile); every other lane (holo/glass/forcefield/terrain) keeps [1,1]
                 // exactly as before, so their own tiling lanes are untouched.
@@ -13117,19 +15594,26 @@ impl SceneController {
                 {
                     use wgpu::util::DeviceExt;
                     if !self.obj_vbuf_cache.contains_key(&tag) {
+                        // #gpu-build  print-only timing (HMS_LOADPROF); one relaxed add.
+                        let _tb = std::time::Instant::now();
                         let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("obj-vb-cache"),
                             contents: bytemuck::cast_slice(&dec.verts),
                             usage: wgpu::BufferUsages::VERTEX,
                         });
+                        GB_BUF_NS.fetch_add(_tb.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        GB_BUF_BYTES.fetch_add(std::mem::size_of_val(&dec.verts[..]) as u64, std::sync::atomic::Ordering::Relaxed);
                         self.obj_vbuf_cache.insert(tag, vb);
                     }
                     if !self.obj_ibuf_cache.contains_key(&(tag, ui)) {
+                        let _tb = std::time::Instant::now();
                         let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                             label: Some("obj-ib-cache"),
                             contents: bytemuck::cast_slice(uidx),
                             usage: wgpu::BufferUsages::INDEX,
                         });
+                        GB_BUF_NS.fetch_add(_tb.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                        GB_BUF_BYTES.fetch_add(std::mem::size_of_val(uidx) as u64, std::sync::atomic::Ordering::Relaxed);
                         self.obj_ibuf_cache.insert((tag, ui), (ib, uidx.len() as u32));
                     }
                 }
@@ -13143,7 +15627,10 @@ impl SceneController {
                 // zeros albedo at self_illumination.hlsl_include:115-116). Only for OPAQUE-pass parts
                 // (holo/glass parts use fs_holo/fs_blend, which don't read si_ctl). Every other mode
                 // (and HMS_NO_SIMODE) passes [0;4] → the current single-composite object path.
-                let si_arg: [f32; 4] = if ev("HMS_NO_SIMODE").is_ok() || unit_holo || unit_glass || usi_mode != 4 {
+                let si_arg: [f32; 4] = if lane_halo_from_diffuse {
+                    // #sword-blade lane 10 carries `self_illum_color x self_illum_intensity`.
+                    [usi_mode as f32, usi_cmul[0], usi_cmul[1], usi_cmul[2]]
+                } else if ev("HMS_NO_SIMODE").is_ok() || unit_holo || unit_glass || usi_mode != 4 {
                     [0.0; 4]
                 } else {
                     [usi_mode as f32, usi_cmul[0], usi_cmul[1], usi_cmul[2]]
@@ -13188,43 +15675,48 @@ impl SceneController {
                     ff_mul.map(|m| m.0).or(veh_bd_view), // Halogram overlay_multiply_map; bump_detail_map (None on every other object lane)
                     u_scroll, // Forcefield: engine plasma scroll rate (else [0,0])
                     ffl.map_or(u_base_tile, |l| [l[0][0], l[0][1]]), // noise_a xform scale; else base_map xform scale
-                    if let Some(l) = ffl { l[1] } else if veh_lane { umat.detail.map_or([0.0; 4], |d| d.1) } else { g_detail_xform }, // glass: fresnel triplet; ff: noise_b xform; detail_map xform; else 0
+                    if let Some(l) = ffl { l[1] } else if (veh_lane || det_alpha_only) && veh_detail_view.is_some() { umat.detail.map_or([0.0; 4], |d| d.1) } else { g_detail_xform }, // glass: fresnel triplet; ff: noise_b xform; detail_map xform; else 0
                     0.0,
-                    // Keep the object gloss mask at 1.0 so parts retain their sun GLINT/sheen
-                    // (the earlier mat_spec>0 gate wrongly flattened glass-like panels that had no
-                    // authored spec constant → "glass has no color/shading"). The blue SKY env-reflection
-                    // that made whole forge blocks look reflective is instead killed for dynamic objects
-                    // directly in the shader (mesh_shade: `obj_matte`, lm.w==2), leaving glass reflection
-                    // to the separate glass pass. So blocks are matte, glass keeps its look.
-                    1.0,
-                    if veh_lane { [umat.spec, umat.rough] } else { [dec.mat_spec, dec.mat_rough] }, // per-material specular constants; THIS part's (shader 0's for the legacy lane)
-                    if let Some(l) = ffl { l[3] } else if veh_lane { umat.spec2 } else { g_spec2 }, // artist-Fresnel constants; glass: albedo_color body; ff: colour+intensity
+                    // The object gloss mask. HMS used to pass a blanket 1.0 so parts retained their sun
+                    // GLINT/sheen (an earlier mat_spec>0 gate wrongly flattened glass-like panels that had
+                    // no authored spec constant → "glass has no color/shading"), and that blanket 1.0 is
+                    // still right for a part with no per-part decode (rmtr objects, single-material legacy).
+                    //
+                    // #objmat A FORGE piece now decodes its own material, so it carries its own
+                    // `specular_mask` option instead: digits 1/2 = specular_mask_from_diffuse (the base
+                    // map's alpha IS the gloss mask), 0 = no_specular_mask (no per-texel mask). Unit/item
+                    // parts keep the blanket 1.0 so the already-validated vehicle/weapon lane is
+                    // byte-identical (18 of their 269 live parts author no_specular_mask; a measured
+                    // follow-up, not something this change can validate).
+                    obj_sfa_lane, // #objmask [0 no mask / 1 from_diffuse / 2 from_diffuse + alpha-only detail]
+                    if mat_lane { [umat.spec, umat.rough] } else { [dec.mat_spec, dec.mat_rough] }, // #objmat per-material specular constants: THIS part's own (shader 0's only where no part decode exists)
+                    if let Some(l) = ffl { l[3] } else if mat_lane { umat.spec2 } else { g_spec2 }, // artist-Fresnel constants; glass: albedo_color body; ff: colour+intensity
                     if veh_lane { umat.bump.map_or([0.0; 4], |b| b.1) } else { g_bump_xform }, // Object bump xform (authored bump_map xform); glass: env_tint_color + flag; ff: noise_b scroll + flags
-                    if let Some(l) = ffl { if ff_mask.is_some() { [l[4][0], -1.0, l[4][2], l[4][3]] } else { l[4] } } else if veh_lane { [umat.area, 0.0, 0.0, 0.0] } else { g_fine_xform }, // Fine detail; glass: glancing rim tint; ff: v/alpha (-1 = per-texel mask in at_tex)/amf/has_overlay;.x = area_specular_contribution (.z/.w flags stay 0)
+                    if let Some(l) = ffl { if ff_mask.is_some() { [l[4][0], -1.0, l[4][2], l[4][3]] } else { l[4] } } else if mat_lane { [umat.area, obj_alb_a_lane, 0.0, 0.0] } else { g_fine_xform }, // Fine detail; glass: glancing rim tint; ff: v/alpha (-1 = per-texel mask in at_tex)/amf/has_overlay;.x = area_specular_contribution (.z/.w flags stay 0)
                     // cc-albedo parts carry the AUTHORED default change colours in xbump.rgb
                     // (primary) and si_ctl.yzw (secondary) -- lanes an opaque object part never uses -- so bump_detail_xform /
                     // env_ctl are free for the engine bump_detail / env lanes. mesh_shade applies them through the mask when
                     // the instance has no forge team/object colour.
-                    if let Some(l) = ffl { l[5] } else if veh_lane { umat.bump_detail.map_or([0.0, 0.0, 0.0, umat.menv], |b| [b.1[0], b.1[1], if veh_bd_view.is_some() { 1.0 } else { 0.0 }, umat.menv]) } else { g_bdx }, // ff: overlay_map xform; [bump_detail tile, present, environment_map_specular_contribution]; rmsh glass: [mask xform, flag, contribution]
-                    if let Some(l) = ffl { l[6] } else if veh_lane { umat.env_ctl } else if let Some(e) = g_env_ctl { e } else { [0.0; 4] }, // ff: overlay_detail xform; vehicle lane / rmgl: [env_tint, specular_coefficient]; else env-matte
+                    if let Some(l) = ffl { l[5] } else if mat_lane { umat.bump_detail.map_or([0.0, 0.0, 0.0, umat.menv], |b| [b.1[0], b.1[1], if veh_bd_view.is_some() { 1.0 } else { 0.0 }, umat.menv]) } else { g_bdx }, // ff: overlay_map xform; [bump_detail tile, present, environment_map_specular_contribution]; rmsh glass: [mask xform, flag, contribution]
+                    if let Some(l) = ffl { l[6] } else if mat_lane { umat.env_ctl } else if let Some(e) = g_env_ctl { e } else { [0.0; 4] }, // ff: overlay_detail xform; vehicle lane / rmgl: [env_tint, specular_coefficient]; else env-matte
                     None, // Object meshes are lit via PVL/airprobe, not the atlas GPU path
                     true, // DYNAMIC OBJECT → shader adds the dominant-lobe geometric-normal soft-shade
-                    if veh_lane || (opaque_route && umat.mm_set) { (umat.mm as f32) + 1.0 } else { 0.0 }, // MAT-1: the vehicle lane dispatches the part's material_model (diffuse_only kills spec/env); every opaque/cutout rmsh part of ANY object class (diffuse_only = no glint), else unset
-                    if let Some(l) = ffl { l[7] } else if has_cc_map && si_arg[0] < 0.5 { [0.0, dec.cc_default[1][0], dec.cc_default[1][1], dec.cc_default[1][2]] } else { si_arg }, // LIT-SI-3: [self_illum mode, cmul.rgb]; ff: overlay tint+intensity; cc: secondary change colour
+                    if mat_lane || (opaque_route && umat.mm_set) { (umat.mm as f32) + 1.0 } else { 0.0 }, // MAT-1: the vehicle lane dispatches the part's material_model (diffuse_only kills spec/env); every opaque/cutout rmsh part of ANY object class (diffuse_only = no glint), else unset
+                    if let Some(l) = ffl { l[7] } else if has_cc_map && si_arg[0] < 0.5 { [0.0, u_cc[1][0], u_cc[1][1], u_cc[1][2]] } else { si_arg }, // LIT-SI-3: [self_illum mode, cmul.rgb]; ff: overlay tint+intensity; cc: secondary change colour
                     gop_view, // MAT-30 slot: opacity_texture for rmsh object glass (else None → base.a clip)
                     gsm_view, // material_texture slot = specular_mask_texture for rmsh object glass (else None)
                     if let Some(l) = ffl { [l[0][2], l[0][3], l[8][2], l[8][3]] } else if let Some(g) = uglass_op.as_ref() { [0.0, g.gamma, 0.0, g.mode] } else if let Some((_, _, aa)) = uglass_det { [0.0, 0.0, aa, 3.0] } else if has_cc_map { [0.0, 0.0, 0.0, 6.0] } else { [0.0; 4] }, // ff: noise_a offset + overlay scroll; glass: opacity mode; rmgl: [_,_,albedo_a,3]; cc-albedo: mode 6
                     if let Some((_, mx)) = ff_mask { mx } else if let Some((_, mx)) = ff_mul { mx } else if let Some(g) = uglass_op.as_ref() { g.xform } else if let Some((_, xf, _)) = uglass_det { xf } else if let (true, Some((_, xf))) = (has_cc_map, ucc) { xf } else { [0.0; 4] }, // ff: alpha_mask_map xform; multiply-map xform; glass: opacity/detail map UV xform; cc-albedo: mask xform
-                    None, None, if let Some(l) = ffl { l[9] } else if has_cc_map { [dec.cc_default[0][0], dec.cc_default[0][1], dec.cc_default[0][2], 0.0] } else { obj_glass_xbump }, // cc: primary change colour; glass: ctl lanes
-                    if let Some(x) = ffx { x.gamma } else if veh_lane { veh_xctl } else if g_env_ctl.is_some() { [0.0, 0.0, 1.0, g_env_lod] } else if unit_glass && uglass_envopt == 2 && ev("HMS_NO_ENV_DYNAMIC").is_err() { [0.0, 0.0, 2.0, 0.0] } else { [0.0; 4] }, // MAT-13/19: ff: xctl = bitmap gamma flags; [_,_,cube bound, snorm bits | lod<<4]; rmgl/rmsh glass: xctl.z = 1 cube bound (authored or the cluster cube) + its lod
-                    if veh_lane { veh_cube_view } else if g_env_ctl.is_some() { gcube_view } else { None },
+                    None, None, if let Some(l) = ffl { l[9] } else if has_cc_map { [u_cc[0][0], u_cc[0][1], u_cc[0][2], 0.0] } else { obj_glass_xbump }, // cc: primary change colour; glass: ctl lanes
+                    if let Some(x) = ffx { x.gamma } else if mat_lane { veh_xctl } else if g_env_ctl.is_some() { [0.0, 0.0, 1.0, g_env_lod] } else if unit_glass && uglass_envopt == 2 && ev("HMS_NO_ENV_DYNAMIC").is_err() { [0.0, 0.0, 2.0, 0.0] } else { [0.0; 4] }, // MAT-13/19: ff: xctl = bitmap gamma flags; [_,_,cube bound, snorm bits | lod<<4]; rmgl/rmsh glass: xctl.z = 1 cube bound (authored or the cluster cube) + its lod
+                    if mat_lane { veh_cube_view } else if g_env_ctl.is_some() { gcube_view } else { None },
                 );
                 if oprobes.iter().any(|p| p.0[3] > 0.0) { m.set_instance_probes(queue, &oprobes); }
                 if (dec.spec_rgb[3] > 0.5 || dec.fres_rgb[3] > 0.5) && ev("HMS_NO_SPEC_RGB").is_err() { m.set_spec_tints(queue, dec.spec_rgb, dec.fres_rgb); }
                 // THIS part's specular_tint / fresnel_color (HMS's dielectric defaults when unauthored, so
                 // the colour selects stay byte-identical to the scalar lanes); spec_rgb.w = 1 + `roughness` (the area/env
                 // LUT z), fres_rgb.w = 2 flags the engine object material lane to mesh_shade.
-                if veh_lane {
+                if mat_lane {
                     let st = if umat.spec_rgb[3] > 0.5 { umat.spec_rgb } else { [0.04, 0.04, 0.04, 1.0] };
                     let fc = if umat.fres_rgb[3] > 0.5 { umat.fres_rgb } else { [1.0, 1.0, 1.0, 1.0] };
                     m.set_spec_tints(queue, [st[0], st[1], st[2], 1.0 + umat.rough_lut], [fc[0], fc[1], fc[2], 2.0]);
@@ -13237,7 +15729,7 @@ impl SceneController {
                 // spec_rgb / fres_rgb lanes = [edge_tint.rgb, power], [center_tint.rgb, 1 = on].
                 if let Some((e, c)) = ffx.and_then(|x| x.edge_fade) { m.set_spec_tints(queue, e, c); }
                 // holo (alpha-blended shape) → glass (alpha-blend) → cutout (alpha-test) → opaque.
-                if unit_holo {
+                {
                     // T5: route by the AUTHORED blend mode (engine halogram blend_mode = as .shader,
                     // NOT hardcoded additive). alpha_blend(4)/premul(6) → alpha-blended
                     // holo; additive(1/5) → additive glow. solid_marker still forces alpha (readable shape).
@@ -13250,26 +15742,46 @@ impl SceneController {
                     // solid pass (the hill beacon's forge_blue_holo / forge_spartan_holo are multilayer halograms;
                     // their readable translucent silhouette is an HMS choice, kept byte-identical).
                     let ff_engine_marker = ff_engine && ffl.map_or(false, |l| l[2][2] < 5.5);
-                    if (solid_marker && !(ff_engine_marker && forced_cc.is_none())) || (!ff_engine && matches!(ublend, 4 | 6)) {
-                        holo_solid_meshes.push(m);
-                    } else {
+                    match lane_in.lane(ff_engine_marker, forced_cc.is_some()) {
+                        PartLane::HoloSolid => holo_solid_meshes.push(m),
                         // Glowing overlays (killball, light glow, powerup, particles) → additive.
-                        holo_meshes.push(m);
+                        PartLane::Additive => holo_meshes.push(m),
+                        PartLane::Blend => blend_meshes.push(m),
+                        PartLane::Cutout => {
+                            m.casts_shadow = grp_casts;
+                            cutout_meshes.push(m);
+                        }
+                        PartLane::Opaque => {
+                            m.casts_shadow = grp_casts;
+                            meshes.push(m);
+                        }
                     }
-                } else if unit_glass {
-                    blend_meshes.push(m);
-                } else if ualpha {
-                    m.casts_shadow = grp_casts;
-                    cutout_meshes.push(m);
-                } else {
-                    m.casts_shadow = grp_casts;
-                    meshes.push(m);
                 }
             }
         }
         // The models whose texture slots were all uploaded this pass no longer need their CPU
         // texture bytes (shared bytes are freed once their last sharer has uploaded too).
+        //
+        // #damage A model whose draw parts are SPLIT BY hlmt VARIANT (vehicles, equipment — and,
+        // with the DAMAGE display state, one part set per authored state) only ever uploads the
+        // parts of the variant it was drawn in. Freeing its bytes there left every other variant's
+        // parts with no texture for the rest of the session: picking `destroyed` on a Warthog drew
+        // its chaingun as a plain WHITE blob (its state-3 parts had never uploaded, and their bytes
+        // were gone). Such a model keeps its bytes until every part has its textures on the GPU;
+        // single-variant models (all parts in one variant set — the bulk of the memory) are
+        // unaffected and release exactly as before.
         for t in tex_done_tags {
+            let hold = match self.geom_cache.get(&t) {
+                Some(Some(d)) => {
+                    let split = d.obj_parts.iter().any(|p| p.vbits != d.obj_parts[0].vbits);
+                    split && d.obj_parts.iter().enumerate().any(|(ui, p)| {
+                        (p.tex.is_some() && !self.obj_tex_cache.contains_key(&(t, ui, 0)))
+                            || (p.emissive.is_some() && !self.obj_tex_cache.contains_key(&(t, ui, 1)))
+                    })
+                }
+                _ => false,
+            };
+            if hold { continue; }
             if let Some(Some(d)) = self.geom_cache.get_mut(&t) {
                 d.tex_uploaded = true;
                 release_model_texture_bytes(d);
@@ -13277,7 +15789,12 @@ impl SceneController {
         }
         // If we deferred any NEW tags this frame, keep re-running so they build over the
         // next frames (bounded per frame → responsive window, objects pop in progressively).
-        self.rebuild_pending = self.rebuild_pending || gpu_remaining;
+        self.rebuild_pending = self.rebuild_pending || gpu_remaining || hull_deferred;
+        if gpu_new > 0 {
+            self.gpu_tail_frames += 1;
+            self.gpu_tail_models += gpu_new;
+            self.gpu_tail_ms += t_gpu_budget.elapsed().as_secs_f64() * 1000.0;
+        }
         if ev("HMS_REBUILD_DIAG").is_ok() {
             eprintln!("REBUILD_DIAG pass: {} ms (objloop {} ms of which probes {} ms; meshloop {} ms) gpu_new={gpu_new} gpu_remaining={gpu_remaining} pending={} objects={} vbuf_cache={} terrain_ready={}", t_rebuild.elapsed().as_millis(), t_objloop_ms, t_probe_us / 1000, t_meshloop.elapsed().as_millis(), self.rebuild_pending, objects.len(), self.obj_vbuf_cache.len(), self.obj_terrain_ready.len());
         }
@@ -13315,8 +15832,8 @@ impl SceneController {
                     let r = self.resolve_lift_fx(ot);
                     self.lift_fx_cache.insert(ot, r);
                 }
-                let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
-                let m = if (s - 1.0).abs() > 1e-4 { object_matrix(o) * Mat4::from_scale(Vec3::splat(s)) } else { object_matrix(o) };
+                let s = self.object_scale(o);
+                let m = self.object_world(o);
                 if ev("HMS_NO_LIFT_PARTICLES").is_err() {
                     let all = ev("HMS_LIFT_FX_ALL").is_ok();
                     let mode = self.resolve_object_mode(ot);
@@ -13336,6 +15853,8 @@ impl SceneController {
                             world: m, effe,
                             label: format!("obj {ot:#x} datum {:#x}", o.datum),
                             systems, locs,
+                            birth: None,
+                            path: None,
                         });
                     }
                 }
@@ -13387,8 +15906,8 @@ impl SceneController {
                 for o in objects {
                     let ot = o.primary_tag;
                     if ot == 0 || ot == 0xFFFF_FFFF { continue; }
-                    let s = self.obj_scales.get(&o.datum).copied().unwrap_or(1.0);
-                    let m = if (s - 1.0).abs() > 1e-4 { object_matrix(o) * Mat4::from_scale(Vec3::splat(s)) } else { object_matrix(o) };
+                    let s = self.object_scale(o);
+                    let m = self.object_world(o);
                     let mode = self.resolve_object_mode(ot);
                     let vsid = o.variant_name_sid;
                     for (effe, marker, scale_sid) in self.object_effects(ot) {
@@ -14799,7 +17318,7 @@ impl SceneController {
                 Some(s) if s.len() >= (i + 1) * 3 => [s[i * 3], s[i * 3 + 1], s[i * 3 + 2]],
                 _ => [0.0, 0.0, 0.0],
             };
-            verts.push(MeshVertex { pos: p, normal: n, uv, color, sway, uv2: [0.0, 0.0], tangent: [0.0; 4] });
+            verts.push(MeshVertex { pos: p, normal: n, uv, color, sway, uv2: [0.0, 0.0], tangent: [0.0; 4], bone: [0, 0] });
         }
         let indices: Vec<u32> = dm.indices.iter().map(|&i| i as u32).collect();
         // decode+upload each decorator card texture ONCE per tag (many sets share one
@@ -18809,6 +21328,14 @@ impl SceneController {
                 {
                     line.push_str(&format!(" | albedo_color=[{:.3},{:.3},{:.3}]", ac[0], ac[1], ac[2]));
                 }
+                // The engine multiplies the BSP diffuse light by `diffuse_coefficient`
+                // (entry_points / cook_torrance_core; 435 of the 565 captured lightmapped BSP
+                // pixel shaders read it). Logged so a material's authored value is visible.
+                if let Some(dc) = self.native.bsp_material_shader_constants(bsp, dec.material_index)
+                    .and_then(|c| c.real("diffuse_coefficient"))
+                {
+                    line.push_str(&format!(" | diffuse_coefficient={:.4}", dc[0]));
+                }
                 // Asset extraction: for the wood planks (same base texture, but authored as
                 // multiple materials with DIFFERENT albedo_color → they render dark on one level
                 // and orange on another). Dump the actual base + detail AVERAGE colour so we can
@@ -19126,6 +21653,17 @@ impl SceneController {
                 eprintln!("FFUPLOAD BSP mat={} verts={} idx={} views base={} emis={} pal={} ov={} lanes={:?}",
                     dec.material_index, dec.verts.len(), dec.indices.len(), view.is_some(), emis_view.is_some(), detail_view.is_some(), bump_view.is_some(), ffl.unwrap());
             }
+            // The material's authored `diffuse_coefficient` (see DecodedModel::mat_dcoef): the
+            // engine scales the whole DIFFUSE light by it before the albedo multiply. It rides
+            // `matmodel.y` (the vertex-attribute budget is full), so it is handed to the renderer
+            // as a one-shot immediately before the upload. The glass lane carries its own copy.
+            // 1.0 = the upload default → a material that authors none is byte-identical.
+            // HMS_NO_DCOEF=1 restores the previous behaviour for A/B.
+            let dcoef_now = if dec.is_glass_shader || ev("HMS_NO_DCOEF").is_ok() { 1.0 } else { dec.mat_dcoef };
+            mesh.set_next_dcoef(dcoef_now);
+            if ev("HMS_DCOEFDIAG").is_ok() && (dcoef_now - 1.0).abs() > 1e-4 {
+                eprintln!("HMS_DCOEFDIAG mat={} dcoef={:.3}", dec.material_index, dcoef_now);
+            }
             let _t_up = std::time::Instant::now();
             let pre_vbuf_was_some = pre_vbuf.is_some();
             let mut m = if let (Some(vb), Some(ib)) = (pre_vbuf, pre_ibuf) {
@@ -19169,6 +21707,10 @@ impl SceneController {
                     dec.material_index, dec.cluster, dec.lm_gpu, m.lm_flag(), dec.lm_dm_tag, dec.lm_dm_sub, dec.lm_sdm_tag, dec.lm_sdm_sub, pre_vbuf_was_some, dec.verts.len());
             }
             if (dec.spec_rgb[3] > 0.5 || dec.fres_rgb[3] > 0.5) && ev("HMS_NO_SPEC_RGB").is_err() { m.set_spec_tints(queue, dec.spec_rgb, dec.fres_rgb); }
+            // The material's authored `diffuse_coefficient` (see DecodedModel::mat_dcoef). The
+            // glass lane carries its own copy (xbump.y), so only the opaque BSP lane needs it
+            // here; 1.0 is the upload default, so a material that authors none is byte-identical.
+            // HMS_NO_DCOEF=1 restores the previous behaviour for A/B.
             // BSP halogram modes 6 / 7 edge_fade_simple record (see the object upload).
             if let Some((e, c)) = dec.ff_extra.as_ref().and_then(|x| x.edge_fade) { m.set_spec_tints(queue, e, c); }
             // fresnel_color + the "tint the area term" flag ride the (BSP-unused) obj_probe0 lane.
@@ -19488,7 +22030,10 @@ impl crate::objscene::ObjectScene for SceneController {
         SceneController::maybe_rebuild(self, objects, colors, mr, device, queue).map(crate::objscene::RebuiltLanes::from_tuple)
     }
     fn set_object_scales(&mut self, scales: HashMap<u32, f32>) { SceneController::set_object_scales(self, scales) }
+    fn set_object_transforms(&mut self, t: HashMap<u32, Mat4>) { SceneController::set_object_transforms(self, t) }
     fn set_object_casters(&mut self, casters: std::collections::HashSet<u32>) { SceneController::set_object_casters(self, casters) }
+    fn set_object_damage(&mut self, states: HashMap<u32, u8>) { SceneController::set_object_damage(self, states) }
+    fn damage_states_of(&self, o: &ObjectInfo) -> Vec<u8> { SceneController::object_damage_states(self, o) }
     fn pick(&self, origin: Vec3, dir: Vec3) -> Option<u32> { SceneController::pick(self, origin, dir) }
     fn aabb_of(&self, datum: u32) -> Option<([f32; 3], [f32; 3])> { SceneController::aabb_of(self, datum) }
     fn object_obb(&self, datum: u32) -> Option<crate::construct::Obb> { SceneController::object_obb(self, datum) }
@@ -19507,14 +22052,19 @@ impl crate::objscene::ObjectScene for SceneController {
     // them too; the Reach bodies are unchanged (native coll / phmo walkers).
     fn collision_world_edges(&self, o: &ObjectInfo) -> Vec<([f32; 3], [f32; 3])> { SceneController::collision_world_edges(self, o) }
     fn physics_world_edges(&self, o: &ObjectInfo) -> Vec<([f32; 3], [f32; 3])> { SceneController::physics_world_edges(self, o) }
+    fn physics_body(&self, o: &ObjectInfo) -> Option<crate::physics_settle::PhysBody> { SceneController::physics_body(self, o) }
+    fn physics_world_tris(&self, o: &ObjectInfo) -> Vec<[Vec3; 3]> { SceneController::physics_world_tris(self, o) }
+    fn static_tris_in_aabb(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) { SceneController::static_tris_in_aabb(self, mn, mx, out) }
     fn pick_entry_counts(&self, datum: u32) -> (usize, usize) {
         let all: Vec<&PickEntry> = self.picks.iter().filter(|p| p.datum == datum).collect();
         (all.len(), all.iter().filter(|p| p.att).count())
     }
     fn bsp_flags_report(&self) -> String { SceneController::bsp_flags_report(self) }
     fn spawn_camera_pose(&self) -> Option<(Vec3, f32, f32)> { SceneController::spawn_camera_pose(self) }
+    fn spawn_camera(&self) -> Option<crate::spawn_camera::Pose> { SceneController::spawn_camera(self) }
     // The Reach primitive (BSP soup with the ray cap + object triangles).
     fn raycast_solid(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> { SceneController::raycast_solid(self, origin, dir, max) }
+    fn raycast_solid_excluding(&self, origin: Vec3, dir: Vec3, max: f32, exclude: &[u32]) -> Option<f32> { SceneController::raycast_solid_excluding(self, origin, dir, max, exclude) }
 }
 
 /// Messages streamed from the background load worker to the main (render) thread.
@@ -20225,7 +22775,9 @@ pub fn forge_color_srgb(index: usize) -> [u8; 3] {
 /// primary slot. Explicit Color (0..7) wins → palette[color]; color 0xFF/none → palette[team]
 /// ("use team"). This is the colour multiplied into the change_color materials' SELF-ILLUM
 /// (light strips / spawn-point body) — NOT the body albedo.
-fn forge_tint(tc: Option<(u8, u8)>) -> [f32; 4] {
+/// #vehicle-ride  Exposed so the RIDE lane tints its actors with the same table as the object
+/// pipeline. One table, so a vehicle cannot change colour the moment you sit in it.
+pub(crate) fn forge_tint(tc: Option<(u8, u8)>) -> [f32; 4] {
     match tc {
         Some((team, color)) => {
             // Explicit object COLOUR (0..7) wins. Else a REAL TEAM (0..7) → team colour. Else
@@ -20276,6 +22828,61 @@ fn forge_tint_index(tc: Option<(u8, u8)>) -> i32 {
 /// self-illum lanes, engine 0.5 grey for the change_color albedo masks).
 const FORGE_CC_NEUTRAL: i32 = 8;
 
+/// HMS_LOADPROF per-tag GPU-build reporter: prints the wall time and the native page-cache work
+/// one render-model tag's GPU build (vertex/index buffers + texture upload with mip generation)
+/// cost, on drop, so every `continue` path in the long mesh loop still reports. Only tags over
+/// 20 ms are printed — the point is to find the stalls, not to log the whole palette.
+struct TagBuildProf {
+    t: std::time::Instant,
+    name: String,
+    tag: u32,
+    nat: std::sync::Arc<NativeDll>,
+}
+
+impl Drop for TagBuildProf {
+    fn drop(&mut self) {
+        let ms = self.t.elapsed().as_secs_f64() * 1000.0;
+        use std::sync::atomic::Ordering::Relaxed;
+        // DRAIN FIRST, print second. These counters are global read-and-reset, so returning early
+        // for a cheap build would leave its work in them and the NEXT printed line would claim it
+        // -- which made the per-line split sum to 117% of the line's own wall time. Every build
+        // drains; only the expensive ones print.
+        let ps = self.nat.page_stats();
+        // WHERE the milliseconds went. Every counter is read-and-reset, and the build loop clears
+        // them when it starts timing a tag, so each line accounts for exactly one model.
+        let up = hms_render::upprof::take();
+        let bp = hms_native::bmpprof::take();
+        let buf_ms = GB_BUF_NS.swap(0, Relaxed) as f64 / 1e6;
+        let buf_mb = GB_BUF_BYTES.swap(0, Relaxed) as f64 / 1048576.0;
+        let (calls, hk, hs, empty, uploads) = (
+            GB_TEX_CALLS.swap(0, Relaxed),
+            GB_TEX_HIT_KEY.swap(0, Relaxed),
+            GB_TEX_HIT_SRC.swap(0, Relaxed),
+            GB_TEX_EMPTY.swap(0, Relaxed),
+            GB_TEX_UPLOAD.swap(0, Relaxed),
+        );
+        // Anything the named buckets do not cover is shader/material resolution and the per-part
+        // walk: reported as a residual rather than left unexplained.
+        let named = up.total_ms() + bp.total_ms() + buf_ms;
+        if ms < 20.0 {
+            return;
+        }
+        eprintln!(
+            "HMS_LOADPROF   gpu-build tag={:#x} '{}' {:.0} ms |              tex-upload {:.0} ms (of which CPU mipgen {:.0} ms) n={} {:.1} Mpix | bc-dds {:.0} ms n={} |              native-decode {:.0} ms n={} (raw {:.0} ms n={}) [off-thread {:.0} ms n={}] | buffers {:.0} ms {:.1} MB |              mesh {:.0} ms n={} | terrain {:.0} ms n={} | resolve/other {:.0} ms |              tex slots {} (key-hit {} src-hit {} empty {} UPLOADED {}) |              page hits={} inflates={} inflated={:.0} MB inflate={:.0} ms",
+            self.tag, self.name, ms,
+            up.tex_ms, up.tex_mip_ms, up.tex_n, up.tex_mpix,
+            up.dds_ms, up.dds_n,
+            bp.dec_ms, bp.dec_n, bp.raw_ms, bp.raw_n, bp.off_ms, bp.off_n,
+            buf_ms, buf_mb,
+            up.mesh_ms, up.mesh_n,
+            up.terr_ms, up.terr_n,
+            (ms - named).max(0.0),
+            calls, hk, hs, empty, uploads,
+            ps.0, ps.1, ps.2 as f64 / 1048576.0, ps.3 as f64 / 1e6
+        );
+    }
+}
+
 // Object decode phase timers (HMS_LOADPROF / --bench-mvar). Accumulated across the parallel
 // predecode; swapped+printed by the bench. GEOM = native geometry+UV decode, MAT = rmt2
 // shader-constant walks + main tex, PARTS = per-submesh split + per-shader bitmaps.
@@ -20290,6 +22897,19 @@ static OBJ_T_EMIS_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static OBJ_T_FF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// CPU-sum of share_part_textures during the object predecode.
 static OBJ_T_INTERN_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// #gpu-build  Per-tag GPU-build accounting for `obj_tex_ensure` (see [`TagBuildProf`]).
+/// CALLS = texture slots asked for; HIT_KEY = already on the GPU for this (tag, part, kind);
+/// HIT_SRC = another model had already uploaded the same decoded source; EMPTY = the CPU bytes
+/// were already released; UPLOAD = a real GPU upload happened.
+static GB_TEX_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GB_TEX_HIT_KEY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GB_TEX_HIT_SRC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GB_TEX_EMPTY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GB_TEX_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Time spent in `device.create_buffer_init` for this tag's vertex + index buffers.
+static GB_BUF_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GB_BUF_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 static BMP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BMP_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static BMP_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -20447,6 +23067,43 @@ fn decode_model(native: &NativeDll, cache: CacheHandle, mode_tag: u32, obj_tag: 
     decode_model_cached(native, cache, mode_tag, obj_tag, None)
 }
 
+/// #sword-blade The DRAW LANE every part of one object takes, read off the shipped tags with no
+/// GPU: `decode_model` (which is pure CPU — tag + bitmap decode) followed by the one lane rule
+/// (`PartLaneIn`). `name_holo` / `marker_forced` / forced change-colour are the SCENE's facts
+/// about a Forge marker placement, so they are false here; a weapon, a vehicle or a biped is
+/// never one, which is exactly the population this answers for.
+///
+/// Returns one `(inputs, lane)` per drawn part, in part order.
+pub fn object_part_lanes(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> Vec<(PartLaneIn, PartLane)> {
+    let mode = native.resolve_mode(cache, obj_tag);
+    if mode == 0 || mode == 0xFFFF_FFFF { return Vec::new() }
+    let Some(dec) = decode_model(native, cache, mode, obj_tag) else { return Vec::new() };
+    let nm = native.tag_name(cache, mode).unwrap_or_default();
+    let mk = |blend: u32, alpha_test: bool, has_emissive: bool, emis_cc: bool, is_halo: bool,
+              is_ff: bool, is_glass: bool, ff_extra: bool, si_mode: u8| {
+        let i = PartLaneIn {
+            blend, alpha_test, has_emissive, emis_cc, is_halo, is_ff, is_glass, ff_extra, si_mode,
+            name_holo: false, marker_forced: false,
+            shield_name_blend: shield_name_forces_blend(&nm, blend),
+        };
+        // No forcefield record is read here, so `ff_engine_marker` cannot be true and there is no
+        // forced marker colour — the two facts only a Forge marker placement supplies.
+        let l = i.lane(false, false);
+        (i, l)
+    };
+    if dec.obj_parts.is_empty() {
+        if dec.indices.len() < 3 { return Vec::new() }
+        return vec![mk(dec.blend, dec.alpha_test, dec.emissive.is_some(), false, dec.is_halo,
+                       dec.is_forcefield, false, dec.ff_extra.is_some(), dec.self_illum_mode)];
+    }
+    dec.obj_parts
+        .iter()
+        .filter(|p| !p.event_gated && p.indices.len() >= 3)
+        .map(|p| mk(p.blend, p.alpha_test, p.emissive.is_some(), p.emis_change_color, p.is_halo,
+                    p.is_forcefield, p.is_glass, p.ff_extra.is_some(), p.self_illum_mode))
+        .collect()
+}
+
 /// The engine's RESTING-STATE section mask of an object = the hlmt DEFAULT variant
 /// (variant[0]) applied to the render_model region/permutation table. Layout (verified on the
 /// forge_halo banshee/scorpion/falcon with HMS_REGIONDIAG + raw block pointer arithmetic):
@@ -20456,10 +23113,13 @@ fn decode_model(native: &NativeDll, cache: CacheHandle, mode_tag: u32, obj_tag: 
 ///         everything past permutation 1 was mis-read)
 ///   hlmt  +0x84 variants block; variant 0x38 B: name @0, regions block (count @0x14, ptr @0x18)
 ///   vreg  0x18 B: name @0, render_model region index i8 @4, permutations block (count @8, ptr @0xC)
-///   vperm 0x10 B: name @0, render_model permutation index i8 @4  (-1 = the region is HIDDEN in this
-///         variant -- the banshee/falcon vehicle DAMAGE DECAL regions (charred holes, blast marks,
-///         ripped-open tech) are authored exactly like that; the native resolver turned -1 into
-///         permutation 0 and drew them over the pristine hull = the "reddish hologram layer")
+///   vperm 0x24 B (reach_tag_test.exe tagdefs s_model_variant_permutation = 36 B; only entry 0 is
+///         read here, so the old "0x10 B" note was harmless): name @0, render_model permutation
+///         index i8 @4  (-1 = the region is HIDDEN in this variant -- the banshee/falcon vehicle
+///         DAMAGE DECAL regions (charred holes, blast marks, ripped-open tech) are authored exactly
+///         like that; the native resolver turned -1 into permutation 0 and drew them over the
+///         pristine hull = the "reddish hologram layer"); states block @0xC; runtime state
+///         permutation indices i8[5] @0x18 (see `decode_variant_perm`, the DAMAGE display state)
 /// Rules: one permutation per region (the variant's first entry, else render_model perm 0); a region
 /// the variant hides contributes nothing; sections no region references at all (detached props) stay
 /// visible. None when the object has no hlmt variants (plain prop) or a block is unreadable, in
@@ -20532,11 +23192,183 @@ fn object_default_change_colors(native: &NativeDll, cache: CacheHandle, obj_tag:
 /// variant selects for region `r` (Some(-1) = the region is hidden, None = the variant does not list
 /// the region -> the engine falls back to permutation 0). Same layout as `resting_section_mask`
 /// (hlmt +0x84 variants 0x38 B: name @0, regions block @0x14/0x18; vregion 0x18 B: rm region i8 @4,
-/// permutations block @8/0xC; vperm 0x10 B: rm permutation i8 @4), read for EVERY variant instead of
-/// just variant 0. None when the object has no hlmt variants (plain prop) or a block is unreadable.
+/// permutations block @8/0xC; vperm 0x24 B: rm permutation i8 @4, runtime state permutation
+/// indices i8[5] @0x18), read for EVERY variant instead of just variant 0. None when the object has
+/// no hlmt variants (plain prop) or a block is unreadable.
+///
+/// #damage After the real variants come SYNTHETIC (variant, damage state) entries, one per
+/// variant and state 1..4 that at least one of its regions authors a permutation for
+/// (`states[i]` = that state, `sids[i]` = the variant's sid): their `choice` is the variant's with
+/// each authoring region replaced by its state permutation - the engine rule (a region whose
+/// runtime state index is -1 stays on the base permutation). Real entries keep their indices, so
+/// the default picture is untouched; a placement displayed in a damage state selects its
+/// synthetic entry (`DecodedModel::state_variant_index`).
 struct HlmtVariants {
     sids: Vec<u32>,
+    /// Damage state per entry: 0 for a real variant, 1..4 for a synthetic (variant, state) entry.
+    states: Vec<u8>,
     choice: Vec<Vec<Option<i32>>>,
+    /// #instmesh Which INSTANCES of the render model's instance mesh each entry shows: the OR of
+    /// the 128-bit `instance mask` of every permutation this variant selects (render_model
+    /// permutation +0x08..+0x18, four 32-bit flag words). Reach's armour attachments live there,
+    /// not in sections, so without this a variant shows every shoulder, forearm and knee piece in
+    /// the game at once.
+    inst: Vec<u128>,
+    /// #skin #load-scope Did this model get any SYNTHETIC per-player armour variant appended?
+    ///
+    /// Only a model that actually has one of the customisable regions can wear one, which in
+    /// practice means the player bipeds. Everything else - every Forge piece, every vehicle - is
+    /// unaffected by the player variant list, and saying so is what stops a film opening from
+    /// invalidating the whole scene's decoded geometry (see `set_player_variants`).
+    player_entries: usize,
+}
+
+/// #damage Size of one hlmt variant PERMUTATION entry (`s_model_variant_permutation`, Reach and
+/// Halo 4 alike).
+pub(crate) const HLMT_VPERM_SIZE: usize = 0x24;
+
+/// #damage Size of one hlmt variant permutation STATE entry (`s_model_variant_state`).
+pub(crate) const HLMT_VSTATE_SIZE: usize = 0xC;
+
+/// #damage Per damage state (index = `model_state_enum` 0 default .. 4 destroyed) what a
+/// region shows: `None` = no entry authored, the region keeps its base permutation; `Some(-1)`
+/// = an entry naming NO permutation (empty name, runtime index -1): the region is HIDDEN in
+/// that state - how the Reach banshee's whole hull and the warthog's windshield / fenders are
+/// authored for `destroyed` (the part is blown off); `Some(i)` = render_model permutation `i`.
+pub(crate) type StatePerms = [Option<i8>; 5];
+
+/// #damage Decode one hlmt variant permutation entry: (render_model permutation index @4, -1 =
+/// hidden; the per-state table, see [`StatePerms`]).
+///
+/// The per-state table comes from the entry's STATES block (`states`: `n_states` entries of
+/// 0xC B: permutation name sid @0, runtime permutation index i8 @4, state enum i16 @6), each
+/// resolved to the render_model region's permutation of that NAME (`perm_names`, the region's
+/// permutation name sids in order), falling back to the entry's runtime index. The 0x18 "runtime
+/// state permutation indices" array is NOT populated in the shipped Reach caches (all zero on
+/// every forge_halo vehicle - the engine fills it at model load from the same states block), so
+/// it is only trusted when the states block is empty and it holds a non-zero index.
+/// None when the slice is short.
+pub(crate) fn decode_variant_perm(e: &[u8], states: &[u8], n_states: usize, perm_names: &[u32]) -> Option<(i32, StatePerms)> {
+    if e.len() < HLMT_VPERM_SIZE { return None; }
+    let base = e[4] as i8 as i32;
+    let mut st: StatePerms = [None; 5];
+    let n = n_states.min(states.len() / HLMT_VSTATE_SIZE);
+    if n > 0 {
+        for k in 0..n {
+            let se = &states[k * HLMT_VSTATE_SIZE..(k + 1) * HLMT_VSTATE_SIZE];
+            let name = u32::from_le_bytes([se[0], se[1], se[2], se[3]]);
+            let rp = se[4] as i8;
+            let state = i16::from_le_bytes([se[6], se[7]]);
+            if !(0..5).contains(&state) { continue; }
+            let idx = perm_names.iter().position(|&n| n == name && name != 0 && name != 0xFFFF_FFFF)
+                .map(|i| i as i8)
+                .or_else(|| (rp >= 0 && (rp as usize) < perm_names.len().max(1)).then_some(rp))
+                .unwrap_or(-1);
+            st[state as usize] = Some(idx);
+        }
+    } else {
+        let rt: Vec<i8> = (0..5).map(|k| e[0x18 + k] as i8).collect();
+        if rt.iter().any(|&v| v > 0) {
+            for (k, v) in st.iter_mut().enumerate() { *v = Some(rt[k]); }
+        }
+    }
+    Some((base, st))
+}
+
+#[cfg(test)]
+mod damage_state_tests {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> { (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap()).collect() }
+
+    /// forge_halo hlmt variant permutation entries + their STATES blocks, captured with
+    /// HMS_STATEDIAG (2026-09-24). Region permutation NAME sids from the render_model.
+    /// banshee (obj 0x9bf) default variant, hull region sid 0x148b: base 'default'; states
+    /// 0/1/2 name 'default', 3 (major) names 0x1494 (= render_model permutation 1), 4
+    /// (destroyed) names NOTHING (sid 0, runtime -1) = hidden. Its 0x18 runtime array is all 0.
+    const BANSHEE_HULL: (&str, &str, &[u32]) = (
+        "01000000000000000000803f05000000209bdb5e00000000000000000000000000000000",
+        "01000000000000000000000001000000000001000000000001000000000002000000000094140000010003000000000000000000ff00040000000000",
+        &[1, 0x1494],
+    );
+    /// banshee damage DECAL region sid 0x1c56: base -1 (hidden), the only state entry is
+    /// 2 (medium) naming 0x1493 = permutation 0.
+    const BANSHEE_DECAL: (&str, &str, &[u32]) = (
+        "00000000ff0000000000003f02000000389bdb5e00000000000000000000000000000000",
+        "93140000000002000000000000000000ff00040000000000",
+        &[0x1493],
+    );
+    /// warthog (obj 0x69d) region sid 0x168e: base = permutation 1 ('default' is the region's
+    /// SECOND permutation), states 0..4 name default/18fe/1493/1494/1495 = 1,3,2,0,4.
+    const WARTHOG_168E: (&str, &str, &[u32]) = (
+        "01000000010000000000803f05000000cd53c95e00000000000000000000000000000000",
+        "010000000100000000000000fe1800000300010000000000931400000200020000000000941400000000030000000000951400000400040000000000",
+        &[0x1494, 1, 0x1493, 0x18fe, 0x1495],
+    );
+    /// warthog region sid 0x1903 (rm 0): no states block at all -> nothing authored.
+    const WARTHOG_1903: (&str, &str, &[u32]) = ("01000000000000000000803f000000000000000000000000000000000000000000000000", "", &[1]);
+
+    fn dec(t: (&str, &str, &[u32])) -> (i32, StatePerms) {
+        let e = unhex(t.0);
+        assert_eq!(e.len(), HLMT_VPERM_SIZE, "one 36-byte s_model_variant_permutation");
+        let sb = unhex(t.1);
+        decode_variant_perm(&e, &sb, sb.len() / HLMT_VSTATE_SIZE, t.2).expect("decodes")
+    }
+
+    #[test]
+    fn reach_vehicle_state_tables_decode_from_the_states_block() {
+        assert_eq!(dec(BANSHEE_HULL), (0, [Some(0), Some(0), Some(0), Some(1), Some(-1)]));
+        assert_eq!(dec(BANSHEE_DECAL), (-1, [None, None, Some(0), None, Some(-1)]));
+        assert_eq!(dec(WARTHOG_168E), (1, [Some(1), Some(3), Some(2), Some(0), Some(4)]));
+        assert_eq!(dec(WARTHOG_1903), (0, [None; 5]));
+    }
+
+    /// The synthetic (variant, state) entries: one per state some region authors, the base
+    /// choice with the authoring regions replaced (hidden -1 included); nothing for states no
+    /// region authors, and real entries are never touched.
+    #[test]
+    fn synthetic_state_entries_follow_the_engine_rule() {
+        let hull = dec(BANSHEE_HULL).1;
+        let decal = dec(BANSHEE_DECAL).1;
+        let choice = vec![Some(0), Some(-1), None];
+        let stperm = vec![Some(hull), Some(decal), None];
+        let mut hv = HlmtVariants { sids: vec![1], states: vec![0], choice: vec![choice.clone()], inst: vec![0], player_entries: 0 };
+        push_state_entries(&mut hv, 1, &choice, &stperm, 0);
+        assert_eq!(hv.states, vec![0, 1, 2, 3, 4]);
+        assert_eq!(hv.sids, vec![1; 5]);
+        assert_eq!(hv.choice[0], choice, "the real variant is untouched");
+        assert_eq!(hv.choice[1], vec![Some(0), Some(-1), None], "minor: hull names default, decal stays hidden");
+        assert_eq!(hv.choice[2], vec![Some(0), Some(0), None], "medium: the decal region appears");
+        assert_eq!(hv.choice[3], vec![Some(1), Some(-1), None], "major: charred hull permutation");
+        assert_eq!(hv.choice[4], vec![Some(-1), Some(-1), None], "destroyed: hull and decal hidden (blown apart)");
+        // a model authoring nothing gets no synthetic entries
+        let mut none = HlmtVariants { sids: vec![1], states: vec![0], choice: vec![vec![None; 2]], inst: vec![0], player_entries: 0 };
+        push_state_entries(&mut none, 1, &[None; 2], &[Some(dec(WARTHOG_1903).1), None], 0);
+        assert_eq!(none.sids.len(), 1);
+    }
+}
+
+/// #damage Append the (variant, state) synthetic entries for one real variant: `choice` is the
+/// variant's per-region pick, `stperm[r]` its regions' runtime state permutation indices (None
+/// for regions the variant does not list). One entry per state 1..4 that some region authors
+/// (index >= 0); a state authored nowhere is not offered.
+fn push_state_entries(out: &mut HlmtVariants, sid: u32, choice: &[Option<i32>], stperm: &[Option<StatePerms>], inst: u128) {
+    for st in 1..=4usize {
+        if out.sids.len() >= 64 { return; }
+        let mut c = choice.to_vec();
+        let mut any = false;
+        for (r, sp) in stperm.iter().enumerate() {
+            if let Some(Some(p)) = sp.map(|sp| sp[st]) { c[r] = Some(p as i32); any = true; }
+        }
+        if any {
+            out.sids.push(sid);
+            out.states.push(st as u8);
+            out.choice.push(c);
+            // A damage state swaps whole SECTIONS; the armour attachments it shows are the
+            // base variant's, so the synthetic entry inherits its instance mask.
+            out.inst.push(inst);
+        }
+    }
 }
 
 /// The object's DEFAULT MODEL VARIANT (obje +0x60, a hlmt variant Name stringId; 0 =
@@ -20591,28 +23423,67 @@ fn hlmt_variant_child_markers(native: &NativeDll, cache: CacheHandle, obj_tag: u
     out
 }
 
-fn hlmt_variants(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mode_tag: u32) -> Option<HlmtVariants> {
+/// An `obje`-derived object's MODEL tag (`hlmt`), found the way every other site here finds it:
+/// the object's own meta block carries the reference as the little-endian group tag `'tmlh'`
+/// followed at +12 by the tag index. `None` for an object with no model.
+pub(crate) fn object_hlmt(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> Option<u32> {
     if obj_tag == 0 || obj_tag == 0xFFFF_FFFF { return None; }
     let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
     let ob = native.tag_meta(cache, obj_tag, 0, 0x400)?;
-    let mut hlmt = 0xFFFF_FFFFu32;
     for o in (0..ob.len().saturating_sub(16)).step_by(4) {
-        if &ob[o..o + 4] == b"tmlh" { hlmt = u(&ob, o + 12) & 0xFFFF; break; }
+        if &ob[o..o + 4] == b"tmlh" {
+            let h = u(&ob, o + 12) & 0xFFFF;
+            return (h != 0xFFFF).then_some(h);
+        }
     }
-    if hlmt == 0xFFFF_FFFF { return None; }
+    None
+}
+
+fn hlmt_variants(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mode_tag: u32) -> Option<HlmtVariants> {
+    let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+    let hlmt = object_hlmt(native, cache, obj_tag)?;
     let h = native.tag_meta(cache, hlmt, 0, 0x8C)?;
     let (vcnt, vptr) = (u(&h, 0x84), u(&h, 0x88));
     if vcnt == 0 || vcnt > 64 { return None; }
     let m = native.tag_meta(cache, mode_tag, 0, 0x70)?;
-    let rcnt = u(&m, 12);
+    let (rcnt, rptr) = (u(&m, 12), u(&m, 16));
     if rcnt == 0 || rcnt > 0x1000 { return None; }
+    // #damage the render_model regions' permutation NAME sids (region 16 B: perms count @4, ptr
+    // @8; perm 0x18 B: name @0) - what a variant permutation's states block names
+    let rb = native.tag_ptr_bytes(cache, rptr, rcnt * 16);
+    let perm_names_of = |r: usize| -> Vec<u32> {
+        let Some(rb) = rb.as_ref() else { return Vec::new() };
+        let re = &rb[r * 16..r * 16 + 16];
+        let (pcnt, pptr) = (u(re, 4), u(re, 8));
+        if pcnt == 0 || pcnt > 0x1000 { return Vec::new(); }
+        native.tag_ptr_bytes(cache, pptr, pcnt * 0x18).map(|pb| (0..pcnt as usize).map(|p| u(&pb, p * 0x18)).collect()).unwrap_or_default()
+    };
+    // #instmesh region r's permutation p INSTANCE MASK: the four 32-bit flag words at
+    // render_model permutation +0x08 ("instance mask 0-31" .. "96-127"), i.e. which chunks of the
+    // model's instance mesh that permutation puts on the body.
+    let inst_mask_of = |r: usize, p: i32| -> u128 {
+        if p < 0 { return 0; }
+        let Some(rb) = rb.as_ref() else { return 0 };
+        let re = &rb[r * 16..r * 16 + 16];
+        let (pcnt, pptr) = (u(re, 4), u(re, 8));
+        if pcnt == 0 || pcnt > 0x1000 || p as u32 >= pcnt { return 0; }
+        match native.tag_ptr_bytes(cache, pptr + p as u32 * 0x18, 0x18) {
+            Some(pe) => (0..4).fold(0u128, |a, k| a | ((u(&pe, 8 + k * 4) as u128) << (k * 32))),
+            None => 0,
+        }
+    };
     let vb = native.tag_ptr_bytes(cache, vptr, vcnt * 0x38)?;
-    let mut out = HlmtVariants { sids: Vec::with_capacity(vcnt as usize), choice: Vec::with_capacity(vcnt as usize) };
+    let mut out = HlmtVariants { sids: Vec::with_capacity(vcnt as usize), states: Vec::with_capacity(vcnt as usize), choice: Vec::with_capacity(vcnt as usize), inst: Vec::with_capacity(vcnt as usize), player_entries: 0 };
+    // print-only: dump every variant permutation entry (hex) + its decoded state table
+    let diag = ev("HMS_STATEDIAG").is_ok();
+    // per real variant: (sid, choice, per-region state permutation indices) for the synthetic entries
+    let mut real: Vec<(u32, Vec<Option<i32>>, Vec<Option<StatePerms>>, u128)> = Vec::with_capacity(vcnt as usize);
     for v in 0..vcnt as usize {
         let ve = &vb[v * 0x38..v * 0x38 + 0x38];
         let vsid = u(ve, 0);
         if v == 0 && (vsid == 0 || vsid == 0xFFFF_FFFF) { return None; }
         let mut choice: Vec<Option<i32>> = vec![None; rcnt as usize];
+        let mut stperm: Vec<Option<StatePerms>> = vec![None; rcnt as usize];
         let (vrc, vrp) = (u(ve, 0x14), u(ve, 0x18));
         if vrc > 0 && vrc <= 256 {
             if let Some(vrb) = native.tag_ptr_bytes(cache, vrp, vrc * 0x18) {
@@ -20622,14 +23493,95 @@ fn hlmt_variants(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mode_tag:
                     if rm < 0 || rm as u32 >= rcnt { continue; }
                     let (vpc, vpp) = (u(re, 8), u(re, 12));
                     if vpc == 0 || vpc > 256 { continue; }
-                    if let Some(vpb) = native.tag_ptr_bytes(cache, vpp, 0x10) {
-                        choice[rm as usize] = Some(vpb[4] as i8 as i32);
+                    // entry 0 = the permutation HMS shows (the engine rolls one by probability)
+                    if let Some(vpb) = native.tag_ptr_bytes(cache, vpp, HLMT_VPERM_SIZE as u32) {
+                        // its states block (count @0xC, ptr @0x10): per damage state, a permutation name
+                        let (nst, pst) = (u(&vpb, 0xC), u(&vpb, 0x10));
+                        let sb: Vec<u8> = if nst > 0 && nst <= 32 { native.tag_ptr_bytes(cache, pst, nst * HLMT_VSTATE_SIZE as u32).unwrap_or_default() } else { Vec::new() };
+                        let names = perm_names_of(rm as usize);
+                        if let Some((perm, st)) = decode_variant_perm(&vpb, &sb, nst as usize, &names) {
+                            choice[rm as usize] = Some(perm);
+                            stperm[rm as usize] = Some(st);
+                            if diag {
+                                let hex: String = vpb.iter().map(|b| format!("{b:02x}")).collect();
+                                let shex: String = sb.iter().map(|b| format!("{b:02x}")).collect();
+                                eprintln!("HMS_STATEDIAG obj={obj_tag:#x} mode={mode_tag:#x} '{}' variant[{v}] sid={vsid:#x} region sid={:#x} rm={rm} nperm={vpc} perm={perm} states={st:?} perm_names={names:x?} hex={hex} states_hex={shex}",
+                                    native.tag_name(cache, mode_tag).unwrap_or_default(), u(re, 0));
+                            }
+                        }
                     }
                 }
             }
         }
+        // #instmesh the armour attachments this variant wears: the OR of the instance mask of
+        // every permutation it selects (an UNLISTED region falls back to permutation 0, the same
+        // rule `HlmtVariants::shows` applies to sections; a HIDDEN region contributes nothing).
+        let inst_bits = (0..rcnt as usize).fold(0u128, |a, r| {
+            match choice[r] {
+                Some(c) if c < 0 => a,
+                Some(c) => a | inst_mask_of(r, c),
+                None => a | inst_mask_of(r, 0),
+            }
+        });
         out.sids.push(vsid);
-        out.choice.push(choice);
+        out.states.push(0);
+        out.choice.push(choice.clone());
+        out.inst.push(inst_bits);
+        real.push((vsid, choice, stperm, inst_bits));
+    }
+    // #skin The synthetic PER-PLAYER variants, appended straight after the real ones so they are
+    // never crowded out by the damage-state entries below (the variant mask is 64 bits wide).
+    // Each starts from the model's own default variant (entry 0) and applies that player's
+    // (region, permutation) picks on top -- which is precisely what Reach's armoury does.
+    if let Some(pv) = player_variants() {
+        // region sid -> render_model region index, and per region its permutation name sids
+        let region_sid: Vec<u32> = rb
+            .as_ref()
+            .map(|rb| (0..rcnt as usize).map(|r| u(&rb[r * 16..r * 16 + 16], 0)).collect())
+            .unwrap_or_default();
+        // #elite WHICH SPECIES this render model is. Reach stores a Spartan loadout and an Elite
+        // loadout per player, and the two overlap on `armor_fx`, so the body decides which one it
+        // wears: a model carrying the region the tag's `elite selections` block overrides
+        // (`armor_pieces`) is the Elite's.
+        let elite_model = {
+            let er = elite_customization_regions(native, cache);
+            !er.is_empty() && region_sid.iter().any(|s| er.contains(s))
+        };
+        for v in pv.iter() {
+            if out.sids.len() >= 64 { break; }
+            let mut choice = out.choice.first().cloned().unwrap_or_else(|| vec![None; rcnt as usize]);
+            let mut touched = false;
+            let picks = if elite_model { &v.elite_picks } else { &v.picks };
+            for (rsid, psid) in picks {
+                let Some(r) = region_sid.iter().position(|s| s == rsid) else { continue };
+                let names = perm_names_of(r);
+                // A permutation the model does not carry leaves the region alone rather than
+                // hiding it -- a missing piece must never delete a body part.
+                if let Some(p) = names.iter().position(|n| n == psid) { choice[r] = Some(p as i32); touched = true; }
+            }
+            // #load-scope A player variant that changes NOTHING on this model is not appended.
+            // It used to be, as a copy of the default, and that alone changed the model's variant
+            // COUNT - which changes the part split, which is why opening a film had to throw away
+            // every decoded Forge object in the scene. A Forge wall cannot wear a helmet.
+            if !touched { continue; }
+            out.player_entries += 1;
+            let inst_bits = (0..rcnt as usize).fold(0u128, |a, r| match choice[r] {
+                Some(c) if c < 0 => a,
+                Some(c) => a | inst_mask_of(r, c),
+                None => a | inst_mask_of(r, 0),
+            });
+            out.sids.push(v.sid);
+            out.states.push(0);
+            out.choice.push(choice);
+            out.inst.push(inst_bits);
+        }
+    }
+    // #damage the synthetic (variant, damage state) entries, after every real variant
+    for (vsid, choice, stperm, inst) in &real {
+        push_state_entries(&mut out, *vsid, choice, stperm, *inst);
+    }
+    if diag {
+        eprintln!("HMS_STATEDIAG obj={obj_tag:#x} mode={mode_tag:#x} entries={} states={:?}", out.sids.len(), out.states);
     }
     Some(out)
 }
@@ -20658,7 +23610,290 @@ impl HlmtVariants {
 /// `resting_section_mask` generalised to all variants (identical per-region rule, permutation
 /// entries 0x18 B with mesh_index i16 @4 / mesh_count i16 @6). None when the object has no hlmt
 /// variants, in which case the caller keeps the single default mask (every section = all bits).
-fn variant_section_bits(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mode_tag: u32, n_sections: usize) -> Option<(Vec<u32>, Vec<u64>)> {
+/// #skin One recorded player's ARMOUR SELECTION, in the only terms a render model understands:
+/// a list of `(region string_id, permutation string_id)` picks, exactly what an `hlmt` model
+/// variant holds and exactly what `globals\player_model_customization` stores per option.
+///
+/// A Theater player's ten appearance bytes index ten option blocks of that tag; each option
+/// carries such a list. Collect a player's ten options into one `PlayerVariant` and the render
+/// model can wear it: `hlmt_variants` appends it as an extra variant, so the section mask and the
+/// instanced-attachment mask fall out of the SAME code every shipped variant goes through,
+/// instead of a second, parallel selection path.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct PlayerVariant {
+    /// The synthetic variant's name string id. `build_actor_meshes` is given this to select it.
+    pub sid: u32,
+    /// `(region sid, permutation sid)` picks for a SPARTAN body, applied over the model's
+    /// default variant: `film::SPARTAN_APPEARANCE_SLOTS` resolved through the customisation
+    /// table.
+    pub picks: Vec<(u32, u32)>,
+    /// #elite The same thing for an ELITE body: `film::ELITE_APPEARANCE_SLOTS`.
+    ///
+    /// Reach keeps one armour choice per species and a player has BOTH, so which list a body
+    /// wears is decided by the render model it is drawn from, not by the player. The two lists
+    /// would otherwise fight over `armor_fx`, the one region both species carry.
+    pub elite_picks: Vec<(u32, u32)>,
+}
+
+impl PlayerVariant {
+    /// Does this player's recording change anything at all on either species?
+    pub fn worn(&self) -> bool {
+        !self.picks.is_empty() || !self.elite_picks.is_empty()
+    }
+}
+
+/// #skin The synthetic per-player variants currently in force, plus a generation counter so a
+/// cached decode can be told it is stale. Global because `decode_model_cached` is a free function
+/// shared by the viewport, the background predecode and the actor builder.
+/// #skin Install the per-player variant list WITHOUT a renderer, so an offline audit resolves a
+/// recorded appearance through exactly the renderer's own `variant_section_bits` walk instead of a
+/// re-implementation of it. The app always goes through `SceneController::set_player_variants`,
+/// which also invalidates the caches this cannot see.
+#[allow(dead_code)]
+pub(crate) fn set_player_variants_for_audit(variants: Vec<PlayerVariant>) {
+    *PLAYER_VARIANTS.write().unwrap() = if variants.is_empty() { None } else { Some(std::sync::Arc::new(variants)) };
+}
+
+static PLAYER_VARIANTS: std::sync::RwLock<Option<std::sync::Arc<Vec<PlayerVariant>>>> =
+    std::sync::RwLock::new(None);
+
+/// #fp An explicit per-section draw mask for a render model that has NO `hlmt`, and therefore no
+/// variant to pick a permutation with.
+///
+/// Reach's FIRST-PERSON arm models (`matg @player representation`) are bare `mode` tags: there is
+/// no object, no model tag and no variant list, so every filter the decode has is unavailable and
+/// the native fallback allows EVERY permutation of every region -- two complete sets of arms plus
+/// all five forearm attachments, overlapping. The caller works out which sections it wants (see
+/// `reach_actor::default_section_mask`) and installs the answer here, keyed by render-model tag.
+///
+/// Empty by default, so nothing in the ordinary object path changes. Keyed by `mode_tag`, which
+/// is also the `geom_cache` key, so a model is decoded once with a stable mask.
+static SECTION_PICK: std::sync::RwLock<Option<std::sync::Arc<HashMap<u32, Vec<bool>>>>> =
+    std::sync::RwLock::new(None);
+
+/// The installed section pick for one render model, if any.
+fn section_pick(mode_tag: u32) -> Option<Vec<bool>> {
+    SECTION_PICK.read().ok()?.as_ref()?.get(&mode_tag).cloned()
+}
+
+/// Snapshot of the synthetic per-player variants (cheap: one Arc clone).
+fn player_variants() -> Option<std::sync::Arc<Vec<PlayerVariant>>> {
+    PLAYER_VARIANTS.read().ok().and_then(|g| g.clone())
+}
+
+/// The synthetic-variant name string id for player slot `slot`. Deliberately far outside the
+/// range of any real `string_id` so it can never collide with an authored variant name.
+pub const fn player_variant_sid(slot: u8) -> u32 { 0xF1A1_0000 | slot as u32 }
+
+/// #instmesh One Reach render_model INSTANCE: a chunk of the model's single "instance mesh"
+/// that is placed on its own skeleton node. Reach packs every armour-customisation attachment —
+/// shoulder plates, forearm pieces, knee guards, belt pouches, ear pieces — into ONE giant mesh
+/// and then places ~100 chunks of it around the skeleton, instead of giving each piece its own
+/// section. Drawing that mesh as an ordinary rigid section binds all of it to the ONE node named
+/// in its mesh header, which is why every attachment floated beside the Spartan instead of
+/// sitting on it.
+///
+/// Layout (engine reflection data, `reach_tag_test.exe` tag definitions):
+///   render_model +0x1C  `instance mesh index`   (long block index into the meshes block)
+///   render_model +0x20  `instance placements`   block of `s_render_model_instance_placement`, 60 B:
+///                         name string_id @0x00, node index (long block index) @0x04,
+///                         scale @0x08, forward @0x0C, left @0x18, up @0x24, position @0x30
+///   s_mesh       +0x0C  `subparts`              block of `s_subpart`, 16 B:
+///                         index start @0x00, index count @0x04, part index @0x08
+/// The instance mesh's subparts are 1:1 with the placements, in order. They do **NOT** tile its
+/// index buffer: measured on `objects\characters\spartans\spartans`, 105 placements cover
+/// indices 0..132,529 with **35 gaps totalling 89 indices**. (The last subpart does end on the
+/// section's own index count, which is what made the tiling look exact.) An index no placement
+/// owns belongs to no attachment, and the engine — which issues one call per placement — never
+/// draws it; see the collapse in `maybe_rebuild`. Every placement on that model carries scale 1
+/// and an IDENTITY basis, so the geometry is already in model space and only the NODE matters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ModelInstance {
+    /// Skeleton node this chunk rides (render_model node index; < 0 = model space).
+    pub node: i32,
+    /// Index range of this chunk inside the instance mesh's own index buffer.
+    pub index_start: u32,
+    pub index_count: u32,
+}
+
+/// #instmesh-space Translate each placement's RAW-STRIP index range into a range of the EXPANDED
+/// triangle list, using the per-triangle origin map the native expansion reports.
+///
+/// `origins[t]` is the raw-strip window that produced triangle `t`, so the triangles a raw range
+/// `[a, b)` owns are those with `a <= origin < b - 2`: a strip window at `i` consumes raw indices
+/// `i, i+1, i+2`, so the last window wholly inside the range starts at `b - 3`.
+///
+/// Returns, per placement and in placement order, `Some((first index, end index))` into the
+/// expanded buffer, or `None` for a placement that owns no triangle. The whole result is `None`
+/// per entry when `origins` is absent (an older native library): translating is then impossible,
+/// and applying the raw offsets anyway is the bug this replaces, so nothing is rebound at all.
+///
+/// Origins are non-decreasing within a slice but the slices themselves need not be in raw order,
+/// so this scans rather than assuming a binary search is valid, and ASSERTS the result is one
+/// contiguous run — if a placement's triangles were ever scattered through the buffer the caller's
+/// single-range rebind could not express it, and silently rebinding part of a piece is exactly the
+/// class of fault this is fixing.
+pub(crate) fn instance_index_ranges(
+    insts: &[ModelInstance],
+    origins: Option<&[u32]>,
+) -> Vec<Option<(usize, usize)>> {
+    let Some(origins) = origins else { return vec![None; insts.len()] };
+    insts
+        .iter()
+        .map(|inst| {
+            let a = inst.index_start;
+            // A range shorter than one window owns nothing.
+            let b = inst.index_start.checked_add(inst.index_count)?;
+            if b < a + 3 {
+                return None;
+            }
+            let last = b - 2; // exclusive bound on the window start
+            let mut first: Option<usize> = None;
+            let mut end = 0usize;
+            for (t, &o) in origins.iter().enumerate() {
+                if o >= a && o < last {
+                    if first.is_none() {
+                        first = Some(t);
+                    } else if t != end {
+                        // Not contiguous: refuse rather than bind half a piece.
+                        return None;
+                    }
+                    end = t + 1;
+                }
+            }
+            first.map(|f| (f * 3, end * 3))
+        })
+        .collect()
+}
+
+/// #instmesh-space The draw runs ONE submesh of the instance mesh contributes, split per
+/// placement: `(placement index, start, end, variant bits)`, the range being in the submesh's own
+/// section's EXPANDED index space.
+///
+/// This is the only place the part builder is allowed to cut the instance mesh, and it exists so
+/// that cut can be measured. The rule it encodes:
+///
+/// * The range is `owners[i]` — the placement's `s_subpart` range already TRANSLATED out of raw
+///   triangle-strip space by `instance_index_ranges`. The raw `ModelInstance::index_start` /
+///   `index_count` are deliberately NOT read here: a render_model states them in strip space and
+///   the decoded buffer is the expanded triangle list, so the raw numbers cut the list off
+///   triangle boundaries and the concatenated runs weld unrelated attachments into shards.
+/// * A placement is drawn only when some variant's 128-bit instance mask carries it
+///   (`inst_vbits[i] != 0`). An index past that mask (>= 128) can be in no variant's mask, so it
+///   is not worn. A model with NO hlmt variants has no mask at all: everything it places is drawn.
+/// * The run is clipped to the submesh, because a submesh is one shader's slice of the section.
+pub(crate) fn instance_part_runs(
+    insts: &[ModelInstance],
+    owners: &[Option<(usize, usize)>],
+    inst_vbits: &[u64],
+    sm_start: usize,
+    sm_len: usize,
+) -> Vec<(usize, usize, usize, u64)> {
+    let sm_end = sm_start.saturating_add(sm_len);
+    (0..insts.len())
+        .filter_map(|i| {
+            let (ra, rb) = owners.get(i).copied().flatten()?;
+            let (a, b) = (ra.max(sm_start), rb.min(sm_end));
+            if b <= a {
+                return None;
+            }
+            let vb = if inst_vbits.is_empty() { u64::MAX } else { inst_vbits.get(i).copied().unwrap_or(0) };
+            (vb != 0).then_some((i, a, b, vb))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod instmesh_part_tests {
+    use super::{instance_part_runs, ModelInstance};
+
+    fn inst(start: u32, count: u32) -> ModelInstance {
+        ModelInstance { node: 1, index_start: start, index_count: count }
+    }
+
+    /// #instmesh-space **THE GATE for "the armour does not grow spikes".**
+    ///
+    /// The part builder cuts the instance mesh once per placement and CONCATENATES the pieces
+    /// into one index list per shader. Those cuts must land on the triangle boundaries of the
+    /// EXPANDED list — i.e. they must come from `instance_index_ranges`, not from the placement's
+    /// raw triangle-strip offsets. Cut anywhere else and the join between two runs invents a
+    /// triangle out of one attachment's last vertices and another's first, which is a shard
+    /// stretching across the body.
+    ///
+    /// The raw ranges here are deliberately NOTHING like the translated ones, so a builder that
+    /// went back to reading `ModelInstance::index_start` cannot accidentally pass.
+    #[test]
+    fn instance_runs_come_from_the_translated_ranges_and_never_the_raw_strip_offsets() {
+        // Two placements. Their RAW strip ranges are 0..60 and 60..90; the strip expanded, so the
+        // triangles they really own sit at 0..90 and 90..150 of the list — different numbers, and
+        // the second one not even the same length.
+        let insts = [inst(0, 60), inst(60, 30)];
+        let owners = [Some((0usize, 90usize)), Some((90usize, 150usize))];
+        let vbits = [0b01u64, 0b11];
+
+        let runs = instance_part_runs(&insts, &owners, &vbits, 0, 150);
+        assert_eq!(runs, vec![(0, 0, 90, 0b01), (1, 90, 150, 0b11)],
+            "the runs must be the TRANSLATED ranges; the raw 0..60 / 60..90 are strip offsets");
+        // and every cut is on a triangle boundary, which is the property that stops the shards
+        for (_, a, b, _) in &runs {
+            assert_eq!(a % 3, 0, "run starts at {a}, which is not a triangle boundary");
+            assert_eq!(b % 3, 0, "run ends at {b}, which is not a triangle boundary");
+        }
+
+        // Clipped to ONE shader's submesh: a shader owns a slice of the section, and a placement
+        // that falls outside it contributes nothing to that shader's part.
+        assert_eq!(instance_part_runs(&insts, &owners, &vbits, 90, 60), vec![(1, 90, 150, 0b11)]);
+
+        // A placement no variant wears is not drawn...
+        assert_eq!(instance_part_runs(&insts, &owners, &[0, 0b11], 0, 150), vec![(1, 90, 150, 0b11)]);
+        // ...nor is one the 128-bit instance mask cannot reach (no membership word at all).
+        assert_eq!(instance_part_runs(&insts, &owners, &[0b01], 0, 150), vec![(0, 0, 90, 0b01)]);
+        // ...but a model with NO hlmt variants has no mask to consult and draws everything.
+        assert_eq!(instance_part_runs(&insts, &owners, &[], 0, 150),
+            vec![(0, 0, 90, u64::MAX), (1, 90, 150, u64::MAX)]);
+        // A placement the expansion produced no triangles for is drawn by nobody.
+        assert_eq!(instance_part_runs(&insts, &[None, Some((90, 150))], &vbits, 0, 150),
+            vec![(1, 90, 150, 0b11)]);
+    }
+}
+
+/// #instmesh `(instance mesh index, the placements)` of a render_model, or `None` when the model
+/// has no instanced geometry (every ordinary prop).
+pub(crate) fn model_instances(native: &NativeDll, cache: CacheHandle, mode_tag: u32) -> Option<(usize, Vec<ModelInstance>)> {
+    let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+    let m = native.tag_meta(cache, mode_tag, 0, 0x70)?;
+    let inst_mesh = u(&m, 0x1C) as i32;
+    if inst_mesh < 0 { return None; }
+    let (pcnt, pptr) = (u(&m, 0x20), u(&m, 0x24));
+    if pcnt == 0 || pcnt > 512 { return None; }
+    const PLACEMENT: u32 = 60;
+    let pb = native.tag_ptr_bytes(cache, pptr, pcnt * PLACEMENT)?;
+    // the instance mesh's subparts give each placement its slice of the index buffer
+    let (mcnt, mptr) = (u(&m, crate::reach_skel::OFF_MESHES), u(&m, crate::reach_skel::OFF_MESHES + 4));
+    if inst_mesh as u32 >= mcnt { return None; }
+    const MESH: u32 = 92;
+    // Read the whole meshes block and index into it: a raw tag-block pointer is resolved by the
+    // native reader, so offsetting it by hand is not guaranteed to land anywhere valid.
+    let mb = native.tag_ptr_bytes(cache, mptr, mcnt * MESH)?;
+    let me = &mb[inst_mesh as usize * MESH as usize..(inst_mesh as usize + 1) * MESH as usize];
+    let (scnt, sptr) = (u(me, 0x0C), u(me, 0x10));
+    if scnt == 0 || scnt > 4096 { return None; }
+    const SUBPART: u32 = 16;
+    let sb = native.tag_ptr_bytes(cache, sptr, scnt * SUBPART)?;
+    // The two blocks must be the same length — that 1:1 pairing IS the placement rule. If a
+    // model ever breaks it, draw nothing rather than guess which chunk goes where.
+    if scnt != pcnt { return None; }
+    let out = (0..pcnt as usize)
+        .map(|i| ModelInstance {
+            node: u(&pb, i * PLACEMENT as usize + 4) as i32,
+            index_start: u(&sb, i * SUBPART as usize),
+            index_count: u(&sb, i * SUBPART as usize + 4),
+        })
+        .collect();
+    Some((inst_mesh as usize, out))
+}
+
+pub(crate) fn variant_section_bits(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mode_tag: u32, n_sections: usize) -> Option<(Vec<u32>, Vec<u8>, Vec<u64>, Vec<u64>, bool)> {
     if n_sections == 0 || n_sections > 0x1000 { return None; }
     let hv = hlmt_variants(native, cache, obj_tag, mode_tag)?;
     let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
@@ -20693,7 +23928,17 @@ fn variant_section_bits(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mo
         }
     }
     for s in 0..n_sections { if !referenced[s] { bits[s] = all; } }
-    Some((hv.sids, bits))
+    // #instmesh the same membership, per INSTANCE of the instance mesh: bit v is set when
+    // variant v's instance mask carries that instance. 128 is the mask's own width.
+    let mut inst_bits = vec![0u64; 128];
+    for v in 0..nv {
+        let m = hv.inst.get(v).copied().unwrap_or(0);
+        for (i, b) in inst_bits.iter_mut().enumerate() {
+            if m & (1u128 << i) != 0 { *b |= 1u64 << v; }
+        }
+    }
+    let player = hv.player_entries > 0;
+    Some((hv.sids, hv.states, bits, inst_bits, player))
 }
 
 fn resting_section_mask(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mode_tag: u32, n_sections: usize) -> Option<Vec<bool>> {
@@ -20729,7 +23974,7 @@ fn resting_section_mask(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mo
                 if rm < 0 || rm as u32 >= rcnt { continue; }
                 let (vpc, vpp) = (u(re, 8), u(re, 12));
                 if vpc == 0 || vpc > 256 { continue; }
-                if let Some(vpb) = native.tag_ptr_bytes(cache, vpp, 0x10) {
+                if let Some(vpb) = native.tag_ptr_bytes(cache, vpp, HLMT_VPERM_SIZE as u32) {
                     choice[rm as usize] = Some(vpb[4] as i8 as i32);
                 }
             }
@@ -20765,7 +24010,25 @@ fn resting_section_mask(native: &NativeDll, cache: CacheHandle, obj_tag: u32, mo
 /// mask: for vehicles whose rotor/tail/wings are only correct under the hlmt DEFAULT variant's
 /// region→permutation map, we use that mask instead of perm[0]-of-every-region (which picks the
 /// blur rotor + drops the empty-perm[0] tail/wing regions). Empty mask ⇒ perm[0] behaviour.
+/// #reach-skin The `per mesh node map` byte run of one mesh (render_model `render geometry`
+/// +0x4C, one nested block per mesh; its bytes are render_model node indices). `None` when the
+/// model omits the map, in which case a skinned vertex's blend index IS the node index.
+fn skin_node_map(native: &NativeDll, cache: CacheHandle, mode_tag: u32, mesh: usize) -> Option<Vec<u8>> {
+    let blk = crate::reach_actor::tag_block(
+        native, cache, mode_tag,
+        crate::reach_skel::OFF_PER_MESH_NODE_MAP,
+        crate::reach_skel::PER_MESH_NODE_MAP_ELEM, 8191);
+    let elem = crate::reach_skel::PER_MESH_NODE_MAP_ELEM;
+    if blk.len() < (mesh + 1) * elem { return None; }
+    let e = &blk[mesh * elem..(mesh + 1) * elem];
+    let m = crate::reach_actor::block_at(native, cache, e, 0, 1, 255);
+    if m.is_empty() { None } else { Some(m) }
+}
+
 fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, obj_tag: u32, bmp: Option<&BitmapCache>) -> Option<DecodedModel> {
+    // #blade-anim the object's function block, read once: which engine input drives each
+    // function a shader's animated parameters can name (see `object_function_state`).
+    let obj_fns = object_function_imports(native, cache, obj_tag);
     let model = native.open_model(cache, mode_tag).ok()?;
     let n = native.model_section_count(model);
     // DETERMINISTIC default-variant section mask. For objects that carry hlmt variants
@@ -20783,19 +24046,34 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
     // (sprint_spartan etc.) while the hlmt default is the ELITE drop, and the old default-only mask
     // could only ever draw the Elite pack. Models without hlmt variants keep the exact resting mask
     // (every section = all bits, one part per shader as before).
+    // #fp An explicit section pick installed for this render model, if one was (see SECTION_PICK).
+    let sec_pick = section_pick(mode_tag);
     let sec_variants = variant_section_bits(native, cache, obj_tag, mode_tag, n as usize);
     let vmask: Vec<bool> = match &sec_variants {
-        Some((_, bits)) => bits.iter().map(|b| *b != 0).collect(),
+        Some((_, _, bits, _, _)) => bits.iter().map(|b| *b != 0).collect(),
         None => resting_section_mask(native, cache, obj_tag, mode_tag, n as usize)
             .unwrap_or_else(|| native.resolve_default_variant_mask(cache, obj_tag)),
     };
     let sec_bits: Vec<u64> = match &sec_variants {
-        Some((_, bits)) => bits.clone(),
+        Some((_, _, bits, _, _)) => bits.clone(),
         None => vec![u64::MAX; n as usize],
     };
-    let variant_sids: Vec<u32> = sec_variants.as_ref().map(|(s, _)| s.clone()).unwrap_or_default();
+    // #instmesh the model's instanced armour attachments (Reach bipeds) and, per instance, which
+    // hlmt variants wear it. `None` for every ordinary prop.
+    let instances = model_instances(native, cache, mode_tag);
+    let inst_vbits: Vec<u64> = sec_variants.as_ref().map(|(_, _, _, ib, _)| ib.clone()).unwrap_or_default();
+    let variant_sids: Vec<u32> = sec_variants.as_ref().map(|(s, _, _, _, _)| s.clone()).unwrap_or_default();
+    let variant_states: Vec<u8> = sec_variants.as_ref().map(|(_, st, _, _, _)| st.clone()).unwrap_or_default();
+    // #load-scope Whether this model's decode DEPENDS on the player variant list, so that list
+    // changing invalidates this model and nothing else.
+    let uses_player_variants: bool = sec_variants.as_ref().map(|(_, _, _, _, p)| *p).unwrap_or(false);
     if ev("HMS_MASKDIAG").is_ok() {
-        if let Some((sids, bits)) = &sec_variants {
+        if let Some((im, insts)) = instances.as_ref() {
+            eprintln!("HMS_MASKDIAG instances mode={mode_tag:#x} '{}' instance_mesh={im} placements={} worn_by_default={}",
+                native.tag_name(cache, mode_tag).unwrap_or_default(), insts.len(),
+                (0..insts.len()).filter(|i| inst_vbits.get(*i).copied().unwrap_or(u64::MAX) & 1 != 0).count());
+        }
+        if let Some((sids, _, bits, _, _)) = &sec_variants {
             let def = bits.iter().filter(|b| **b & 1 != 0).count();
             let union = bits.iter().filter(|b| **b != 0).count();
             eprintln!("HMS_MASKDIAG variants obj={obj_tag:#x} mode={mode_tag:#x} '{}' variants={:x?} default_sections={def} union_sections={union}/{n} bits={:x?}",
@@ -20807,6 +24085,12 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
     // Combined-index offset where each section's indices begin (None = section skipped).
     // Submesh index ranges are section-relative; this maps them into `indices`.
     let mut section_index_base: Vec<Option<usize>> = vec![None; n as usize];
+    // #instmesh-space Each armour placement's index range TRANSLATED out of raw-strip space into
+    // the expanded triangle list, SECTION-relative (so it composes with `section_index_base` the
+    // same way a submesh range does). Filled when the instance mesh is decoded below; the
+    // per-shader part builder further down reads the SAME ranges, because slicing the expanded
+    // buffer at the raw offsets is exactly the fault that put shards through the body.
+    let mut inst_owners: Vec<Option<(usize, usize)>> = Vec::new();
     let _t_geom = std::time::Instant::now();
     for i in 0..n {
         // Render only permutation-0 sections (the default, non-damaged variant). Vehicles &
@@ -20818,7 +24102,11 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
         // Prefer the deterministic default-variant mask (one permutation per region — static
         // wheels/rotor, undamaged body) when the object has hlmt variants; else fall back to the
         // native ParseModeTag heuristic (perm[0] of every region + orphans).
-        let mut allowed = if !vmask.is_empty() {
+        // #fp An explicit pick wins over both masks: a model with no `hlmt` has no variant to
+        // choose a permutation with, and the native fallback allows them all at once.
+        let mut allowed = if let Some(pick) = &sec_pick {
+            pick.get(i as usize).copied().unwrap_or(false)
+        } else if !vmask.is_empty() {
             vmask.get(i as usize).copied().unwrap_or(false)
         } else {
             native.model_section_allowed(model, i)
@@ -20864,6 +24152,7 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
         let Some(geom) = native.model_decode_geometry(model, i) else { continue };
         let uvs = native.model_decode_uvs(model, i);
         section_index_base[i as usize] = Some(indices.len());
+        let vstart = verts.len();
         append_section(
             &mut verts,
             &mut indices,
@@ -20874,6 +24163,122 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
             sec.index_stride,
             None, // G1: render-model path keeps the derivative tangent frame
         );
+        // #reach-skin SKIN-1: fill `MeshVertex::bone` so the SKINNED pipeline can pose this
+        // section (the unskinned pipeline never reads the field, so this is inert for ordinary
+        // objects). Two cases, exactly as the engine's mesh types split:
+        //   * a SKINNED section (`s_skinned_vertex` 0x02 / `s_flat_skinned` 0x06) carries four
+        //     (bone, weight) pairs per vertex, where the authored index addresses this MESH's
+        //     `per mesh node map` - translated to render_model NODE indices here, because the
+        //     GPU palette is indexed by node;
+        //   * a RIGID section (0x01 / 0x05) is bound whole to `s_mesh.rigid node index`
+        //     (the per-mesh node map of a rigid Reach mesh is exactly that one byte - verified
+        //     on the Spartan: every vfmt=1 mesh has node_map=[rigid_node]), so it gets weight
+        //     255 on that single node. Without this the rigid armour pieces of a biped would
+        //     stay in the bind pose while the skinned body animates.
+        let vcount = verts.len() - vstart;
+        if crate::reach_skel::is_skinned_format(sec.vertex_format) {
+            if let Some(blend) = native.model_decode_blend(model, i) {
+                let node_map = skin_node_map(native, cache, mode_tag, i as usize);
+                let nv = vcount.min(blend.len() / 8);
+                for k in 0..nv {
+                    let b = &blend[k * 8..k * 8 + 8];
+                    let mut idx = [0u8; 4];
+                    let mut w = [b[4], b[5], b[6], b[7]];
+                    for c in 0..4 {
+                        match node_map.as_ref() {
+                            // A slot past the end of this mesh's node map addresses a bone the
+                            // mesh does not use. DROP that influence (weight 0) instead of
+                            // binding the vertex to node 0 — node 0 is the pedestal at the model
+                            // origin, so the old fallback dragged one corner of a piece to the
+                            // Spartan's feet and stretched the rest to meet it.
+                            Some(m) => match m.get(b[c] as usize) {
+                                Some(&n) => idx[c] = n,
+                                None => { idx[c] = 0; w[c] = 0; }
+                            },
+                            None => idx[c] = b[c],
+                        }
+                    }
+                    if w.iter().all(|v| *v == 0) { w[0] = 255; }
+                    verts[vstart + k].bone = crate::reach_skel::pack_bone_slots(idx, w);
+                }
+            }
+        } else if sec.node_index >= 0 {
+            let node = sec.node_index.min(254) as u8;
+            let bone = crate::reach_skel::pack_bone_slots([node, 0, 0, 0], [255, 0, 0, 0]);
+            for v in verts[vstart..].iter_mut() { v.bone = bone; }
+            let _ = vcount;
+        }
+        // #instmesh The INSTANCE MESH is not one rigid piece: it is ~100 separate armour
+        // attachments packed into a single mesh, each placed on its OWN skeleton node by the
+        // model's `instance placements` block. Its mesh header names a single rigid node (the
+        // belt on a Spartan), so the branch above has just bound every shoulder, forearm, knee
+        // and ear piece to that one bone — which is why they hung in mid-air beside the body
+        // instead of sitting on it. Rebind per instance, through each chunk's own index range.
+        if let Some((im, insts)) = instances.as_ref() {
+            if i as usize == *im {
+                let ibase = section_index_base[i as usize].unwrap_or(0);
+                // Each instance gets its OWN COPY of the vertices it uses. Neighbouring
+                // attachments in this mesh share vertices (the engine draws each instance as its
+                // own call with the node as a constant, so sharing costs it nothing), but a
+                // single baked vertex buffer can hold only one bone per vertex — so without the
+                // copy the last instance written wins and the pieces that shared those vertices
+                // are stretched between two bones. That is the "warped armour" look.
+                // #instmesh-space A placement's `s_subpart` range is stated in the section's RAW
+                // index space, and Reach stores that buffer as a TRIANGLE STRIP; what is in
+                // `indices` here is the EXPANDED TRIANGLE LIST (132,529 strip indices become
+                // 204,069 list indices on this very mesh). Applying the raw offsets directly —
+                // which is what this used to do — hands each attachment somebody else's
+                // triangles: measured, **74 of the Spartan's 105 attachments were bound to a bone
+                // their geometry is nowhere near**, a kneepad placement getting helmet triangles
+                // and so on. That is the floating-armour fault.
+                //
+                // `model_section_triangle_origins` is the translation, and it comes from the
+                // expansion itself (`StripToList` in the native reader) rather than being
+                // recomputed here, so it cannot drift from the buffer it describes: entry `t` is
+                // the raw-strip window that produced triangle `t`. A raw range [a, b) therefore
+                // owns the triangles whose origin lies in [a, b-2).
+                let origins = native.model_section_triangle_origins(model, i);
+                let owners = instance_index_ranges(insts, origins.as_deref());
+                inst_owners.clone_from(&owners);
+                let mut remap: HashMap<u32, u32> = HashMap::new();
+                for (inst, range) in insts.iter().zip(owners.iter()) {
+                    if inst.node < 0 { continue; }
+                    let Some((ra, rb)) = *range else { continue };
+                    let bone = crate::reach_skel::pack_bone_slots([inst.node.min(254) as u8, 0, 0, 0], [255, 0, 0, 0]);
+                    let a = ibase + ra;
+                    let b = (ibase + rb).min(indices.len());
+                    remap.clear();
+                    for k in a..b {
+                        let old = indices[k];
+                        let new = match remap.get(&old) {
+                            Some(&n) => n,
+                            None => {
+                                let Some(mut v) = verts.get(old as usize).copied() else { continue };
+                                v.bone = bone;
+                                verts.push(v);
+                                let n = (verts.len() - 1) as u32;
+                                remap.insert(old, n);
+                                n
+                            }
+                        };
+                        indices[k] = new;
+                    }
+                }
+                // The gap-collapse that once lived here is gone for good: the 35 "gaps" it
+                // keyed on are the strip's RESTART SENTINELS, not unclaimed geometry, so in list
+                // space it was deleting arbitrary triangles. With the ranges translated there is
+                // nothing left to collapse.
+                if ev("HMS_MASKDIAG").is_ok() {
+                    let placed = owners.iter().filter(|r| r.is_some()).count();
+                    eprintln!(
+                        "HMS_MASKDIAG instmesh mode={mode_tag:#x} section {i}: {} placements, {placed} translated into the expanded list ({} triangle origins){}",
+                        insts.len(),
+                        origins.as_ref().map(|o| o.len()).unwrap_or(0),
+                        if origins.is_none() { "  -- NO ORIGIN MAP: the native library predates it, armour NOT rebound" } else { "" }
+                    );
+                }
+            }
+        }
     }
     OBJ_GEOM_NS.fetch_add(_t_geom.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     // Is this a multiplayer MARKER (spawn points, hill/flag/circle objective beacons,
@@ -20919,6 +24324,10 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
         // shader exactly as before.
         let mut by_shader: std::collections::BTreeMap<(i32, u64), Vec<u32>> = std::collections::BTreeMap::new();
         let mut covered = 0usize;
+        // #instmesh-space print-only: how many of the instance mesh's indices the per-placement
+        // split actually hands to a draw part. Must equal the mesh's own index count; anything
+        // less is armour that is decoded and then never drawn.
+        let mut inst_fed = 0usize;
         for si in 0..sm_count {
             let Some(sm) = native.model_submesh(model, si) else { continue };
             let Some(base) = section_index_base.get(sm.section_index as usize).copied().flatten() else { continue };
@@ -20928,6 +24337,33 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                 continue;
             }
             covered += end - start;
+            // #instmesh a submesh of the INSTANCE MESH spans several armour attachments, and a
+            // variant wears only some of them. Split it by instance so each piece carries its own
+            // variant membership; a piece no variant wears ends up with vbits 0 and is never drawn
+            // (that is how "wearing every shoulder in the game at once" is avoided).
+            //
+            // #instmesh-space The range to slice with is the TRANSLATED one. A placement's
+            // `s_subpart` range is stated in the section's RAW TRIANGLE-STRIP space; `indices`
+            // here is the EXPANDED triangle list, and on the shipped Spartan those are different
+            // buffers of different lengths (132,529 strip indices -> 204,069 list indices). Using
+            // the raw numbers to cut the list — which is what this did — cuts it at offsets that
+            // are not triangle boundaries and then CONCATENATES the pieces, so the first triangle
+            // of every run is assembled from the tail of one attachment and the head of another:
+            // a shard stretching from, say, a shoulder plate to a knee guard. That is the spiky
+            // geometry erupting from the torso. `inst_owners` is the same translation the bone
+            // rebind above uses, so both passes now agree on which triangles are whose.
+            if let Some((im, insts)) = instances.as_ref() {
+                if sm.section_index as usize == *im {
+                    for (_ii, a, b, vb) in instance_part_runs(
+                        insts, &inst_owners, &inst_vbits,
+                        sm.index_start as usize, sm.index_length as usize,
+                    ) {
+                        inst_fed += b - a;
+                        by_shader.entry((sm.shader_index, vb)).or_default().extend_from_slice(&indices[base + a..base + b]);
+                    }
+                    continue;
+                }
+            }
             let vb = sec_bits.get(sm.section_index as usize).copied().unwrap_or(u64::MAX);
             by_shader.entry((sm.shader_index, vb)).or_default().extend_from_slice(&indices[start..end]);
         }
@@ -20937,6 +24373,19 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
         // data), fall back to the single-`tex` whole-model path so no geometry is ever dropped.
         // (A single-shader model whose sections differ by variant also splits, so the
         // whole-model path never draws two variants at once.)
+        if ev("HMS_MASKDIAG").is_ok() {
+            if let Some((im, _)) = instances.as_ref() {
+                let total = section_index_base.get(*im).copied().flatten()
+                    .map(|b| (0..sm_count).filter_map(|i| native.model_submesh(model, i))
+                        .filter(|s| s.section_index as usize == *im)
+                        .map(|s| s.index_length as usize).sum::<usize>().min(indices.len() - b))
+                    .unwrap_or(0);
+                eprintln!("HMS_MASKDIAG instparts mode={mode_tag:#x} instance mesh {im}: {inst_fed}/{total} indices reach a draw part");
+            }
+            eprintln!("HMS_MASKDIAG parts obj={obj_tag:#x} mode={mode_tag:#x} '{}' submeshes={sm_count} shaders={} covered={covered}/{} -> {}",
+                native.tag_name(cache, mode_tag).unwrap_or_default(), by_shader.len(), indices.len(),
+                if by_shader.len() > 1 && covered == indices.len() { "per-shader parts" } else { "SINGLE whole-model (no per-part textures)" });
+        }
         if by_shader.len() > 1 && covered == indices.len() {
             by_shader
                 .into_iter()
@@ -20975,10 +24424,30 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                     };
                     let si_cmul = if si_mode == 4 {
                         let sc = native.model_shader_constants(model, sh);
-                        let color = sc.as_ref().and_then(|c| c.real("self_illum_color")).unwrap_or([1.0, 1.0, 1.0, 1.0]);
-                        let inten = sc.as_ref()
+                        let mut color = sc.as_ref().and_then(|c| c.real("self_illum_color")).unwrap_or([1.0, 1.0, 1.0, 1.0]);
+                        let mut inten = sc.as_ref()
                             .and_then(|c| c.real("self_illum_intensity").map(|v| v[0]).or_else(|| c.scalar("self_illum_intensity")))
                             .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+                        // #blade-anim A from_diffuse glow whose colour or intensity is an ANIMATED
+                        // parameter takes the decoded mapping function at its driving object
+                        // function's state, not the inert authored constant. The energy sword's two
+                        // blade halograms are the case that matters: both gate on `fx_camo`
+                        // (= `active_camouflage`), so without camo the engine emits nothing from
+                        // them -- while the "intensity 0 means unauthored, use 1" fallback above
+                        // painted their artwork over the whole blade.
+                        {
+                            let names: Vec<String> = sc.as_ref().map(|c| c.dump_args().into_iter().map(|a| a.1).collect()).unwrap_or_default();
+                            let stag = native.model_shader_tag(model, sh).max(0) as u32;
+                            let params = shader_animated_params(native, cache, stag, &names);
+                            let (c0, i0) = (color, inten);
+                            if let Some(c3) = anim_color_at_state(native, cache, &obj_fns, &params, "self_illum_color") { color = [c3[0], c3[1], c3[2], color[3]]; }
+                            if let Some(v) = anim_param_at_state(native, cache, &obj_fns, &params, "self_illum_intensity", ANIM_TY_VALUE) {
+                                if v >= 0.0 { inten = v; }
+                            }
+                            if ev("HMS_SIMODE_DIAG").is_ok() && (color != c0 || inten != i0) {
+                                eprintln!("HMS_SIMODE_DIAG SI4-ANIM mode={mode_tag:#x} sh={sh} color {:?}->{:?} inten {i0}->{inten}", &c0[..3], &color[..3]);
+                            }
+                        }
                         let cm = [color[0] * inten, color[1] * inten, color[2] * inten];
                         if cm.iter().all(|v| v.is_finite() && *v >= 0.0) { cm } else { [0.0; 3] }
                     } else { [0.0; 3] };
@@ -21033,6 +24502,9 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                     let shcls = native.model_shader_class(model, sh);
                     let dname = if d != 0 && d != 0xFFFF_FFFF { native.tag_name(cache, d).unwrap_or_default() } else { String::new() };
                     let is_halo = shcls == "rmhg" || dname.contains("halogram") || dname.contains("drop_holo") || dname.contains("_holo");
+                    // #elite-knife a halogram effect that only an ANIMATION EVENT switches on is
+                    // not part of a body at rest (the Elite's two energy daggers).
+                    let event_gated = is_halo && shader_animation_event_gated(native, cache, &obj_fns, model, sh);
                     if ev("HMS_HALODIAG").is_ok() {
                         eprintln!("HALODIAG mode={mode_tag:#x} sh={sh} cls='{shcls}' blend={blend} diffuse='{dname}' is_halo={is_halo}");
                     }
@@ -21202,12 +24674,40 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                         // authors no channels (all-zero → would bake fully black otherwise).
                         let three_ch: Option<([f32; 4], [f32; 4], [f32; 4], f32)> = if !emis_change_color && si_mode == 2 {
                             let sc = native.model_shader_constants(model, sh);
-                            let ca = sc.as_ref().and_then(|c| c.real("channel_a")).unwrap_or([0.0; 4]);
-                            let cb = sc.as_ref().and_then(|c| c.real("channel_b")).unwrap_or([0.0; 4]);
-                            let cc = sc.as_ref().and_then(|c| c.real("channel_c")).unwrap_or([0.0; 4]);
-                            let inten = sc.as_ref()
+                            let mut ca = sc.as_ref().and_then(|c| c.real("channel_a")).unwrap_or([0.0; 4]);
+                            let mut cb = sc.as_ref().and_then(|c| c.real("channel_b")).unwrap_or([0.0; 4]);
+                            let mut cc = sc.as_ref().and_then(|c| c.real("channel_c")).unwrap_or([0.0; 4]);
+                            let mut inten = sc.as_ref()
                                 .and_then(|c| c.real("self_illum_intensity").map(|v| v[0]).or_else(|| c.scalar("self_illum_intensity")))
                                 .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(1.0);
+                            // #blade-anim The constants above are the object's INERT state: every
+                            // animated parameter of this material is a mapping function of an
+                            // OBJECT FUNCTION, and the shipped constants are those functions at 0.
+                            // The energy sword's blade is the case that matters — `channel_a`'s
+                            // ALPHA (the weight of its primary blade colour) is authored 0 and is
+                            // driven to 0.25 by `blade_activate`, so reading the constant alone
+                            // drew the blade with its brightest channel switched off entirely.
+                            // Apply each parameter's decoded function at its driving function's
+                            // state (`object_function_state`); time-driven parameters are left to
+                            // the scroll lanes.
+                            {
+                                let names: Vec<String> = sc.as_ref().map(|c| c.dump_args().into_iter().map(|a| a.1).collect()).unwrap_or_default();
+                                let stag = native.model_shader_tag(model, sh).max(0) as u32;
+                                let params = shader_animated_params(native, cache, stag, &names);
+                                for (nm, ch) in [("channel_a", &mut ca), ("channel_b", &mut cb), ("channel_c", &mut cc)] {
+                                    if let Some(c3) = anim_color_at_state(native, cache, &obj_fns, &params, nm) { ch[0] = c3[0]; ch[1] = c3[1]; ch[2] = c3[2]; }
+                                    if let Some(a) = anim_param_at_state(native, cache, &obj_fns, &params, nm, ANIM_TY_ALPHA) { ch[3] = a; }
+                                }
+                                if let Some(v) = anim_param_at_state(native, cache, &obj_fns, &params, "self_illum_intensity", ANIM_TY_VALUE) {
+                                    if v >= 0.0 { inten = v; }
+                                }
+                                if ev("HMS_SIMODE_DIAG").is_ok() {
+                                    for p in &params {
+                                        eprintln!("HMS_SIMODE_DIAG 3CH-ANIM sh={sh} type={} arg='{}' input='{}' value={:.4}", p.ty, p.arg,
+                                            native.string_id(cache, p.input).unwrap_or_else(|| "<time>".into()), p.f.eval(object_function_state(&obj_fns, &native.string_id(cache, p.input).unwrap_or_default())));
+                                    }
+                                }
+                            }
                             let nonzero = [ca, cb, cc].iter().any(|c| c[0].abs() + c[1].abs() + c[2].abs() > 0.0 && c[3].abs() > 0.0);
                             if ev("HMS_SIMODE_DIAG").is_ok() {
                                 eprintln!("HMS_SIMODE_DIAG 3CH sh={} ca={:?} cb={:?} cc={:?} inten={} nonzero={}", sh, ca, cb, cc, inten, nonzero);
@@ -21229,12 +24729,20 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                                 let n = rgba.len() / 4;
                                 let dims_ok = (*ew as usize).saturating_mul(*eh as usize) == n;
                                 let all_finite = [ca, cb, cc].iter().all(|c| c.iter().all(|v| v.is_finite())) && inten.is_finite();
+                                if ev("HMS_SIMODE_DIAG").is_ok() && !(dims_ok && all_finite) {
+                                    eprintln!("HMS_SIMODE_DIAG 3CH-BAKE sh={sh} SKIPPED dims_ok={dims_ok} all_finite={all_finite} texels={n} {}x{}", *ew, *eh);
+                                }
                                 if dims_ok && all_finite {
                                     // Per-texel composite (linear, floor 0). Track the peak to decide HDR.
                                     let mut comp = Vec::<[f32; 3]>::with_capacity(n);
                                     let mut peak = 0.0f32;
                                     for px in rgba.chunks_exact(4) {
-                                        let (r, g, b) = (px[0] as f32 / 255.0, px[1] as f32 / 255.0, px[2] as f32 / 255.0);
+                                        // #blade-anim The decoded texel buffer is BGRA (it is uploaded as
+                                        // Bgra8Unorm, which is why mesh_shade's `tex.rgb` reads wood as orange),
+                                        // so the self-illum map's RED mask — the one `channel_a` weights — is
+                                        // byte [2], not byte [0]. Reading it the other way round swapped mask A
+                                        // with mask C.
+                                        let (r, g, b) = (px[2] as f32 / 255.0, px[1] as f32 / 255.0, px[0] as f32 / 255.0);
                                         let out = [
                                             (r * ca[3] * ca[0] + g * cb[3] * cb[0] + b * cc[3] * cc[0]) * inten,
                                             (r * ca[3] * ca[1] + g * cb[3] * cb[1] + b * cc[3] * cc[1]) * inten,
@@ -21243,6 +24751,13 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                                         let o = [out[0].max(0.0), out[1].max(0.0), out[2].max(0.0)];
                                         peak = peak.max(o[0]).max(o[1]).max(o[2]);
                                         comp.push(o);
+                                    }
+                                    if ev("HMS_SIMODE_DIAG").is_ok() {
+                                        let mut mean = [0.0f64; 3];
+                                        for o in &comp { for k in 0..3 { mean[k] += o[k] as f64; } }
+                                        let c = comp.len().max(1) as f64;
+                                        eprintln!("HMS_SIMODE_DIAG 3CH-BAKE sh={sh} {}x{} texels={} dims_ok={dims_ok} peak={peak:.3} mean=[{:.3},{:.3},{:.3}]",
+                                            *ew, *eh, n, mean[0] / c, mean[1] / c, mean[2] / c);
                                     }
                                     // HDR f16 buffer when the composite exceeds 1 (keeps over-bright accents).
                                     if peak > 1.0 {
@@ -21255,13 +24770,15 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                                         }
                                         part_emissive_hdr = Some((hdr, *ew, *eh));
                                     }
-                                    // u8 hue-preserving clamp (the LDR fallback / non-HDR path).
+                                    // u8 hue-preserving clamp (the LDR fallback / non-HDR path). BGRA, so the
+                                    // composite's red goes back into byte [2] — writing it to [0] made the
+                                    // 8-bit fallback come out with its red and blue exchanged.
                                     for (i, o) in comp.iter().enumerate() {
                                         let m = o[0].max(o[1]).max(o[2]);
                                         let s = if m > 1.0 { 1.0 / m } else { 1.0 };
-                                        rgba[i * 4] = (o[0] * s * 255.0) as u8;
+                                        rgba[i * 4 + 2] = (o[0] * s * 255.0) as u8;
                                         rgba[i * 4 + 1] = (o[1] * s * 255.0) as u8;
-                                        rgba[i * 4 + 2] = (o[2] * s * 255.0) as u8;
+                                        rgba[i * 4] = (o[2] * s * 255.0) as u8;
                                     }
                                 }
                             }
@@ -21485,6 +25002,21 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                             }
                         }
                     }
+                    // #blade-anim  A plain HALOGRAM (no forcefield record) still has an authored
+                    // UV scroll, and nothing was reading it — which is why a held energy sword's
+                    // blade drew correct but FROZEN. `energy_sword_blade_activation` authors a
+                    // 5 s TranslationY on its `base_map`, and fs_holo's lane 10 samples exactly
+                    // that map. The 3-channel self-illum family (lane 9) scrolls its
+                    // `self_illum_map` the same way where one is authored. Carried on the
+                    // existing per-part `ff_scroll`, which no non-forcefield part read before.
+                    if !is_forcefield {
+                        let cls = native.model_shader_class(model, sh);
+                        if cls == "rmhg" {
+                            ff_scroll = model_shader_anim_scroll(native, cache, model, sh, "base_map");
+                        } else if si_mode == 2 {
+                            ff_scroll = model_shader_anim_scroll(native, cache, model, sh, "self_illum_map");
+                        }
+                    }
                     let (tex, emissive) = if is_forcefield { (ff_tex, ff_emis) } else { (tex, emissive) };
                     // Forcefields ride the animated palette path (not mesh_shade's emis_tex)
                     // → they must NOT carry the HDR self-illum buffer.
@@ -21502,7 +25034,7 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
                     // rmtr part of a multi-material model → its terrain layer set (same reader as shader 0
                     // of a single-material rmtr object; None when no base layer resolves).
                     let terrain = if native.model_shader_class(model, sh) == "rmtr" { build_model_terrain_tags(native, model, sh) } else { None };
-                    ObjPart { indices: idx, vbits, tex, emissive, diffuse_tag: d, blend, alpha_test: at, base_tile, is_glass, is_halo, glass_mat, glass_op, glass_detail, glass_detail_xform, glass_albedo_a, glass_env, glass_env_opt, glass_dyn_lod, emis_change_color,
+                    ObjPart { indices: idx, vbits, tex, emissive, diffuse_tag: d, blend, alpha_test: at, base_tile, is_glass, is_halo, event_gated, glass_mat, glass_op, glass_detail, glass_detail_xform, glass_albedo_a, glass_env, glass_env_opt, glass_dyn_lod, emis_change_color,
                               is_forcefield, ff_scroll, ff_color, ff_extra, emissive_hdr, cc_map: part_cc_map, cc_map_xform: part_cc_xform, self_illum_mode: si_mode, self_illum_cmul: si_cmul, mat: part_mat, foliage, terrain }
                 })
                 .collect()
@@ -21783,6 +25315,8 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
     let Some(mut dec) = finalize(verts, indices, tex, emissive) else { native.close_model(model); return None; }; // Handle still open here
     dec.obj_parts = obj_parts;
     dec.variant_sids = variant_sids;
+    dec.variant_states = variant_states;
+    dec.uses_player_variants = uses_player_variants;
     dec.emissive_hdr = single_emissive_hdr; // single-material HDR self-illum
     dec.alpha_test = cutout;
     dec.cc_map = obj_cc_map;
@@ -21850,6 +25384,8 @@ fn decode_model_cached(native: &NativeDll, cache: CacheHandle, mode_tag: u32, ob
         String::new()
     };
     dec.is_halo = sh0_cls == "rmhg" || sh0_diff.contains("halogram") || sh0_diff.contains("drop_holo") || sh0_diff.contains("_holo");
+    // #elite-knife the same event gate for a SINGLE-material halogram model.
+    dec.event_gated = dec.is_halo && shader_animation_event_gated(native, cache, &obj_fns, model, 0);
     // Apply the single-material forcefield — grayscale noise in tex+emissive, real colour +
     // scroll, and force the additive holo route (see-through + animated).
     if native.model_shader_class(model, 0) == "rmsh" && matches!(dec.blend, 4 | 6) {
@@ -23759,6 +27295,15 @@ fn decode_bsp_mesh(
                 // via the real HREK curve (power_roughness_conversion.hlsl_include).
                 if !is_water && dec.terrain.is_none() {
                     let rx = |name: &str| sc.real(name).map(|v| v[0]).filter(|v| v.is_finite() && *v > 0.0);
+                    // `diffuse_coefficient` scales the DIFFUSE light only (engine
+                    // `r2 = (lightmap + simple) * diffuse_coefficient; out = r2*albedo + spec + env`).
+                    // Read on its own (not through `rx`, which drops 0.0 — and 0.0 is authored, on
+                    // pure emitters whose diffuse the engine kills outright).
+                    if let Some(dc) = sc.real("diffuse_coefficient").map(|v| v[0])
+                        .filter(|v| v.is_finite() && *v >= 0.0 && *v <= 64.0)
+                    {
+                        dec.mat_dcoef = dc;
+                    }
                     // rmgl has NO specular_coefficient parameter (glass.hlsl_include:52 `#define
                     // specular_coefficient 1`), so this gate left mat_env = 0 → no env reflection on rmgl panes.
                     if let Some(coef) = rx("specular_coefficient").or_else(|| if dec.is_glass_shader { Some(1.0) } else { None }) {
@@ -24172,6 +27717,17 @@ impl DecodedModel {
         find(vsid).or_else(|| find(default_sid)).map_or(0, |i| i.min(63) as u8)
     }
 
+    /// #damage The bit index of the (variant `base`, damage `state`) synthetic entry, or `base`
+    /// itself when the model authors no permutation for that state in that variant (state 0 is
+    /// always `base`), so an unauthored state draws the regular model exactly as before.
+    fn state_variant_index(&self, base: u8, state: u8) -> u8 {
+        if state == 0 { return base; }
+        let Some(&sid) = self.variant_sids.get(base as usize) else { return base };
+        self.variant_sids.iter().zip(self.variant_states.iter())
+            .position(|(&s, &st)| s == sid && st == state)
+            .map_or(base, |i| i.min(63) as u8)
+    }
+
     /// A BSP glass surface (rmsh alpha_blend/premul or rmgl). Its vertex colour is the
     /// albedo_color tint (legacy) or the per-vertex probe lanes (glass_pv) — never the airprobe
     /// ambient, which used to overwrite it for every non-PVL pane (hangar glass body = 0.06 grey ambient).
@@ -24286,7 +27842,10 @@ fn finalize(
         indices,
         obj_parts: Vec::new(),
         variant_sids: Vec::new(),
+        variant_states: Vec::new(),
+        uses_player_variants: false, // set by decode_model_cached from the hlmt variant walk
         is_halo: false, // Set by decode_model_cached (needs the model/shader handle)
+        event_gated: false, // #elite-knife set by decode_model (needs the model/shader handle)
         is_forcefield: false, // Set by decode_model_cached for single-material shields
         ff_color: [1.0, 1.0, 1.0],
         ff_scroll: [0.0, 0.0],
@@ -24339,6 +27898,7 @@ fn finalize(
         mat_spec: 0.0,
         mat_rough: -1.0,
         mat_env: 0.0,
+        mat_dcoef: 1.0,
         mattex_tag: 0, // MAT-31: set at decode when the material's rmt2 binds a material_texture
         mattex_black_rough: 0.0,
         mattex_black_specmult: 0.0,
@@ -24455,7 +28015,7 @@ const CACHE_MAGIC: u32 = 0x484D_5343; // "HMSC"
 // normals, uncapped diffuse_tile, glass lanes, foliage alpha rule, water atlas routing, opacity
 // texture fields, curve-encoded texture bytes, BC5_SNORM bumps, literal multi-detail bake) is
 // summarised here so a stale cache is never mistaken for a rendering change.
-const CACHE_VERSION: u32 = 28;
+const CACHE_VERSION: u32 = 29;
 
 // --- little-endian byte writers (append to a Vec<u8>) ---
 fn cw_u32(b: &mut Vec<u8>, v: u32) { b.extend_from_slice(&v.to_le_bytes()); }
@@ -24509,6 +28069,7 @@ fn cache_write_mesh(b: &mut Vec<u8>, m: &DecodedModel) {
     cw_f32n(b, &m.glass_ctl); cw_u32(b, m.glass_spec_mask_tag); // (v24)
     for l in &m.layer_scroll { cw_f32(b, l[0]); cw_f32(b, l[1]); } cw_u32(b, m.albedo_tmpl as u32);
     cw_f32(b, m.mat_spec); cw_f32(b, m.mat_rough); cw_f32(b, m.mat_env);
+    cw_f32(b, m.mat_dcoef); // authored diffuse_coefficient (CACHE_VERSION 29)
     cw_u32(b, m.material_model as u32); // MAT-1
     cw_u32(b, m.self_illum_mode as u32); // LIT-SI-3
     cw_f32n(b, &m.self_illum_cmul); // LIT-SI-3
@@ -24552,6 +28113,7 @@ fn cache_read_mesh(r: &mut CReader) -> Option<DecodedModel> {
     let mut layer_scroll = [[0.0f32; 2]; 4]; for l in layer_scroll.iter_mut() { l[0] = r.f32()?; l[1] = r.f32()?; }
     let albedo_tmpl = r.u32()? as u8;
     let (mat_spec, mat_rough, mat_env) = (r.f32()?, r.f32()?, r.f32()?);
+    let mat_dcoef = r.f32()?; // authored diffuse_coefficient (CACHE_VERSION 29)
     let material_model = r.u32()? as u8; // MAT-1
     let self_illum_mode = r.u32()? as u8; // LIT-SI-3
     let self_illum_cmul = r.f32n::<3>()?; // LIT-SI-3
@@ -24565,7 +28127,10 @@ fn cache_read_mesh(r: &mut CReader) -> Option<DecodedModel> {
     Some(DecodedModel {
         obj_parts: Vec::new(),
         variant_sids: Vec::new(),
+        variant_states: Vec::new(),
+        uses_player_variants: false,
         is_halo: false,
+        event_gated: false,
         is_forcefield: false,
         ff_color: [1.0, 1.0, 1.0],
         ff_scroll: [0.0, 0.0],
@@ -24580,7 +28145,7 @@ fn cache_read_mesh(r: &mut CReader) -> Option<DecodedModel> {
         cc_default: [[1.0; 3]; 2],
         diffuse_tag, blend, detail_tag, bump_tag, bump_xform, detail_xform, fres_xform, spec_rgb, fres_rgb, detail2_tag, detail2_xform,
         detail3_tag, detail3_xform, cluster, material_index, shader_kind, has_pvl, scroll, diffuse_tile,
-        uv_density, alpha_test, alpha_test_tag, opacity_tag, opacity_xform, opacity_mode, opacity_gamma, env_option, layer_scroll, albedo_tmpl, mat_spec, mat_rough, mat_env, material_model, albedo_option: 0, self_illum_mode, self_illum_cmul,
+        uv_density, alpha_test, alpha_test_tag, opacity_tag, opacity_xform, opacity_mode, opacity_gamma, env_option, layer_scroll, albedo_tmpl, mat_spec, mat_rough, mat_env, mat_dcoef, material_model, albedo_option: 0, self_illum_mode, self_illum_cmul,
         obj_mat: ObjMat::default(), // (not persisted: objects decode at runtime)
         foliage: None, // (not persisted)
         mat_spec2, lm_gpu, lm_dm_tag, lm_dm_sub,
@@ -24824,3 +28389,554 @@ fn airprobe_vis(_probe: &LightProbeGrid, _p: Vec3) -> f32 {
     0.0
 }
 
+
+/// #sword-blade The one lane rule (`PartLaneIn`), gated.
+///
+/// The rule used to live as two inline expressions ~500 lines apart inside `maybe_rebuild`, which
+/// is why `build_actor_meshes` could not reuse it and folded every transparent part into the
+/// opaque list — a held energy sword drew as a solid grey blade. These pin the extracted rule to
+/// the expressions it replaced, over the WHOLE input space, so the extraction cannot have moved a
+/// single part into a different pass.
+#[cfg(test)]
+mod part_lane_tests {
+    use super::{PartLane, PartLaneIn};
+
+    /// A literal transcription of the pre-extraction code (`maybe_rebuild`, two sites). Kept
+    /// verbatim on purpose: this is the oracle, not a second implementation to maintain.
+    fn old_lane(i: &PartLaneIn, ff_engine_marker: bool, forced_cc: bool) -> PartLane {
+        let (ublend, ualpha, uemis, uemis_cc, uhalo, uff, uglass, usi_mode) =
+            (i.blend, i.alpha_test, i.has_emissive, i.emis_cc, i.is_halo, i.is_ff, i.is_glass, i.si_mode);
+        let (name_holo, marker_forced) = (i.name_holo, i.marker_forced);
+        let unit_holo = uff || (uemis && matches!(ublend, 1 | 4 | 5 | 6 | 7 | 8))
+            || (uemis_cc && name_holo) || uhalo || marker_forced;
+        let solid_marker = name_holo || marker_forced;
+        let unit_glass = !unit_holo && (uglass || i.shield_name_blend);
+        let ff_engine = uff && i.ff_extra;
+        let _ = usi_mode;
+        if unit_holo {
+            if (solid_marker && !(ff_engine_marker && !forced_cc)) || (!ff_engine && matches!(ublend, 4 | 6)) {
+                PartLane::HoloSolid
+            } else {
+                PartLane::Additive
+            }
+        } else if unit_glass {
+            PartLane::Blend
+        } else if ualpha {
+            PartLane::Cutout
+        } else {
+            PartLane::Opaque
+        }
+    }
+
+    /// Same, for the two fs_holo sub-lanes (9 and 10) the sword's blade layers take.
+    fn old_sublanes(i: &PartLaneIn) -> (bool, bool) {
+        let unit_holo = i.is_ff || (i.has_emissive && matches!(i.blend, 1 | 4 | 5 | 6 | 7 | 8))
+            || (i.emis_cc && i.name_holo) || i.is_halo || i.marker_forced;
+        let solid_marker = i.name_holo || i.marker_forced;
+        let illum_only = unit_holo && !i.is_halo && !i.is_ff && !i.emis_cc && !solid_marker
+            && matches!(i.blend, 1 | 5) && i.si_mode == 2 && i.has_emissive;
+        let halo_from_diffuse = unit_holo && i.is_halo && i.si_mode == 4 && !(i.is_ff && i.ff_extra);
+        (illum_only, halo_from_diffuse)
+    }
+
+    /// Every combination of the nine booleans x every authored BLEND_TYPE x the self-illum options
+    /// that matter x both late facts: 9 blends x 4 si_modes x 2^9 flags x 4 = 73 728 cases.
+    fn all_inputs() -> Vec<(PartLaneIn, bool, bool)> {
+        let mut out = Vec::new();
+        for blend in 0..=8u32 {
+            for si_mode in [0u8, 2, 4, 10] {
+                for bits in 0..512u32 {
+                    let b = |k: u32| bits & (1 << k) != 0;
+                    let i = PartLaneIn {
+                        blend, si_mode,
+                        alpha_test: b(0), has_emissive: b(1), emis_cc: b(2), is_halo: b(3),
+                        is_ff: b(4), is_glass: b(5), ff_extra: b(6), name_holo: b(7),
+                        marker_forced: b(8),
+                        // Independent of the flags above in the real decode (it is a tag-PATH
+                        // hint x "not authored opaque"), so sweep it with the blend mode.
+                        shield_name_blend: blend != 0 && b(5),
+                    };
+                    for ffm in [false, true] {
+                        for fcc in [false, true] {
+                            out.push((i, ffm, fcc));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_extracted_lane_rule_matches_the_expressions_it_replaced() {
+        let cases = all_inputs();
+        assert_eq!(cases.len(), 9 * 4 * 512 * 4);
+        for (i, ffm, fcc) in &cases {
+            assert_eq!(i.lane(*ffm, *fcc), old_lane(i, *ffm, *fcc),
+                "lane mismatch for {i:?} ff_engine_marker={ffm} forced_cc={fcc}");
+            assert_eq!((i.lane_illum_only(), i.lane_halo_from_diffuse()), old_sublanes(i),
+                "fs_holo sub-lane mismatch for {i:?}");
+        }
+    }
+
+    /// The five authored shapes of the energy sword's parts, as the shipped tag decodes them
+    /// (HMS_GLASSDIAG on `objects\weapons\melee\energy_sword\energy_sword`, 7 parts): two opaque
+    /// hilt parts, two `rmhg` halograms on fs_holo lane 10, one engine forcefield part, and two
+    /// additive 3-channel self-illum blade layers on lane 9. NOT ONE of the five may be Opaque —
+    /// that is the whole defect.
+    #[test]
+    fn the_energy_swords_five_blade_layers_are_transparent_lanes() {
+        let part = |blend, has_emissive, is_halo, is_ff, ff_extra, si_mode| PartLaneIn {
+            blend, has_emissive, is_halo, is_ff, ff_extra, si_mode, ..Default::default()
+        };
+        // parts 0,1 — the hilt: opaque rmsh, no self-illum.
+        for p in [part(0, false, false, false, false, 0), part(0, false, false, false, false, 0)] {
+            assert_eq!(p.lane(false, false), PartLane::Opaque);
+        }
+        // parts 2,3 — the two blade HALOGRAMS: additive rmhg, self_illumination = from_diffuse.
+        let halo = part(1, false, true, false, false, 4);
+        assert_eq!(halo.lane(false, false), PartLane::Additive, "an rmhg blade halogram must be additive");
+        assert!(halo.lane_halo_from_diffuse(), "it is fs_holo lane 10");
+        assert!(!halo.lane_illum_only());
+        // part 4 — the engine forcefield layer (si option 10, full FfExtra record).
+        let ff = part(1, true, true, true, true, 10);
+        assert_eq!(ff.lane(false, false), PartLane::Additive, "the forcefield blade layer must be additive");
+        assert!(!ff.lane_halo_from_diffuse(), "the engine halogram lane owns it, not lane 10");
+        // parts 5,6 — the two `sword_illum` 3-channel additive geometry layers.
+        let illum = part(1, true, false, false, false, 2);
+        assert_eq!(illum.lane(false, false), PartLane::Additive, "a sword_illum blade layer must be additive");
+        assert!(illum.lane_illum_only(), "it is fs_holo lane 9");
+        // Five of the seven are transparent: a build with no transparent lane has to fold them
+        // into the opaque pass, which is exactly the grey blade.
+        let all = [part(0, false, false, false, false, 0), part(0, false, false, false, false, 0),
+                   halo, halo, ff, illum, illum];
+        assert_eq!(all.iter().filter(|p| p.lane(false, false).is_transparent()).count(), 5);
+    }
+}
+
+/// #blade-anim The authored UV SCROLL each drawn part of an object carries, uv/s, in part order —
+/// the value the holo lanes are uploaded with. Pure CPU (tag + bitmap decode), so the question
+/// "does this material animate, and how fast" is answerable without a GPU.
+pub fn object_part_scrolls(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> Vec<[f32; 2]> {
+    let mode = native.resolve_mode(cache, obj_tag);
+    if mode == 0 || mode == 0xFFFF_FFFF { return Vec::new() }
+    let Some(dec) = decode_model(native, cache, mode, obj_tag) else { return Vec::new() };
+    if dec.obj_parts.is_empty() {
+        return if dec.indices.len() >= 3 { vec![dec.ff_scroll] } else { Vec::new() };
+    }
+    dec.obj_parts
+        .iter()
+        .filter(|p| !p.event_gated && p.indices.len() >= 3)
+        .map(|p| p.ff_scroll)
+        .collect()
+}
+
+/// #blade-anim The energy sword's blade must ANIMATE, and the rate must be the artist's.
+///
+/// The user's second report on this weapon: "it does look more transparent, but it needs the
+/// effect/animation that was playing on it". The blade decoded and drew correctly and was FROZEN,
+/// for two reasons that had to be fixed together — the decode threw the authored scroll away for
+/// any halogram without a forcefield record, and `fs_holo` then froze the UV anyway because its
+/// "static icon" test is `lane > 2.5` and the self-illum lanes are 9 and 10.
+///
+/// This pins the decode half against the shipped tag. The blade's own
+/// `energy_sword_blade_activation` layer authors a **TranslationY on `base_map` with a 5 s
+/// period** — the very map `fs_holo`'s lane 10 samples — so the rate must come out at 1/5 uv/s.
+#[cfg(test)]
+mod blade_anim_tests {
+    use super::*;
+
+    /// At least one of the sword's transparent parts must carry a non-zero scroll, and every
+    /// rate must be a sane uv/s rather than a decode artefact.
+    #[test]
+    fn the_energy_swords_blade_carries_the_authored_scroll_rate() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let Some(sword) = native.tags_by_group(cache, "weap").into_iter().find(|t| {
+            native.tag_name(cache, *t).unwrap_or_default().contains("energy_sword")
+        }) else { return };
+        let lanes = object_part_lanes(&native, cache, sword);
+        let scrolls = object_part_scrolls(&native, cache, sword);
+        assert_eq!(lanes.len(), scrolls.len(), "one scroll per drawn part");
+        assert!(!scrolls.is_empty(), "the sword draws parts");
+
+        // The OPAQUE hilt never scrolls -- only the energy does.
+        for (i, (l, s)) in lanes.iter().zip(&scrolls).enumerate() {
+            if l.1 == PartLane::Opaque {
+                assert_eq!(*s, [0.0, 0.0], "part {i} is the solid hilt and must not scroll");
+            }
+            assert!(s[0].is_finite() && s[1].is_finite() && s[0].abs() <= 4.0 && s[1].abs() <= 4.0,
+                "part {i} scroll {s:?} is not a plausible uv/s rate");
+        }
+
+        // ...and the blade does. Without this the weapon draws correct but dead.
+        let moving: Vec<(usize, [f32; 2])> = scrolls.iter().enumerate()
+            .filter(|(_, s)| s[0].abs() > 1e-6 || s[1].abs() > 1e-6)
+            .map(|(i, s)| (i, *s)).collect();
+        assert!(!moving.is_empty(),
+            "no part of the energy sword animates -- the blade is frozen again. scrolls {scrolls:?}");
+        // The 5 s TranslationY authored on `energy_sword_blade_activation`'s base_map is 0.2 uv/s.
+        assert!(moving.iter().any(|(_, s)| (s[1].abs() - 0.2).abs() < 0.02),
+            "the blade's 5 s base_map scroll (0.2 uv/s) is missing: {moving:?}");
+        // Every moving part is a TRANSPARENT one -- a scroll on the hilt would be a decode bug.
+        for (i, _) in &moving {
+            assert!(lanes[*i].1.is_transparent(), "part {i} scrolls but is not a transparent lane");
+        }
+    }
+}
+
+/// #projectile  THE ONE-SHOT CLOCK GATES. A muzzle flash and an explosion start at a MOMENT and
+/// then finish; every effect instance HMS simulated before this one was pre-rolled 300 s and
+/// looped for ever. These pin both halves of that split — the birth time and the loop — on the
+/// state machine alone, with no cache and no GPU.
+#[cfg(test)]
+mod one_shot_clock_tests {
+    use super::*;
+
+    fn ev(delay: [f32; 2], duration: [f32; 2]) -> EffectEventDef {
+        EffectEventDef { index: 0, name_sid: 0, flags: 0, skip: 0.0, delay, duration }
+    }
+    fn def(loop_start: i16, mut events: Vec<EffectEventDef>) -> EffectDef {
+        for (i, e) in events.iter_mut().enumerate() { e.index = i; }
+        EffectDef { flags: 0, fixed_seed: 0, loop_start, events }
+    }
+    /// Walk a clock to `t` in 1/60 s frames, the way the interactive app does.
+    fn walk(c: &mut EventClock, d: &EffectDef, from: f32, to: f32) {
+        let mut now = from;
+        while now < to {
+            now = (now + 1.0 / 60.0).min(to);
+            c.advance(d, now);
+        }
+    }
+
+    /// A one-shot born at 10 s has NOTHING before 10 s, plays its events once, and is finished.
+    /// The pre-rolled instance over the same effect is the opposite on every count, which is what
+    /// makes this a gate on the split rather than on one branch of it.
+    #[test]
+    fn a_one_shot_starts_at_its_birth_and_finishes() {
+        // Two 0.25 s events, no delay, `loop start` -1: a muzzle flash's shape.
+        let d = def(-1, vec![ev([0.0, 0.0], [0.25, 0.25]), ev([0.0, 0.0], [0.25, 0.25])]);
+        let mut c = EventClock::new_at(0xBEEF, 10.0, false);
+
+        // Before the birth: no window, nothing active.
+        walk(&mut c, &d, 0.0, 9.5);
+        assert!(c.windows.is_empty(), "a one-shot has played windows {:?} before it was born", c.windows.len());
+        assert!(!c.status(0).0, "event 0 is active before the effect exists");
+
+        // Across the birth: it plays, starting THERE and not at scene time 0.
+        walk(&mut c, &d, 9.5, 10.1);
+        let first = *c.windows.front().expect("the one-shot played its first event");
+        assert!((first.start - 10.0).abs() < 0.02, "the first window starts at {} not at the 10.0 s birth", first.start);
+        assert!(c.status(0).0, "event 0 is not active 0.1 s into its 0.25 s duration");
+
+        // ...and then it ENDS. Both events, once each, and no more.
+        walk(&mut c, &d, 10.1, 12.0);
+        assert!(c.finished(), "a non-looping one-shot is still running 2 s after a 0.5 s effect");
+        // Each event once, in order, and nothing after. This pins the COUNT, the IDENTITY and the
+        // ORDER of the plays -- it is not the weaker "no event twice".
+        let plays: Vec<usize> = c.windows.iter().map(|w| w.event).collect();
+        assert_eq!(plays, vec![0, 1], "a one-shot must play each event exactly once, in order; played {plays:?}");
+
+        // ...and `iteration` is the CHAIN's phase counter, not the event's, so a sequential walk
+        // numbers the second event 2.
+        //
+        // **This is the engine's own law, not a convenience.** `effect_start_event`
+        // (`effects.cpp:3750`, `reach_tag_test.exe` +0x36EB70) holds ONE effect-event datum per
+        // chain -- flags at +0x02, the current event index as a byte at +0x03, the rolled phase
+        // length at +0x10 -- and on each entry into a duration phase it does
+        // `++*(unsigned __int16 *)(datum + 4)` and then starts that event's particle systems.
+        // One 16-bit counter per datum, bumped per PHASE, whatever event the datum has walked on
+        // to. The first draft of this gate asserted the counter read (1, 1) and the clock said
+        // (1, 2); the clock is right and the assertion was wrong, and this is what settled it
+        // from outside the implementation.
+        //
+        // The property the simulator actually consumes is weaker than either reading: the one
+        // functional use of `iteration` anywhere is the change detector in `simulate_emitter`
+        // (`if w.iteration != es.iteration { ... fire starting_count once }`), which only needs
+        // CONSECUTIVE PLAYS OF THE SAME EVENT to differ. Both halves are asserted, so a stepping
+        // change that breaks either the engine's numbering or the detector's requirement fails
+        // here.
+        let its: Vec<u32> = c.windows.iter().map(|w| w.iteration).collect();
+        assert_eq!(its, vec![1, 2], "the chain's phase counter must read 1 then 2 (effects.cpp:3750); read {its:?}");
+
+        // The SABOTAGE, built in: the same effect as a LOOPING instance replays for ever. If the
+        // assert above ever passes for a looping clock, the loop test has stopped biting.
+        let mut l = EventClock::new_at(0xBEEF, 10.0, true);
+        walk(&mut l, &d, 0.0, 12.0);
+        assert!(!l.finished(), "a looping instance must never finish");
+        assert!(
+            l.windows.len() > 4,
+            "a looping instance over a 0.5 s effect played only {} window(s) in 2 s -- the wrap is gone",
+            l.windows.len()
+        );
+        // The DETECTOR's requirement, asserted where it is observable: an event that plays more
+        // than once must carry a DIFFERENT `iteration` each time, or `simulate_emitter` would
+        // fail to re-arm `starting_count` and the second burst of a repeating effect would be
+        // silently missing. (The engine's own re-arm is `c_particle_system::reset`, called at
+        // event start.)
+        for e in 0..d.events.len() {
+            let mine: Vec<u32> = l.windows.iter().filter(|w| w.event == e).map(|w| w.iteration).collect();
+            for p in mine.windows(2) {
+                assert_ne!(
+                    p[0], p[1],
+                    "event {e} played twice with the same iteration {} -- the emitter's re-arm detector is blind",
+                    p[0]
+                );
+            }
+        }
+    }
+
+    /// Scrubbing BACKWARDS past the birth puts the effect away again, and scrubbing forward to the
+    /// same moment twice plays the same thing. Theater's whole determinism rule, on this clock.
+    #[test]
+    fn scrubbing_across_a_one_shot_is_reproducible() {
+        let d = def(-1, vec![ev([0.0, 0.0], [0.3, 0.3])]);
+        let snapshot = |t: f32| -> Vec<(usize, u32, i32)> {
+            let mut c = EventClock::new_at(0x1234, 5.0, false);
+            walk(&mut c, &d, 0.0, t);
+            c.windows.iter().map(|w| (w.event, w.iteration, (w.start * 1000.0) as i32)).collect()
+        };
+        let want = snapshot(5.2);
+        assert_eq!(want, snapshot(5.2), "the same moment must play the same thing");
+        // POSITIVE content first. **An equality gate needs a liveness assertion or it proves only
+        // that nothing happened twice.** Without this one, the gate compared two lists that were
+        // allowed to be EMPTY, and an empty list equals an empty list -- which is exactly how it
+        // survived a sabotage that made the clock ignore its birth entirely: the effect then
+        // played at -300 s and the 300 s window history pruned the evidence away on BOTH sides.
+        // Measured, not theorised: the sabotage was applied, this gate stayed green, and this
+        // assertion is what was missing.
+        assert_eq!(want.len(), 1, "0.2 s after a 0.3 s one-shot's birth exactly one window is open; got {want:?}");
+        assert!(
+            (want[0].2 - 5000).abs() <= 20,
+            "the window starts at {} ms, not at the 5000 ms birth",
+            want[0].2
+        );
+        // Forward then back then forward again, on ONE clock: the state must match a fresh walk.
+        let mut c = EventClock::new_at(0x1234, 5.0, false);
+        walk(&mut c, &d, 0.0, 5.2);
+        c.advance(&d, 1.0); // scrub back before the birth
+        assert!(c.windows.is_empty(), "scrubbing back before the birth leaves {} window(s) alive", c.windows.len());
+        walk(&mut c, &d, 1.0, 5.2);
+        let after: Vec<(usize, u32, i32)> =
+            c.windows.iter().map(|w| (w.event, w.iteration, (w.start * 1000.0) as i32)).collect();
+        assert_eq!(after, want, "a scrub away and back did not restore the same windows");
+    }
+
+    /// The pre-rolled instance is untouched: no birth, and the wrap is still unconditional. This
+    /// is the regression half — every ambient placement and every armour glow in the app depends
+    /// on it, and the one-shot support was added by giving the clock two new fields.
+    #[test]
+    fn the_persistent_instance_is_unchanged() {
+        let d = def(-1, vec![ev([0.0, 0.0], [0.5, 0.5])]);
+        let mut c = EventClock::new(0x99);
+        assert_eq!(c.birth, None);
+        assert!(c.looping);
+        c.advance(&d, 0.0);
+        // Pre-rolled: at scene time 0 it has already been running, so windows exist in the past.
+        assert!(!c.windows.is_empty(), "the persistent instance is no longer pre-rolled");
+        assert!(
+            c.windows.iter().any(|w| w.start < 0.0),
+            "no window starts before scene time 0 -- the 300 s pre-roll is gone"
+        );
+        assert!(!c.finished(), "the persistent instance must never finish");
+    }
+
+    /// A moving source's path sampler and `ParticleSource::origin_at` are ONE law reached two
+    /// ways. They must agree everywhere, or a projectile's trail and the projectile itself would
+    /// drift apart.
+    #[test]
+    fn a_moving_sources_origin_and_its_particles_use_the_same_path() {
+        let p = std::sync::Arc::new(vec![
+            (0.0f32, Vec3::new(0.0, 0.0, 0.0)),
+            (1.0, Vec3::new(10.0, 0.0, 0.0)),
+            (2.0, Vec3::new(10.0, 10.0, 5.0)),
+        ]);
+        let src = ParticleSource {
+            seed: 1,
+            world: Mat4::from_translation(Vec3::new(10.0, 10.0, 5.0)),
+            effe: 0,
+            label: String::new(),
+            systems: std::sync::Arc::new(Vec::new()),
+            locs: Vec::new(),
+            birth: Some(0.0),
+            path: Some(p.clone()),
+        };
+        for t in [-1.0f32, 0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 9.0] {
+            let a = src.origin_at(t);
+            let b = SceneController::path_at(&p, t);
+            assert!((a - b).length() < 1e-5, "at t={t} the source says {a:?} and its particles {b:?}");
+        }
+        // With no path the source is wherever its matrix puts it, both ways.
+        let still = ParticleSource { path: None, ..src };
+        assert_eq!(still.origin_at(123.0), Vec3::new(10.0, 10.0, 5.0));
+    }
+}
+
+/// #fp-light **THE FIRST-PERSON / RENDER-MODEL ACTOR LIGHTING OWNER.**
+///
+/// The engine's law, measured in `reach_tag_test.exe` (the full chain is on
+/// [`SceneController::lighting_object_tag`]): Reach has NO first-person lighting rig. The arms,
+/// the legs and the gun are submitted as ordinary render objects carrying the OBJECT INDEX of
+/// the unit (arms, legs) or of the weapon (gun), and are lit by that object's own
+/// `object_get_lighting_sample` result, post-processed by that object's obje-type `chmt` row.
+///
+/// HMS handed `obj_meta` the bare `mode` tag instead, so a `render_model` header was read as an
+/// `obje` header. These gates pin both halves: what the raw bytes really are (so the failure is
+/// named rather than described), and that the lighting lane now resolves the owner.
+#[cfg(test)]
+mod fp_light_tests {
+    use super::*;
+    use hms_native::CacheHandle;
+
+    fn tag_named(native: &NativeDll, cache: CacheHandle, group: &str, leaf: &str) -> Option<u32> {
+        native
+            .tags_by_group(cache, group)
+            .into_iter()
+            .find(|&t| native.tag_name(cache, t).map_or(false, |n| n.to_lowercase().ends_with(leaf)))
+    }
+
+    /// The first 16 meta bytes of a tag, read HERE and not through `obj_meta`, so a gate's
+    /// expectation never comes out of the code it is testing.
+    fn head16(native: &NativeDll, cache: CacheHandle, tag: u32) -> Vec<u8> {
+        native.tag_meta(cache, tag, 0, 0x10).unwrap_or_default()
+    }
+    fn le32(b: &[u8], o: usize) -> u32 {
+        u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+    }
+
+    /// A `SceneController` over the gates' SHARED native library and cache handle (the same shape
+    /// `film_projectile`'s end-to-end gate uses) — a second `dlopen` + `open_cache` is exactly what
+    /// the shared handle exists to avoid.
+    fn scene_over(native: std::sync::Arc<NativeDll>, cache: CacheHandle) -> SceneController {
+        let mut sc = SceneController::new_shared(native);
+        sc.attach_cache(cache);
+        sc
+    }
+
+    /// **The defect, named by its bytes.** `objects\characters\spartans\fp\fp` is a `render_model`,
+    /// and a `render_model`'s first 16 bytes are `name` / `flags`+`version` / `import info
+    /// checksum` / the `regions` block — NOT `object type` / `secondary flags`+`flags` /
+    /// `runtime flags` / `bounding radius`. Read as an obje, the Spartan arms are "object type
+    /// 22918, flags 0x10000, bounding radius f32::from_bits(2) = 2.8e-45".
+    ///
+    /// Type 22918 is outside the 14-row `chmt` block, so the arms, the legs and the first-person
+    /// gun took the engine's NO-TAG default row instead of forge_halo's authored biped / weapon
+    /// row — no min-luminance floor and no max-contrast fill lift, while the SAME weapon in the
+    /// third-person biped's hands got both. The second half of this gate is that difference, read
+    /// out of the map's own authored `chmt`.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_first_person_arms_model_is_not_an_object_header() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else {
+            eprintln!("fp-light SKIPPED: no forge_halo cache");
+            return;
+        };
+        let sc = scene_over(native.clone(), cache);
+        let native = &*native;
+        let arms = tag_named(native, cache, "mode", "spartans\\fp\\fp").expect("the Spartan arms model");
+        let b = head16(native, cache, arms);
+        assert_eq!(b.len(), 0x10, "the arms model has readable meta");
+        assert_eq!(le32(&b, 0), 0x5986, "render_model `name` string id, read as `object type` = 22918");
+        assert_eq!(le32(&b, 4), 0x0001_0000, "render_model flags(0) + version(1), read as obje flags");
+        assert_eq!(le32(&b, 0xC), 2, "the `regions` block COUNT, read as the bounding radius");
+        assert!(f32::from_bits(2) < 1e-40, "that radius is a denormal: the ray collapses to the 0.05/0.4 clamps");
+        // The brightness consequence, from the map's OWN authored chmt block (forge_halo:
+        // rows 0..3 = bipeds/vehicles/weapons/equipment).
+        let garbage = sc.chmt_params(le32(&b, 0));
+        assert_eq!(garbage, CHMT_DEFAULT, "object type 22918 falls off the 14-row chmt block");
+        let biped_row = sc.chmt_params(0);
+        assert!(
+            (biped_row[0] - 0.4).abs() < 1e-6 && (biped_row[1] - 1.7).abs() < 1e-6,
+            "forge_halo authors min luminance 0.4 / max contrast 1.7 for bipeds, got {biped_row:?}"
+        );
+        assert_ne!(biped_row, garbage, "that is the lift the first-person rig was missing");
+    }
+
+    /// **The fix, for the arms and the legs.** `sub_1408CCE10` writes the player's UNIT object
+    /// index beside the arms model (`first_person_weapons.cpp` +0x4C row) and beside the
+    /// first-person body (+0x24 model, +0x04 object), so both are lit as the BIPED.
+    ///
+    /// The owner is checked against the Spartan biped found independently BY NAME, not against the
+    /// `@player representation` row the production code reads.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_first_person_arms_and_legs_are_lit_as_the_player_biped() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else {
+            eprintln!("fp-light SKIPPED: no forge_halo cache");
+            return;
+        };
+        let sc = scene_over(native.clone(), cache);
+        let native = &*native;
+        let spartan = tag_named(native, cache, "bipd", "spartans\\spartans").expect("the Spartan biped");
+        for leaf in ["spartans\\fp\\fp", "spartans\\fp_body\\fp_body"] {
+            let m = tag_named(native, cache, "mode", leaf).unwrap_or_else(|| panic!("no model '{leaf}'"));
+            let owner = sc.lighting_object_tag(m);
+            assert_eq!(
+                owner, spartan,
+                "'{leaf}' must be lit as the Spartan biped {spartan:#x}, got {owner:#x} '{}'",
+                native.tag_name(cache, owner).unwrap_or_default()
+            );
+            // and the owner really is an obje whose header makes sense as one
+            let h = head16(native, cache, owner);
+            assert_eq!(le32(&h, 0) & 0xFFFF, 0, "a `bipd` is obje object type 0 (biped)");
+            let r = f32::from_le_bytes([h[0xC], h[0xD], h[0xE], h[0xF]]);
+            assert!((0.1..5.0).contains(&r), "the Spartan's bounding radius is a real number, got {r:e}");
+        }
+    }
+
+    /// **The fix, for the gun.** The gun's entry carries the WEAPON object index
+    /// (`first_person_weapons.cpp` +0x3C object, +0x44 model), so it is lit as obje type 2 with
+    /// the weapon's own bounding radius. A Reach weapon's `first person model` IS its ordinary
+    /// render model (`reach_actor::first_person_weapon`), so resolving "which object owns this
+    /// render model" lands on the weapon itself.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_first_person_weapon_model_is_lit_as_its_weapon() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else {
+            eprintln!("fp-light SKIPPED: no forge_halo cache");
+            return;
+        };
+        let sc = scene_over(native.clone(), cache);
+        let native = &*native;
+        let mut checked = 0;
+        for leaf in ["rifle\\assault_rifle\\assault_rifle", "pistol\\magnum\\magnum", "rifle\\sniper_rifle\\sniper_rifle"] {
+            let Some(weap) = tag_named(native, cache, "weap", leaf) else { continue };
+            let (Some(fpm), _) = crate::reach_actor::first_person_weapon(native, cache, weap, 0) else { continue };
+            assert_eq!(
+                sc.raw_tag_class(fpm).as_deref(),
+                Some("mode"),
+                "'{leaf}' first person model is a bare render model"
+            );
+            let owner = sc.lighting_object_tag(fpm);
+            assert_eq!(
+                owner, weap,
+                "'{leaf}' first-person model must be lit as its own weapon {weap:#x}, got {owner:#x} '{}'",
+                native.tag_name(cache, owner).unwrap_or_default()
+            );
+            let h = head16(native, cache, owner);
+            assert_eq!(le32(&h, 0) & 0xFFFF, 2, "a `weap` is obje object type 2 (weapon)");
+            checked += 1;
+        }
+        assert!(checked >= 2, "forge_halo has at least two of these weapons; checked {checked}");
+    }
+
+    /// An object tag is already the object: `lighting_object_tag` must be the identity for
+    /// everything that is not a bare `render_model`, or every placed Forge piece would change.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn an_object_tag_is_its_own_lighting_owner() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else {
+            eprintln!("fp-light SKIPPED: no forge_halo cache");
+            return;
+        };
+        let sc = scene_over(native.clone(), cache);
+        let native = &*native;
+        let mut n = 0;
+        for cls in OBJECT_TAG_CLASSES {
+            for t in native.tags_by_group(cache, cls).into_iter().take(8) {
+                assert_eq!(sc.lighting_object_tag(t), t, "{cls} {t:#x} is its own lighting owner");
+                n += 1;
+            }
+        }
+        assert!(n > 20, "the cache has object tags to check; saw {n}");
+    }
+}

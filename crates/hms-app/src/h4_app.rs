@@ -146,6 +146,13 @@ pub fn h4_shape_slot_names(shape: u8) -> &'static [&'static str] {
 /// wu -> raw shape value (1/256 wu, clamped to 16 bits).
 pub fn h4_wu_to_shape(wu: f32) -> u16 { shape_wu_to_raw(wu) }
 
+/// Raw 1/256-wu shape units per ONE Forge unit. The game's Forge menu shows boundary sizes in
+/// "Forge units" = world units x 10 (a Forge "100" is 10.0 wu), and the `.mvar` stores world
+/// units x 256, so one Forge unit is 256/10 = 25.6 raw. #forge-shape-units
+pub const RAW_PER_FORGE_UNIT: f32 = 25.6;
+/// Forge-unit value -> raw shape value (what the shape setter writes).
+pub fn h4_forge_to_shape(fu: f32) -> u16 { (fu.max(0.0) * RAW_PER_FORGE_UNIT).round().min(65535.0) as u16 }
+
 /// True when a path is under a `hopper_map_variants` folder. That folder feeds matchmaking
 /// only - MCC's Custom Games list comes from `halo4\map_variants` and the account's
 /// `LocalFiles\<xuid>\Halo4\Map` - so a save there is refused.
@@ -324,6 +331,7 @@ impl App {
         self.loaded_map_id = Some(v.map_id);
         self.variant_retry = None;
         crate::mapcat::save_last_variant(&path.to_string_lossy());
+        self.note_recent_variant(&path); // File ▸ Open recent (main.rs / recent.rs)
         // (camera: gui.rs `h4_drive_load` lands it at the variant's loadout camera / initial
         // spawn through spawncam.rs right after this returns)
         let ms = t0.elapsed().as_millis();
@@ -390,7 +398,7 @@ impl App {
     /// Bounds of the open Halo 4 variant (xmin xmax ymin ymax zmin zmax): the box a save
     /// quantises against - the open variant's, or the user's edited one (the gate and the clamp
     /// must agree with what the encoder writes).
-    fn h4_bounds(&self) -> Option<[f32; 6]> {
+    pub(crate) fn h4_bounds(&self) -> Option<[f32; 6]> {
         if let Some(g) = self.variant_globals.as_ref() { if self.global_edits.bounds != g.bounds { return Some(self.global_edits.bounds); } }
         self.h4_scene.as_ref().and_then(|s| s.bounds())
     }
@@ -440,15 +448,18 @@ impl App {
     /// cap) -> `h4::mvar::save_objects` with the header edits. Refuses a destination inside the
     /// matchmaking folder. Returns (objects written, objects not written).
     pub(crate) fn h4_save_variant_to(&self, dst: &Path) -> Result<(usize, usize), String> {
-        let src = self.current_variant_path.clone().or_else(|| self.new_variant_template.clone()).ok_or("no Halo 4 variant is open")?;
-        if !crate::h4::mvar::is_h4_variant(&src) { return Err(format!("{} is not a Halo 4 variant", src.display())); }
-        // MCC lists custom Halo 4 variants from `halo4\map_variants\*.mvar`
+        let src = self.current_variant_path.clone().or_else(|| self.new_variant_template.clone()).ok_or("no variant is open")?;
+        if !crate::h4::mvar::is_h4_variant(&src) { return Err(format!("{} is not a Halo 4 or Halo 2 Anniversary variant", src.display())); }
+        // MCC lists custom variants from `<game>\map_variants\*.mvar`
         // (MCC-Win64-Shipping.exe sub_14043CE28 -> sub_1404430A0("halo4\\map_variants", "*.mvar"))
-        // and from the signed-in account's `LocalFiles\<xuid>\Halo4\Map`; `hopper_map_variants`
+        // and from the signed-in account's `LocalFiles\<xuid>\<game>\Map`; `hopper_map_variants`
         // feeds matchmaking only, so a file saved there never shows in Custom Games - refuse it.
+        // The folder pair differs per game: Halo 4 uses `halo4` / `Halo4`, H2A `groundhog` /
+        // `Halo2A`, so the message names the one that applies to the file being saved. #h2a-mvar
+        let (game_dir, acct_dir) = crate::h4::mvar::variant_folders(&src);
         if let Some(dir) = dst.parent() {
             if is_hopper_variant_dir(dir) {
-                return Err("hopper_map_variants is the matchmaking folder - the game never lists a file saved there. Save into halo4\\map_variants (Custom Games list) or LocalFiles\\<xuid>\\Halo4\\Map instead".into());
+                return Err(format!("hopper_map_variants is the matchmaking folder - the game never lists a file saved there. Save into {game_dir}\\map_variants (Custom Games list) or LocalFiles\\<xuid>\\{acct_dir}\\Map instead"));
             }
         }
         let (mut list, gate) = self.h4_build_save()?;
@@ -616,7 +627,10 @@ impl App {
             return;
         };
         let mut best: Option<(usize, PathBuf)> = None;
+        // both games' folders: the search filters by map id, and Halo 4 / H2A ids never collide,
+        // so an H2A map finds its own template here instead of "no .mvar for map id N". #h2a-mvar
         let mut dirs = crate::h4::mvar::variant_dirs();
+        dirs.extend(crate::h4::mvar::h2a_variant_dirs());
         if let Some(d) = self.current_variant_path.as_ref().and_then(|p| p.parent()) { dirs.push(d.to_path_buf()); }
         for d in dirs {
             let Ok(rd) = std::fs::read_dir(&d) else { continue };
@@ -629,7 +643,7 @@ impl App {
             }
         }
         let Some((_, tpl)) = best else {
-            self.spawn_status = format!("New variant: no Halo 4 .mvar for map id {map_id} found to use as a template.");
+            self.spawn_status = format!("New variant: no .mvar for map id {map_id} found to use as a template.");
             return;
         };
         let Ok(v) = crate::h4::mvar::parse_h4_variant(&tpl) else {
@@ -656,9 +670,13 @@ impl App {
         // the scene's open variant supplies the bounds / budget / spawn camera
         // that the save gates read; a new variant inherits the template's, otherwise Save As
         // fails with "no Halo 4 variant is open" when the map was loaded without a variant.
+        let template_is_h2a = v.chunk_version == crate::h4::mvar::H2A_MVAR_VERSION;
         if let Some(sc) = self.h4_scene.as_mut() { sc.set_variant(Some((tpl.clone(), v))); }
         self.rebuild_overlays();
-        self.spawn_status = format!("New Halo 4 variant (template {}): place objects, then Save into halo4\\map_variants (the folder MCC's Custom Games list scans).", tpl.file_name().unwrap_or_default().to_string_lossy());
+        let (game_dir, _) = crate::h4::mvar::variant_folders(&tpl);
+        self.spawn_status = format!("New {} variant (template {}): place objects, then Save into {game_dir}\\map_variants (the folder MCC's Custom Games list scans).",
+            if template_is_h2a { "Halo 2 Anniversary" } else { "Halo 4" },
+            tpl.file_name().unwrap_or_default().to_string_lossy());
     }
 
     // -----------------------------------------------------------------------------------------
@@ -722,15 +740,15 @@ impl App {
                 };
                 h.shape_values = m.boundary;
             }
-            "radius" | "width" => { m.boundary[0] = h4_wu_to_shape(num("radius/width")?); h.shape_values = m.boundary; }
-            "length" => { m.boundary[1] = h4_wu_to_shape(num("length")?); h.shape_values = m.boundary; }
+            "radius" | "width" => { m.boundary[0] = h4_forge_to_shape(num("radius/width")?); h.shape_values = m.boundary; }
+            "length" => { m.boundary[1] = h4_forge_to_shape(num("length")?); h.shape_values = m.boundary; }
             "top" => {
                 let k = if m.boundary_shape == 2 { 1 } else { 2 };
-                m.boundary[k] = h4_wu_to_shape(num("top")?); h.shape_values = m.boundary;
+                m.boundary[k] = h4_forge_to_shape(num("top")?); h.shape_values = m.boundary;
             }
             "bottom" => {
                 let k = if m.boundary_shape == 2 { 2 } else { 3 };
-                m.boundary[k] = h4_wu_to_shape(num("bottom")?); h.shape_values = m.boundary;
+                m.boundary[k] = h4_forge_to_shape(num("bottom")?); h.shape_values = m.boundary;
             }
             "b0" | "b1" | "b2" | "b3" => {
                 let k = (field.as_bytes()[1] - b'0') as usize;
@@ -768,7 +786,7 @@ impl App {
         let label_name = |l: Option<u8>| l.map(|i| self.mvar_labels.get(i as usize).cloned().unwrap_or_else(|| format!("#{i}"))).unwrap_or_else(|| "none".into());
         let labels = format!("'{}' (#{}), {}, {}, {}", m.label, m.label_idx as i32, label_name(h.labels_extra[0]), label_name(h.labels_extra[1]), label_name(h.labels_extra[2]));
         let nvals = [0usize, 1, 3, 4][(m.boundary_shape as usize).min(3)];
-        let vals: Vec<String> = (0..nvals).map(|k| format!("{}={} ({:.2} wu)", h4_shape_slot_names(m.boundary_shape)[k], m.boundary[k], m.boundary[k] as f32 / 256.0)).collect();
+        let vals: Vec<String> = (0..nvals).map(|k| format!("{}={:.1}fu ({:.2} wu)", h4_shape_slot_names(m.boundary_shape)[k], m.boundary[k] as f32 / RAW_PER_FORGE_UNIT, m.boundary[k] as f32 / 256.0)).collect();
         let type_data = match &h.ordnance {
             Some(t) => format!("{t:?}"),
             None => match h.object_type {
@@ -884,8 +902,17 @@ impl App {
         for (k, n) in names.iter().enumerate() {
             ui.label(format!("  {n}"));
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut m.boundary[k]).range(0..=65535).speed(8.0));
-                ui.small(format!("= {:.2} wu", m.boundary[k] as f32 / 256.0)).on_hover_text("raw value / 256 (the 1/256 wu scale is consistent with the shipped data; not confirmed in-game)");
+                // Edit in FORGE UNITS - the value the game's Forge menu shows, which is world
+                // units x 10 (so a Forge "100" is 10.0 wu). The .mvar stores the raw 1/256-wu
+                // value, so forge_units = raw / 25.6 and raw = forge_units * 25.6.
+                let mut fu = m.boundary[k] as f32 / RAW_PER_FORGE_UNIT;
+                if ui.add(egui::DragValue::new(&mut fu).range(0.0..=2559.0).speed(1.0).max_decimals(1))
+                    .on_hover_text("Forge units, as in the game's Forge menu (100 = 10.0). Stored as the 1/256 world-unit raw value.")
+                    .changed()
+                {
+                    m.boundary[k] = (fu * RAW_PER_FORGE_UNIT).round().clamp(0.0, 65535.0) as u16;
+                }
+                ui.small(format!("= {:.2} wu", m.boundary[k] as f32 / 256.0));
             });
             ui.end_row();
         }
@@ -1012,9 +1039,11 @@ mod tests {
         assert_eq!(App::h4_set_field(&mut m, "label", "grif_spawn", &mut labels), Ok(true));
         assert_eq!((m.label_idx, m.label.as_str()), (0, "grif_spawn"));
         assert_eq!(App::h4_set_field(&mut m, "shape", "box", &mut labels), Ok(true));
-        assert_eq!(App::h4_set_field(&mut m, "width", "3", &mut labels), Ok(true));
-        assert_eq!(App::h4_set_field(&mut m, "top", "1.5", &mut labels), Ok(true));
-        assert_eq!(m.boundary, [768, 0, 384, 0]);
+        // shape fields are in FORGE UNITS (game Forge menu units = wu x 10 = raw / 25.6):
+        // width 100 fu -> 2560 raw (10.0 wu), top 50 fu -> 1280 raw (5.0 wu). #forge-shape-units
+        assert_eq!(App::h4_set_field(&mut m, "width", "100", &mut labels), Ok(true));
+        assert_eq!(App::h4_set_field(&mut m, "top", "50", &mut labels), Ok(true));
+        assert_eq!(m.boundary, [2560, 0, 1280, 0]);
         assert_eq!(m.h4.as_ref().unwrap().shape_values, m.boundary);
         // `scale` writes the record's 6-bit scale quantum
         assert_eq!(App::h4_set_field(&mut m, "scale", "2", &mut labels), Ok(true));

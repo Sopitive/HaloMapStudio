@@ -101,13 +101,29 @@ pub fn variant_attachments(c: &H4Cache, obje_tag: usize, variant: Option<usize>)
 /// `object_get_marker_by_string_id` failure, which `object_attach_to_marker` treats as
 /// "no marker" rather than guessing another group.
 pub fn marker_frame(c: &H4Cache, mode_tag: usize, sid: u32) -> Option<Mat4> {
+    marker_frame_at(c, mode_tag, sid, 0)
+}
+
+/// #settle Every instance of marker group `sid` (a vehicle's four `wheel` markers), in order.
+pub fn marker_frames_all(c: &H4Cache, mode_tag: usize, sid: u32) -> Vec<Mat4> {
+    let mut out = Vec::new();
+    while let Some(m) = marker_frame_at(c, mode_tag, sid, out.len()) {
+        out.push(m);
+        if out.len() >= 64 { break; }
+    }
+    out
+}
+
+/// Instance `idx` of marker group `sid` (None past the group's last marker).
+fn marker_frame_at(c: &H4Cache, mode_tag: usize, sid: u32, idx: usize) -> Option<Mat4> {
     if sid == 0 || sid == 0xFFFF_FFFF { return None; }
     let d = c.data();
     let mm = c.tag_meta(mode_tag)?;
     let (ng, og) = c.block(mm + OFF_MODE_MARKER_GROUPS)?;
     let gi = (0..ng.min(4096)).find(|&i| d.u32_at(og + i * MARKER_GROUP_ELEM) == sid)?;
     let (nm, om) = c.block(og + gi * MARKER_GROUP_ELEM + 4)?;
-    if nm == 0 { return None; }
+    if idx >= nm { return None; }
+    let om = om + idx * MARKER_ELEM;
     let f = |o: usize| d.f32_at(o);
     let mpos = Vec3::new(f(om + 4), f(om + 8), f(om + 12));
     let mrot = Quat::from_xyzw(f(om + 0x10), f(om + 0x14), f(om + 0x18), f(om + 0x1C));

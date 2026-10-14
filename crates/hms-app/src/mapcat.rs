@@ -23,7 +23,7 @@ const SCENARIO_NAME_MAX: usize = 256;
 // strings sit 8 bytes EARLIER than in a Reach cache. Everything below is verified on all 54
 // files under `halo4/maps`.
 /// Per-title folders under the MCC root that carry a `maps` subfolder, Reach first.
-const GAME_DIRS: [&str; 3] = ["haloreach", "halo4", "groundhog"];
+const GAME_DIRS: [&str; 5] = ["haloreach", "halo4", "groundhog", "halo3", "halo3odst"];
 /// Bytes read from the start of a cache to classify it (covers every field inspected).
 const HEADER_PROBE_LEN: usize = 1280;
 /// The cache magic as it appears ON DISK (little-endian "head").
@@ -38,6 +38,13 @@ const HALO4_BUILD: &str = "Apr  1 2023 17:35:22";
 /// docs/h2a_support_plan.md. `groundhog/maps/ca_forge_skybox03_built.map` is a user/EK-built
 /// cache carrying "Jan  3 2024 10:26:12" instead and is classified by its folder.
 const H2A_BUILD: &str = "Jun 13 2023 20:21:18";
+/// The Halo 3 / Halo 3: ODST MCC build strings. #h3: Halo 3 caches are a Reach-family container
+/// (build string at +160, like Reach), so they are keyed on these exact strings (or the
+/// `halo3`/`halo3odst` folder) - Reach's own +160 build never matches them.
+const HALO3_BUILD: &str = "Dec 21 2023 22:31:37";
+const HALO3ODST_BUILD: &str = "May 16 2023 11:44:41";
+/// Build-string offset in a Reach / Halo 3 cache (Halo 4 / H2A: 152). 32 bytes, null-terminated.
+const REACH_BUILD_OFFSET: usize = 160;
 /// Build-string offset in a Halo 4 cache (Reach: 160). 32 bytes, null-terminated.
 const HALO4_BUILD_OFFSET: usize = 152;
 const HALO4_BUILD_LEN: usize = 32;
@@ -54,6 +61,8 @@ pub enum Game {
     Halo4,
     /// Halo 2 Anniversary (MCC `groundhog`). #h2a
     H2A,
+    /// Halo 3 / Halo 3: ODST (MCC `halo3` / `halo3odst`). #h3 - a Reach-family container.
+    Halo3,
 }
 
 impl Game {
@@ -63,6 +72,7 @@ impl Game {
             Game::Reach => "reach",
             Game::Halo4 => "halo4",
             Game::H2A => "h2a",
+            Game::Halo3 => "halo3",
         }
     }
     /// #map-picker: the title as a person calls it (the map picker's game row).
@@ -71,6 +81,7 @@ impl Game {
             Game::Reach => "Reach",
             Game::Halo4 => "Halo 4",
             Game::H2A => "Halo 2 Anniversary",
+            Game::Halo3 => "Halo 3",
         }
     }
     /// The MCC install sub-folder this title's `maps/` lives in.
@@ -79,6 +90,7 @@ impl Game {
             Game::Reach => "haloreach",
             Game::Halo4 => "halo4",
             Game::H2A => "groundhog",
+            Game::Halo3 => "halo3",
         }
     }
 }
@@ -100,6 +112,11 @@ pub struct MapCandidate {
     pub game: Game,
     /// The Halo 4 header `type` (0 campaign/ff, 1 mp, 3 shared, 4 campaign); None for Reach.
     pub h4_type: Option<i16>,
+    /// MCC map GUID of a Workshop map (`<item>/multiplayer/<map>.json` `MapGuid`), stored in the
+    /// same byte order a Reach .mvar carries its `mcc-map-id` (the .NET `Guid` layout: the first
+    /// three fields little-endian). Modded maps have NO numeric map id (their .mvar says
+    /// 0xFFFFFFFE), so this is the only key that routes a variant to its modded base map.
+    pub mcc_guid: Option<[u8; 16]>,
 }
 
 /// Classification is by FOLDER. Everything in the game's own `haloreach\maps` folder is a
@@ -215,6 +232,7 @@ impl MapCandidate {
             Game::Reach => base,
             Game::Halo4 => format!("{base} [Halo 4]"),
             Game::H2A => format!("{base} [Halo 2A]"),
+            Game::Halo3 => format!("{base} [Halo 3]"),
         }
     }
 }
@@ -298,7 +316,7 @@ pub fn enumerate() -> Vec<MapCandidate> {
         let fa = a.label().to_lowercase().starts_with("forge");
         let fb = b.label().to_lowercase().starts_with("forge");
         // game group first (Reach < Halo 4 < Halo 2A), then forge-first, then alphabetical
-        let grp = |g: Game| match g { Game::Reach => 0u8, Game::Halo4 => 1, Game::H2A => 2 };
+        let grp = |g: Game| match g { Game::Reach => 0u8, Game::Halo4 => 1, Game::H2A => 2, Game::Halo3 => 3 };
         let ga = grp(a.game);
         let gb = grp(b.game);
         ga.cmp(&gb)
@@ -393,9 +411,13 @@ fn maps_dirs_under(root: &Path) -> Vec<PathBuf> {
         root.join("haloreach").join("maps"),
         root.join("halo4").join("maps"),
         root.join("groundhog").join("maps"),
+        root.join("halo3").join("maps"),
+        root.join("halo3odst").join("maps"),
         root.join("Content").join("haloreach").join("maps"),
         root.join("Content").join("halo4").join("maps"),
         root.join("Content").join("groundhog").join("maps"),
+        root.join("Content").join("halo3").join("maps"),
+        root.join("Content").join("halo3odst").join("maps"),
         root.join("maps"), // a `haloreach` (or `halo4`) folder was passed
         root.to_path_buf(), // a `maps` folder was passed
     ];
@@ -410,6 +432,12 @@ fn maps_dirs_under(root: &Path) -> Vec<PathBuf> {
 
 /// Existing fixed-drive roots (C:..Z:). A/B are skipped (legacy floppies). Cheap: a non-existent
 /// drive letter fails `is_dir` immediately.
+///
+/// On Linux a drive letter never exists, so this used to return EMPTY and every caller that
+/// walks it -- the Xbox app / Microsoft Store layouts in `xbox_maps_folders` -- found nothing at
+/// all. A Windows disk mounted on a Linux desktop carries exactly those layouts, so the mount
+/// points stand in for drive roots: `/mnt/<vol>`, `/media/<vol>`, and `/run/media/<user>/<vol>`,
+/// which is where udisks (KDE, GNOME) actually mounts a volume.
 fn fixed_drive_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     for letter in b'C'..=b'Z' {
@@ -418,11 +446,23 @@ fn fixed_drive_roots() -> Vec<PathBuf> {
             roots.push(root);
         }
     }
+    for mnt in ["/mnt", "/media", "/run/media"] {
+        let Ok(rd) = std::fs::read_dir(mnt) else { continue };
+        for vol in rd.flatten() {
+            let p = vol.path();
+            if !p.is_dir() { continue }
+            // the volume itself, and one level deeper for udisks' /run/media/<user>/<vol>
+            if let Ok(inner) = std::fs::read_dir(&p) {
+                roots.extend(inner.flatten().map(|e| e.path()).filter(|q| q.is_dir()));
+            }
+            roots.push(p);
+        }
+    }
     roots
 }
 
 /// Steam root + libraries parsed from libraryfolders.vdf.
-fn steam_library_folders() -> Vec<PathBuf> {
+pub(crate) fn steam_library_folders() -> Vec<PathBuf> {
     let mut libs = Vec::new();
     let Some(root) = steam_install_path() else { return libs };
     let root = PathBuf::from(root);
@@ -587,11 +627,20 @@ fn classify_header(buf: &[u8], path: &Path) -> (Game, Option<i16>) {
         return (Game::Reach, None);
     }
     let build = printable_cstr(buf, HALO4_BUILD_OFFSET, HALO4_BUILD_LEN);
+    // #h3: Halo 3 caches carry their build at +160 (Reach-family layout), not +152.
+    let build160 = printable_cstr(buf, REACH_BUILD_OFFSET, HALO4_BUILD_LEN);
     let in_folder = |name: &str| path.components().any(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(name));
+    // #h3: Halo 3 / ODST use the Reach-family container - keyed on the build string at +160 or a
+    // `halo3`/`halo3odst` folder. Checked FIRST (before the +152 checks) so these caches never
+    // fall through to Reach.
+    let game = if build160.as_deref() == Some(HALO3_BUILD) || build160.as_deref() == Some(HALO3ODST_BUILD)
+        || in_folder("halo3") || in_folder("halo3odst")
+    {
+        Game::Halo3
     // #h2a: groundhog caches use the Halo 4 header layout, so they are recognised the same way -
     // by the build string at +152, or by living in a `groundhog` folder (EK-built caches carry a
     // different build string).
-    let game = if build.as_deref() == Some(H2A_BUILD) || in_folder("groundhog") {
+    } else if build.as_deref() == Some(H2A_BUILD) || in_folder("groundhog") {
         Game::H2A
     } else if build.as_deref() == Some(HALO4_BUILD)
         || in_folder("halo4")
@@ -636,6 +685,8 @@ fn read_candidate(path: &Path) -> Option<MapCandidate> {
         Game::Reach => printable_cstr(&probe, SCENARIO_NAME_OFFSET as usize, SCENARIO_NAME_MAX),
         // Halo 4 and Halo 2 Anniversary share the shifted header layout
         Game::Halo4 | Game::H2A => printable_cstr(&probe, HALO4_SCENARIO_OFFSET, SCENARIO_NAME_MAX),
+        // #h3: Halo 3 is a Reach-family container - scenario path at 0xE0
+        Game::Halo3 => printable_cstr(&probe, 0xE0, SCENARIO_NAME_MAX),
     }
     .unwrap_or_default();
     let stem = if !scenario_name.is_empty() {
@@ -650,7 +701,8 @@ fn read_candidate(path: &Path) -> Option<MapCandidate> {
 
     let modded = is_modded_map(path);
     let map_id = read_map_id(path);
-    Some(MapCandidate { path: path.to_path_buf(), file_name, scenario_name, stem, modded, map_id, game, h4_type })
+    let mcc_guid = if modded { workshop_map_guid(path) } else { None };
+    Some(MapCandidate { path: path.to_path_buf(), file_name, scenario_name, stem, modded, map_id, game, h4_type, mcc_guid })
 }
 
 /// Forge map-variant folders for every detected MCC install — the natural default
@@ -663,12 +715,14 @@ pub fn variant_dirs() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for maps in probable_maps_folders() {
         let Some(haloreach) = maps.parent() else { continue };
-        // `halo4\map_variants` holds Halo 4 .mvar files (chunk v50/v51: see `h4_variant_dirs`) and
-        // `groundhog\map_variants` holds Halo 2 Anniversary ones (chunk v52, not yet decoded) -
-        // neither is a Reach variant, so keep both out of the Reach list. #h2a
+        // `halo4\map_variants` holds Halo 4 .mvar files (chunk v50/v51: see `h4_variant_dirs`),
+        // `groundhog\map_variants` holds Halo 2 Anniversary ones (chunk v52) and
+        // `halo3`/`halo3odst\map_variants` hold Halo 3 ones (a different BLF object record) - none
+        // is a Reach variant, so keep them all out of the Reach list. #h2a #h3
         if haloreach.file_name().map_or(false, |n| {
             let n = n.to_string_lossy();
             n.eq_ignore_ascii_case("halo4") || n.eq_ignore_ascii_case("groundhog")
+                || n.eq_ignore_ascii_case("halo3") || n.eq_ignore_ascii_case("halo3odst")
         }) {
             continue;
         }
@@ -682,20 +736,45 @@ pub fn variant_dirs() -> Vec<PathBuf> {
     out
 }
 
-/// The Halo 4 variant folders (`<MCC>/halo4/map_variants` + `hopper_map_variants`) of
-/// every detected install - the Halo 4 counterpart of `variant_dirs`, kept separate because
-/// the Reach list is what the variant browser keys on.
-fn h4_variant_dirs() -> Vec<PathBuf> {
+/// The `map_variants` + `hopper_map_variants` folders under a given game sub-folder
+/// (`halo4` / `groundhog`) of every detected install.
+fn game_variant_dirs(folder: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for maps in probable_maps_folders() {
-        let Some(halo4) = maps.parent() else { continue };
-        if !halo4.file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("halo4")) { continue; }
+        let Some(gf) = maps.parent() else { continue };
+        if !gf.file_name().map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case(folder)) { continue; }
         for sub in ["map_variants", "hopper_map_variants"] {
-            let d = halo4.join(sub);
+            let d = gf.join(sub);
             if d.is_dir() && !out.contains(&d) { out.push(d); }
         }
     }
     out
+}
+
+/// The Halo 4 variant folders (`<MCC>/halo4/map_variants` + `hopper_map_variants`) of
+/// every detected install - the Halo 4 counterpart of `variant_dirs`, kept separate because
+/// the Reach list is what the variant browser keys on.
+fn h4_variant_dirs() -> Vec<PathBuf> { game_variant_dirs("halo4") }
+
+/// The Halo 2 Anniversary (`groundhog`) variant folders. #h2a
+fn h2a_variant_dirs() -> Vec<PathBuf> { game_variant_dirs("groundhog") }
+
+/// The Halo 3 (`halo3`) variant folders: the 320 shipped `hopper_map_variants` + the 13
+/// `map_variants` (ODST ships no map variants). Opening one routes to the Halo 3 loader
+/// (`import_mvar` -> `h3_import_mvar`). #h3
+pub(crate) fn h3_variant_dirs() -> Vec<PathBuf> { game_variant_dirs("halo3") }
+
+/// #xgame The `map_variants` + `hopper_map_variants` folders of ANY title, keyed on the same
+/// [`Game`] the rest of the app uses. Reach keeps its own (`variant_dirs`); the other three are
+/// the per-folder walk. Halo 2 Anniversary's live under `groundhog`, NOT `halo4` - using the
+/// Halo 4 folders for H2A finds no templates at all.
+pub fn variant_dirs_of(game: Game) -> Vec<PathBuf> {
+    match game {
+        Game::Reach => variant_dirs(),
+        Game::Halo4 => game_variant_dirs("halo4"),
+        Game::H2A => game_variant_dirs("groundhog"),
+        Game::Halo3 => game_variant_dirs("halo3"),
+    }
 }
 
 /// MCC install roots (`<MCC>` of `<MCC>/haloreach/maps` and `<MCC>/halo4/maps`), for
@@ -735,6 +814,77 @@ pub fn read_map_id(map_path: &Path) -> Option<u32> {
     let b = data.get(p..p + 4)?;
     let id = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
     if id == 0 || id == 0xFFFF_FFFF { None } else { Some(id) }
+}
+
+/// The candidate a Reach .mvar targets: by MCC map GUID first (a variant saved on a Workshop
+/// map carries `map_id` 0xFFFFFFFE and ONLY the GUID identifies its base map), then by numeric
+/// map id. Halo 4 / H2A caches are never returned (their variants route elsewhere).
+pub fn find_map_for_variant(cands: &[MapCandidate], map_id: u32, mcc_guid: Option<[u8; 16]>) -> Option<usize> {
+    let reach = |c: &MapCandidate| c.game == Game::Reach;
+    if let Some(g) = mcc_guid.filter(|g| g.iter().any(|b| *b != 0)) {
+        if let Some(i) = cands.iter().position(|c| reach(c) && c.mcc_guid == Some(g)) {
+            return Some(i);
+        }
+    }
+    if crate::mvar::is_unassigned_map_id(map_id) { return None; }
+    cands.iter().position(|c| reach(c) && c.map_id == Some(map_id))
+}
+
+/// Parse a textual GUID (`8a7098b6-b84a-4ceb-9de9-d37cbc4f6d17`, braces/case ignored) into the
+/// byte order a Reach .mvar stores its `mcc-map-id` in: the .NET `Guid` memory layout, i.e. the
+/// first three groups little-endian and the last two as written. Verified against the RCC
+/// "Outskirts" variant, whose stream holds `MapGuid` of `forge_halo_modded.json` in exactly
+/// this order.
+pub fn parse_guid_le(text: &str) -> Option<[u8; 16]> {
+    let hex: String = text.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 32 { return None; }
+    let mut raw = [0u8; 16];
+    for (i, b) in raw.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    let mut out = raw;
+    out[0..4].reverse();
+    out[4..6].reverse();
+    out[6..8].reverse();
+    Some(out)
+}
+
+/// The MCC map GUID a Workshop map is registered under: the item's `multiplayer/*.json`
+/// descriptor whose `ScenarioFile` ends in this map's file stem (e.g.
+/// `levels/multi/forge_halo/forge_halo_modded` for `forge_halo_modded.map`) carries the
+/// `MapGuid` that a .mvar saved on the map stores as its `mcc-map-id`. None for stock maps
+/// (they route by numeric map id) and for items without a descriptor.
+pub fn workshop_map_guid(map_path: &Path) -> Option<[u8; 16]> {
+    let item = workshop_item_dir(map_path)?;
+    let stem = map_path.file_stem()?.to_string_lossy().to_lowercase();
+    let rd = std::fs::read_dir(item.join("multiplayer")).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.extension().map_or(false, |x| x.eq_ignore_ascii_case("json")) { continue; }
+        let Ok(text) = std::fs::read_to_string(&p) else { continue };
+        let Some(scen) = json_string_field(&text, "ScenarioFile") else { continue };
+        let scen_stem = scen.replace('\\', "/");
+        let scen_stem = scen_stem.rsplit('/').next().unwrap_or(&scen_stem).to_lowercase();
+        if scen_stem != stem { continue; }
+        if let Some(g) = json_string_field(&text, "MapGuid").and_then(|g| parse_guid_le(&g)) {
+            return Some(g);
+        }
+    }
+    None
+}
+
+/// The string value of a top-level-ish `"key": "value"` pair (first occurrence, case-insensitive
+/// key); minimal, dependency-free, enough for the MCC map descriptors.
+fn json_string_field(text: &str, key: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let k = lower.find(&format!("\"{}\"", key.to_lowercase()))?;
+    let rest = &text[k + key.len() + 2..];
+    let colon = rest.find(':')?;
+    let rest = &rest[colon + 1..];
+    let q = rest.find('"')?;
+    let rest = &rest[q + 1..];
+    let e = rest.find('"')?;
+    Some(rest[..e].to_string())
 }
 
 /// Locate a map's `.mapinfo` companion: the sibling `info\` folder (stock layout) first,
@@ -789,7 +939,19 @@ pub fn quick_variant_dirs() -> Vec<(String, PathBuf)> {
         let label = if name == "hopper_map_variants" { "[Halo 4] hopper_map_variants" } else { "[Halo 4] map_variants" };
         push(label.to_string(), d);
     }
-    // (the per-account `MCC\LocalFiles\<XUID>\Halo4\Map` folder is picked up by the loop below,
+    // The Halo 2 Anniversary (groundhog) game folders. #h2a
+    for d in h2a_variant_dirs() {
+        let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let label = if name == "hopper_map_variants" { "[Halo 2A] hopper_map_variants" } else { "[Halo 2A] map_variants" };
+        push(label.to_string(), d);
+    }
+    // The Halo 3 game folders. #h3
+    for d in h3_variant_dirs() {
+        let name = d.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let label = if name == "hopper_map_variants" { "[Halo 3] hopper_map_variants" } else { "[Halo 3] map_variants" };
+        push(label.to_string(), d);
+    }
+    // (the per-account `MCC\LocalFiles\<XUID>\Halo4\Map` / `Halo3\Map` folders are picked up by the loop below,
     // which lists every game's save folder that holds a .mvar)
     for root in mcc_localfiles_roots() {
         // `<profile>/AppData/LocalLow/MCC/LocalFiles` — name the profile, because a machine can
@@ -821,6 +983,36 @@ pub fn quick_variant_dirs() -> Vec<(String, PathBuf)> {
         }
     }
     out
+}
+
+/// The quick-access folders GROUPED BY GAME for the Open / Save dialog sidebar, in the order
+/// Reach, Halo 3, Halo 4, Halo 2 Anniversary: each game's `map_variants` /
+/// `hopper_map_variants` and the per-account MCC save folders (`LocalFiles\<XUID>\<Game>\Map`,
+/// keyed by the game folder name MCC uses: HaloReach / Halo3 / Halo4 / Halo2A). The folder labels
+/// lose their game prefix (the header carries it). Folders of a game MCC has no save folder for
+/// simply have no such rows. #dialogs
+pub fn quick_variant_groups() -> Vec<(Game, Vec<(String, PathBuf)>)> {
+    let mut groups: Vec<(Game, Vec<(String, PathBuf)>)> = [Game::Reach, Game::Halo3, Game::Halo4, Game::H2A].iter().map(|g| (*g, Vec::new())).collect();
+    let game_of = |label: &str| -> Option<Game> {
+        let l = label.to_ascii_lowercase();
+        if l.starts_with("[reach]") || l.contains("haloreach") { Some(Game::Reach) }
+        else if l.starts_with("[halo 3]") || l.contains("halo3") { Some(Game::Halo3) }
+        else if l.starts_with("[halo 4]") || l.contains("halo4") { Some(Game::Halo4) }
+        else if l.starts_with("[halo 2a]") || l.contains("halo2a") || l.contains("groundhog") { Some(Game::H2A) }
+        else { None }
+    };
+    for (label, path) in quick_variant_dirs() {
+        let Some(g) = game_of(&label) else { continue };
+        // "[Halo 3] hopper_map_variants" -> "hopper_map_variants"; "[save] Halo3 · profile" -> "saved (profile)"
+        let short = if let Some(rest) = label.strip_prefix('[').and_then(|r| r.split_once("] ")).map(|(_, r)| r.to_string()) {
+            if label.starts_with("[save]") {
+                match rest.split_once(" \u{b7} ") { Some((_, profile)) => format!("saved \u{b7} {profile}"), None => "saved".to_string() }
+            } else { rest }
+        } else { label.clone() };
+        if let Some((_, v)) = groups.iter_mut().find(|(gg, _)| *gg == g) { v.push((short, path)); }
+    }
+    groups.retain(|(_, v)| !v.is_empty());
+    groups
 }
 
 /// Does this directory hold at least one .mvar? Shallow, and stops at the first hit.
@@ -864,21 +1056,82 @@ pub(crate) fn mcc_localfiles_roots() -> Vec<PathBuf> {
             }
         }
     }
-    // A mounted Windows install: /mnt/*/Users/<name>.
+    // A mounted Windows install: /mnt/<vol>/Users/<name>, and ONE LEVEL DEEPER for the
+    // desktop auto-mounters -- udisks (KDE, GNOME) mounts a volume at
+    // /run/media/<user>/<vol>, not /run/media/<vol>, so scanning only the first level finds
+    // nothing on an ordinary Linux desktop. The saved-film scan had this exact bug and missed
+    // most of this machine's clips until it was widened the same way; here it hid a whole
+    // Windows profile's worth of game-saved variants.
     for mnt in ["/mnt", "/media", "/run/media"] {
         let Ok(rd) = std::fs::read_dir(mnt) else { continue };
         for vol in rd.flatten() {
-            let users = vol.path().join("Users");
-            let Ok(u) = std::fs::read_dir(&users) else { continue };
-            for e in u.flatten() {
-                if e.path().is_dir() {
-                    out.push(tail(e.path()));
+            let p = vol.path();
+            let mut roots = vec![p.clone()];
+            if let Ok(inner) = std::fs::read_dir(&p) {
+                roots.extend(inner.flatten().map(|e| e.path()).filter(|q| q.is_dir()));
+            }
+            for root in roots {
+                let Ok(u) = std::fs::read_dir(root.join("Users")) else { continue };
+                for e in u.flatten() {
+                    if e.path().is_dir() {
+                        out.push(tail(e.path()));
+                    }
                 }
             }
         }
     }
     out.retain(|p| p.is_dir());
     out
+}
+
+/// #shared-dirs Where the shared resource caches (`shared.map`, `campaign.map`, ...) of `map_path`
+/// live when they are not beside it. The cache's layout table names them by bare filename and the
+/// game resolves that against a `haloreach\maps` folder; a Steam Workshop item keeps its maps in
+/// `<item>\maps\`. Measured on the installed items (2026-09-24): an item that ships its OWN
+/// `<item>\haloreach\maps\shared.map` has its maps' page tables built against THAT file (the
+/// stock one inflates short: `ReadRes: segOff>=got`), while an item without one reads the stock
+/// `haloreach\maps\shared.map` cleanly -- the manifest's `HasSharedFiles` flag is false on all of
+/// them and is NOT the discriminator. Order: the item's own folder when it exists, then every
+/// detected stock `haloreach\maps`. The native always tries the map's own folder before this
+/// list. Empty for a stock map.
+pub fn shared_cache_dirs(map_path: &Path) -> Vec<PathBuf> {
+    let Some(item) = workshop_item_dir(map_path) else { return Vec::new() };
+    let mut out = vec![item.join("haloreach").join("maps")];
+    out.extend(probable_maps_folders().into_iter().filter(|m| {
+        m.parent().and_then(|p| p.file_name()).map_or(false, |n| n.to_string_lossy().eq_ignore_ascii_case("haloreach"))
+    }));
+    out.retain(|d| d.is_dir());
+    out.dedup();
+    out
+}
+
+#[cfg(test)]
+mod shared_dirs_tests {
+    use super::*;
+
+    /// A stock map has no fallback list; a Workshop map's list starts with the item's own
+    /// `haloreach\maps` when it exists, followed by the stock `haloreach\maps` folders.
+    #[test]
+    fn workshop_items_prefer_their_own_shared_caches_then_stock() {
+        let tmp = std::env::temp_dir().join(format!("hms_shared_dirs_{}", std::process::id()));
+        let item = tmp.join("steamapps").join("workshop").join("content").join("976730").join("123");
+        let own = item.join("haloreach").join("maps");
+        std::fs::create_dir_all(item.join("maps")).unwrap();
+        let map = item.join("maps").join("x.map");
+        std::fs::write(&map, b"").unwrap();
+
+        // no own shared caches: only the stock folders (all of them end in haloreach/maps)
+        let dirs = shared_cache_dirs(&map);
+        assert!(!dirs.contains(&own));
+        assert!(dirs.iter().all(|d| d.ends_with("haloreach/maps") || d.ends_with("haloreach\\maps")), "{dirs:?}");
+
+        std::fs::create_dir_all(&own).unwrap();
+        let dirs = shared_cache_dirs(&map);
+        assert_eq!(dirs.first(), Some(&own), "an item that ships shared caches is tried first: {dirs:?}");
+
+        assert!(shared_cache_dirs(Path::new("/games/Halo The Master Chief Collection/haloreach/maps/forge_halo.map")).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 #[cfg(test)]
@@ -897,6 +1150,78 @@ mod quick_dirs_tests {
 
 // Cache classification tests. Each test returns early (with a note) when the MCC folder
 // it needs is not on this machine, so CI without the game still passes.
+#[cfg(test)]
+mod guid_route_tests {
+    use super::*;
+
+    #[test]
+    fn guid_parses_into_the_mvar_byte_order() {
+        // .NET Guid layout: first three groups little-endian, last two as written.
+        let g = parse_guid_le("8a7098b6-b84a-4ceb-9de9-d37cbc4f6d17").unwrap();
+        assert_eq!(g, [0xb6, 0x98, 0x70, 0x8a, 0x4a, 0xb8, 0xeb, 0x4c, 0x9d, 0xe9, 0xd3, 0x7c, 0xbc, 0x4f, 0x6d, 0x17]);
+        assert_eq!(parse_guid_le("{8A7098B6-B84A-4CEB-9DE9-D37CBC4F6D17}").unwrap(), g);
+        assert!(parse_guid_le("8a7098b6").is_none());
+    }
+
+    #[test]
+    fn json_field_reads_the_descriptor() {
+        let t = "{\n\t\"MapGuid\": \"8a7098b6-b84a-4ceb-9de9-d37cbc4f6d17\",\n\t\"ScenarioFile\": \"levels/multi/forge_halo/forge_halo_modded\",\n}";
+        assert_eq!(json_string_field(t, "ScenarioFile").as_deref(), Some("levels/multi/forge_halo/forge_halo_modded"));
+        assert_eq!(json_string_field(t, "mapguid").as_deref(), Some("8a7098b6-b84a-4ceb-9de9-d37cbc4f6d17"));
+    }
+
+    fn cand(game: Game, map_id: Option<u32>, guid: Option<[u8; 16]>) -> MapCandidate {
+        MapCandidate {
+            path: PathBuf::from("x.map"), file_name: "x.map".into(), scenario_name: String::new(), stem: "x".into(),
+            modded: guid.is_some(), map_id, game, h4_type: None, mcc_guid: guid,
+        }
+    }
+
+    #[test]
+    fn variant_routes_by_guid_before_map_id_and_never_by_the_unassigned_id() {
+        let g = parse_guid_le("8a7098b6-b84a-4ceb-9de9-d37cbc4f6d17").unwrap();
+        let cands = vec![
+            cand(Game::Reach, Some(3006), None),        // stock Forge World
+            cand(Game::Halo4, Some(3006), Some(g)),     // a Halo 4 cache must never win
+            cand(Game::Reach, None, Some(g)),           // the Workshop forge_halo_modded
+        ];
+        // modded variant: map_id -2, GUID set -> the Workshop map
+        assert_eq!(find_map_for_variant(&cands, 0xFFFF_FFFE, Some(g)), Some(2));
+        // stock variant (no GUID or an unknown one) -> by id
+        assert_eq!(find_map_for_variant(&cands, 3006, None), Some(0));
+        assert_eq!(find_map_for_variant(&cands, 3006, Some([9u8; 16])), Some(0));
+        // an unassigned id with no GUID match cannot fall back onto some other map
+        assert_eq!(find_map_for_variant(&cands, 0xFFFF_FFFE, None), None);
+        assert_eq!(find_map_for_variant(&cands, 0xFFFF_FFFE, Some([9u8; 16])), None);
+    }
+
+    /// The real RCC Workshop item (when installed): forge_halo_modded.map is registered under the
+    /// GUID its descriptor states, and the downloaded "RCC Outskirts" variant carries that GUID.
+    #[test]
+    fn rcc_forge_world_modded_resolves_from_its_descriptor() {
+        let map = Path::new("/mnt/games/SteamLibrary/steamapps/workshop/content/976730/3590252347/maps/forge_halo_modded.map");
+        if !map.exists() { eprintln!("skip: RCC workshop item not installed"); return; }
+        let g = workshop_map_guid(map).expect("descriptor GUID");
+        assert_eq!(g, parse_guid_le("8a7098b6-b84a-4ceb-9de9-d37cbc4f6d17").unwrap());
+        let c = read_candidate(map).expect("candidate");
+        assert!(c.modded);
+        assert_eq!(c.mcc_guid, Some(g));
+        assert_eq!(c.map_id, None, "workshop maps carry no numeric id");
+        // The downloaded companion variant, under whoever's Downloads this is. Skipped when it
+        // is not there, like the workshop item above — a hard-coded home directory in a
+        // published source tree is nobody else's path.
+        let mvar = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join("Downloads/b4f8528d-0165-4698-9231-a152a12b7e48.mvar");
+        if mvar.exists() {
+            let v = crate::mvar::parse_variant(&mvar).expect("parse");
+            assert_eq!(v.map_id, 0xFFFF_FFFE);
+            assert_eq!(v.mcc_map_id, Some(g));
+            let cands = vec![c];
+            assert_eq!(find_map_for_variant(&cands, v.map_id, v.mcc_map_id), Some(0));
+        }
+    }
+}
+
 #[cfg(test)]
 mod h4_tests {
     use super::*;

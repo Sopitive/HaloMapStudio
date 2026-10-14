@@ -10,6 +10,7 @@
 #                   MCC (Windows, optional `injection` feature of hms-app)
 #   * hms-inject  - inject / evict that DLL into a running MCC (Windows, optional)
 #   * hms-mcp     - Model Context Protocol bridge to hms-app's script server
+#   * hms-sound   - FMOD FSB5 sound banks (read-only; no decoder, no output)
 # =============================================================================
 
 [workspace]
@@ -21,10 +22,11 @@ members = [
     "crates/hms-render",
     "crates/hms-app",
     "crates/hms-mcp",
+    "crates/hms-sound",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.4.0"
 edition = "2021"
 authors = ["Sopitive"]
 license = "PolyForm-Noncommercial-1.0.0"
@@ -38,6 +40,19 @@ bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.29", features = ["bytemuck"] }
 libloading = "0.8"
 memmap2 = "0.9"
+
+# Audio (hms-sound only).
+#
+# `lewton` is a pure-Rust Vorbis decoder (MIT OR Apache-2.0). It is here rather
+# than libvorbis because Reach's banks need the RAW-PACKET API — an FSB5 bank
+# holds no Ogg framing and no setup header — and because it needs no C
+# toolchain. Its own dependencies are `byteorder` and `tinyvec`; the optional
+# `ogg`, `futures` and `tokio-io` features stay off.
+#
+# `cpal` is the output device. It is opened LAZILY and failing to open it must
+# never stop HMS running: see `hms_sound::out`.
+lewton = { version = "0.10", default-features = false }
+cpal = "0.15"
 
 # Win32 surface used by hms-inject / hms-ipc.
 [workspace.dependencies.windows]
@@ -61,3 +76,39 @@ codegen-units = 1
 # A fast-ish dev profile — wgpu/egui are painful to run unoptimized.
 [profile.dev.package."*"]
 opt-level = 2
+
+# A fast-iteration profile for the inner edit/test loop. `release` keeps
+# `codegen-units = 1` because that is what ships, and that serialises the whole
+# 90k-line hms-app crate through ONE codegen unit, so a one-line edit costs
+# minutes on a 32-core machine. `quick` is the same optimisation level with the
+# parallelism put back:
+#
+#   cargo test --profile quick -p hms-app <filter>
+#   cargo build --profile quick -p hms-app
+#
+# Use it for development and tests; never for a release build or a timing
+# measurement that has to match what users run (use `--release` for those).
+#
+# TWO SETTINGS HERE ARE LOAD-BEARING. Both were tried and both broke the app
+# while every test still passed, so neither may be "optimised" back:
+#
+#   lto = "thin"       MUST NOT be `false`. With LTO off the GUI allocates
+#                      without bound during a map load — measured 30 GB in 23 s
+#                      against 2.4 GB for the identical source with thin LTO —
+#                      until the OS kills it (and, on a machine whose swap is
+#                      zram, often the desktop session with it). The runaway is
+#                      in the wgpu render-bundle path (`execute_bundles` ->
+#                      `register_init_action`), which only stays bounded when it
+#                      is optimised across crates. Saves ~1 min of build time
+#                      and costs the app.
+#   incremental = false MUST NOT be `true`. Incremental builds in ~5 s but the
+#                      resulting binary SEGFAULTS on startup (in the rayon tag
+#                      predecode of the auto-reopened map) while all tests pass.
+#
+# Tests passing is NOT evidence this profile produces a working binary. Launch
+# the GUI once after changing anything here.
+[profile.quick]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+incremental = false

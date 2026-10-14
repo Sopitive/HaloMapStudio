@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html" class="cur" aria-current="page">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -68,6 +69,9 @@
 <h2>My variant opens but shows "N unresolved" or "0/N objects resolved"</h2>
 <p>Each object in a variant refers to an entry of the base map's Forge palette. If the variant was made for a different map (or a modded map with a different palette) those references cannot be matched. The app loads the base map automatically by the map id stored in the file; if that map is not installed the variant is drawn on whatever is loaded and most objects will be unresolved. Unresolved objects are kept in the file on save; they are simply not displayed. <code>hms_mvar_diag.txt</code> next to the executable and <code>hms-app --resolve-mvar &lt;map&gt; &lt;file.mvar&gt;</code> show the details.</p>
 
+<h2>An "Update X.Y.Z available" pill appeared next to Help</h2>
+<p>A newer release is on GitHub. It is only a notice: click it to read the notes and download, right-click it to hide it for that version, or turn the daily check off under <em>Settings ▸ Updates</em>. Installing restarts the app and restores your session, unsaved variant edits included. Details in <a href="getting-started.html#updating">Updating</a>.</p>
+
 <h2>Does Save make a backup?</h2>
 <p><strong>No.</strong> <em>File ▸ Save</em> overwrites the open <code>.mvar</code> in place. Use <em>Save As…</em> or copy the file first. Never save over a variant while MCC has it open. See <a href="maps-and-variants.html#save">Saving</a> for exactly what is rewritten.</p>
 
@@ -99,7 +103,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

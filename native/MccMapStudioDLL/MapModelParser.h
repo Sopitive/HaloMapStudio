@@ -112,6 +112,15 @@ __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionGeometry(
     uint8_t** outVertexBytes, uint32_t* outVertexBytesLen,
     uint8_t** outIndexBytes,  uint32_t* outIndexBytesLen);
 
+// #instmesh-space Per emitted triangle, the raw-strip window index that produced
+// it. The tag states `s_part`/`s_subpart` ranges in RAW STRIP space while the
+// call above returns the EXPANDED LIST, so this is what translates one into the
+// other. A raw range [a, b) owns the triangles whose origin is in [a, b-2).
+// Caller frees with ZH_MMP_Free.
+__declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionTriangleOrigins(
+    ZH_ModelHandle h, uint32_t sectionIndex,
+    uint32_t** outOrigin, uint32_t* outOriginCount);
+
 // Optional: surface UV channel separately so the viewer can build textured
 // MeshGeometry3D without re-walking the vertex stream. Returns null if the
 // section's format has no UVs.
@@ -124,6 +133,15 @@ __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionUVs(
 __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionNormals(
     ZH_ModelHandle h, uint32_t sectionIndex,
     float** outNrmFloat3, uint32_t* outNrmFloatCount);
+
+// SKIN-1: per-vertex bone palette for a SKINNED section (vertex format 0x02 /
+// 0x06). 8 bytes per vertex: blendindices u8[4] (indices into this mesh's
+// `per mesh node map` byte run in the render_model tag meta, render_geometry
+// +0x4C), then blendweight u8[4] (/255). Returns false with no allocation when
+// the section is not skinned. Caller frees with ZH_MMP_FreeBuffer.
+__declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionBlendData(
+    ZH_ModelHandle h, uint32_t sectionIndex,
+    uint8_t** outBlendBytes, uint32_t* outBlendBytesLen);
 
 // Submesh + material lookups so the viewer can build per-segment materials.
 __declspec(dllexport) uint32_t __stdcall ZH_MMP_GetSubmeshCount(ZH_ModelHandle h);

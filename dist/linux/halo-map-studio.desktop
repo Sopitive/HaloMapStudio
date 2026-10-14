@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Halo Map Studio
+Comment=Halo: Reach / Halo 4 / H2A map viewer and Forge editor
+Exec=@EXEC@ %f
+Icon=halo-map-studio
+Terminal=false
+Categories=Graphics;3DGraphics;Game;
+StartupWMClass=halo-map-studio
+MimeType=application/x-mvar;

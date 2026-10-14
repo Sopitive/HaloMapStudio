@@ -113,6 +113,7 @@ pub fn headless_run(map_path: &str, out: &str, w: u32, h: u32) -> Result<()> {
                 Lane::AlphaTest => renderer.append_alphatest_meshes(v),
                 Lane::Blend => renderer.append_blend_meshes(v),
                 Lane::Additive => renderer.append_additive_meshes(v),
+                Lane::Water => renderer.append_water_meshes(v),
                 Lane::Sky => renderer.set_sky_meshes(v.into_iter().map(|m| { let b = m.blend_mode(); let k = m.centroid()[0]; (m, b, k) }).collect()),
             }
         }
@@ -159,11 +160,11 @@ pub fn headless_run(map_path: &str, out: &str, w: u32, h: u32) -> Result<()> {
         }
         // The GUI's post-load camera (spawncam.rs) over the same scene + soup
         if spawncam_wanted {
-            spawn_cam = super::spawncam::spawn_camera(&es);
+            spawn_cam = super::spawncam::spawn_camera_framed(&es, Some(stats.frame_bounds()));
             match spawn_cam {
                 Some(c) => logln!("HMS_SPAWNCAM: source={} pos=({:.2},{:.2},{:.2}) yaw={:.1} pitch={:.1} raw=({:.2},{:.2},{:.2}) stand-off moved {:.2} wu (soup {} tris)",
                     c.source.label(), c.pos.x, c.pos.y, c.pos.z, c.yaw.to_degrees(), c.pitch.to_degrees(), c.raw_pos.x, c.raw_pos.y, c.raw_pos.z, (c.pos - c.raw_pos).length(), es.soup_len()),
-                None => logln!("HMS_SPAWNCAM: source=none (no variant camera / spawn, no scenario starting location / spawn placement / camera) - bounds overview"),
+                None => logln!("HMS_SPAWNCAM: source=none (no variant / scenario spawn, starting location, camera or bounds) - bounds overview"),
             }
         }
         editor_scene = Some(es);
@@ -175,7 +176,11 @@ pub fn headless_run(map_path: &str, out: &str, w: u32, h: u32) -> Result<()> {
     renderer.set_sun_dir(stats.sun_dir());
     // Lbsp +0x30 sun colour: absolute HDR rgb with the atlas path (same units as its lobes),
     // hue only (max 1) for the flat placeholder lighting.
-    renderer.set_scene_tints(stats.sun_tint(), [1.0; 3]);
+    // HMS_H4_SUNSCALE=<f> (diagnostic): scale the analytic sun tint (0 = lightmap only)
+    let sun_scale: f32 = std::env::var("HMS_H4_SUNSCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let st = stats.sun_tint();
+    renderer.set_scene_tints([st[0] * sun_scale, st[1] * sun_scale, st[2] * sun_scale], [1.0; 3]);
+    renderer.set_sky_ground_level(0.6); // H4/H2A post crushes the 0.2 ground to black
     // The object sun shadow (forge-lightmap burn law) over every caster: the static scenario
     // objects + the editor scene's variant objects (HMS_H4_SOUP=1 path), and the cascade
     {
@@ -188,7 +193,8 @@ pub fn headless_run(map_path: &str, out: &str, w: u32, h: u32) -> Result<()> {
     }
     // The map's atmosphere fog (lighting.rs); zero = none. HMS_H4_NOFOG=1 renders without it
     // (a per-term diagnostic, like HMS_NOFOG on the Reach path).
-    renderer.set_fog(&queue, &if std::env::var("HMS_H4_NOFOG").is_ok() { [0.0; 28] } else { stats.fog.unwrap_or([0.0; 28]) });
+    renderer.set_fog(&queue, &if std::env::var("HMS_H4_NOFOG").is_ok() { [0.0; hms_render::FOG_UNIFORM_LEN] } else { stats.fog.unwrap_or([0.0; hms_render::FOG_UNIFORM_LEN]) });
+    if let Some(sky) = stats.fog_sky_color { renderer.set_sky_colors(sky, stats.fog_ground_color); } // fallback-sky colours from the fogg
     // cfxs: exposure band + engine meter, filmic composite, bloom, the colour-grading LUT and
     // the self-illum exposure law (lighting.rs `apply_post`, shared with the GUI + script host).
     // HMS_H4_POSTDBG bit mask (diag only): 1 = Reach meter (key/geomean) instead of the engine
@@ -212,7 +218,31 @@ pub fn headless_run(map_path: &str, out: &str, w: u32, h: u32) -> Result<()> {
         cam.pitch = c.pitch;
     }
     logln!("camera pos {:?} yaw {:.1} pitch {:.1} far {:.0}", cam.pos.to_array(), cam.yaw.to_degrees(), cam.pitch.to_degrees(), cam.far);
-    for _ in 0..3 { renderer.render(&device, &queue, &cam, 0.0); }
+
+    // --- Forge special-FX screen effects (#forge-fx-h4): resolve the placed FX objects' `sefc`
+    // tags and compose them (engine per-term max) into the post colour matrix + exposure gain,
+    // exactly like the GUI's refresh_screen_fx / the Reach headless path. HMS_FORGE_FX=0 disables
+    // the placed orbs (H4 has no scenario default, so off == identity). Needs the editor scene
+    // (HMS_H4_SOUP=1 / HMS_SPAWNCAM / HMS_MVAR), which is where the variant's FX orbs live.
+    if let Some(es) = editor_scene.as_ref() {
+        let cache = es.cache().clone();
+        let (objects, _) = es.variant_editor_objects();
+        let mut obje_tags: Vec<usize> = Vec::new();
+        for o in &objects {
+            if let Some(idx) = super::edit::h4_tag_index(o.primary_tag) {
+                if !obje_tags.contains(&idx) { obje_tags.push(idx); }
+            }
+        }
+        let mut sfx_cache = super::screenfx::H4ScreenFxCache::default();
+        let active = super::screenfx::active_screen_fx(&cache, &mut sfx_cache, obje_tags.into_iter());
+        let enabled = crate::screenfx::env_forge_fx_enabled();
+        let line = crate::screenfx::push_to_renderer(&renderer, &queue, &active, enabled);
+        logln!("{line}");
+    }
+
+    // HMS_TIME = the animation clock of the shot in seconds (sky scroll, water), default 0
+    let shot_time: f32 = std::env::var("HMS_TIME").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    for _ in 0..3 { renderer.render(&device, &queue, &cam, shot_time); }
     // print-only diag of the burn-map fit: texel (wu), depth range (wu), square side (wu)
     {
         let d = renderer.h4_shadow_diag.get();
@@ -287,7 +317,7 @@ pub fn headless_run(map_path: &str, out: &str, w: u32, h: u32) -> Result<()> {
             let mut it = rest.splitn(2, '.');
             let q: Option<u8> = it.next().and_then(|t| t.trim().parse().ok());
             let v: u8 = it.next().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
-            q.and_then(|q| es.resolve_item(q, Some(v)).map(|(t, _, _)| t))
+            q.and_then(|q| es.resolve_item(q, Some(v)).map(|(t, _, _, _)| t))
         } else if let Some(name) = item.strip_prefix('n') {
             let needle = name.trim().to_ascii_lowercase();
             es.palette().iter().find_map(|e| e.variants.iter().find_map(|pv| {

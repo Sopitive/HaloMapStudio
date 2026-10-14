@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -39,21 +40,73 @@
 <h1>Changelog</h1>
 <p class="lead">Release notes are published alongside each build on <a href="https://github.com/Sopitive/HaloMapStudio/releases">GitHub Releases</a>. This page summarises them.</p>
 
-<h2>v0.1.0 — 2026-09 <span class="tag">current</span></h2>
-<p>First public binary release (Windows x64 and Linux x64 archives). Source code is planned to follow once the renderer and the Forge editing workflow settle.</p>
+<h2>v1.4.0 — 2026-10-12 <span class="tag">current</span></h2>
+<p>The last public release was v1.2.2; v1.3.1 was prepared and never published, so this release carries both halves. The headline additions are <strong>Halo 3</strong>, <strong>Halo 2 Anniversary editing</strong> and <strong>Halo Reach Theater</strong>.</p>
+
+<h3>Theater — Reach saved films</h3>
 <ul>
-  <li>Halo: Reach map viewer with engine-faithful lighting, materials, water, sky, fog and effect particles; automatic discovery of Steam and Workshop maps.</li>
-  <li>Forge variant (<code>.mvar</code>) open / edit / save, including Forge properties, labels, parents, boundaries and the 651-slot budget.</li>
-  <li>Blender-style editing (grab / rotate / duplicate, axis locks, magnet, precision, array), gizmos, box select, mass edit, undo/redo, Line and Fill placement tools.</li>
-  <li>Construction (CAD) tools: guides, circles, squares, face-to-face mate, anchor, mirror, fill edge.</li>
-  <li>Forge script language with an in-app console, headless <code>--script</code> / <code>--exec</code> runner, a local command server and the <code>hms-mcp</code> MCP bridge.</li>
-  <li>Headless PNG rendering (<code>HMS_SHOT</code>), <code>--dump-maps</code> and variant inspection flags.</li>
-  <li>Optional real-time probe GI and a path-traced lighting bake.</li>
-  <li>Halo 4 support: engine-faithful rendering and Forge variant editing (open / edit / save), read with a pure-Rust cache parser.</li>
-  <li>Projects (<code>.mmsproj</code>) and a quick-save session slot; settings stored per user.</li>
+  <li><strong>Saved films open and play.</strong> <em>File ▸ Open theater clip…</em> loads a Reach <code>.mov</code> (including the in-progress <code>.temp</code> recording of a match you are still playing), draws the film's own Forge map, and plays the recording back with transport controls, a scrub timeline (<em>View ▸ Theater timeline</em>), free / follow / over-the-shoulder / first-person cameras and a cast list. See <a href="theater.html">Theater</a>.</li>
+  <li><strong>Players are the characters they really were.</strong> Each body is drawn as the biped the recording names — Spartans <em>and Elites</em> — skinned and posed by the game's own animation graphs, wearing the armour, the armour effect and the colours that player had chosen, and holding the weapon the recording gives them (including the weapon the gametype's loadout spawns them with).</li>
+  <li><strong>Movement from the recording, not guessed.</strong> Walk, run, back-off and strafe cycles are driven by measured stride rates per weapon class; idle clips play at the engine's 30 fps (they used to run nearly eight times too fast); players ride, enter and leave vehicles; melee swings, weapon fire, reloads and assassinations are read off the film's own event channel rather than inferred from how a body moved.</li>
+  <li><strong>Deaths.</strong> A killed player plays the ragdoll clip their own character has (the Elite's is named differently, which is why Elites used to stay standing), falls to the floor under the gravity measured from the recordings, and lies where they fell until the recording itself removes them — several seconds, as in game — instead of vanishing after five.</li>
+  <li><strong>First person.</strong> Looking through a player's eyes draws their own arms <em>and the weapon in them</em>, both posed by that weapon's own first-person animation, with the player's forearm and chest pieces on the hands. Each species has its own arms.</li>
+  <li><strong>The game's own HUD.</strong> The player list is built from Reach's own scoreboard widget tags, and floating player names use Reach's own font, team-coloured, with no background plate — both read from the game's assets rather than drawn by us.</li>
+  <li><strong>Statistics.</strong> <em>Theater ▸ Statistics</em> and <code>--film-stats</code> report per-player time, distance, weapons, vehicles, deaths and the match score out of the recording, and name who was responsible for about nine deaths in ten.</li>
+  <li><strong>What a recording does not contain is now said plainly</strong> rather than silently approximated: a Reach film records only the recorder's own kill feed, most medals and assists are absent, one body per clip has a live look direction, and a clip can hold more players than it holds gamertags.</li>
 </ul>
 
-<h2>Unreleased — 2026-09-16 / 2026-09-18</h2>
+<h3>Halo 3</h3>
+<ul>
+  <li><strong>Maps open in the viewer</strong> — textured clusters and instances, baked lightmaps, skies, fog, scenario objects and object lighting from the map's light probes.</li>
+  <li><strong>Map variants open in the editor</strong> with the map's Forge palette, attachments, water and damage states, and save byte-for-byte against every shipped variant.</li>
+  <li><strong>You can place objects.</strong> Dragging a palette piece into the viewport, the Line and Fill tools and the <code>place</code> verb all used to refuse silently unless a variant was already open; a shipped variant is now adopted as a blank canvas.</li>
+  <li><strong>Lighting is no longer about a fifth too dark.</strong> Halo 3 was being put through Halo Reach's tone curve; it now uses its own (<code>1.5c − 0.5c³</code>), which lifts everything below white by about 22%.</li>
+</ul>
+
+<h3>Halo 2 Anniversary</h3>
+<ul>
+  <li><strong>Map variants can now be saved.</strong> H2A was read-only. Its variants now open, edit and save through the full Halo 4 editor, and HMS reproduces 283 of the 289 shipped H2A variants byte-for-byte (the six are duplicates of two files whose own stored checksum matches no formula over their payload — MCC never checks it).</li>
+  <li>All seven maps surveyed and fixed: skies, ocean tint, layered material families, fog and the fallback sky gradient.</li>
+</ul>
+
+<h3>Halo 4</h3>
+<ul>
+  <li>Exposure and bloom follow the engine chain, Forge lightmap burn shadows, object lighting from surface and air probes, an exposure override in the GUI, the grid family, a faster sky and fog.</li>
+</ul>
+
+<h3>Editing</h3>
+<ul>
+  <li><strong>Prefabs.</strong> Save a selection as a reusable building block (<code>.hmsprefab</code>) and drop it into any map, in any supported game. <em>Tools ▸ Prefabs</em>.</li>
+  <li><strong>Every control can be rebound.</strong> <em>Settings ▸ Controls &amp; keyboard</em> lists all 38 editor actions, with left-handed presets; flight keys bind by physical position, so AZERTY and Dvorak layouts work.</li>
+  <li><strong>Convert a map variant to another game.</strong> <em>File ▸ Convert variant to another game…</em> re-creates a Forge map on another title's canvas. All four titles work as a source <em>and</em> as a target, and every piece that cannot be re-created is reported with the reason rather than quietly left out.</li>
+  <li><strong>Save precision preview.</strong> A ghost of the pose a save can actually store, plus snap-to-representable — rotation is the big loss (a Halo 3 facing angle is eight bits).</li>
+  <li><strong>Damage states.</strong> The Object panel shows an object's damage state (minor … destroyed); kept in the project, never written to the <code>.mvar</code>.</li>
+  <li><strong>Spawn camera and physics settle.</strong> The camera opens on the variant's spawn points; placed objects can be settled onto the ground with the map's collision.</li>
+  <li><strong>Model import.</strong> Imported geometry keeps its materials, is selectable and movable like any other object, and is browsed through the same file picker as everything else.</li>
+  <li><strong>Open recent</strong> lists what you last opened — variants, base maps, projects and theater clips.</li>
+</ul>
+
+<h3>Rendering</h3>
+<ul>
+  <li><strong>Forge pieces have their reflections, and the shine nothing asked for is gone.</strong> Every Forge object was shaded with the material constants of its <em>first</em> part, so a reflective catwalk was matte and a plain platform had a sheen the map never authored. Each part now carries its own specular, roughness and environment map, read from the object's own materials.</li>
+  <li><strong>The energy sword has its two glowing blades</strong> (five additive layers, three of which were being discarded), and energy blades and vehicle accent lights no longer have their red and blue exchanged.</li>
+  <li><strong>Parked Forge vehicles no longer glow</strong> with lit headlights, brake lights and dashboards.</li>
+  <li><strong>Weapons and equipment lying in a map are the size the game draws them</strong> — about a third larger than before — and a held weapon is the size the weapon tag states for that player's species.</li>
+  <li><strong>Solid barriers no longer draw see-through</strong>, and switching a damage state no longer leaves other states untextured.</li>
+  <li><strong>Forge objects appear much faster</strong> instead of trickling in one at a time; Theater playback on a busy 16-player clip is several times faster and no longer grows in memory as it plays.</li>
+</ul>
+
+<h3>Other</h3>
+<ul>
+  <li><strong>Modded and Workshop maps.</strong> Maps installed from the Steam Workshop no longer load with missing geometry: the parser could not find MCC's stock <code>shared.map</code> (it only looked beside the map), so every model paged out of the shared cache failed to decode. Variants saved against a Workshop map are routed to the right base map by its MCC map GUID instead of the <code>-2</code> placeholder the file carries. Load time for a large modded map dropped from 47 s to under 8 s.</li>
+  <li><strong>Graphics &amp; performance settings.</strong> A Settings page that trades picture quality for speed: presets, render scale, shadow / post / texture / draw-distance knobs, a frame cap and an idle throttle.</li>
+  <li><strong>Auto-update (opt-in).</strong> The app checks GitHub Releases once a day and shows a small <em>Update available</em> pill next to <em>Help</em>; the Update window downloads the archive, verifies it, installs it after you close the app and restores your session (see <a href="getting-started.html#updating">Updating</a>). Settings ▸ <em>Updates</em> turns the check off.</li>
+  <li><strong>Linux.</strong> Maps are found on udisks-mounted drives and in the Xbox app's layout, not only under Steam; settings and projects use XDG paths instead of a Windows-only environment variable.</li>
+  <li>Version numbers: the app, the archives (<code>HaloMapStudio-1.4.0-&lt;platform&gt;.zip</code> plus <code>.sha256</code>) and these pages now share one version.</li>
+</ul>
+
+<h2>v1.1 – v1.2 — 2026-09-16 / 2026-09-22</h2>
+<p>Released as the v1.1.x pre-releases and v1.2.1 / v1.2.2 on GitHub; the list below is what they added over v0.1.0.</p>
 <ul>
   <li><strong>Variant properties.</strong> Every global field of a map variant (Reach and Halo 4) is now decoded and shown in a <em>Variant properties</em> group of the left panel - ids, stamps, activity / mode / engine, category, budget, flags, the world bounds, the chunk length / SHA-1 / <code>_fsm</code> and the per-piece quota table with palette names - with the engine's field names on hover; category, maximum budget, world bounds (behind a warning) and quota min / max are editable; <code>variant get</code> / <code>variant set</code> do the same from scripts. Reach saves now write a correct <code>mvar</code> chunk length and SHA-1 and mirror header edits into the <code>chdr</code> chunk (both were left stale before). See <a href="maps-and-variants.html#properties">Variant properties</a>.</li>
   <li><strong>Halo 4 Forge editing.</strong> A Halo 4 map variant now opens as an editable scene: select / box-select with the outline, G / R, gizmo, Shift+D, Delete, undo / redo, drag-and-drop placement from the map's own Forge palette (localised names, the game's placement defaults per piece), the Object panel with the Halo 4 record (quota / variant, team and colour, object type, spawn order / time, four labels, parent, placement bits, shape in world units, type extras, a <em>raw (unverified)</em> group and an editor-only scale), mass edits, and <code>place</code> / <code>set</code> / <code>get</code> / <code>save as</code> in scripts. <em>File ▸ Save</em> writes the open <code>.mvar</code> in place and <em>Save As</em> writes a new one, both through the engine's own encoder after a save check (objects outside the variant bounds are clamped, stale types are reported; the budget and the palette maxima are not checked, because the game ignores both). The encoder reproduces every shipped variant byte-for-byte and an HMS-saved variant loads in MCC. See <a href="halo4.html">Halo 4</a>.</li>
@@ -72,10 +125,24 @@
   <li><strong>Settings.</strong> Fly speed and the camera stand-off live in <em>Settings ▸ Camera, render &amp; display</em>; diagnostics under <em>Advanced</em>. Settings files: <code>forge_fx.txt</code>, <code>scaled_objects.txt</code>, <code>shadow_casters.txt</code>, <code>map_spawns.txt</code>, <code>physics_outlines.txt</code>.</li>
   <li>Earlier: left panel reorganisation, searchable variant object list, placement tools moved to the Tools menu, Edit and View menus, Help ▸ Keyboard shortcuts as the shortcut reference.</li>
 </ul>
+<h2>v0.1.0 — 2026-09</h2>
+<p>First public binary release (Windows x64 and Linux x64 archives). Source code is planned to follow once the renderer and the Forge editing workflow settle.</p>
+<ul>
+  <li>Halo: Reach map viewer with engine-faithful lighting, materials, water, sky, fog and effect particles; automatic discovery of Steam and Workshop maps.</li>
+  <li>Forge variant (<code>.mvar</code>) open / edit / save, including Forge properties, labels, parents, boundaries and the 651-slot budget.</li>
+  <li>Blender-style editing (grab / rotate / duplicate, axis locks, magnet, precision, array), gizmos, box select, mass edit, undo/redo, Line and Fill placement tools.</li>
+  <li>Construction (CAD) tools: guides, circles, squares, face-to-face mate, anchor, mirror, fill edge.</li>
+  <li>Forge script language with an in-app console, headless <code>--script</code> / <code>--exec</code> runner, a local command server and the <code>hms-mcp</code> MCP bridge.</li>
+  <li>Headless PNG rendering (<code>HMS_SHOT</code>), <code>--dump-maps</code> and variant inspection flags.</li>
+  <li>Optional real-time probe GI and a path-traced lighting bake.</li>
+  <li>Halo 4 support: engine-faithful rendering and Forge variant editing (open / edit / save), read with a pure-Rust cache parser.</li>
+  <li>Projects (<code>.mmsproj</code>) and a quick-save session slot; settings stored per user.</li>
+</ul>
+
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

@@ -133,7 +133,12 @@ pub fn load_placements(c: &H4Cache) -> Vec<H4Placement> {
         let Some((npal, palo)) = c.block(sm + t.palette) else { continue };
         if np > 0x40000 || npal > 4096 { continue; }
         for i in 0..np {
-            let e = po + i * t.stride;
+            // #h2a: every H2A placement record is 4 bytes longer than Halo 4's (the same +4 delta
+            // the H2A .mvar records carry). Read with Halo 4's stride, record k drifted 4k bytes,
+            // so Ascension's vista ring (a scenery placement) took garbage position/scale and
+            // sat on top of the map.
+            let stride = if c.engine == super::cache::Engine::H2A { t.stride + 4 } else { t.stride };
+            let e = po + i * stride;
             let pal = d.i16_at(e);
             if pal < 0 || pal as usize >= npal { continue; }
             let Some((_, palette_tag)) = c.tag_ref(palo + pal as usize * PALETTE_ELEM) else { continue };
@@ -146,6 +151,10 @@ pub fn load_placements(c: &H4Cache) -> Vec<H4Placement> {
             let f = |o: usize| d.f32_at(e + o);
             let mut scale = f(0x20);
             if !(scale > 0.0) || !scale.is_finite() { scale = 1.0; }
+            if std::env::var("HMS_H4_PLACEDIAG").is_ok() { // print-only: the raw record as f32 / i16
+                let fl: Vec<String> = (0..0x18).map(|k| { let v = d.f32_at(e + k * 4); if v.is_finite() && v.abs() < 1e6 && (v == 0.0 || v.abs() > 1e-5) { format!("{v:.3}") } else { format!("i{}", d.i16_at(e + k * 4)) } }).collect();
+                eprintln!("  H4PLACE {} '{}' pal {pal} '{}' stride {stride} | {}", std::str::from_utf8(&class).unwrap_or("?"), name, c.tag_name(palette_tag).rsplit('\\').next().unwrap_or(""), fl.join(" "));
+            }
             out.push(H4Placement {
                 class,
                 palette_tag,
@@ -202,6 +211,8 @@ pub fn model_of(c: &H4Cache, palette_tag: usize) -> Option<usize> {
 #[derive(Clone, Debug, Default)]
 pub struct H4Permutation {
     pub name: String,
+    /// Raw string id of the name (hlmt variant permutation STATES name it).
+    pub sid: u32,
     pub mesh_index: i16,
     pub mesh_count: i16,
 }
@@ -282,6 +293,11 @@ pub fn load_model(c: &H4Cache, mode_tag: usize) -> Result<H4Model> {
     // meshes + the single model-wide bounds element
     let (nm, om) = c.block(mm + OFF_MODE_MESHES).unwrap_or((0, 0));
     let (nb, ob) = c.block(mm + OFF_MODE_BOUNDS).unwrap_or((0, 0));
+    if std::env::var("HMS_H4_OBJDIAG").is_ok() { // print-only: raw compression element + block counts at nearby offsets
+        let d = c.data();
+        let cnt: Vec<String> = [0x74usize, 0x78, 0x7C, 0x80, 0x84, 0x88, 0x8C, 0x90].iter().map(|&o| format!("+{o:#x}:{}", c.block(mm + o).map_or("-".into(), |(n, _)| n.to_string()))).collect();
+        if let Some((n, bp)) = c.block(mm + 0x80) { let fl: Vec<String> = (0..14).map(|k| format!("{:.1}", d.f32_at(bp + k * 4))).collect(); eprintln!("  H4OBJ mode '{}': blocks {} | bounds[0/{n}] {}", c.tag_name(mode_tag).rsplit('\\').next().unwrap_or(""), cnt.join(" "), fl.join(" ")); }
+    }
     let mut meshes = Vec::with_capacity(nm);
     let mut mesh_info = Vec::with_capacity(nm);
     for i in 0..nm.min(4096) {
@@ -314,7 +330,7 @@ pub fn load_model(c: &H4Cache, mode_tag: usize) -> Result<H4Model> {
             if let Some((np, op)) = c.block(e + 4) {
                 for k in 0..np.min(4096) {
                     let p = op + k * PERMUTATION_ELEM;
-                    r.permutations.push(H4Permutation { name: c.sid(d.u32_at(p)), mesh_index: d.i16_at(p + 4), mesh_count: d.i16_at(p + 6) });
+                    r.permutations.push(H4Permutation { name: c.sid(d.u32_at(p)), sid: d.u32_at(p), mesh_index: d.i16_at(p + 4), mesh_count: d.i16_at(p + 6) });
                 }
             }
             if let Some(p0) = r.permutations.first() {
@@ -344,6 +360,9 @@ pub fn load_model(c: &H4Cache, mode_tag: usize) -> Result<H4Model> {
                 inverse: [v3(44), v3(56), v3(68), v3(80)],
             });
         }
+    }
+        if std::env::var("HMS_H4_OBJDIAG").is_ok() { // print-only: node table
+        for (k, n) in nodes.iter().enumerate() { eprintln!("  H4OBJ   node {k:2} '{}' parent {} translation {:?} scale {:.3}", n.name, n.parent, n.translation.map(|v| (v * 10.0).round() / 10.0), n.scale); }
     }
     Ok(H4Model { tag: mode_tag, name, meshes, mesh_info, geometry, materials, regions, nodes, lod0_meshes })
 }
@@ -397,8 +416,21 @@ pub fn decode_mesh_generic(c: &H4Cache, g: &GeometryResource, m: &MeshDef, index
     // decoding through a zero range would collapse the whole mesh onto pos_min. Cannot change
     // Halo 4 output: no Halo 4 mesh with geometry has degenerate bounds (its cluster meshes carry
     // no vertex buffer at all), and where the extents are real this is the identical arithmetic.
-    let raw_pos = b.is_degenerate();
+    // Compression is signalled by the bounds FLAGS (bit 0 = position normalized to the extents,
+    // bit 1 = uv normalized), NOT by whether the extents happen to be zero. Halo 4 sets flags=3 on
+    // every mesh (both compressed), so this is identical there; but some H2A meshes carry
+    // UNcompressed (absolute) positions with the flag clear yet still have non-zero extents -
+    // normalizing those absolute coordinates through the extents threw one vertex out to a garbage
+    // position (the "streak" across the map). is_degenerate() stays as a safety net. #h2a-vertex
+    let raw_pos = (b.flags & 1) == 0 || b.is_degenerate();
+    let raw_uv = (b.flags & 2) == 0 || b.is_degenerate();
     let stride = vb.stride as usize;
+    if std::env::var("HMS_H4_OBJDIAG").is_ok() { // print-only: raw vertex layout probe
+        let raw: &[u8] = &vraw;
+        let n = (raw.len() / stride).min(3);
+        let hex: Vec<String> = (0..n).map(|k| { let v = &raw[k * stride..k * stride + stride]; let f: Vec<String> = (0..stride / 4).map(|j| { let x = v.f32_at(j * 4); if x.is_finite() && x.abs() < 1e5 && (x == 0.0 || x.abs() > 1e-6) { format!("{x:.3}") } else { format!("i{}/{}", v.i16_at(j * 4), v.i16_at(j * 4 + 2)) } }).collect(); f.join(" ") }).collect();
+        eprintln!("  H4OBJ     vbprobe: vb {:?} kind {} stride {stride} count {} index_type {index_type} | v0..: {}", m.vb, vb.kind, vb.count, hex.join("  ||  "));
+    }
     let mut verts = Vec::with_capacity(vb.count as usize);
     for k in 0..vb.count as usize {
         let o = k * stride;
@@ -414,14 +446,20 @@ pub fn decode_mesh_generic(c: &H4Cache, g: &GeometryResource, m: &MeshDef, index
         };
         let u = vraw.u16_at(o + 16) as f32 / 65535.0;
         let v = vraw.u16_at(o + 18) as f32 / 65535.0;
-        let uv = if raw_pos { [u, v] } else { [b.uv_min[0] + u * (b.uv_max[0] - b.uv_min[0]), b.uv_min[1] + v * (b.uv_max[1] - b.uv_min[1])] };
+        let uv = if raw_uv { [u, v] } else { [b.uv_min[0] + u * (b.uv_max[0] - b.uv_min[0]), b.uv_min[1] + v * (b.uv_max[1] - b.uv_min[1])] };
         // same tail as the BSP's type 2 (geometry.rs): normal snorm16x3 @20, tangent snorm16x3
         // @28 + handedness @34, blend f32 @12 (0 on every model format except type 37, rejected)
         let normal = [sn16(vraw.i16_at(o + 20)), sn16(vraw.i16_at(o + 22)), sn16(vraw.i16_at(o + 24))];
         let tangent = [sn16(vraw.i16_at(o + 28)), sn16(vraw.i16_at(o + 30)), sn16(vraw.i16_at(o + 32)), sn16(vraw.i16_at(o + 34))];
         verts.push(H4Vertex { pos, normal, uv, tangent, blend: f(3) });
     }
-    let raw_idx: Vec<u32> = (0..iraw.len() / 2).map(|k| iraw.u16_at(k * 2) as u32).collect();
+    // Index width: 16-bit unless the mesh cannot be addressed by u16 (more than 65535 vertices)
+    // or the buffer is sized for 4-byte indices. H2A's vista ring (`ca_ascension_halosections`,
+    // 71 841 verts) ships a 32-bit index buffer; read as u16 every triangle became two garbage
+    // ones spanning the whole 48 000 wu strip, which drew the ring's ocean over the map.
+    let total_idx: usize = m.parts.iter().map(|p| p.index_start as usize + p.index_count as usize).max().unwrap_or(0);
+    let wide = vb.count as usize > 65535 || (total_idx > 0 && iraw.len() >= total_idx * 4 && iraw.len() < total_idx * 6);
+    let raw_idx: Vec<u32> = if wide { (0..iraw.len() / 4).map(|k| iraw.u32_at(k * 4)).collect() } else { (0..iraw.len() / 2).map(|k| iraw.u16_at(k * 2) as u32).collect() };
     let nv = verts.len() as u32;
     if !strip {
         return Ok(Some(DecodedMesh { verts, indices: raw_idx, parts: m.parts.clone() }));
@@ -466,7 +504,12 @@ pub fn decode_model_mesh(c: &H4Cache, model: &H4Model, mesh_idx: usize) -> Resul
 // Variant element (Assembly Halo4MCC hlmt.xml, cross-checked on the Ravine palette objects):
 //   +0x04 i8[32] runtime model region index per render-model region (-1 = not in this variant),
 //   +0x24 regions block, 0x18 B: name @0, rm region i8 @4, parent variant i16 @6, permutations
-//   block @8 (0x24 B: name @0, rm permutation i8 @4, probability f32 @8).
+//   block @8 (0x24 B: name @0, rm permutation i8 @4, probability f32 @8, states block @0xC
+//   (0xC B: name @0, rm permutation i8 @4, property flags u8 @5, state enum16 @6, initial
+//   probability f32 @8), runtime state permutation indices i8[5] @0x18 by model_state_enum
+//   0 default / 1 minor / 2 medium / 3 major / 4 destroyed, -1 = the state keeps the base
+//   permutation) - the same 36-byte s_model_variant_permutation as Reach (Assembly Halo4MCC
+//   hlmt.xml, confirmed on the Ravine Warthog / Mantis: see `variant_damage_states` tests).
 // obje +0x148 change colours block (0x18 B): initial permutations block @0 (0x20 B: weight f32
 //   @0, lower rgb @4, upper rgb @0x10, variant name sid @0x1C); slot 0 primary, 1 secondary ...
 // obje +0x154 multiplayer object block (0xCC B, one element): engine flags u8 @0, type u8 @1,
@@ -481,6 +524,8 @@ pub const OFF_HLMT_VARIANTS: usize = 0xC4;
 pub const HLMT_VARIANT_ELEM: usize = 0x6C;
 pub const HLMT_VREGION_ELEM: usize = 0x18;
 pub const HLMT_VPERM_ELEM: usize = 0x24;
+/// #damage vperm +0x18: runtime state permutation indices, i8[5] indexed by the damage state.
+pub const HLMT_VPERM_STATES: usize = 0x18;
 pub const CHANGE_COLOR_ELEM: usize = 0x18;
 pub const CHANGE_COLOR_PERM_ELEM: usize = 0x20;
 pub const MP_OBJECT_ELEM: usize = 0xCC;
@@ -532,26 +577,99 @@ pub fn object_variant_index(c: &H4Cache, obje_tag: usize, sid: u32) -> Option<us
 /// The variant/permutation picture is not confirmed against the game for Halo 4 (visually
 /// plausible: the Warthog gauss / rocket palette variants show their turrets).
 pub fn variant_meshes(c: &H4Cache, obje_tag: usize, model: &H4Model, variant: Option<usize>) -> Vec<usize> {
+    variant_state_meshes(c, obje_tag, model, variant, 0)
+}
+
+/// #damage Per region of hlmt variant `variant` (None = 0): (region name sid, the variant's
+/// permutation pick (-1 hidden), the runtime state permutation indices i8[5]). Empty when the
+/// object has no hlmt variants / the variant is out of range.
+fn variant_region_table(c: &H4Cache, obje_tag: usize, model: Option<&H4Model>, variant: Option<usize>) -> Vec<(u32, i32, [Option<i8>; 5])> {
     let d = c.data();
-    let fallback = || model.lod0_meshes.clone();
-    let Some(hlmt) = hlmt_of(c, obje_tag) else { return fallback() };
-    let Some(hm) = c.tag_meta(hlmt) else { return fallback() };
-    let Some((nv, vo)) = c.block(hm + OFF_HLMT_VARIANTS) else { return fallback() };
+    let mut out = Vec::new();
+    // render_model region name sid -> its permutation name sids (loaded here when the caller
+    // has no model in hand: the state list query)
+    let loaded;
+    let model = match model {
+        Some(m) => Some(m),
+        None => { loaded = model_of(c, obje_tag).and_then(|m| load_model(c, m).ok()); loaded.as_ref() }
+    };
+    let mut model_perm_names: HashMap<u32, Vec<u32>> = HashMap::new();
+    if let Some(m) = model {
+        for r in &m.regions { model_perm_names.entry(r.sid).or_insert_with(|| r.permutations.iter().map(|p| p.sid).collect()); }
+    }
+    let Some(hlmt) = hlmt_of(c, obje_tag) else { return out };
+    let Some(hm) = c.tag_meta(hlmt) else { return out };
+    let Some((nv, vo)) = c.block(hm + OFF_HLMT_VARIANTS) else { return out };
     let vi = variant.unwrap_or(0);
-    if vi >= nv { return fallback(); }
+    if vi >= nv { return out; }
     let ve = vo + vi * HLMT_VARIANT_ELEM;
-    // region name -> (rm permutation index or -1 hidden) from the variant's region list
-    let mut choice: HashMap<u32, i32> = HashMap::new();
     if let Some((nr, ro)) = c.block(ve + 0x24) {
         for r in 0..nr.min(1024) {
             let re = ro + r * HLMT_VREGION_ELEM;
             let name = d.u32_at(re);
-            let perm = match c.block(re + 8) {
-                Some((np, po)) if np > 0 => d.u8_at(po) as i8 as i32,
-                _ => 0,
+            let (perm, st) = match c.block(re + 8) {
+                Some((np, po)) if np > 0 => {
+                    // per damage state: the STATES block entry (0xC B: permutation name sid @0,
+                    // runtime permutation index i8 @4, state enum i16 @6) resolved against the
+                    // render_model region's permutation NAMES (`model_perm_names`); the 0x18
+                    // runtime array is only trusted when the block is empty and it holds a
+                    // non-zero index (it is unpopulated in the shipped caches, as in Reach)
+                    // None = no entry (the region keeps its base permutation), Some(-1) = an
+                    // entry naming no permutation (hidden in that state), Some(i) = permutation i
+                    let mut st: [Option<i8>; 5] = [None; 5];
+                    let names = model_perm_names.get(&name).map(|v| v.as_slice()).unwrap_or(&[]);
+                    match c.block(po + 0xC) {
+                        Some((ns, so)) if ns > 0 => {
+                            for k in 0..ns.min(32) {
+                                let se = so + k * 0xC;
+                                let pname = d.u32_at(se);
+                                let rp = d.u8_at(se + 4) as i8;
+                                let state = d.i16_at(se + 6);
+                                if !(0..5).contains(&state) { continue; }
+                                let idx = names.iter().position(|&n| n == pname && pname != 0 && pname != 0xFFFF_FFFF).map(|i| i as i8)
+                                    .or_else(|| (rp >= 0 && (rp as usize) < names.len().max(1)).then_some(rp));
+                                st[state as usize] = Some(idx.unwrap_or(-1));
+                            }
+                        }
+                        _ => {
+                            let rt: Vec<i8> = (0..5).map(|k| d.u8_at(po + HLMT_VPERM_STATES + k) as i8).collect();
+                            if rt.iter().any(|&v| v > 0) { for (k, v) in st.iter_mut().enumerate() { *v = Some(rt[k]); } }
+                        }
+                    }
+                    // rm permutation index @4 (the old read at @0 took the NAME sid's low byte,
+                    // 0x39 on every Ravine vehicle region, which `.get(57).or_else(first)` turned
+                    // into permutation 0 - right by accident for the shipped variants)
+                    (d.u8_at(po + 4) as i8 as i32, st)
+                }
+                _ => (0, [None; 5]),
             };
-            choice.entry(name).or_insert(perm);
+            if !out.iter().any(|(n, _, _)| *n == name) { out.push((name, perm, st)); }
         }
+    }
+    out
+}
+
+/// #damage The damage states (1 minor .. 4 destroyed) that hlmt variant `variant` of the
+/// object authors a permutation for in at least one region, ascending. Empty = the object can
+/// only be shown undamaged.
+pub fn variant_damage_states(c: &H4Cache, obje_tag: usize, variant: Option<usize>) -> Vec<u8> {
+    let table = variant_region_table(c, obje_tag, None, variant);
+    (1..=4u8).filter(|&st| table.iter().any(|(_, _, sp)| sp[st as usize].is_some())).collect()
+}
+
+/// #damage `variant_meshes` displayed in damage `state` (0 = the regular model, identical to
+/// `variant_meshes`): per region, the permutation is the variant's runtime state permutation
+/// index for that state when authored (>= 0, even for a region the variant hides - the vehicle
+/// damage decals are authored exactly so), else the variant's base pick - the engine rule.
+pub fn variant_state_meshes(c: &H4Cache, obje_tag: usize, model: &H4Model, variant: Option<usize>, state: u8) -> Vec<usize> {
+    let fallback = || model.lod0_meshes.clone();
+    let table = variant_region_table(c, obje_tag, Some(model), variant);
+    if table.is_empty() { return fallback(); }
+    // region name -> (rm permutation index or -1 hidden), the state's pick applied
+    let mut choice: HashMap<u32, i32> = HashMap::new();
+    for (name, perm, st) in &table {
+        let p = match st.get(state as usize) { Some(Some(sp)) if state > 0 => *sp as i32, _ => *perm };
+        choice.entry(*name).or_insert(p);
     }
     let mut out = Vec::new();
     let mut push_perm = |p: &H4Permutation| {
@@ -831,5 +949,71 @@ mod tests {
         }
         let n = dm.indices.len() / 3;
         assert!(agree * 100 / n >= 70, "strip facing agreement {agree}/{n}");
+    }
+
+    /// #damage The Ravine Warthog / Mantis author DESTROYED (and the Warthog also the
+    /// intermediate) damage states in their hlmt variant permutations (+0x18 runtime state
+    /// permutation indices of the 0x24-byte entry): the state list, and the destroyed mesh set
+    /// differing from the default one (state 0 = `variant_meshes` exactly).
+    #[test]
+    fn ravine_vehicles_author_damage_states() {
+        let Some(c) = open("ca_forge_ravine.map") else { return };
+        let find = |suffix: &str| -> Option<usize> {
+            for cls in [b"vehi", b"bipd"] {
+                if let Some(t) = c.find_tags(cls).into_iter().find(|&t| c.tag_name(t).ends_with(suffix)) { return Some(t); }
+            }
+            None
+        };
+        let mut seen = 0;
+        // (tag suffix, authored states, a region whose table was checked by hand: name, base
+        // permutation @4, per-state permutation from the STATES block resolved by name)
+        let wants = [
+            ("storm_warthog\\storm_warthog", vec![1u8, 2, 3, 4], ("mainhull", 1, [None, Some(0i8), Some(2), Some(3), Some(4)])),
+            ("storm_mantis\\storm_mantis", vec![1u8, 2, 3, 4], ("l_shoulder", 4, [None, Some(0i8), Some(2), Some(3), Some(1)])),
+        ];
+        for (suffix, expect_states, (rname, rbase, rstates)) in wants {
+            let Some(ot) = find(suffix) else { eprintln!("skip: {suffix} missing"); continue };
+            let mode = model_of(&c, ot).expect("mode");
+            let model = load_model(&c, mode).expect("model");
+            let pv = object_variant_index(&c, ot, 0);
+            let table = variant_region_table(&c, ot, Some(&model), pv);
+            for (name, perm, st) in &table {
+                eprintln!("{suffix} variant {pv:?} region {} perm {perm} states {st:?}", c.sid(*name));
+            }
+            // raw STATES block entries of every region (print-only): (name, runtime perm, state)
+            {
+                let d = c.data();
+                let hlmt = hlmt_of(&c, ot).unwrap();
+                let hm = c.tag_meta(hlmt).unwrap();
+                let (_, vo) = c.block(hm + OFF_HLMT_VARIANTS).unwrap();
+                let ve = vo + pv.unwrap_or(0) * HLMT_VARIANT_ELEM;
+                if let Some((nr, ro)) = c.block(ve + 0x24) {
+                    for r in 0..nr {
+                        let re = ro + r * HLMT_VREGION_ELEM;
+                        if let Some((np, po)) = c.block(re + 8) {
+                            let mut row = String::new();
+                            if let Some((ns, so)) = c.block(po + 0xC) {
+                                for k in 0..ns { let se = so + k * 0xC; row.push_str(&format!(" ('{}' rp{} st{})", c.sid(d.u32_at(se)), d.u8_at(se + 4) as i8, d.i16_at(se + 6))); }
+                            }
+                            eprintln!("   raw {} nperm={np} base@4={} states:{row}", c.sid(d.u32_at(re)), d.u8_at(po + 4) as i8);
+                        }
+                    }
+                }
+            }
+            let states = variant_damage_states(&c, ot, pv);
+            eprintln!("{suffix}: damage states {states:?}");
+            assert_eq!(states, expect_states, "{suffix} authored damage states");
+            let row = table.iter().find(|(n, _, _)| c.sid(*n) == rname).unwrap_or_else(|| panic!("{suffix}: region {rname}"));
+            assert_eq!((row.1, row.2), (rbase, rstates), "{suffix} region {rname} (base permutation, per-state permutations)");
+            let def = variant_meshes(&c, ot, &model, pv);
+            assert_eq!(variant_state_meshes(&c, ot, &model, pv, 0), def, "state 0 is the default picture");
+            let dead = variant_state_meshes(&c, ot, &model, pv, 4);
+            assert_ne!(dead, def, "{suffix}: the destroyed state must swap permutations");
+            assert!(!dead.is_empty());
+            // a state the model does not author draws the default model
+            if !states.contains(&2) { assert_eq!(variant_state_meshes(&c, ot, &model, pv, 2), def); }
+            seen += 1;
+        }
+        assert!(seen > 0);
     }
 }

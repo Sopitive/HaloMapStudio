@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -41,10 +42,12 @@
 <div class="toc"><strong>On this page</strong><ul>
 <li><a href="#select">Selecting objects</a></li>
 <li><a href="#place">Placing objects</a></li>
+<li><a href="#prefabs">Prefabs (reusable builds)</a></li>
 <li><a href="#tools">Tool modes and gizmos</a></li>
 <li><a href="#modal">Grab / rotate / duplicate (modal transforms)</a></li>
 <li><a href="#magnet">Axis lock, magnet and precision</a></li>
 <li><a href="#panel">The Object panel</a></li>
+<li><a href="#precision">Save precision (what the file will hold)</a></li>
 <li><a href="#flags">SCALED and SHADOW pseudo-flags</a></li>
 <li><a href="#bspwarn">Objects outside playable space</a></li>
 <li><a href="#mass">Mass edit</a></li>
@@ -77,6 +80,98 @@
 </ul>
 <p>Objects can also be placed with the <a href="scripting.html#place">script <code>place</code> command</a>, including relative to or flush against another object.</p>
 
+<h2 id="prefabs">Prefabs (reusable builds)</h2>
+<p>A <strong>prefab</strong> is a saved group of Forge objects &mdash; a tower, a ramp set, a whole base &mdash; that you
+can drop into any variant again and again. If your map uses several copies of the same structure, build it once,
+save it as a prefab, and place it wherever you need it. <em>(GitHub issue&nbsp;#5.)</em></p>
+
+<h3 id="prefab-save">Saving a selection</h3>
+<p>Select the objects you want (click, then <kbd>Shift</kbd>+click to add, or box-select), open
+<em>Tools&nbsp;&#9656;&nbsp;Prefabs&hellip;</em>, type a name and press <strong>Save <em>n</em> selected</strong>.</p>
+<p>What is captured, per object: which palette piece it is, its position and rotation, its <strong>team</strong>, colour,
+<strong>spawn order</strong> and respawn time, gametype <strong>labels</strong>, boundary <strong>shape and size</strong>, the
+teleporter channel and passability, spare clips, and the HMS-only <em>scaled</em> / <em>shadow</em> /
+<em>damage-state</em> flags &mdash; plus, on Halo&nbsp;4, user data, the lock flag, the trait-zone index and the
+record's own object-scale field.</p>
+<p>Positions are stored <strong>relative to the prefab's own anchor</strong>, never to the map, so a prefab is a shape
+rather than a place. The anchor is the <strong>centre of the group's footprint at its lowest piece</strong>: dropping the
+prefab puts the middle of its footprint under your cursor with its base at the cursor's height, exactly as placing a
+single object does.</p>
+
+<h3 id="prefab-place">Placing one</h3>
+<p>Pick a prefab from the list to see what it contains (a count per kind, its size in world units, the game and canvas
+it came from). Then set where it goes and press <strong>Place</strong>:</p>
+<ul>
+  <li><strong>At the camera</strong> (the default) drops it on the surface you are looking at; untick it to type an
+      exact position.</li>
+  <li><strong>Yaw</strong> turns the whole group about the vertical axis.</li>
+  <li><strong>Mirror X / Y / Z</strong> flips it across that axis through its own anchor &mdash; the same thing the
+      Construct tool's Mirror does, so a mirrored copy faces the way a real mirror image would. That is how you get the
+      matching half of a symmetric map without rebuilding it.</li>
+  <li><strong>Preview</strong> resolves and reports the placement <em>without creating anything</em>.</li>
+</ul>
+<p>Placing a prefab is <strong>one undo step</strong>, and the whole group is <strong>selected straight afterwards</strong>,
+so you can nudge, rotate or snap it into place immediately. That is also how you drop a prefab
+<em>exactly where the cursor is</em>: place it, then press <kbd>G</kbd> and the whole group follows the
+cursor with the usual axis locks, magnet snapping and precision modifier, dropping where you click.
+<kbd>R</kbd> rotates the group the same way, and <kbd>Esc</kbd> puts it back.</p>
+<p>A prefab that <strong>does not fit</strong> places <strong>nothing at all</strong> and says why &mdash; it never leaves
+half a structure behind. The three limits checked first are the variant's object <strong>slots</strong> (651, or 640 on
+Halo&nbsp;3), the palette entry's <strong>maximum allowed</strong> count, and the canvas <strong>budget</strong>; the
+message names the limit and the numbers. (Reach's Forge palette carries no prices or per-piece limits that HMS can read
+offline, so on Reach only the slot count applies, and the report says so rather than printing a number nobody can
+trust.) Both checks can be switched off in the panel.</p>
+
+<h3 id="prefab-crossgame">Placing a prefab from another game</h3>
+<p>A prefab saved in one game can be placed in another. This is a clearly-labelled <strong>second step</strong>:
+same-game placement always works on its own, and only when the open canvas is a different game (or the same game's
+canvas does not carry a piece) does HMS route each object through the same
+<a href="maps-and-variants.html#crossgame">cross-game equivalence resolver</a> the variant converter uses.</p>
+<p>The report is per object and honest about what it did:</p>
+<ul>
+  <li><strong>exact</strong> &mdash; the very same palette piece (found by palette slot, catalog object or object tag).</li>
+  <li><strong>equivalent</strong> / <strong>close</strong> &mdash; the resolver is confident; nothing to check.</li>
+  <li><strong>APPROXIMATE</strong> &mdash; the nearest thing the target palette has. These are highlighted and counted
+      separately, because an approximate match is often <em>not</em> the right piece. Go and look at them.</li>
+  <li><strong>NO MATCH</strong> &mdash; the object is <strong>left out and listed</strong>. HMS never silently
+      substitutes a wildly wrong piece.</li>
+</ul>
+<p>The headline count deliberately excludes the approximate matches, for the same reason the variant converter's
+coverage number does. <em>Accept at best</em> sets how good a match has to be before it is used at all.</p>
+
+<h3 id="prefab-share">Sharing a prefab</h3>
+<p>Each prefab is <strong>one file</strong> you can hand to someone: readable JSON with a
+<code>.hmsprefab</code> extension, in <code>prefabs\</code> inside the app's data folder (the panel shows the exact path,
+and the script verb <code>prefab where</code> prints it). Nothing in it points at your install, so it works on any
+machine.</p>
+<ul>
+  <li><strong>Import file&hellip;</strong> opens the usual file browser, filtered to prefabs, so you can take one from
+      anywhere on disk; it is checked and copied into your prefabs folder, and the browser's details line tells you what
+      a file holds before you open it.</li>
+  <li><strong>Export&hellip;</strong> writes a copy somewhere easy to find.</li>
+  <li><strong>Rename</strong> and <strong>Delete</strong> are in the list.</li>
+</ul>
+<p>An imported file is treated as untrusted: it is size-checked, parsed strictly, and refused with a message (never a
+crash) if it is not a prefab, is from a newer format than your build understands, claims more objects than a variant can
+hold, or carries no objects. Unusable positions or orientations inside an otherwise-good file are repaired and reported.
+A prefab's name can never make HMS write outside the prefabs folder.</p>
+<p>The format is small enough to write by hand. Only <code>format</code>, <code>version</code>,
+<code>name</code>, <code>game</code> and an <code>objects</code> list with a <code>pos</code>,
+<code>fwd</code> and <code>up</code> each are required; everything else has a sensible default, and
+positions are relative to the prefab's anchor:</p>
+<pre><code>{
+  "format": "hms-prefab", "version": 1,
+  "name": "Two blocks", "game": "reach", "canvas": "forge_halo",
+  "objects": [
+    { "key": "ff_plat_2x2#block_2x2", "pos": [0, 0, 0], "fwd": [1, 0, 0], "up": [0, 0, 1] },
+    { "key": "ff_plat_2x2#block_2x2", "pos": [0, 0, 1], "fwd": [1, 0, 0], "up": [0, 0, 1], "team": 0 }
+  ]
+}</code></pre>
+<p>The <code>key</code> is the piece's cross-game identity (its tag name plus the palette variant);
+<code>prefab show</code> and the panel's contents list name the pieces a prefab holds, and
+<code>xgame catalog</code> lists every key HMS knows.</p>
+<p>Everything here is scriptable &mdash; see <a href="scripting.html#prefab"><code>prefab</code></a>.</p>
+
 <h2 id="tools">Tool modes and gizmos</h2>
 <p>The floating toolbar in the viewport's top-left corner has four modes:</p>
 <div class="tablewrap"><table>
@@ -101,7 +196,7 @@
 <tr><td><kbd>Enter</kbd> or left-click</td><td>Confirm.</td></tr>
 <tr><td><kbd>Esc</kbd> or right-click</td><td>Cancel — poses are restored and duplicates removed.</td></tr>
 </table></div>
-<p>Pressing <kbd>G</kbd> or <kbd>R</kbd> during an operation switches to that operation. The OS cursor is hidden and captured while a transform is active (locked in place on Windows and Wayland, confined to the window on X11), and again while you fly with the right mouse button. Each confirmed transform is a single undo step.</p>
+<p>Every transform key on this page is a <strong>default</strong> and can be changed in <em>Settings ▸ Controls &amp; keyboard…</em> (<a href="shortcuts.html#rebind">details</a>). Pressing <kbd>G</kbd> or <kbd>R</kbd> during an operation switches to that operation. The OS cursor is hidden and captured while a transform is active (locked in place on Windows and Wayland, confined to the window on X11), and again while you fly with the right mouse button. Each confirmed transform is a single undo step.</p>
 
 <h2 id="magnet">Axis lock, magnet and precision</h2>
 <ul>
@@ -133,9 +228,58 @@
 <tr><td><code>position</code></td><td>X, Y, Z in world units (drag or type).</td></tr>
 <tr><td><code>rotation</code></td><td>X, Y, Z in <strong>degrees</strong>: X = roll, Y = pitch (positive = nose down), Z = yaw, right-hand rule — the same convention as the script <code>rotate</code> command. Typing a <kbd>-</kbd> <strong>anywhere</strong> in the field flips the sign (<code>90 -</code> = <code>-90</code>), and a trailing <code>deg</code> or <code>°</code> is accepted; the same goes for the <code>position</code> and raw forward / up fields.</td></tr>
 <tr><td><em>raw forward / up (advanced)</em></td><td>The underlying orientation vectors and their lengths, with <em>reset to unit</em> to normalise them. Stretched/skewed vectors preview in the viewer but are not yet written to the file.</td></tr>
+<tr><td><em>save precision</em></td><td>What this pose will cost when the variant is written: the exact position and rotation the file will hold, the error per axis and in total, and the rotation error split into roll / pitch / yaw. See <a href="#precision">Save precision</a>.</td></tr>
 </table></div>
 <p>Below the grid the panel lists the object's material (diffuse and emissive bitmap tags, blend mode) for reference. Every property edit is undoable.</p>
 <p>The fields that belong to the <em>variant</em> rather than to one object - its name, ids, budget, world bounds and the per-piece quota table - live in the left panel's <em>Variant properties</em> group; see <a href="maps-and-variants.html#properties">Variant properties</a>.</p>
+
+<h2 id="precision">Save precision (what the file will hold)</h2>
+<p>A map variant cannot store a pose exactly. Every game <strong>quantises</strong> it when the file is
+written, and reads that quantised value back when the map loads:</p>
+<ul>
+  <li><strong>Position</strong> is three integers measured across the variant's <em>world bounds</em> box.
+  The number of bits per axis is derived from how big that box is, so the spacing of the position grid
+  is a property of <em>your variant</em>, not a fixed number — widen the world bounds and every
+  position in the file gets coarser. Halo 3 always uses 16 bits per axis; Reach, Halo 4 and Halo 2
+  Anniversary compute the width from the extent (typically 21–23 bits).</li>
+  <li><strong>Rotation</strong> is an up vector snapped to a grid of directions plus a single turn
+  angle about it. That makes the error <strong>anisotropic</strong>: a small change in yaw costs one
+  angle step, while pitch and roll have to be expressed through the up vector's own grid. Reach,
+  Halo 4 and Halo 2 Anniversary store the angle in 14 bits (about 0.02&deg; of granularity); Halo 3
+  stores it in <strong>8</strong>, so a Halo 3 object's facing can be out by up to about 0.7&deg;.</li>
+</ul>
+<p>The <em>save precision</em> section at the bottom of the Object panel reports exactly what the
+next save will do to the selected object: the position it will actually hold, the error per axis and
+in total in world units, the total rotation error in degrees and the same error split into
+roll / pitch / yaw so you can see <em>which</em> axis is costing you. The numbers update live as you
+drag, rotate or type. The section also says how much of the available error the pose is using: a
+pose that is paying within a tenth of the <em>most</em> the format can cost it &mdash; sitting almost
+exactly between two representable values &mdash; is flagged as <strong>quantising badly</strong>,
+because a nudge of less than half a grid step would make the save free. A pose that survives the save
+untouched is reported as exact — and most objects are, because they were loaded from a file and have
+never been moved.</p>
+<p><strong>See it in the viewport.</strong> Tick <em>View &#9656; Overlays &#9656; Save-precision
+ghost</em> (off by default, remembered between runs) and the selected object is drawn a second time,
+in violet, at the pose the file will really hold. The ghost is drawn through anything in front of it,
+because at true scale it sits <em>inside</em> the object's own surface. The drift is small &mdash; on a
+Reach or Halo&nbsp;4 canvas the position lands under a millimetre out, and the rotation under a fifth
+of a degree &mdash; so an <strong>exaggerate</strong> factor next to the checkbox amplifies it so
+you can see which way the piece slides and which way it turns; &times;1 is the truth. The status bar
+says the ghost is on for as long as it is, and says <em>EXAGGERATED &times;N</em> whenever the factor
+is not 1, so an amplified ghost is never mistaken for the real result. An object whose pose is
+already exact draws no ghost at all — its absence is the answer.</p>
+<p><strong>Remove the error instead of watching it.</strong> <em>Snap to representable</em> moves the
+selection onto the nearest pose the file can store exactly, after which the predicted error is zero
+and a save changes nothing. It is one undo step, it is never applied automatically, and applying it
+twice does nothing the second time. With several objects selected it snaps all of them.</p>
+<p><strong>Scripted / headless.</strong> <code>precision</code> prints the open variant's grid and
+the error statistics over every object; <code>precision &lt;datum&gt;</code> details one object;
+<code>precision worst [n]</code> ranks the worst offenders by position and by rotation, which is the
+list to work through before releasing a map; <code>precision snap [selection|all|&lt;datum&gt;]</code>
+applies the snap; <code>precision ghost [on|off] [&lt;factor&gt;]</code> drives the overlay. See the
+<a href="scripting.html">scripting reference</a>.</p>
+<div class="note"><p>Halo 2 Anniversary stores a pose the way Halo 4 does, so the prediction there is the
+Halo 4 one.</p></div>
 
 <h2 id="flags">SCALED and SHADOW pseudo-flags</h2>
 <p>Two per-object switches control how the <em>viewer</em> treats a piece. They are <strong>pseudo-flags</strong>: the <code>.mvar</code> format has no field for them, so they are never written to the variant; your overrides are stored in the project file (<code>.mmsproj</code>) instead and restored when you open the project.</p>
@@ -191,13 +335,13 @@
 <h2 id="extras">Model Painter, Import geometry, Light bake map</h2>
 <ul>
   <li><strong>Tools ▸ Model Painter…</strong> voxelises an <code>.obj</code> from the <code>models/</code> folder next to the executable (resolution 4–48, size 2–200 world units) and places one copy of the selected palette item per surface voxel.</li>
-  <li><strong>Tools ▸ Import geometry…</strong> loads an <code>.obj</code> / <code>.glb</code> from <code>models/</code> as a persistent reference mesh you can place objects on (for example a level converted from another game). <em>Clear imported</em> removes it.</li>
+  <li><strong>Tools ▸ Import geometry…</strong> loads an <code>.obj</code>, <code>.glb</code> or <code>.gltf</code> — from <code>models/</code> or, with <em>Browse…</em>, from anywhere on disk — as a persistent model you can place objects on (for example a level converted from another game). It draws with its <strong>own materials and textures</strong>: glTF base-colour maps and factors (PNG and JPEG, embedded or beside the file) and OBJ <code>map_Kd</code> / <code>Kd</code> from the sibling <code>.mtl</code>, one material at a time so a multi-material model is not flattened to one look; a model with no materials draws in a clean neutral instead. Imported models are lit like a placed Forge piece — the map's own probe light where the model stands, plus the sun and its shadow — so they sit in the level rather than glowing flat. Each import is <strong>movable</strong>: select it in the viewport and use the gizmo, <kbd>G</kbd>/<kbd>R</kbd>, or the panel's Position / Rotation / Scale fields, and objects snap and settle onto it wherever you put it. The browser's details line says what a file carries (parts, materials, textures) before you import it. Projects remember every import's file and pose. <em>Clear all</em> removes them.</li>
   <li><strong>Tools ▸ Light bake map…</strong> renders a top-down map of the baked light colour a Forge piece would receive at every spot on the level, enumerates the achievable shades, and for a chosen shade finds the closest-matching positions with <em>Move here</em> / <em>Camera</em> buttons. Useful for colour-matching pieces that are lit by the lightmap.</li>
 </ul>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

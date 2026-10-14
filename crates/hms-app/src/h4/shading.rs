@@ -136,6 +136,10 @@ pub struct H4Shading {
     pub boundary: Option<Boundary>,
     /// `srf_char_cov*` (`#h4-veh`): the Covenant three-colour view-angle ramp.
     pub char_cov: Option<CharCov>,
+    /// `srf_ca_skybox_terrain` (`#h2a-vista`): the H2A vista ring terrain (own constant lights).
+    pub skybox_terrain: Option<SkyboxTerrain>,
+    /// `srf_ca_skybox_water` (`#h2a-vista`): the H2A vista ocean (own key light + cube fresnel).
+    pub skybox_water: Option<SkyboxWater>,
 }
 
 // #h4-veh
@@ -220,6 +224,87 @@ pub struct Layered3 {
     pub mask_mode: u8,
 }
 
+// #h2a-vista
+/// `srf_ca_skybox_terrain` (H2A: the vista RING of Ascension - `ca_ascension_halosections`'s
+/// terrain tiles and mountains, drawn as huge world scenery; also on the other groundhog maps'
+/// vistas): a two-layer tinted terrain composed from a GREY packed atlas plus a tree overlay and
+/// a modulation map, lit by its OWN constant lights - no lightmap, no probe, no scene sun. Read
+/// from the shipped DXBC of ca_ascension.map (scratch asc_ps/terrain_ps01_A.asm = the G-buffer
+/// entry; entries 04/06/09/11/36/37 are BYTE-IDENTICAL, so the BSP and the object lighting paths
+/// compute the same thing). Samplers in `mat ` slot order: t0 `color_combo_map` (cb11[0]),
+/// t1 `macro_normal_map`, t2 `mix_map`, t3 `tree_color_map`, t4 `tree_normal_map`,
+/// t5 `modulate_map`; `cb13[k]` = `user_parameter_16k` = p_k below (17 slots, p0..p16).
+///
+/// Albedo (entry 01, `o0.rgb`; only the combo map's R and G are read - it is two grey masks):
+/// ```text
+/// B      = combo.g * p0.rgb * p0.w                       (base layer)
+/// A      = combo.r * p1.rgb * p1.w                       (second layer)
+/// wA     = p2.x * min(1, (mix.g * p2.y)^p2.y)
+/// c      = lerp(B, A, wA)
+/// tw     = min(1, mix.b^p3.w)                            (highlight / snow weight)
+/// c      = c + sat(c + tw * p3.rgb * p4.x)               (yes: the base is added twice)
+/// tm     = sat(tree.a + mix.r - 1)                       (tree mask)
+/// c      = lerp(c, tree.rgb * p4.yzw * p5.y, p5.x * min(1, tm^(1 - p5.z)))
+/// albedo = c * (1 + sat((1 - tw) * p6.rgb * p7.x * mod.rgb^p6.w))
+/// ```
+/// Normal (`o1`): `n = lerp(n_macro, n_tree, tree weight) + n_tree * mod.rgb^2 * p7.y`
+/// (component-wise by the modulate map's channels), both maps signed .xy with z = sqrt(1 - |xy|^2),
+/// then the tangent frame. Spec mask = 0 (`o0.w`): the family has no specular at all.
+///
+/// Lighting (every lit entry; `t16` = the G-buffer albedo, N = the decoded WORLD normal,
+/// P = world position, d = |P - eye|):
+/// ```text
+/// wrap(N, dir, w) = sat(dot(N, normalize(dir)) * (1 - w) - (1 - w) + 1)
+/// light  = wrap(N, (p10.w, p11.x, p11.y), p12.w) * p12.rgb * p11.z          (cool fill)
+///        + wrap(N, (p7.z, p7.w, p8.x),  p9.w)  * p9.rgb  * p8.y            (warm key)
+///        + p14.rgb                                                          (ambient)
+/// A      = 1 - sat((d - p14.w) / (p15.x - p14.w))                            (near = 1)
+/// B      = sat((P.y - (1 - p15.w)) / (p15.w - p16.x))
+/// C      = sat((P.y - p15.w) / (p16.x - p15.w))
+/// D      = sat((P.z - p15.y) / (p15.z - p15.y))
+/// f      = sat(1 - A + B + C - D)
+/// out    = lerp(albedo * light, p16.yzw, f) * exposure
+/// ```
+/// Ascension's tiles: key (0.6, 0.2, 0.2) x (1, 0.87, 0.67) x 2.5 wrap 0.15, fill (-1, 0, 0) x
+/// (0.23, 0.49, 0.54) x 0.5 wrap 0.127, no ambient, haze (0.106, 0.255, 0.289) from d = -1000 to
+/// 12000 wu (the ring is 7600 wu across), released above z = 2000. The renderer's lane 4 reads
+/// the 17 constants back from a 17x1 RGBA16F texture in the `bump_detail3` slot (the instance
+/// attribute budget is full - mesh.rs InstanceRaw).
+#[derive(Clone, Debug)]
+pub struct SkyboxTerrain {
+    pub mix: Option<usize>,
+    pub mix_xform: [f32; 4],
+    pub modulate: Option<usize>,
+    pub modulate_xform: [f32; 4],
+    /// user_parameter_160..176 as the shader's cb13[0..17] (missing slots zero).
+    pub params: [[f32; 4]; 17],
+}
+
+/// `srf_ca_skybox_water` (`#h2a-vista`): the vista OCEAN of the same ring (`skybox_water_01`),
+/// entries 01 / 06 of ca_ascension.map (scratch asc_ps/water_ps01_A.asm, water_ps06_A.asm).
+/// Slots: t0..t2 `waves01..03_normal_map`, t3 `color_map` (sampled at the SECOND uv set `v1.zw`),
+/// t4 `noise_map`, t5 `reflection_map` (cube).
+/// ```text
+/// G-buffer: albedo = color.rgb * p0.rgb;  o1.z = color.a (a per-texel reflection / spec mask)
+///           discard unless sat((1.00001 - color.a)^-p3.x - min(1, noise^p2.w)) >= 0.998   (foam holes)
+///           N = normalize((sum of the 3 wave maps rotated by p3.zyw about (0.5, 0.5)) * p1.y / 12, z)
+/// Lit:      V = normalize(P - eye), NdotV = sat(-V.N), L = normalize(p4.xyz), H = normalize(L - V)
+///           refl = cube(reflect(V, N), lod 1 - p0.w) * p2.rgb * lerp(0.04, max(p0.w, 0.04), (1 - NdotV)^5) * p1.x * color.a
+///           diff = sat(N.L) * p5.rgb * p4.w + p6.rgb
+///           S = 2^(9 p0.w);  spec = sat(N.L) * sat(N.H)^S * (S / 8 + 1) * ((1 - sat(L.H))^5 * 0.96 + 0.04) * p5.rgb * p4.w * color.a
+///           out = lerp(albedo * diff + refl + spec, p8.yzw, haze(p6.w, p7, p8)) * exposure   (the terrain's haze law)
+/// ```
+/// Ascension: p0 = (0.35, 0.61, 0.80, 0.85), p1.x = 3 (reflection), p4 = (0.6, 0.2, 0.2, 1) with
+/// p5 = (0.62, 0.54, 0.42) (the same key direction as the terrain), no ambient. PROVISIONAL in the
+/// port (mesh.rs lane 5): the colour map is replaced by its MEAN linear colour (the 36-B object
+/// vertex carries no second uv set; at uv1 it smears into streaks), the wave normals (|xy| <= 0.025 = 1.5 deg on Ascension) are the geometric
+/// normal, the foam alpha test is not applied (the additive foam sheets draw over the water).
+#[derive(Clone, Debug)]
+pub struct SkyboxWater {
+    /// user_parameter_160..168 as the shader's cb13[0..9] (missing slots zero).
+    pub params: [[f32; 4]; 9],
+}
+
 // #grid-render
 /// `srf_ca_boundary` / `srf_ca_boundary_noscale` (the Halo 4 Forge GRID piece `fw_grid`, the
 /// boundary walls): a fully self-illuminated ADDITIVE family with no lit term at all. Read from
@@ -292,7 +377,15 @@ impl H4Shading {
         let mut t = H4TexRoles::default();
         // layer0_coMap / r_color: the layered terrain families that are not decoded
         // (srf_env_m30_rock_occlusion, ...) at least get their first layer instead of white
-        (t.color, t.color_xform) = tex(m, &["color_map", "diffuseMap", "diffuse_map", "base_map", "baseMap", "color1_map", "layer0_coMap", "r_color"]);
+        // color_combo_map last: srf_ca_skybox_terrain (H2A Ascension's vista ring tiles /
+        // mountains, drawn as world scenery) has NO color_map - its albedo is a tiled terrain
+        // colour atlas that mix_map selects from. Without it the sunlit ring took the WHITE
+        // fallback and read as a solid white shell around the whole map.
+        // cloud_alpha_map / texture_01_map last: srf_ca_skybox_cloudlayer* keeps its cloud
+        // texture (rgb + alpha mask) under `cloud_alpha_map`, srf_ca_skybox_6texcombine its first
+        // sheet under `texture_01_map`. Unpicked, both fell back to WHITE and, being additive
+        // emissive layers, painted a tinted sheet over the whole vista (magenta ocean).
+        (t.color, t.color_xform) = tex(m, &["color_map", "diffuseMap", "diffuse_map", "base_map", "baseMap", "color1_map", "layer0_coMap", "r_color", "color_combo_map", "cloud_alpha_map", "texture_01_map"]);
         (t.normal, t.normal_xform) = tex(m, &["normal_map", "normalMap"]);
         (t.normal_detail, t.normal_detail_xform) = tex(m, &["normal_detail_map"]);
         (t.color_detail, t.color_detail_xform) = tex(m, &["color_detail_map"]);
@@ -340,6 +433,8 @@ impl H4Shading {
             layered: None,
             boundary: None,
             char_cov: None,
+            skybox_terrain: None,
+            skybox_water: None,
         }
     }
 
@@ -501,6 +596,33 @@ impl H4Shading {
             //   two_height_detailnormal_reflection: 2 layers: l0 p1, l1 p7 masked by blend.g with
             //     (p10.y, p10.z) -> layer slot 2 (slot 1 = layer 0 again, weight 0)
             // Spec constants stay the layer-0 stand-in of the decoded family (PROVISIONAL).
+            // #h2a-layered: Halo 2 Anniversary's PBR layered families (Zanzibar plaster / terrain,
+            // Relic sand, Coagulation ground ...): `blend_map` + `layer0/1/2_coMap` with
+            // `layer_N_normal_map`. They are NOT in the Halo 4 table, so the generic picker took
+            // `layer0_coMap` alone - white plaster / one rock layer everywhere = the grey-white
+            // Zanzibar. Routed through the Layered3 lane as a straight blend-map channel mix
+            // (mask_mode 1: l0*B.r + l1*B.g + l2*B.b), neutral tints - APPROXIMATION until the
+            // family's pixel shader is transcribed (their constants are PBR, not blend heights).
+            f if f.starts_with("srf_pbr_ca_terrain") || f.starts_with("srf_pbr_ca_plaster") => {
+                s.known = true;
+                let (blend, _) = tex(m, &["blend_map"]);
+                let l0 = tex(m, &["layer0_coMap"]); let l1 = tex(m, &["layer1_coMap"]); let l2 = tex(m, &["layer2_coMap"]);
+                let n0 = tex(m, &["layer_0_normal_map", "layer0_nmMap"]); let n1 = tex(m, &["layer_1_normal_map", "layer1_nmMap"]); let n2 = tex(m, &["layer_2_normal_map", "layer2_nmMap"]);
+                s.tex.color = l0.0; s.tex.color_xform = l0.1;
+                s.tex.normal = n0.0; s.tex.normal_xform = n0.1;
+                s.albedo_tint = [1.0, 1.0, 1.0]; s.diffuse_intensity = 1.0;
+                if blend.is_some() && (l1.0.is_some() || l2.0.is_some()) {
+                    s.layered = Some(Layered3 {
+                        blend,
+                        layer_co: [l0.0, l1.0.or(l0.0), l2.0.or(l1.0).or(l0.0)], layer_co_xform: [l0.1, if l1.0.is_some() { l1.1 } else { l0.1 }, if l2.0.is_some() { l2.1 } else if l1.0.is_some() { l1.1 } else { l0.1 }],
+                        layer_nm: [n0.0, n1.0.or(n0.0), n2.0.or(n1.0).or(n0.0)], layer_nm_xform: [n0.1, if n1.0.is_some() { n1.1 } else { n0.1 }, if n2.0.is_some() { n2.1 } else if n1.0.is_some() { n1.1 } else { n0.1 }],
+                        layer_tint: [[1.0; 3]; 3],
+                        all_detail: None, all_detail_xform: [1.0, 1.0, 0.0, 0.0],
+                        blend1: [0.0, 0.0], blend2: [0.0, 0.0],
+                        mask_mode: 1,
+                    });
+                }
+            }
             "srf_ca_layered_redoubt" | "srf_ca_layered_basin" | "srf_ca_layered_basin_detail"
             | "srf_ca_layered_three_height_detailnormalx2" | "srf_ca_layered_one_reflection"
             | "srf_layered_three_height" | "srf_layered_three_height_detailnormal"
@@ -642,6 +764,39 @@ impl H4Shading {
                     spec_detail_xform: sd_xform,
                 });
             }
+            // #h2a-vista srf_ca_skybox_terrain: see the `SkyboxTerrain` doc for the asm-derived
+            // law. Texture roles: base = color_combo_map (two grey masks), normal = macro_normal_map,
+            // normal_detail = tree_normal_map, color_detail = tree_color_map; the mix / modulate maps
+            // ride the struct. No specular, no reflection, no self-illum, no lit tint.
+            "srf_ca_skybox_terrain" => {
+                s.known = true;
+                s.spec_model = SpecModel::None;
+                s.spec_src = SpecSource::None;
+                (s.tex.color, s.tex.color_xform) = tex(m, &["color_combo_map"]);
+                (s.tex.normal, s.tex.normal_xform) = tex(m, &["macro_normal_map"]);
+                (s.tex.normal_detail, s.tex.normal_detail_xform) = tex(m, &["tree_normal_map"]);
+                (s.tex.color_detail, s.tex.color_detail_xform) = tex(m, &["tree_color_map"]);
+                let (mix, mix_xform) = tex(m, &["mix_map"]);
+                let (modulate, modulate_xform) = tex(m, &["modulate_map"]);
+                let mut params = [[0.0f32; 4]; 17];
+                for (k, slot) in params.iter_mut().enumerate() { *slot = p(k); }
+                s.albedo_tint = [1.0; 3]; s.diffuse_intensity = 1.0;
+                s.spec_intensity = 0.0; s.refl_intensity = 0.0;
+                s.skybox_terrain = Some(SkyboxTerrain { mix, mix_xform, modulate, modulate_xform, params });
+            }
+            // #h2a-vista srf_ca_skybox_water: see the `SkyboxWater` doc. base = color_map (resolved
+            // above), the reflection cube rides the std cube slot, the constants the bump_detail3 row.
+            "srf_ca_skybox_water" => {
+                s.known = true;
+                s.spec_model = SpecModel::None;
+                s.spec_src = SpecSource::None;
+                s.tex.normal = None; s.tex.normal_detail = None; s.tex.color_detail = None;
+                let mut params = [[0.0f32; 4]; 9];
+                for (k, slot) in params.iter_mut().enumerate() { *slot = p(k); }
+                s.albedo_tint = [1.0; 3]; s.diffuse_intensity = 1.0;
+                s.spec_intensity = 0.0; s.refl_intensity = 0.0;
+                s.skybox_water = Some(SkyboxWater { params });
+            }
             // #h4-veh srf_char_constant: NO textures, NO samplers, no lighting at all - entry 01
             // writes `o0.rgb = up160.rgb` and entries 04/06 are byte-identical and emit
             // `ps_view_albedo * up160.w` through the self-illum exposure lerp. A pure emissive
@@ -679,7 +834,7 @@ impl H4Shading {
                 else if s.tex.specular.is_some() { s.spec_model = SpecModel::Blinn; s.spec_src = SpecSource::SpecularMap; s.spec_intensity = 1.0; s.rough_min = 0.01; s.rough_max = 1.0; }
             }
         }
-        if !detail_on && !fam.contains("layered") { s.tex.normal_detail = None; }
+        if !detail_on && !fam.contains("layered") && s.skybox_terrain.is_none() { s.tex.normal_detail = None; }
         if s.tex.reflection_cube.is_none() { s.refl_intensity = 0.0; }
         if s.rough_min <= 0.0 { s.rough_min = 1e-5; }
         if s.rough_max <= 0.0 { s.rough_max = s.rough_min; }
@@ -712,7 +867,7 @@ pub fn describe(s: &H4Shading) -> String {
         s.spec_tint_by_albedo, s.refl_tint, s.refl_intensity, s.fresnel_scale, s.fresnel_power, s.fresnel_weight, s.fresnel_invert,
         s.self_illum_color, s.self_illum_intensity, s.self_illum_mode, s.normal_detail_fade_start, s.normal_detail_fade_end,
         if s.snow.is_some() { " +snow" } else { "" },
-        if s.layered.is_some() { " +layered3" } else if s.boundary.is_some() { " +boundary" } else { "" })
+        if s.layered.is_some() { " +layered3" } else if s.boundary.is_some() { " +boundary" } else if s.skybox_terrain.is_some() { " +skybox_terrain" } else if s.skybox_water.is_some() { " +skybox_water" } else { "" })
         + &s.char_cov.as_ref().map(|c| format!(" +charcov face {:?}^{:.2} mid {:?}^{:.2} graze {:?}^{:.2} refl-sat {:.2}{}",
             [c.face[0], c.face[1], c.face[2]], c.face[3], [c.mid[0], c.mid[1], c.mid[2]], c.mid[3],
             [c.graze[0], c.graze[1], c.graze[2]], c.graze[3], c.refl_saturation,
@@ -775,6 +930,40 @@ mod tests {
         }
         eprintln!("families known {known}/{total}");
         assert!(known * 100 >= total * 85, "known {known}/{total}");
+    }
+
+    /// #h2a-vista: Ascension's ring tiles (`srf_ca_skybox_terrain`) and ocean
+    /// (`srf_ca_skybox_water`) decode into the vista lanes with their texture roles and the raw
+    /// user constants (terraintile_01: p0 = (0.511, 0.542, 0.231, 0.291), p15 = (12000, -500,
+    /// 2000, 300); skybox_water_01: p0.w = 0.85, p1.x = 3, p7.x = 12000).
+    #[test]
+    fn h2a_vista_families_decode() {
+        let Some(dir) = crate::h4::cache::h2a_maps_dir() else { return };
+        let p = dir.join("ca_ascension.map");
+        if !p.is_file() { eprintln!("skip: {} missing", p.display()); return; }
+        let c = H4Cache::open(&p).expect("open");
+        let mut seen = 0;
+        for t in c.find_tags(b"mat ") {
+            let name = c.tag_name(t).to_string();
+            if !(name.ends_with("ca_ascension_terraintile_01") || name.ends_with("skybox_water_01")) { continue; }
+            let m = crate::h4::materials::load_material(&c, t);
+            let s = H4Shading::from_material(&m);
+            assert!(s.known, "{}", describe(&s));
+            assert_eq!(s.spec_model, SpecModel::None);
+            if name.ends_with("terraintile_01") {
+                let st = s.skybox_terrain.as_ref().expect("skybox terrain lane");
+                assert!(s.tex.color.is_some() && s.tex.normal.is_some() && s.tex.normal_detail.is_some() && s.tex.color_detail.is_some(), "{}", describe(&s));
+                assert!(st.mix.is_some() && st.modulate.is_some());
+                assert!((s.tex.color_xform[0] - 15.0).abs() < 1e-4 && (s.tex.color_detail_xform[0] - 8.0).abs() < 1e-4 && (st.modulate_xform[0] - 3.0).abs() < 1e-4);
+                assert!((st.params[0][3] - 0.291).abs() < 1e-4 && (st.params[15][0] - 12000.0).abs() < 1e-3 && (st.params[15][1] + 500.0).abs() < 1e-3, "{:?}", st.params);
+            } else {
+                let sw = s.skybox_water.as_ref().expect("skybox water lane");
+                assert!(s.tex.color.is_some() && s.tex.reflection_cube.is_some() && s.tex.normal.is_none(), "{}", describe(&s));
+                assert!((sw.params[0][3] - 0.85).abs() < 1e-4 && (sw.params[1][0] - 3.0).abs() < 1e-4 && (sw.params[7][0] - 12000.0).abs() < 1e-3, "{:?}", sw.params);
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "both vista materials found");
     }
 
     /// The Forge GRID piece's material (`fw_grid` -> `srf_ca_boundary_noscale`) decodes into the

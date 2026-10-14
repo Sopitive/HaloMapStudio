@@ -4,8 +4,11 @@
 //! Entered from `main()` when `HMS_SHOT` is set. The documented inputs (site/headless.html):
 //! `HMS_SHOT` (output PNG), `HMS_MAP` (stem / substring / path), `HMS_SHOT_SIZE` ("WxH", default
 //! 1600x900), `HMS_CAM` ("x,y,z,yawDeg,pitchDeg"), `HMS_VIEW` / `HMS_DIST` / `HMS_FOV`,
-//! `HMS_SPAWNCAM`, `HMS_STANDOFF`, `HMS_TIME`, `HMS_MVAR` / `HMS_MVAR_LIST`, `HMS_PLACE` /
-//! `HMS_PLACE_COLOR`, the overlay switches and `HMS_PREVIEW_SHOT`. Every other `HMS_*` read here
+//! `HMS_SPAWNCAM`, `HMS_STANDOFF`, `HMS_TIME`, `HMS_LANE_DROP` (empty named render lanes, so a
+//! surface class can be isolated by differencing two captures), `HMS_MVAR` / `HMS_MVAR_LIST`, `HMS_IMPORT` /
+//! `HMS_IMPORT_POSE` (#model-import), `HMS_PLACE` /
+//! `HMS_PLACE_COLOR`, `HMS_ACTOR` (posed Reach bipeds), the overlay switches and
+//! `HMS_PREVIEW_SHOT`. Every other `HMS_*` read here
 //! is a print-only development diagnostic (each is described where it is read). A companion
 //! "<png>.log" records the scene statistics.
 
@@ -65,6 +68,11 @@ pub fn run() -> anyhow::Result<()> {
     // IS Halo 4's apart from the pointer expander (docs/h2a_support_plan.md).
     if crate::h2a::is_h2a_cache(std::path::Path::new(&map_path)) {
         return crate::h2a::render::headless_run(&map_path, &out, w, h);
+    }
+    // #h3: Halo 3 (MCC) caches are a Reach-family container with its own pure-Rust reader
+    // (h3/*). Cluster BSP geometry through the shared renderer.
+    if crate::h3::is_halo3_cache(std::path::Path::new(&map_path)) {
+        return crate::h3::render::headless_run(&map_path, &out, w, h);
     }
 
     // --- windowless wgpu device (DX12/Vulkan offscreen; no surface) ---
@@ -183,6 +191,11 @@ pub fn run() -> anyhow::Result<()> {
     if let Ok(v) = std::env::var("HMS_VEHMAT") { for t in v.split(',') { if let Ok(tag) = u32::from_str_radix(t.trim().trim_start_matches("0x"), 16) { scene.dump_object_materials(tag); } } }
     // HMS_OBJE_CC=<obj hex,...>: the obje change-colour block. HMS_DUMP_BITMAP=<bitm hex,...>: bitmap headers.
     if let Ok(v) = std::env::var("HMS_OBJE_CC") { for t in v.split(',') { if let Ok(tag) = u32::from_str_radix(t.trim().trim_start_matches("0x"), 16) { scene.scan_change_colors(tag); } } }
+    // #objshine HMS_OBJMETA=<tag-name substring>: class + obje type/flags/radius + chmt per tag.
+    if let Ok(v) = std::env::var("HMS_OBJMETA") { scene.scan_obj_meta(v.trim()); }
+    // #objmat HMS_OBJMAT_SWEEP=1|<substring>: the per-PART engine material of every Forge-palette
+    // object (this part's own specular / roughness / environment lane vs shader 0's legacy constants).
+    if let Ok(v) = std::env::var("HMS_OBJMAT_SWEEP") { scene.scan_obj_mat(v.trim()); }
     if let Ok(v) = std::env::var("HMS_DUMP_BITMAP") { for t in v.split(',') { if let Ok(tag) = u32::from_str_radix(t.trim().trim_start_matches("0x"), 16) { scene.dump_bitmap_diag(tag); } } }
     // HMS_DUMP_LUT3D=<tag hex>:<out path> writes a 3D bitmap (engine LUT) as a raw u8 volume.
     if let Ok(v) = std::env::var("HMS_DUMP_LUT3D") { if let Some((t, p)) = v.split_once(':') { if let Ok(tag) = u32::from_str_radix(t.trim().trim_start_matches("0x"), 16) { scene.dump_lut3d_diag(tag, p.trim()); } } }
@@ -229,6 +242,29 @@ pub fn run() -> anyhow::Result<()> {
     let _ = handle.join();
     let mut scene = *done_scene.ok_or_else(|| anyhow::anyhow!("load worker died before Done"))?;
     logln!("meshes: opaque={n_op} terrain={n_ter} water={n_wat} alphatest={n_at} foliage={n_fol} blend={n_bl} additive={n_add} decal={n_dec} sky={n_sky}");
+    // HMS_LANE_DROP=<lane,...> (diagnostic, print-only in effect): empties the named render
+    // lanes before the shot, so the pixels a lane owns can be isolated by differencing two
+    // captures (the fidelity rig's per-surface-class masks). Lanes: opaque, terrain, water,
+    // alphatest, foliage, blend, additive, decal, sky.
+    if let Ok(v) = std::env::var("HMS_LANE_DROP") {
+        for lane in v.split(',').map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()) {
+            match lane.as_str() {
+                "opaque" => renderer.set_static_meshes(Vec::new()),
+                "terrain" => renderer.set_terrain_meshes(Vec::new()),
+                "water" => renderer.set_water_meshes(Vec::new()),
+                "alphatest" => renderer.set_alphatest_meshes(Vec::new()),
+                "foliage" => renderer.set_foliage_meshes(Vec::new()),
+                "blend" => renderer.set_blend_meshes(Vec::new()),
+                "additive" => renderer.set_additive_meshes(Vec::new()),
+                "decal" => renderer.set_decal_meshes(Vec::new()),
+                "sky" => renderer.set_sky_meshes(Vec::new()),
+                // the scenario-object lanes are uploaded further down; handled there.
+                "objects" => continue,
+                other => { logln!("HMS_LANE_DROP: unknown lane '{other}'"); continue; }
+            }
+            logln!("HMS_LANE_DROP: emptied lane '{lane}'");
+        }
+    }
     // HMS_PATHTRACED=1 replaces the shipped lightmaps with the GPU path-traced bake: bake, fill
     // baked_atlas, clear the BSP-derived meshes, reload (load_step then builds LightmapInputs from
     // the baked atlas). The same flow as the interactive toggle.
@@ -806,10 +842,17 @@ pub fn run() -> anyhow::Result<()> {
     // maybe_rebuild works under a per-frame time budget (interactive smoothness), so it may
     // leave models un-decoded and set rebuild_pending. Headless wants the complete set in one
     // shot: loop until it settles (each call returns the full current set; the last is complete).
+    // The variant's models decode on a background thread (start_background_predecode) and land
+    // through the rebuild's poll; a fixed pass count could run out before a slow decode delivered
+    // (each pass re-runs the per-object lighting raycasts), leaving the shot with NO objects. Wait
+    // on wall-clock instead, yielding between passes while nothing new has arrived.
     let mut obj_meshes = None;
-    for _ in 0..4096 {
+    let t_wait = std::time::Instant::now();
+    loop {
         obj_meshes = scene.maybe_rebuild(&objects, &empty, renderer.mesh_renderer(), &device, &queue).or(obj_meshes);
         if !scene.rebuild_pending() { break; }
+        if t_wait.elapsed().as_secs() > 600 { logln!("object decode still pending after 600 s; rendering what arrived"); break; }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
     if let Some((op, cut, holo, holo_solid, blend)) = obj_meshes {
         logln!("object meshes: opaque={} cutout={} holo={} holo_solid={} blend={}", op.len(), cut.len(), holo.len(), holo_solid.len(), blend.len());
@@ -818,6 +861,58 @@ pub fn run() -> anyhow::Result<()> {
         renderer.set_dynamic_holo_meshes(holo);
         renderer.set_dynamic_holo_solid_meshes(holo_solid);
         renderer.set_dynamic_blend_meshes(blend);
+    }
+    // HMS_LANE_DROP=objects (diagnostic): the scenario-object lanes, dropped here because they
+    // are uploaded after the BSP lanes above.
+    if std::env::var("HMS_LANE_DROP").map(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("objects"))).unwrap_or(false) {
+        renderer.set_dynamic_meshes(Vec::new());
+        renderer.set_dynamic_cutout_meshes(Vec::new());
+        renderer.set_dynamic_holo_meshes(Vec::new());
+        renderer.set_dynamic_holo_solid_meshes(Vec::new());
+        renderer.set_dynamic_blend_meshes(Vec::new());
+        logln!("HMS_LANE_DROP: emptied lane 'objects'");
+    }
+    // #reach-skin HMS_ACTOR: place posed, GPU-SKINNED Reach bipeds (optionally holding a
+    // weapon) in the capture. Spec (several separated by ';'):
+    //     <bipd name>@x,y,z[,yawDeg][:anim=<animation name>][:frame=<n>][:weapon=<weap name>]
+    // e.g. HMS_ACTOR="spartans@10,2,0.6,180:anim=combat:rifle:idle:frame=0:weapon=assault_rifle"
+    // `frame=` pins a frame (and stops playback) so a capture is deterministic; without it the
+    // actor is at frame 0. See crates/hms-app/src/reach_actor.rs for the API.
+    let mut actor_scene = crate::reach_actor::ActorScene::default();
+    if let Ok(spec) = std::env::var("HMS_ACTOR") {
+        if let Some(cache) = scene.cache_handle() {
+            let specs = crate::reach_actor::parse_actor_specs(&spec);
+            for line in crate::reach_actor::apply_actor_specs(&mut actor_scene, scene.native_dll(), cache, &specs) {
+                logln!("{line}");
+            }
+            let t_a = std::time::Instant::now();
+            loop {
+                renderer.set_first_person_fov_scale(crate::film_play::first_person_fov_scale());
+                let built = crate::reach_actor::build_actor_meshes(
+                    &mut actor_scene, &mut scene, renderer.mesh_renderer(), &device, &queue);
+                if !built.pending || t_a.elapsed().as_secs() > 300 {
+                    // #sword-blade the three TRANSPARENT lanes are reported too: "the held sword
+                    // reached a transparent pipeline" is exactly what a headless gate reads.
+                    let (o, c, h, hs, b) = built.world.counts();
+                    let (fo, fc, fh, fhs, fb) = built.first_person.counts();
+                    logln!("actor meshes: opaque={o} cutout={c} holo={h} holo_solid={hs} blend={b} ({} actor(s)); first-person rig: opaque={fo} cutout={fc} holo={fh} holo_solid={fhs} blend={fb}", actor_scene.actors.len());
+                    let l = built.world;
+                    let f = built.first_person;
+                    renderer.set_actor_meshes(l.opaque, l.cutout, l.holo, l.holo_solid, l.blend);
+                    renderer.set_first_person_meshes(f.opaque, f.cutout, f.holo, f.holo_solid, f.blend);
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            actor_scene.update(0.0, &queue);
+            // #armour-fx The ACTOR PARTICLE LANE (a player's armour effect), from the pose
+            // `update` just produced. Simulated by `build_particle_meshes` further down.
+            scene.set_actor_particle_sources(actor_scene.particle_sources());
+            for l in actor_scene.fx_report() { logln!("actor fx: {l}"); }
+            for l in actor_scene.describe() { logln!("  {l}"); }
+        } else {
+            logln!("HMS_ACTOR ignored: no Reach cache open");
+        }
     }
     // The phmo overlay (solid translucent + outline) for hidden forge blocks: shown unless
     // HMS_PHYSICS_OUTLINES=0, the same default the GUI's View > "Show hidden-block physics
@@ -878,8 +973,58 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
+    // #model-import: HMS_IMPORT=<model.glb|.gltf|.obj> imports that model into the loaded map,
+    // exactly as Tools > Import geometry does in the GUI (same reader, same GPU build, same
+    // dynamic-object lighting lane), so the textured result is capturable without a window.
+    // HMS_IMPORT_POSE="x,y,z[,yawDeg[,scale]]" places it (default: the identity pose).
+    if let Ok(spec) = std::env::var("HMS_IMPORT") {
+        for path in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            match crate::modelimport::load(std::path::Path::new(path)) {
+                Ok(d) => {
+                    logln!(
+                        "HMS_IMPORT '{path}': {} \u{B7} {} part(s), {} verts, {} tris, {}",
+                        d.format, d.parts.len(), d.vert_count(), d.tri_count(), d.material_summary()
+                    );
+                    for n in &d.notes { logln!("HMS_IMPORT note: {n}"); }
+                    match crate::build_import_meshes(renderer.mesh_renderer(), &device, &queue, &d) {
+                        Some(g) => {
+                            let tris = g.tris.len();
+                            let idx = renderer.append_imported_model(g.opaque, g.cutout);
+                            let mut im = crate::extimport::ImportedModel::at_identity(std::path::PathBuf::from(path), g.tris);
+                            if let Ok(pose) = std::env::var("HMS_IMPORT_POSE") {
+                                let v: Vec<f32> = pose.split(',').filter_map(|t| t.trim().parse().ok()).collect();
+                                if v.len() >= 3 { im.pos = [v[0], v[1], v[2]]; }
+                                if let Some(y) = v.get(3) { im.set_euler_deg([0.0, 0.0, *y]); }
+                                if let Some(sc) = v.get(4) { if sc.is_finite() && *sc > 0.0 { im.scale = *sc; } }
+                            }
+                            renderer.set_imported_transform(&queue, idx, im.matrix());
+                            // Same lighting the GUI gives an import: the map's absolute airprobe
+                            // ambient where the model stands (neutral white with no probe grid).
+                            let amb = scene.import_ambient(im.world_center()).unwrap_or([1.0; 3]);
+                            renderer.set_imported_tint(&queue, idx, [amb[0].max(0.0), amb[1].max(0.0), amb[2].max(0.0), 1.0]);
+                            let c = im.world_center();
+                            logln!(
+                                "HMS_IMPORT placed [{idx}] at pos=[{:.2},{:.2},{:.2}] scale={:.3} centre=[{:.2},{:.2},{:.2}] radius={:.2} ambient=[{:.4},{:.4},{:.4}] ({tris} tris)",
+                                im.pos[0], im.pos[1], im.pos[2], im.scale, c.x, c.y, c.z, im.world_radius(), amb[0], amb[1], amb[2]
+                            );
+                        }
+                        None => logln!("HMS_IMPORT '{path}': no drawable triangles"),
+                    }
+                }
+                Err(e) => logln!("HMS_IMPORT '{path}': {e}"),
+            }
+        }
+    }
+
     // --- camera ---
     let mut cam = build_camera(&scene, obj_centroid);
+    if std::env::var("HMS_SPAWNCAM").is_ok() {
+        // the GUI's post-load camera (spawn_camera.rs); the log line names the source
+        match scene.spawn_camera() {
+            Some(p) => logln!("HMS_SPAWNCAM: {} (soup {} tris)", p.describe(), scene.soup_len()),
+            None => logln!("HMS_SPAWNCAM: source=none (no spawn / starting location / soft ceiling / bounds) - overview framing"),
+        }
+    }
     logln!("camera: pos=[{:.1},{:.1},{:.1}] yaw={:.1} pitch={:.1}", cam.pos.x, cam.pos.y, cam.pos.z, cam.yaw.to_degrees(), cam.pitch.to_degrees());
 
     // HMS_VISHIST=1 (print-only): the airprobe sky-mask histogram and, below, the raw 2-bit
@@ -1476,6 +1621,10 @@ fn build_camera(scene: &SceneController, obj_centroid: Option<(Vec3, f32)>) -> C
         }));
     if let Some((center, radius)) = framed {
         let radius = radius.max(5.0);
+        if std::env::var("HMS_CAMDBG").is_ok() {
+            eprintln!("CAMDBG obj_centroid={:?} scene_bounds={:?} -> center {:?} radius {:.1}",
+                obj_centroid.map(|(c,r)|(c,r)), scene.scene_bounds(), center, radius);
+        }
         let view = std::env::var("HMS_VIEW").unwrap_or_default();
         let dmul: f32 = std::env::var("HMS_DIST").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
         let dist = (radius / (cam.fov_y * 0.5).tan() * 1.15 + radius * 0.2) * dmul;

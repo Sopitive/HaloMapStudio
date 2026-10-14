@@ -17,8 +17,11 @@ EXPORTS
     ZH_MBP_FreeRawDDS
     ZH_MBP_GetPageCacheBytes
     ZH_MBP_GetPageStats
+    ZH_MBP_ReadResource
+    ZH_MBP_ResolveStringId
     ZH_MBP_GetRawDDS
     ZH_MBP_OpenCache
+    ZH_MBP_SetSharedCacheDirs
     ZH_TrimHeaps
 
     ; ---- Generic tag access ----
@@ -36,8 +39,10 @@ EXPORTS
 
     ; ---- render_model decode (MapModelParser / OverlayWalker) ----
     ZH_MMP_CloseModel
+    ZH_MMP_DecodeSectionBlendData
     ZH_MMP_DecodeSectionColors
     ZH_MMP_DecodeSectionGeometry
+    ZH_MMP_DecodeSectionTriangleOrigins
     ZH_MMP_DecodeSectionUVs
     ZH_MMP_EnumerateAttachments
     ZH_MMP_FreeBuffer

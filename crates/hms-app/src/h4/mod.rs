@@ -56,6 +56,7 @@ pub mod unic;
 pub mod gui;
 pub mod render;
 pub mod scene;
+pub mod screenfx;
 pub mod shading;
 pub mod lighting;
 pub mod edit;

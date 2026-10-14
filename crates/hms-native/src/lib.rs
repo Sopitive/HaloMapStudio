@@ -116,6 +116,15 @@ pub type WideChar = u16;
 #[cfg(not(windows))]
 pub type WideChar = u32;
 type FnOpenCache = unsafe extern "C" fn(*const WideChar) -> u64;
+
+/// NUL-terminated `wchar_t` encoding of `s` for the target (UTF-16 on Windows, UTF-32 on
+/// Linux/glibc), so the same C++ source works either way.
+fn to_wide(s: &str) -> Vec<WideChar> {
+    #[cfg(windows)]
+    { s.encode_utf16().chain(std::iter::once(0)).collect() }
+    #[cfg(not(windows))]
+    { s.chars().map(|c| c as WideChar).chain(std::iter::once(0)).collect() }
+}
 type FnU64 = unsafe extern "C" fn(u64);
 type FnFindBitmap = unsafe extern "C" fn(u64, u32, u32, *mut ZhBitmapInfo) -> i32;
 type FnDecodeBitmap =
@@ -140,6 +149,8 @@ type FnGetBspMesh = unsafe extern "C" fn(u64, u32, *mut ZhBspMesh) -> i32;
 type FnDecodeGeom =
     unsafe extern "C" fn(u64, u32, *mut *mut u8, *mut u32, *mut *mut u8, *mut u32) -> i32;
 type FnDecodeVec = unsafe extern "C" fn(u64, u32, *mut *mut u8, *mut u32) -> i32;
+/// `ZH_MMP_DecodeSectionTriangleOrigins(model, section, out u32**, out count) -> bool`.
+type FnTriOrigins = unsafe extern "C" fn(u64, u32, *mut *mut u32, *mut u32) -> i32;
 // DIRECT-VB: ZH_BSP_GetRawGeometry(bsp, meshIndex, out ZhRawGeom*) -> bool. Hands back the
 // .map's prebuilt compressed VB/IB verbatim (pointers into the resource mmap) + de-quant
 // constants, for engine-style verbatim GPU upload + in-shader decompress.
@@ -987,7 +998,18 @@ pub struct NativeDll {
     mbp_page_stats: Option<unsafe extern "C" fn(*mut u64, *mut u64, *mut u64, *mut u64, *mut u64)>,
     mmp_decode_geom: FnDecodeGeom,
     mmp_decode_uvs: Option<FnDecodeVec>,
+    /// #instmesh-space Optional: per emitted triangle, the raw-strip window that produced it.
+    /// Absent on a DLL built before 2026-10-11, in which case `section_triangle_origins`
+    /// returns `None` and the caller must say it cannot translate rather than guess.
+    mmp_tri_origins: Option<FnTriOrigins>,
     mmp_decode_colors: Option<FnDecodeVec>,
+    /// SKIN-1: ZH_MMP_DecodeSectionBlendData - per-vertex bone palette of a SKINNED
+    /// render_model section (8 bytes/vertex: 4 node-map indices, then 4 /255 weights).
+    mmp_decode_blend: Option<FnDecodeVec>,
+    /// SKIN-1: ZH_MBP_ResolveStringId(cache, sid, out, cap) -> written length.
+    mbp_resolve_sid: Option<unsafe extern "C" fn(u64, u32, *mut u8, i32) -> i32>,
+    /// SKIN-2: ZH_MBP_ReadResource(cache, rid, def**, defLen*, fixups**, fixupCount*, data**, dataLen*).
+    mbp_read_resource: Option<unsafe extern "C" fn(u64, i32, *mut *mut u8, *mut u32, *mut *mut u32, *mut u32, *mut *mut u8, *mut u32) -> i32>,
     mmp_shader_diffuse: Option<FnTagByShader>,
     mmp_shader_emissive: Option<FnTagByShader>,
     mmp_shader_blend: Option<FnTagByShader>,
@@ -1054,6 +1076,8 @@ pub struct NativeDll {
     mbp_page_cache_bytes: Option<FnU64ToU64>,
     /// drop the resident pages of the .map file mapping(s) (re-fault on demand).
     mbp_drop_map_pages: Option<FnU64>,
+    /// #shared-dirs `ZH_MBP_SetSharedCacheDirs` (newline-separated wide list); None on an old DLL.
+    mbp_set_shared_dirs: Option<unsafe extern "C" fn(*const WideChar)>,
 }
 
 // SAFETY: NativeDll is a loaded Library + raw C fn pointers + no interior mutable
@@ -1076,6 +1100,75 @@ macro_rules! opt {
     ($lib:expr, $name:literal) => {
         unsafe { $lib.get(concat!($name, "\0").as_bytes()).ok().map(|s| *s) }
     };
+}
+
+/// #gpu-build  Native bitmap-decode profiling: how much of a model's GPU build is spent inside
+/// the native decoder rather than on the GPU upload. Read-and-reset, print-only, one relaxed
+/// atomic add per decode.
+pub mod bmpprof {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static DEC_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DEC_N: AtomicU64 = AtomicU64::new(0);
+    /// `raw_dds`, which hands back the block-compressed bytes without decoding them.
+    pub static RAW_NS: AtomicU64 = AtomicU64::new(0);
+    pub static RAW_N: AtomicU64 = AtomicU64::new(0);
+    /// The same work when it happens OFF the thread that reads these counters — i.e. on a rayon
+    /// predecode worker. Split out because it is the difference between "this is on the critical
+    /// path" and "this is already parallel and overlapping the build".
+    pub static OFF_NS: AtomicU64 = AtomicU64::new(0);
+    pub static OFF_N: AtomicU64 = AtomicU64::new(0);
+    /// The thread that reads the counters (the GPU-build loop's thread), learned on first read.
+    static READER: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct BmpProf {
+        pub dec_ms: f64,
+        pub dec_n: u64,
+        pub raw_ms: f64,
+        pub raw_n: u64,
+        /// Decode work that happened on OTHER threads during the same window (parallel
+        /// predecode). Not on the critical path, and must not be billed to it.
+        pub off_ms: f64,
+        pub off_n: u64,
+    }
+    impl BmpProf {
+        /// On-critical-path only; `off_ms` is deliberately excluded.
+        pub fn total_ms(&self) -> f64 {
+            self.dec_ms + self.raw_ms
+        }
+    }
+    /// Read every counter and reset it, so a caller can bracket one unit of work.
+    pub fn take() -> BmpProf {
+        let _ = READER.set(std::thread::current().id());
+        BmpProf {
+            dec_ms: DEC_NS.swap(0, Relaxed) as f64 / 1e6,
+            dec_n: DEC_N.swap(0, Relaxed),
+            raw_ms: RAW_NS.swap(0, Relaxed) as f64 / 1e6,
+            raw_n: RAW_N.swap(0, Relaxed),
+            off_ms: OFF_NS.swap(0, Relaxed) as f64 / 1e6,
+            off_n: OFF_N.swap(0, Relaxed),
+        }
+    }
+    pub(crate) struct Guard(pub std::time::Instant, pub &'static AtomicU64, pub &'static AtomicU64);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // Only work on the READER's own thread is on its critical path. Anything else is a
+            // parallel predecode worker overlapping it, and billing that to the build made a
+            // model's decode total exceed the model's own wall time (3157 ms "inside" a 1197 ms
+            // build), which is how the contamination was caught.
+            let ns = self.0.elapsed().as_nanos() as u64;
+            match READER.get() {
+                Some(r) if *r != std::thread::current().id() => {
+                    OFF_N.fetch_add(1, Relaxed);
+                    OFF_NS.fetch_add(ns, Relaxed);
+                }
+                _ => {
+                    self.1.fetch_add(1, Relaxed);
+                    self.2.fetch_add(ns, Relaxed);
+                }
+            }
+        }
+    }
 }
 
 impl NativeDll {
@@ -1166,7 +1259,11 @@ impl NativeDll {
             mbp_page_stats: opt!(lib, "ZH_MBP_GetPageStats"),
             mmp_decode_geom: req!(lib, "ZH_MMP_DecodeSectionGeometry"),
             mmp_decode_uvs: opt!(lib, "ZH_MMP_DecodeSectionUVs"),
+            mmp_tri_origins: opt!(lib, "ZH_MMP_DecodeSectionTriangleOrigins"),
             mmp_decode_colors: opt!(lib, "ZH_MMP_DecodeSectionColors"),
+            mmp_decode_blend: opt!(lib, "ZH_MMP_DecodeSectionBlendData"),
+            mbp_resolve_sid: opt!(lib, "ZH_MBP_ResolveStringId"),
+            mbp_read_resource: opt!(lib, "ZH_MBP_ReadResource"),
             mmp_shader_diffuse: opt!(lib, "ZH_MMP_GetShaderDiffuseBitmapTagId"),
             mmp_shader_emissive: opt!(lib, "ZH_MMP_GetShaderEmissiveBitmapTagId"),
             mmp_shader_blend: opt!(lib, "ZH_MMP_GetShaderBlendMode"),
@@ -1212,6 +1309,7 @@ impl NativeDll {
             mbp_clear_page_cache: opt!(lib, "ZH_MBP_ClearPageCache"),
             mbp_page_cache_bytes: opt!(lib, "ZH_MBP_GetPageCacheBytes"),
             mbp_drop_map_pages: opt!(lib, "ZH_MBP_DropMapPages"), // #mem2
+            mbp_set_shared_dirs: opt!(lib, "ZH_MBP_SetSharedCacheDirs"), // #shared-dirs
             _lib: std::mem::ManuallyDrop::new(lib),
         };
         Ok(dll)
@@ -1219,13 +1317,7 @@ impl NativeDll {
 
     // ---- cache ----
     pub fn open_cache(&self, path: &str) -> Result<CacheHandle> {
-        // The native side takes a `const wchar_t*`, and wchar_t is NOT the same
-        // width everywhere: 16-bit on Windows, 32-bit on Linux/glibc. Encode to
-        // match the target's wchar_t so the same C++ source works either way.
-        #[cfg(windows)]
-        let wide: Vec<WideChar> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        #[cfg(not(windows))]
-        let wide: Vec<WideChar> = path.chars().map(|c| c as WideChar).chain(std::iter::once(0)).collect();
+        let wide = to_wide(path);
         let h = unsafe { (self.mbp_open_cache)(wide.as_ptr()) };
         if h == 0 {
             bail!("ZH_MBP_OpenCache failed for {path}");
@@ -1234,6 +1326,18 @@ impl NativeDll {
     }
     pub fn close_cache(&self, h: CacheHandle) {
         unsafe { (self.mbp_close_cache)(h.0) }
+    }
+
+    /// #shared-dirs Where the native looks for a cache's shared resource caches (`shared.map`,
+    /// `campaign.map`, ...) when they are not beside the primary map: tried in order after the
+    /// sibling folder. Set BEFORE `open_cache` (shared caches open lazily on the first cross-cache
+    /// read). Returns false when the loaded DLL predates the export (sibling-only lookup).
+    pub fn set_shared_cache_dirs(&self, dirs: &[std::path::PathBuf]) -> bool {
+        let Some(f) = self.mbp_set_shared_dirs else { return false };
+        let list = dirs.iter().map(|d| d.to_string_lossy().replace(['\n', '\r'], "")).collect::<Vec<_>>().join("\n");
+        let wide = to_wide(&list);
+        unsafe { f(wide.as_ptr()) };
+        true
     }
 
     /// Enumerate the structure-BSP tag ids referenced by a scenario tag.
@@ -2478,6 +2582,33 @@ impl NativeDll {
     pub fn model_decode_geometry(&self, h: ModelHandle, i: u32) -> Option<GeomBuffers> {
         decode_geom(self.mmp_decode_geom, self.mmp_free, h.0, i)
     }
+    /// #instmesh-space For section `i`, one entry per EMITTED TRIANGLE of the decoded index
+    /// buffer: the index of the raw-strip window that produced it.
+    ///
+    /// A render_model states `s_part` / `s_subpart` ranges in the section's RAW index space, and
+    /// Reach stores that buffer as a triangle STRIP; `model_decode_geometry` returns the EXPANDED
+    /// triangle list, which is a different and longer buffer. This is the translation between
+    /// them: a raw range `[a, b)` owns exactly the triangles whose origin lies in `[a, b-2)`.
+    ///
+    /// `None` when the library predates the export — the caller must then decline to translate
+    /// rather than apply a raw offset to the expanded buffer, which is what bound 74 of the
+    /// Spartan's 105 armour attachments to the wrong bone.
+    pub fn model_section_triangle_origins(&self, h: ModelHandle, i: u32) -> Option<Vec<u32>> {
+        let f = self.mmp_tri_origins?;
+        let mut p: *mut u32 = std::ptr::null_mut();
+        let mut n = 0u32;
+        let ok = unsafe { f(h.0, i, &mut p, &mut n) } != 0;
+        if !ok || p.is_null() || n == 0 {
+            if !p.is_null() {
+                unsafe { (self.mmp_free)(p as *mut u8) };
+            }
+            return None;
+        }
+        let v = unsafe { std::slice::from_raw_parts(p, n as usize).to_vec() };
+        unsafe { (self.mmp_free)(p as *mut u8) };
+        Some(v)
+    }
+
     pub fn model_decode_uvs(&self, h: ModelHandle, i: u32) -> Option<Vec<u8>> {
         decode_vec(self.mmp_decode_uvs?, self.mmp_free, h.0, i)
     }
@@ -2494,6 +2625,56 @@ impl NativeDll {
             out.push([r, g, b]);
         }
         Some(out)
+    }
+    /// SKIN-2: one pageable resource of a tag, by its RESOURCE ID (the 4-byte value a
+    /// `pageable resource` field holds; the low 16 bits index the gestalt resource table).
+    /// Returns `(definition_data, fixup_payload_offsets, payload)`:
+    ///   * `definition_data` = the resource's own tag-struct bytes (gestalt fixup blob slice),
+    ///   * `fixup_payload_offsets[i]` = the byte offset in `payload` that definition pointer i
+    ///     resolves to (definition order),
+    ///   * `payload` = the decompressed page data.
+    /// None when the id is unresolvable or the native build predates the export.
+    pub fn read_resource(&self, cache: CacheHandle, resource_id: i32) -> Option<(Vec<u8>, Vec<u32>, Vec<u8>)> {
+        let f = self.mbp_read_resource?;
+        let free = self.mmp_free;
+        let mut dp: *mut u8 = std::ptr::null_mut();
+        let mut dl: u32 = 0;
+        let mut fp: *mut u32 = std::ptr::null_mut();
+        let mut fc: u32 = 0;
+        let mut pp: *mut u8 = std::ptr::null_mut();
+        let mut pl: u32 = 0;
+        let ok = unsafe { f(cache.0, resource_id, &mut dp, &mut dl, &mut fp, &mut fc, &mut pp, &mut pl) } != 0;
+        let defs = if !dp.is_null() && dl > 0 { unsafe { std::slice::from_raw_parts(dp, dl as usize) }.to_vec() } else { Vec::new() };
+        let fixups = if !fp.is_null() && fc > 0 { unsafe { std::slice::from_raw_parts(fp, fc as usize) }.to_vec() } else { Vec::new() };
+        let payload = if !pp.is_null() && pl > 0 { unsafe { std::slice::from_raw_parts(pp, pl as usize) }.to_vec() } else { Vec::new() };
+        unsafe {
+            if !dp.is_null() { free(dp); }
+            if !fp.is_null() { free(fp as *mut u8); }
+            if !pp.is_null() { free(pp); }
+        }
+        if !ok { return None; }
+        Some((defs, fixups, payload))
+    }
+
+    /// SKIN-1: the TEXT of a string id, through the cache's own (namespace-translated)
+    /// string table. None when the sid is 0 / -1 or not in this cache's table.
+    pub fn string_id(&self, cache: CacheHandle, sid: u32) -> Option<String> {
+        let f = self.mbp_resolve_sid?;
+        let mut buf = vec![0u8; 256];
+        let n = unsafe { f(cache.0, sid, buf.as_mut_ptr(), buf.len() as i32) };
+        if n <= 0 { return None; }
+        buf.truncate(n as usize);
+        String::from_utf8(buf).ok().filter(|s| !s.is_empty())
+    }
+
+    /// SKIN-1: per-vertex bone indices + weights of a SKINNED section (Reach vertex format
+    /// 0x02 s_skinned_vertex / 0x06 s_flat_skinned). 8 bytes per vertex, verbatim from the
+    /// vertex buffer: `[i0, i1, i2, i3, w0, w1, w2, w3]`. The indices address the mesh's
+    /// `per mesh node map` byte run (render_model tag meta, render_geometry +0x4C), NOT the
+    /// render_model node list directly; the weights are /255 and sum to 255. None = the
+    /// section is rigid/world/decorator (no bone data), or the native build predates the export.
+    pub fn model_decode_blend(&self, h: ModelHandle, i: u32) -> Option<Vec<u8>> {
+        decode_vec_raw(self.mmp_decode_blend?, self.mmp_free, h.0, i)
     }
     pub fn model_shader_diffuse(&self, h: ModelHandle, shader: i32) -> u32 {
         self.mmp_shader_diffuse
@@ -2899,6 +3080,7 @@ impl NativeDll {
         submap: u32,
         mip: u32,
     ) -> Option<(Vec<u8>, u32, u32)> {
+        let _g = crate::bmpprof::Guard(std::time::Instant::now(), &crate::bmpprof::DEC_N, &crate::bmpprof::DEC_NS);
         let f = self.mbp_decode_bitmap?;
         let free = self.mbp_free?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -2923,6 +3105,7 @@ impl NativeDll {
         submap: u32,
         mip: u32,
     ) -> Option<(Vec<u8>, u32, u32)> {
+        let _g = crate::bmpprof::Guard(std::time::Instant::now(), &crate::bmpprof::DEC_N, &crate::bmpprof::DEC_NS);
         let f = self.mbp_decode_bitmap_keep?;
         let free = self.mbp_free?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -2983,6 +3166,7 @@ impl NativeDll {
         face: u32,
         stride_mode: u32,
     ) -> Option<(Vec<u8>, u32, u32)> {
+        let _g = crate::bmpprof::Guard(std::time::Instant::now(), &crate::bmpprof::DEC_N, &crate::bmpprof::DEC_NS);
         let f = self.mbp_decode_bitmap_face?;
         let free = self.mbp_free?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -3007,6 +3191,7 @@ impl NativeDll {
     /// dominate load time. Returns None when the format isn't block-compressed (the caller
     /// falls back to the CPU decode path).
     pub fn raw_dds(&self, cache: CacheHandle, tag: u32, submap: u32) -> Option<Vec<u8>> {
+        let _g = crate::bmpprof::Guard(std::time::Instant::now(), &crate::bmpprof::RAW_N, &crate::bmpprof::RAW_NS);
         let f = self.mbp_get_raw_dds?;
         let free = self.mbp_free_raw_dds?;
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -3112,6 +3297,19 @@ fn decode_vec(f: FnDecodeVec, free: FnFree, handle: u64, i: u32) -> Option<Vec<u
     // (flat single-colour instanced cliffs/ground).
     let bytes = len as usize * 4;
     let v = unsafe { std::slice::from_raw_parts(p, bytes).to_vec() };
+    unsafe { free(p) };
+    Some(v)
+}
+
+/// SKIN-1: like `decode_vec`, but for an export whose out-length is already a BYTE count
+/// (`ZH_MMP_DecodeSectionBlendData`). The float-count convention in `decode_vec` would read
+/// four times the buffer and walk off the heap.
+fn decode_vec_raw(f: FnDecodeVec, free: FnFree, handle: u64, i: u32) -> Option<Vec<u8>> {
+    let mut p: *mut u8 = std::ptr::null_mut();
+    let mut len = 0u32;
+    let ok = unsafe { f(handle, i, &mut p, &mut len) } != 0;
+    if !ok || p.is_null() || len == 0 { return None; }
+    let v = unsafe { std::slice::from_raw_parts(p, len as usize).to_vec() };
     unsafe { free(p) };
     Some(v)
 }

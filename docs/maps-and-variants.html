@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -84,7 +85,7 @@
 <p>The <em>Add Object</em> palette in the left panel is filled from the loaded map's Forge palette (its "sandbox" palette), grouped by Forge category, with a filter box and a 3D preview of the selected item.</p>
 
 <h2 id="variants">Forge map variants (.mvar)</h2>
-<p>A map variant is the file Halo: Reach writes when you save a Forge map: it lists the placed objects (up to 651) with their position, rotation, team, colour, label, spawn settings, boundaries and so on, plus a title, description, author and a table of Forge labels. Halo Map Studio reads and writes the Reach format (<code>mvar</code> chunk version 31). Halo 4 variants (version 50) can be opened read-only.</p>
+<p>A map variant is the file Halo: Reach writes when you save a Forge map: it lists the placed objects (up to 651) with their position, rotation, team, colour, label, spawn settings, boundaries and so on, plus a title, description, author and a table of Forge labels. Halo Map Studio reads and writes all four formats: Reach (<code>mvar</code> chunk version 31), Halo 4 (body version 50/51), Halo 2 Anniversary (body version 52/53) and Halo 3 (its own MSB-first bitstream, 640 slots shared with the map's own scenario objects). Every save goes through the game's own encoder, and HMS reproduces the variants each game ships byte-for-byte.</p>
 
 <h2 id="where">Where MCC keeps variants</h2>
 <div class="tablewrap"><table>
@@ -102,6 +103,7 @@
   <li>Single-click a file to preview its <strong>Title, Author, Editor and Description</strong> before opening. Double-click or press <strong>📂 Open</strong>.</li>
   <li>If the variant belongs to a different map than the one loaded, the app loads that base map first (matched by the map id stored in the variant) and then places the objects. If the base map is not installed the variant is rendered best-effort on whatever map is loaded.</li>
   <li>The camera jumps to one of the variant's initial spawn points, facing the way a player would. The base map's own spawn markers stay hidden unless <em>View ▸ Show map spawn points</em> is on.</li>
+  <li><strong>File ▸ Open recent</strong> skips the browsing entirely: it lists the variants (and base maps, saved films and imported models) you opened before, newest first, each labelled with its game and showing the full path on hover. Opening one goes through exactly the same route as the browser, base map and all — including a Workshop map, which is matched by its MCC map GUID rather than a map id. An entry whose file has been moved or deleted is marked ✕ and offers to remove itself from the list when clicked; <em>Clear recent items</em> empties it. The browser's own <em>Recent</em> sidebar is derived from the same list, so it is no longer empty at the start of a session.</li>
 </ol>
 <p>The status line then reads for example <code>asylum.mvar: 458 forge objects (0 unresolved …) in 312 ms</code>. "Unresolved" objects are entries the app could not match to the map's Forge palette; they are not displayed but still occupy their slots and are preserved on save. Details are written to <code>hms_mvar_diag.txt</code> next to the executable.</p>
 <p>The left panel shows the objects of the open variant as a searchable list (search by type, name, label or <code>#slot</code>): click to select, <kbd>Ctrl</kbd>/<kbd>Shift</kbd>-click for multi-selection, double-click to fly the camera to the object. <strong>Clear</strong> removes the rendered variant objects from the scene.</p>
@@ -151,9 +153,74 @@
 <h2 id="budget">The 651-object budget</h2>
 <p>A Reach variant has exactly 651 object slots. The bottom-right of the window shows <code>Objects: N / 651</code> (yellow at 90 %, red when full). Objects that are in the file but not displayed still count. When the variant is full, newly placed objects cannot be saved: the status line reports how many had no free slot.</p>
 
+<h2 id="crossgame">Converting a variant to another game</h2>
+<p><em>File ▸ Convert variant to another game…</em> takes a Forge variant authored in one Halo title
+and re-creates it on a Forge canvas of another. Every placed object is mapped to the nearest
+equivalent in the target game's palette — by Forge category, by name and, above all, by the
+<strong>size of its render model in world units</strong>: a Coliseum Wall is 10 × 12 wu in Reach, in
+Halo 4 and in Halo 2 Anniversary, so it is recognisable whatever each game calls it.</p>
+<p>The dialog shows the <strong>coverage</strong> and a per-object report <em>before</em> it writes anything:
+each object is listed as mapped, mapped with a size difference (with the delta in world units), or
+dropped with the reason. <em>Save As…</em> then writes exactly the file the report describes and opens
+it on the target canvas so you can look at the layout.</p>
+<p>Canvases differ wildly in size and origin, so the source layout is re-centred inside the target
+canvas automatically — over that canvas's own build area, floor to floor. <strong>Offset</strong>,
+<strong>Yaw</strong> and <strong>Layout scale</strong> nudge it (layout scale changes the <em>spacing</em> of
+the layout, never the size of the objects). When the target game's pieces are systematically smaller
+— Halo 3's Forge blocks are about half the size of Reach's — the report says which scale to use.</p>
+<p>Position, orientation, team, colour, respawn time, spawn sequence, user data, boundary shape and
+size, teleporter channel, spare clips and gametype labels all carry over wherever the target title
+has the same field. All four engines share the same right-handed Z-up world-unit frame, so a pose
+needs no conversion at all — only the canvas origin differs.</p>
+<p>What does <em>not</em> carry over is reported, never guessed: Halo 3 Forge has no safe or kill
+boundaries, no anti-respawn zone and no respawn camera; Halo 4 has no Overshield or Custom Powerup
+pickup; Halo 3 names its spawns and respawn zones per gametype, so a generic Reach spawn becomes the
+Slayer one and you set the rest with a Forge label. All four titles work as a source and as a
+target.</p>
+<p>Per-type quotas, the canvas budget and the slot array (651 objects in Reach and Halo 4, 640 in
+Halo 3 <em>including</em> the map's own scenario objects) are all respected; gameplay objects are
+placed first, so a budget squeeze never costs you the spawns and objectives.</p>
+<p>A <strong>structure is only ever replaced by a structure</strong>. Blocks, platforms, walls,
+ramps, bridges, corners, railings and pipes form one family and crates, rocks, trees, generators and
+emplacements another, and the matcher refuses to cross the line however well the boxes happen to
+line up — so a Forge platform can never become an artillery emplacement. Gameplay roles (spawns,
+zones, objectives, teleporters) match their own role and nothing else, and gadgets whose model is
+incidental (man cannons, lights, screen FX) match on role rather than size.</p>
+<h3 id="crossgame-data">Correcting the mapping</h3>
+<p>Two data files drive it, both shipped in the repository and both overridable without rebuilding:</p>
+<ul>
+  <li><code>crates/hms-app/src/xgame/catalog.json</code> — every Forge palette object of every
+      installed title with its measured bounding box, category, menu name, tag, multiplayer object
+      type and the canvases it appears on. Rebuild it with <code>hms-app --xgame-build-catalog</code>,
+      list it with <code>hms-app --xgame-catalog [filter]</code>.</li>
+  <li><code>crates/hms-app/src/xgame/equivalence.tsv</code> — one tab-separated row per
+      <em>(source game, source object) → target game</em> with a confidence
+      (<code>exact</code> / <code>close</code> / <code>approximate</code> / <code>none</code>) and the
+      size delta. Edit a row to change what something converts into; a later row wins, so you can
+      append a correction instead of editing in place. Regenerate the automatic rows with
+      <code>hms-app --xgame-build-table</code> — any row whose note contains the word
+      <code>curated</code> is kept.</li>
+</ul>
+<p>To change either without rebuilding HMS, copy the file into the HMS settings folder as
+<code>xgame_catalog.json</code> / <code>xgame_equivalence.tsv</code>
+(<code>%LOCALAPPDATA%\HaloMapStudio</code> on Windows, <code>~/.local/share/HaloMapStudio</code>
+otherwise). A pair the table does not name still converts: HMS falls back to the same size + name +
+category matcher that proposed the table.</p>
+<h3 id="crossgame-cli">From a script or the command line</h3>
+<pre><code>convertvariant &lt;src.mvar&gt; &lt;reach|halo4|halo3&gt; &lt;canvas&gt; [as &lt;out.mvar&gt;]
+               [offset x,y,z] [yaw &lt;deg&gt;] [scale &lt;s&gt;] [keeporigin]
+               [minconf exact|close|approximate] [noquota] [nobudget]
+               [template &lt;file.mvar&gt;] [report] [bykind] [dry]
+xgame catalog|table|canvases [filter]</code></pre>
+<p>The same verbs exist as CLI flags: <code>--xgame-convert</code> (identical grammar),
+<code>--xgame-catalog</code>, <code>--xgame-table</code>, <code>--xgame-build-catalog</code>,
+<code>--xgame-build-table</code> and <code>--xgame-verify &lt;file.mvar&gt;</code>, which reads a
+converted file back with the target title's own reader and checks that re-encoding it changes not a
+single byte.</p>
+
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

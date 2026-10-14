@@ -12,19 +12,28 @@ use glam::{Mat4, Vec3};
 
 mod mesh;
 mod bake;
+pub mod gputimer; // per-pass GPU timestamp timing (measurement only; off by default)
+pub mod quality; // runtime render-quality knobs (Settings ▸ Graphics)
+mod flat; // the FLAT / white-mesh view (unlit clay + depth outline, no textures/post)
 pub mod lightbake_gpu;
 pub mod rtgi;
 pub mod lensfx;
 pub use lensfx::{LensFlareDef, LensFlareInstance, LensFlareReflection};
 pub use bake::{BakeLayer, DetailBaker};
 pub use mesh::memprof;
+// #gpu-build  Upload-path profiling counters, exported beside `memprof` for the same reason:
+// `scene.rs` reads them to break down each object's GPU build. `mod mesh` is PRIVATE, so this
+// re-export is what makes `hms_render::upprof` a path at all — without it the workspace does not
+// compile, which is exactly what happened once.
+pub use mesh::upprof;
 pub use mesh::{
     GpuMesh, LightmapInputs, Material, MeshRenderer, MeshVertex, TerrainMaterialParams, WaterParams,
+    SkinPalette, MAX_SKIN_BONES,  // SKIN-1 (Reach actors)
     make_geom_buffers,
     upload_texture_bgra, upload_texture_bgra_gamma_enc, gamma_encode_lut,
     upload_texture_bgra_nomip,
     sky_legacy,
-    upload_texture_rgba16f_nomip,
+    upload_texture_rgba16f_nomip, upload_texture_rg8_snorm,
     upload_texture_dds,
     upload_texture_rgba,
     build_authored_env_cube, build_hdr_env_cube,
@@ -204,6 +213,13 @@ struct ZoneVertex {
     color: [f32; 4],
 }
 
+/// Floats in the fog uniform: 7 vec4 (`FOG_WGSL` atm0..atm6) + the Halo 4 lane's extension
+/// (`ext[0]` sky layer, `ext[1]` sky colour + mode, `ext[2..18]` sky extinction table, `ext[18..34]`
+/// ground extinction table; 64 entries each, see `H4_FOG_TABLE_LEN`).
+pub const FOG_UNIFORM_LEN: usize = 28 + 4 * (2 + 2 * 16);
+/// Entries per Halo 4 fog extinction table (16 vec4 of the fog uniform extension).
+pub const H4_FOG_TABLE_LEN: usize = 64;
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
@@ -227,6 +243,9 @@ struct SkyUniform {
     // rgb = the map's OWN atmosphere_fog sky inscatter color (not an invented blue);
     // w = has_atmosphere (0 on space maps → the gradient isn't drawn anyway).
     horizon: [f32; 4],
+    /// rgb = explicit below-horizon haze colour (H4/H2A: the fogg ground-fog colour); w = 1 when set,
+    /// else the shader falls back to horizon x sun_dir.w.
+    ground: [f32; 4],
 }
 
 pub struct SceneRenderer {
@@ -246,6 +265,22 @@ pub struct SceneRenderer {
     // Kept so a headless run can read back the LINEAR pre-tonemap scene (HMS_HDR_DUMP; the
     // only reliable probe — post-pass readbacks go through tonemap+auto-exposure).
     hdr_tex: wgpu::Texture,
+    /// Runtime render-quality knobs (Settings ▸ Graphics). `Default` is EXACTLY the shipped
+    /// renderer, so an untouched install is unaffected by this field's existence.
+    quality: quality::RenderQuality,
+    /// The FLAT / white-mesh view's own geometry + resolve pipelines (`flat.rs`). Built once;
+    /// it costs one pipeline pair whether or not the user ever turns the mode on.
+    flat: flat::FlatRenderer,
+    /// Per-pass GPU timestamp timing. `None` unless the in-app graphics benchmark asks for it.
+    gpu_timer: Option<gputimer::GpuTimer>,
+    /// The meter blend scale baked into the lum shader, kept so the lum + post pipelines can be
+    /// rebuilt when the render scale changes (both bake the supersample ratio).
+    lum_meter_scale: f32,
+    /// Print-only diagnostic env switches, snapshotted ONCE at construction. They used to be
+    /// `std::env::var` calls inside `render()` — up to six per frame, two of them allocating and
+    /// one of them parsing a float — and every one of them takes the process-wide environment
+    /// lock. (`scene.rs` has the same snapshot idea in its `ev()` helper.)
+    env: EnvSnapshot,
     post_pipeline: wgpu::RenderPipeline,
     post_bgl: wgpu::BindGroupLayout,
     post_sampler: wgpu::Sampler,
@@ -272,6 +307,9 @@ pub struct SceneRenderer {
     /// The post pass's 3D colour-grading LUT (group 1): identity until a map sets one.
     post_lut_bgl: wgpu::BindGroupLayout,
     post_lut_bg: wgpu::BindGroup,
+    /// A permanent 2³ IDENTITY grading LUT, bound in place of the map's when
+    /// Settings ▸ Graphics ▸ Colour grading is off.
+    post_lut_identity_bg: wgpu::BindGroup,
     post_lut_sampler: wgpu::Sampler,
     lum_bg: wgpu::BindGroup,
     // Analytical-sun shadow map (real-time cast shadows).
@@ -322,6 +360,16 @@ pub struct SceneRenderer {
     camera_buf: wgpu::Buffer,
     fog_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
+    /// #fp-fov The FIRST-PERSON MODEL's own camera: the world camera with a narrower vertical
+    /// field of view. Reach renders the first-person rig in its own pass at
+    /// `vfov * 0.6908 / vfov_scale` (= 0.88 of the world camera's), which is why a viewmodel does
+    /// not splay as the world FOV widens; everything else about the two cameras is identical, so
+    /// this is the same bind group with binding 0 pointing at its own one-matrix buffer.
+    fp_camera_buf: wgpu::Buffer,
+    fp_camera_bg: wgpu::BindGroup,
+    /// The factor above, as the app measured it off the engine. 1.0 = draw the rig through the
+    /// world camera (what HMS did before).
+    fp_fov_scale: f32,
     /// Real-time probe GI state (compute update + the probe buffers bound at camera 10-12).
     rtgi: rtgi::RtGi,
     // vMF diffuse LUT (group0 binding 7/8) — kept so the resize rebuild can re-bind it.
@@ -344,6 +392,17 @@ pub struct SceneRenderer {
     mesh_renderer: std::sync::Arc<MeshRenderer>,
     static_meshes: Vec<GpuMesh>,  // BSP (rebuilt on map load)
     imported_meshes: Vec<GpuMesh>, // external imported geometry (persists across map loads)
+    /// #model-import: the ALPHA-TEST half of the imported lane — the sub-meshes whose glTF
+    /// material is `alphaMode: MASK` (or a BLEND material with a real alpha channel), drawn
+    /// through the cutout pipeline so a leaf card / grating reads as see-through instead of a
+    /// solid rectangle. Kept flat and append-only like `imported_meshes` so both lists suit the
+    /// static bundle chain; `imported_spans` says which sub-meshes belong to which model.
+    imported_cutout_meshes: Vec<GpuMesh>,
+    /// #model-import: per imported MODEL, where its sub-meshes live in the two flat lists above.
+    /// An imported file is one mesh per MATERIAL, so one model owns a RANGE of GpuMeshes; the
+    /// editor addresses a model by index (its pseudo-datum), and every per-model call
+    /// (`set_imported_transform`, `set_imported_tint`, `remove_imported_model`) walks its span.
+    imported_spans: Vec<ImportSpan>,
     /// Static marker meshes (a Halo 4 map's own spawn-family placements) drawn like
     /// `static_meshes` only while `show_markers` - the live "Show map spawn points" toggle
     /// for geometry that is uploaded once per load rather than rebuilt per frame.
@@ -354,6 +413,29 @@ pub struct SceneRenderer {
     marker_blend_meshes: Vec<GpuMesh>,
     show_markers: bool,
     dynamic_meshes: Vec<GpuMesh>, // forge/objects (rebuilt when they change)
+    /// SKIN-1 (Reach actors): posed, GPU-SKINNED character meshes (bipeds + the weapons
+    /// they hold). A separate lane from `dynamic_meshes` because the object rebuild REPLACES
+    /// that list wholesale whenever a Forge placement changes; actors are owned by the actor
+    /// scene and re-posed every frame. Opaque pass; `actor_cutout_meshes` is their alpha-test
+    /// half (visors / hair cards).
+    actor_meshes: Vec<GpuMesh>,
+    actor_cutout_meshes: Vec<GpuMesh>,
+    /// #sword-blade SKIN-2: the actors' TRANSPARENT thirds — the same three lanes a world-placed
+    /// object has (`dynamic_holo_*` / `dynamic_blend_meshes`), drawn in the same sorted
+    /// back-to-front transparent sequence but through the SKINNED pipelines. Before these existed
+    /// `build_actor_meshes` had nowhere to put an additive or halogram part and folded all of them
+    /// into `actor_meshes`, so a held energy sword drew as a solid grey blade.
+    actor_holo_meshes: Vec<GpuMesh>,
+    actor_holo_solid_meshes: Vec<GpuMesh>,
+    actor_blend_meshes: Vec<GpuMesh>,
+    /// #fp-fov The FIRST-PERSON RIG's five lanes — the arms and the gun mounted on the camera.
+    /// Identical to the actor lanes in every way except the camera they are drawn through
+    /// (see [`SceneRenderer::fp_camera_bg`]), which is the whole reason they are a separate list.
+    fp_meshes: Vec<GpuMesh>,
+    fp_cutout_meshes: Vec<GpuMesh>,
+    fp_holo_meshes: Vec<GpuMesh>,
+    fp_holo_solid_meshes: Vec<GpuMesh>,
+    fp_blend_meshes: Vec<GpuMesh>,
     dynamic_cutout_meshes: Vec<GpuMesh>, // cutout objects (tree canopies) → alpha-test pass
     dynamic_holo_meshes: Vec<GpuMesh>, // holo/objective objects (hill markers, globe) → additive pass
     dynamic_holo_solid_meshes: Vec<GpuMesh>, // object markers (spawns/hill/kill-safe shells) → alpha-blended holo (always-readable shape)
@@ -430,12 +512,25 @@ pub struct SceneRenderer {
     /// edges, so the kill floor under the water / terrain reads from above.
     xray_vbuf: Option<wgpu::Buffer>,
     xray_vcount: u32,
+    /// #quant-error  The save-precision GHOST lane: the selected object(s) drawn a second time at
+    /// the pose the `.mvar` will really hold. Its own buffer (not the highlight's) so it can ride
+    /// the same exposure-compensated wire shader as the selection wireframe, depth-ALWAYS, without
+    /// taking that lane over -- at true scale the ghost sits INSIDE the object's own surface, so a
+    /// depth-tested or exposure-blown line would be invisible.
+    ghost_vbuf: Option<wgpu::Buffer>,
+    ghost_vcount: u32,
 
     // Whether the loaded map authored atmosphere (fogg). Gates the procedural horizon
     // gradient: the engine paints no gradient — outdoor maps get their horizon color from
     // atmosphere fog, space maps (no fogg) get nothing behind the sky model. Default true
     // so pre-load behaviour is unchanged; set per-map from SceneController::has_atmosphere.
     sky_has_atmosphere: bool,
+    /// The fallback sky gradient's below-horizon "ground" level (x horizon colour). 0.2 on the
+    /// Reach path; the Halo 4 / H2A path sets 0.6 because its metered post chain crushes 0.2 x
+    /// horizon to a black pit wherever no sky geometry covers the view (`set_sky_ground_level`).
+    sky_ground_level: f32,
+    /// Explicit below-horizon colour (`set_sky_colors`), cleared by `set_fog`.
+    sky_ground_color: Option<[f32; 3]>,
     // Space maps (condemned/zealot): clear to true black (void) and skip the horizon
     // gradient. Default false.
     space_sky: bool,
@@ -497,11 +592,20 @@ impl SceneRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // #fp-fov The first-person model camera (see `fp_camera_buf`).
+        let fp_camera_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("camera-uniform-fp"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         // Atmospheric fog uniform (4 vec4 = the fogg two-band params). Shared on
         // the camera bind group so mesh + terrain fragment shaders can apply fog.
         let fog_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fog-uniform"),
-            size: 112, // 7 × vec4 (sky+ground bands, fog-light disc, sun dir)
+            // 7 x vec4 (sky+ground bands, fog-light disc, sun dir) + the Halo 4 extension
+            // (FOG_UNIFORM_LEN floats: sky layer, mode, two 64-entry extinction tables)
+            size: (FOG_UNIFORM_LEN * 4) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1025,6 +1129,7 @@ impl SceneRenderer {
             .copy_from_slice(bytemuck::cast_slice(&grid_verts));
         grid_vbuf.unmap();
 
+        let quality = quality::RenderQuality::default();
         let Targets {
             color_tex,
             color_view,
@@ -1034,7 +1139,9 @@ impl SceneRenderer {
             depth_copy_view,
             hdr_view,
             hdr_tex,
-        } = make_targets(device, size);
+        } = make_targets(device, size, quality.scene_target(size));
+        let mut flat = flat::FlatRenderer::new(device);
+        flat.retarget(device, &hdr_view, &depth_copy_view);
         let color_view_srgb = color_tex.create_view(&wgpu::TextureViewDescriptor {
             format: Some(COLOR_FORMAT_SRGB),
             ..Default::default()
@@ -1118,11 +1225,13 @@ impl SceneRenderer {
         });
         let lum_view = lum_tex.create_view(&Default::default());
         let rtgi = rtgi::RtGi::new(device);
-        let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera-bg"),
+        // #fp-fov ONE descriptor, two buffers: the world camera and the first-person model
+        // camera differ in binding 0 and nothing else.
+        let mk_camera_bg = |label: &str, cbuf: &wgpu::Buffer| device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
             layout: &camera_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: camera_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: cbuf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: fog_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: light_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&shadow_view) },
@@ -1139,6 +1248,8 @@ impl SceneRenderer {
                 wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&h4_cascade_view) },
             ],
         });
+        let camera_bg = mk_camera_bg("camera-bg", &camera_buf);
+        let fp_camera_bg = mk_camera_bg("camera-bg-fp", &fp_camera_buf);
 
         // Six cube-face cameras (origin eye, 90° FOV, standard cube-face fwd/up) for the
         // env-cube sky capture. Each reuses the shared fog/light/shadow/depth/slights bindings + a
@@ -1245,6 +1356,7 @@ impl SceneRenderer {
         //                (out[j] = dot(vec4(rgb,1), cm[j])); identity until `set_screen_fx`
         //   h4a   @192 = (bloom highlight, inherent, self-illum, sensitivity)
         //   h4b   @208 = (screen brightness log2, H4 meter on, LUT on, H4 bloom on)
+        //   h3    @224 = the Halo 3 tone curve (`set_h3_tone_curve`): (on, WHITE, linear, cubic)
         let post_buf = {
             use wgpu::util::DeviceExt;
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1253,7 +1365,8 @@ impl SceneRenderer {
                                                 0.0, 0.0, 0.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                                 0.0, 0.0, 0.0, 0.0, 0.2406, 0.2406, 0.2406, 0.0, 1.0, 1.0, 1.0, 0.0,
                                                 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
-                                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                                0.0, 0.0, 0.0, 0.0]),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
@@ -1356,17 +1469,12 @@ impl SceneRenderer {
         // `// #h4-expo-2` __SS__ = the supersample factor: the Halo 4 meter's `exposure_downsample`
         // footprint is defined in QUARTER-resolution texels of the engine's render target, which
         // is HMS's OUTPUT size (SS is HMS's own anti-aliasing, not an engine resolution).
-        let lum_src = LUM_WGSL.replace("__METER_SCALE__", &format!("{:.4}", ms)).replace("__SS__", &format!("{:.1}", SS as f32));
-        let lum_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("lum"),
-            source: wgpu::ShaderSource::Wgsl(lum_src.into()),
-        });
         // Meter layout: HDR (0) + sampler (1) + post uniform (2) + the 48x32 H4 pre-pass (3)
         let lum_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("lum-bgl"),
             entries: &[tex_entry(0), samp_entry(1), bufent(2), tex_entry_nf(3)],
         });
-        let lum_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        let _ = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("lum-pl"),
             bind_group_layouts: &[&lum_bgl],
             push_constant_ranges: &[],
@@ -1421,22 +1529,8 @@ impl SceneRenderer {
             ..Default::default()
         });
         let post_lut_bg = make_lut_bg(device, queue, &post_lut_bgl, &post_lut_sampler, None);
-        let lum_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("lum-pipeline"),
-            layout: Some(&lum_layout),
-            vertex: wgpu::VertexState { module: &lum_shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
-            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &lum_shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let post_lut_identity_bg = make_lut_bg(device, queue, &post_lut_bgl, &post_lut_sampler, None);
+        let lum_pipeline = make_lum_pipeline(device, &lum_bgl, ms, quality.scene_scale);
         let bloom = make_bloom_pyramid(device, size);
         let lum_bg = make_lum_bg(device, &lum_bgl, &hdr_view, &post_sampler, &post_buf, &h4pre_view);
         let h4pre_bg = make_tex_bg(device, &tex_bgl, &hdr_view, &post_sampler);
@@ -1724,43 +1818,7 @@ impl SceneRenderer {
         let blur_v_i_h4_pipeline = make_fs_pipeline("fs_blur_v_i_h4");
         let add_m_h4_pipeline = make_fs_pipeline("fs_add_m_h4");
         let add_s_h4_pipeline = make_fs_pipeline("fs_add_s_h4");
-        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("post"),
-            source: wgpu::ShaderSource::Wgsl(POST_WGSL.into()),
-        });
-        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("post-pl"),
-            bind_group_layouts: &[&post_bgl, &post_lut_bgl], // group 1 = the grading LUT
-            push_constant_ranges: &[],
-        });
-        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("post-pipeline"),
-            layout: Some(&post_layout),
-            vertex: wgpu::VertexState {
-                module: &post_shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &post_shader,
-                entry_point: Some("fs"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: COLOR_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let post_pipeline = make_post_pipeline(device, &post_bgl, &post_lut_bgl, quality.resolve_taps());
 
         let mesh_renderer = MeshRenderer::new(device, &camera_bgl, &shadow_bgl, SCENE_HDR_FORMAT, DEPTH_FORMAT);
         // World lens-flare pass (samples the opaque depth copy + the luminance meter).
@@ -1800,6 +1858,7 @@ impl SceneRenderer {
             h4_meter_on: std::cell::Cell::new(false),
             post_lut_bgl,
             post_lut_bg,
+            post_lut_identity_bg,
             post_lut_sampler,
             lum_bg,
             shadow_view,
@@ -1839,6 +1898,9 @@ impl SceneRenderer {
             camera_buf,
             fog_buf,
             camera_bg,
+            fp_camera_buf,
+            fp_camera_bg,
+            fp_fov_scale: 1.0,
             rtgi,
             vmf_lut_view,
             vmf_lut_samp,
@@ -1853,11 +1915,23 @@ impl SceneRenderer {
             mesh_renderer: std::sync::Arc::new(mesh_renderer),
             static_meshes: Vec::new(),
             imported_meshes: Vec::new(),
+            imported_cutout_meshes: Vec::new(),
+            imported_spans: Vec::new(),
             marker_meshes: Vec::new(),
             marker_holo_meshes: Vec::new(),
             marker_blend_meshes: Vec::new(),
             show_markers: false,
             dynamic_meshes: Vec::new(),
+            actor_meshes: Vec::new(),
+            actor_cutout_meshes: Vec::new(),
+            actor_holo_meshes: Vec::new(),
+            actor_holo_solid_meshes: Vec::new(),
+            actor_blend_meshes: Vec::new(),
+            fp_meshes: Vec::new(),
+            fp_cutout_meshes: Vec::new(),
+            fp_holo_meshes: Vec::new(),
+            fp_holo_solid_meshes: Vec::new(),
+            fp_blend_meshes: Vec::new(),
             dynamic_cutout_meshes: Vec::new(),
             dynamic_holo_meshes: Vec::new(),
             dynamic_holo_solid_meshes: Vec::new(),
@@ -1908,6 +1982,8 @@ impl SceneRenderer {
             gizmo_vcount: 0,
             xray_vbuf: None,
             xray_vcount: 0,
+            ghost_vbuf: None,
+            ghost_vcount: 0,
             gizmo_tri_pipeline,
             gizmo_tri_vbuf: None,
             gizmo_tri_vcount: 0,
@@ -1918,6 +1994,8 @@ impl SceneRenderer {
             overlay_vbuf: None,
             overlay_vcount: 0,
             sky_has_atmosphere: true,
+            sky_ground_level: 0.2,
+            sky_ground_color: None,
             space_sky: false,
             sky_tint: [0.21, 0.51, 0.91],
             show_sky: true,
@@ -1942,6 +2020,11 @@ impl SceneRenderer {
             fixed_exposure: 0.0, // 0 → metered auto-exposure; >0 → fixed engine g_exposure
             illum_params: std::cell::Cell::new([1.0, 0.25, 0.25, 2.0, 1.0, 0.0, 0.3]),
             sky_ambient: [0.0, 0.0, 0.0, 0.0], // off by default
+            quality,
+            flat,
+            gpu_timer: None,
+            lum_meter_scale: ms,
+            env: EnvSnapshot::read(),
         }
     }
 
@@ -2166,6 +2249,32 @@ impl SceneRenderer {
         self.overlay_vbuf = Some(buf);
     }
 
+    /// #quant-error  Set (or clear) the save-precision GHOST line list -- world-space (a, b, rgb)
+    /// segments drawn through the WIRE shader with the depth test OFF: a black halo under an
+    /// exposure-compensated core, so the ghost keeps its own colour over a blown-out Forge piece
+    /// as well as in a dark interior, and reads even where it is coincident with the object it
+    /// predicts. Empty clears it.
+    pub fn set_ghost_lines(&mut self, device: &wgpu::Device, segments: &[([f32; 3], [f32; 3], [f32; 3])]) {
+        if segments.is_empty() {
+            self.ghost_vbuf = None;
+            self.ghost_vcount = 0;
+            return;
+        }
+        let mut verts = Vec::with_capacity(segments.len() * 2);
+        for (a, b, c) in segments {
+            verts.push(Vertex { pos: *a, color: *c });
+            verts.push(Vertex { pos: *b, color: *c });
+        }
+        use wgpu::util::DeviceExt;
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ghost-vbuf"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        self.ghost_vcount = verts.len() as u32;
+        self.ghost_vbuf = Some(buf);
+    }
+
     /// Set (or clear) the X-RAY line list -- world-space (a, b, rgb) segments
     /// drawn with the depth test OFF (the gizmo line pipeline), so an overlay hidden under the
     /// terrain or the water (the map's kill floor) still reads. Empty clears it.
@@ -2193,11 +2302,23 @@ impl SceneRenderer {
     /// Rebuild the camera bind group (bindings 5 and 10-12 point at the current depth copy and
     /// probe buffers).
     fn rebuild_camera_bg(&mut self, device: &wgpu::Device) {
-        self.camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera-bg"),
+        self.camera_bg = self.make_camera_bg(device, "camera-bg", 0);
+        // #fp-fov The first-person model camera is the same bind group over its own matrix
+        // buffer, so every rebuild has to refresh BOTH or the rig keeps a stale depth copy.
+        self.fp_camera_bg = self.make_camera_bg(device, "camera-bg-fp", 1);
+        self.bump_static(); // bundles bake in the camera bind group
+    }
+
+    /// One camera bind group over `which` buffer (0 = the world camera, 1 = the first-person
+    /// model camera). Bindings 5 and 10-14 point at the current depth copy and probe buffers,
+    /// which is why these are rebuilt on resize and whenever the GI scene changes.
+    fn make_camera_bg(&self, device: &wgpu::Device, label: &str, which: u32) -> wgpu::BindGroup {
+        let cbuf = if which == 0 { &self.camera_buf } else { &self.fp_camera_buf };
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(label),
             layout: &self.camera_bgl,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: self.camera_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 0, resource: cbuf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: self.fog_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: self.light_buf.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&self.shadow_view) },
@@ -2213,8 +2334,7 @@ impl SceneRenderer {
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.dps_lut_view) },
                 wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&self.h4_cascade_view) },
             ],
-        });
-        self.bump_static(); // bundles bake in the camera bind group
+        })
     }
     /// Upload the map's real-time GI tracer scene (BVH, materials, lights) and size the probe grid.
     pub fn set_rtgi_scene(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &rtgi::RtGiScene) {
@@ -2299,6 +2419,12 @@ impl SceneRenderer {
     /// Lanes: bloom2.y flag (52), bloom2.z/w = P0/P1 (56/60), sfx2.w = P2 (92), bcl.w = P3 (108),
     /// bcm.w = P4 (124) - all otherwise-unused pads of the post uniform.
     pub fn set_h4_filmic(&self, queue: &wgpu::Queue, p: Option<[f32; 5]>) {
+        // This is also the "the map just loaded is not a Halo 4 one, put the composite back"
+        // call every other game's load path makes, so it clears the HALO 3 tone curve too -
+        // otherwise a Reach map opened after a Halo 3 one would keep Halo 3's cubic (the post
+        // uniform outlives the scene). The Halo 3 path re-arms it in `h3::lighting::apply_post`,
+        // which runs after.
+        self.set_h3_tone_curve(queue, None);
         let (flag, v) = match p { Some(v) => (1.0f32, v), None => (0.0f32, [0.0; 5]) };
         queue.write_buffer(&self.post_buf, 52, bytemuck::cast_slice(&[flag, v[0], v[1]]));
         queue.write_buffer(&self.post_buf, 92, bytemuck::cast_slice(&[v[2]]));
@@ -2390,6 +2516,22 @@ impl SceneRenderer {
     /// Live atmosphere fog density bridge (cam.time.z). 0 → const/env default.
     pub fn set_fog_wu(&mut self, fog_wu: f32) { self.fog_wu = fog_wu.max(0.0); }
 
+    /// The HALO 3 tone curve (post.h3 @224; `None` = off, the gamma-2 encode alone, which is what
+    /// Reach / Halo 4 do). `white` is the engine's `tone_curve_white_point`, 1.0 on the shipped
+    /// PC build: the curve is `t = tcc.y c + tcc.w c^3` on `c = min(col, white)` with
+    /// `k = 1.4938016 / white`, `tcc.y = k * 1.0041494`, `tcc.w = -0.15 k^3` - i.e. `1.5c - 0.5c^3`
+    /// at white = 1. See the block comment in `resolve`.
+    pub fn set_h3_tone_curve(&self, queue: &wgpu::Queue, white: Option<f32>) {
+        let v = match white {
+            Some(w) if w.is_finite() && w > 1e-3 => {
+                let k = 1.4938016 / w;
+                [1.0f32, w, k * 1.0041494, -0.15 * k * k * k]
+            }
+            _ => [0.0f32; 4],
+        };
+        queue.write_buffer(&self.post_buf, 224, bytemuck::cast_slice(&v));
+    }
+
     /// Fixed per-frame g_exposure scalar that REPLACES the live auto-exposure meter (written to
     /// grade.w, post uniform offset 28). >0 → the post pass uses this exact gain (no view-dependent
     /// adaptation, matching the engine's fixed sceg exposure); 0 → the metered auto-exposure.
@@ -2440,9 +2582,10 @@ impl SceneRenderer {
     /// once per frame after `render`; None until the first value lands.
     pub fn read_mean_log_async(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<f32> {
         use std::sync::atomic::Ordering;
-        // 1. harvest any slot whose map completed (callback set state 2).
+        let _ = (device, queue); // the copy is recorded by `render` now; see `enqueue_meter_copy`
+        // 1. harvest any slot whose map completed (callback set state 3).
         for (buf, st) in &self.lum_rb {
-            if st.load(Ordering::Acquire) == 2 {
+            if st.load(Ordering::Acquire) == 3 {
                 let v = {
                     let data = buf.slice(..).get_mapped_range();
                     f32::from_le_bytes([data[0], data[1], data[2], data[3]])
@@ -2452,28 +2595,18 @@ impl SceneRenderer {
                 if v.is_finite() { self.lum_rb_last.set(Some(v)); }
             }
         }
-        // 2. queue this frame's copy into the next free slot (skip if all are in flight).
-        let n = self.lum_rb.len();
-        let start = self.lum_rb_next.get();
-        for k in 0..n {
-            let i = (start + k) % n;
-            let (buf, st) = &self.lum_rb[i];
-            if st.load(Ordering::Acquire) != 0 { continue; }
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lum-readback") });
-            enc.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo { texture: &self.lum_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::TexelCopyBufferInfo { buffer: buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) } },
-                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-            );
-            queue.submit(Some(enc.finish()));
-            st.store(1, Ordering::Release);
+        // 2. request the map for any slot whose copy has been SUBMITTED (state 1). The copy
+        //    itself was recorded into the frame's own command encoder by `enqueue_meter_copy`
+        //    (#gfx-perf: this used to build a second command encoder and run a second
+        //    `queue.submit` every single frame, purely to move four bytes).
+        for (buf, st) in &self.lum_rb {
+            if st.load(Ordering::Acquire) != 1 { continue; }
+            st.store(2, Ordering::Release);
             let flag = st.clone();
             buf.slice(..).map_async(wgpu::MapMode::Read, move |r| {
                 // a failed map (device lost) frees the slot instead of wedging it
-                flag.store(if r.is_ok() { 2 } else { 0 }, Ordering::Release);
+                flag.store(if r.is_ok() { 3 } else { 0 }, Ordering::Release);
             });
-            self.lum_rb_next.set((i + 1) % n);
-            break;
         }
         // 3. no explicit poll: every queue.submit() runs a non-blocking maintain that fires the
         // completed map callbacks (wgpu-core queue.rs), so the value is harvested on a later call.
@@ -2481,12 +2614,34 @@ impl SceneRenderer {
         self.lum_rb_last.get()
     }
 
+    /// Record this frame's 1×1 exposure-meter copy into the frame's command encoder. Called by
+    /// `render` right after the lum pass; `read_mean_log_async` then maps whatever was submitted.
+    /// Slot states: 0 free, 1 copy recorded, 2 map pending, 3 value ready.
+    fn enqueue_meter_copy(&self, encoder: &mut wgpu::CommandEncoder) {
+        use std::sync::atomic::Ordering;
+        let n = self.lum_rb.len();
+        let start = self.lum_rb_next.get();
+        for k in 0..n {
+            let i = (start + k) % n;
+            let (buf, st) = &self.lum_rb[i];
+            if st.load(Ordering::Acquire) != 0 { continue; }
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &self.lum_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: buf, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(1) } },
+                wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            );
+            st.store(1, Ordering::Release);
+            self.lum_rb_next.set((i + 1) % n);
+            break;
+        }
+    }
+
     /// Read back the LINEAR pre-tonemap HDR scene (Rgba16Float, SS×size) as f32 RGBA (HMS_HDR_DUMP).
     /// This is the ONLY reliable per-pixel probe — the PNG capture and any debug-return go through the
     /// post pass (exposure + sqrt tonemap + bloom), which saturates and (with auto-exposure) confounds
     /// every ratio. Returns (rgba_f32, width, height). Call after `render`.
     pub fn dump_hdr(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<f32>, u32, u32) {
-        let (w, h) = (self.size.0 * SS, self.size.1 * SS);
+        let (w, h) = self.scene_size();
         self.dump_rgba16f(device, queue, &self.hdr_tex, w, h)
     }
     /// Read back the final bloom level (1/4 output res, RGBA f32: rgb = the bloom the
@@ -2550,7 +2705,8 @@ impl SceneRenderer {
     /// writes p.x). Also clears the Halo 4 filmic curve / meter / grading-LUT flags (a Reach map
     /// loaded after a Halo 4 one must not keep them; the LUT bind group itself is left, the flag gates it).
     pub fn set_auto_exposure(&self, queue: &wgpu::Queue, key: f32, min_ev: f32, max_ev: f32) {
-        self.set_h4_filmic(queue, None);
+        self.set_h4_filmic(queue, None); // also clears the Halo 3 tone curve - see that function
+
         self.set_h4_meter(queue, None);
         queue.write_buffer(&self.post_buf, 216, bytemuck::cast_slice(&[0.0f32]));
         let key = key.clamp(0.02, 4.0);
@@ -2583,11 +2739,18 @@ impl SceneRenderer {
 
     /// Upload the atmospheric fog uniform (7 vec4 packed by the caller from the map's fogg
     /// params; see FOG_WGSL). atm3.w == 0 disables fog in the shader.
-    pub fn set_fog(&mut self, queue: &wgpu::Queue, fog: &[f32; 28]) {
-        queue.write_buffer(&self.fog_buf, 0, bytemuck::cast_slice(&fog[..]));
+    /// `fog` = the 28-float Reach uniform, or the FOG_UNIFORM_LEN-float Halo 4 one (28 + the
+    /// per-layer extinction tables, `hms_app::h4::lighting::H4Fog::uniform`); shorter arrays are
+    /// zero-padded so a stale Halo 4 extension never leaks into the next map.
+    pub fn set_fog(&mut self, queue: &wgpu::Queue, fog: &[f32]) {
+        let mut full = [0.0f32; FOG_UNIFORM_LEN];
+        let n = fog.len().min(FOG_UNIFORM_LEN);
+        full[..n].copy_from_slice(&fog[..n]);
+        queue.write_buffer(&self.fog_buf, 0, bytemuck::cast_slice(&full[..]));
         // Stash the atmosphere sky inscatter color (fog[0..3]) so the outdoor sky gradient
         // is colored from the MAP's own atmosphere tag, not a hardcoded blue.
         self.sky_tint = [fog[0], fog[1], fog[2]];
+        self.sky_ground_color = None; // an explicit H4/H2A `set_sky_colors` must follow set_fog
         // Highlands yellow-sky guard: some maps render a PROCEDURAL sky dome and their fogg
         // "sky" colour is an HDR WARM value (Highlands = 5.0,3.35,0.0) that is NOT an atmosphere
         // inscatter tint. Painted into the fullscreen gradient it makes the whole sky solid yellow.
@@ -2634,16 +2797,87 @@ impl SceneRenderer {
     }
     /// Imported external geometry — a base to forge over. Persists across map loads
     /// (NOT cleared like static/BSP meshes), so import + load-map / import-only both work.
-    pub fn set_imported_meshes(&mut self, meshes: Vec<GpuMesh>) {
-        self.imported_meshes = meshes;
-        self.bump_static();
+    ///
+    /// #model-import: one imported FILE is uploaded as one sub-mesh per material (so a
+    /// multi-material model is not flattened to one look), split into the opaque pass and the
+    /// alpha-test cutout pass. `append_imported_model` returns the MODEL index the editor then
+    /// addresses — which is also the index `set_imported_transform` / `set_imported_tint` /
+    /// `remove_imported_model` take, so the pseudo-datum ↔ model mapping is unchanged.
+    pub fn append_imported_model(&mut self, mut opaque: Vec<GpuMesh>, mut cutout: Vec<GpuMesh>) -> usize {
+        let span = ImportSpan {
+            opaque: (self.imported_meshes.len() as u32, opaque.len() as u32),
+            cutout: (self.imported_cutout_meshes.len() as u32, cutout.len() as u32),
+        };
+        self.imported_meshes.append(&mut opaque);
+        self.imported_cutout_meshes.append(&mut cutout);
+        self.imported_spans.push(span);
+        self.imported_spans.len() - 1
     }
-    pub fn append_imported_meshes(&mut self, mut meshes: Vec<GpuMesh>) {
-        self.imported_meshes.append(&mut meshes);
+    /// Drop imported model `idx` and shift the spans after it. The bundles are re-recorded
+    /// (`bump_static`) because the lists SHRANK — but nothing is re-parsed or re-uploaded, so
+    /// removing one of several imports no longer costs a full re-read of every model file.
+    pub fn remove_imported_model(&mut self, idx: usize) -> bool {
+        let Some(span) = self.imported_spans.get(idx).copied() else { return false };
+        let (o0, on) = (span.opaque.0 as usize, span.opaque.1 as usize);
+        let (c0, cn) = (span.cutout.0 as usize, span.cutout.1 as usize);
+        if o0 + on <= self.imported_meshes.len() {
+            self.imported_meshes.drain(o0..o0 + on);
+        }
+        if c0 + cn <= self.imported_cutout_meshes.len() {
+            self.imported_cutout_meshes.drain(c0..c0 + cn);
+        }
+        self.imported_spans.remove(idx);
+        for s in self.imported_spans.iter_mut().skip(idx) {
+            s.opaque.0 = s.opaque.0.saturating_sub(on as u32);
+            s.cutout.0 = s.cutout.0.saturating_sub(cn as u32);
+        }
+        self.bump_static();
+        true
     }
     pub fn clear_imported_meshes(&mut self) {
         self.imported_meshes.clear();
+        self.imported_cutout_meshes.clear();
+        self.imported_spans.clear();
         self.bump_static();
+    }
+    /// How many imported MODELS are live (one per imported model file).
+    pub fn imported_mesh_count(&self) -> usize {
+        self.imported_spans.len()
+    }
+    /// Every GpuMesh of imported model `idx`, across both lanes.
+    fn imported_model_meshes<'a>(&'a mut self, idx: usize) -> impl Iterator<Item = &'a mut GpuMesh> + 'a {
+        let span = self.imported_spans.get(idx).copied().unwrap_or_default();
+        let (o0, on) = (span.opaque.0 as usize, span.opaque.1 as usize);
+        let (c0, cn) = (span.cutout.0 as usize, span.cutout.1 as usize);
+        let o: &'a mut [GpuMesh] = self.imported_meshes.get_mut(o0..o0.saturating_add(on)).unwrap_or_default();
+        let c: &'a mut [GpuMesh] = self.imported_cutout_meshes.get_mut(c0..c0.saturating_add(cn)).unwrap_or_default();
+        o.iter_mut().chain(c.iter_mut())
+    }
+    /// Place imported model `idx` with a new world matrix. The imported model's transform is
+    /// user-driven (gizmo / numeric fields), so this rewrites each sub-mesh's single instance
+    /// model matrix in place rather than re-uploading the geometry — the cached render bundle
+    /// keeps pointing at the same buffers, so no `bump_static` is needed. Returns false for an
+    /// out-of-range index.
+    pub fn set_imported_transform(&mut self, queue: &wgpu::Queue, idx: usize, m: glam::Mat4) -> bool {
+        if idx >= self.imported_spans.len() {
+            return false;
+        }
+        for gm in self.imported_model_meshes(idx) {
+            gm.set_instance_models(queue, &[m]);
+        }
+        true
+    }
+    /// #model-import: the per-instance LIGHT colour of every sub-mesh of imported model `idx` —
+    /// the probe/airprobe ambient sampled where the model now stands (see hms-app
+    /// `refresh_import_lighting`). Same in-place instance rewrite as the transform.
+    pub fn set_imported_tint(&mut self, queue: &wgpu::Queue, idx: usize, color: [f32; 4]) -> bool {
+        if idx >= self.imported_spans.len() {
+            return false;
+        }
+        for gm in self.imported_model_meshes(idx) {
+            gm.set_instance_colors(queue, &[color]);
+        }
+        true
     }
     /// The static marker lane (replaced per map load; drawn while `show_markers`):
     /// opaque / alpha-test parts, additive parts, alpha-blend parts.
@@ -2655,6 +2889,133 @@ impl SceneRenderer {
     }
     /// Show / hide the marker lane (no re-upload; the bundle is already recorded).
     pub fn set_show_markers(&mut self, on: bool) { self.show_markers = on; }
+
+    /// Does this scene contain anything that MOVES on its own — i.e. anything whose appearance
+    /// depends on `time` rather than only on the camera? Drives the editor's idle throttle: a
+    /// scene with no animated content can safely be redrawn far less often, while one with a
+    /// waterfall, swaying grass, particles or a flare must not be.
+    ///
+    /// Deliberately a superset: water surfaces and the additive/blend lanes carry the scrolling
+    /// and pulsing materials, so their mere presence counts as animated. Being wrong in this
+    /// direction costs a few redundant frames; being wrong in the other direction would freeze
+    /// the picture, which is the one failure a throttle must never have.
+    pub fn has_animated_content(&self) -> bool {
+        !self.particle_meshes.is_empty()
+            || !self.water_meshes.is_empty()
+            || !self.foliage_meshes.is_empty()
+            || !self.blend_meshes.is_empty()
+            || !self.dynamic_blend_meshes.is_empty()
+            || !self.dynamic_holo_meshes.is_empty()
+            // #sword-blade SKIN-2: a posed actor's additive/blend parts (the energy-sword blade)
+            // animate through the same drifting fs_holo material as a world-placed one.
+            || !self.actor_holo_meshes.is_empty()
+            || !self.actor_blend_meshes.is_empty()
+            || !self.fp_holo_meshes.is_empty()
+            || !self.fp_blend_meshes.is_empty()
+            || !self.marker_holo_meshes.is_empty()
+            || !self.lens_elements.is_empty()
+            || !self.lensfx.instances.is_empty()
+            || self.rtgi.enabled
+    }
+
+    // ---- Settings ▸ Graphics (render quality) -----------------------------------------
+    //
+    // `apply_quality` is the ONLY way the quality knobs change, and it is a no-op when nothing
+    // moved. That matters: the panel-opens-and-changes-the-picture defect (`// #h4-expo-3`) came
+    // from a panel pushing state it had merely *read*, so the Graphics page is wired the same way
+    // the Lighting Lab now is — the renderer owns the values and only a user edit pushes.
+
+    pub fn quality(&self) -> quality::RenderQuality {
+        self.quality
+    }
+
+    /// The scene (HDR + depth) target size: the viewport times the render scale.
+    pub fn scene_size(&self) -> (u32, u32) {
+        self.quality.scene_target(self.size)
+    }
+
+    /// Install a new quality set. Reallocates the scene targets only when the render scale
+    /// actually changed, and rebuilds the two pipelines that bake the supersample ratio (the
+    /// post resolve's tap count and the Halo 4 meter's footprint conversion).
+    pub fn apply_quality(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, q: quality::RenderQuality) {
+        if q == self.quality {
+            return;
+        }
+        let scale_changed = (q.scene_scale - self.quality.scene_scale).abs() > 1e-6;
+        let taps_changed = q.resolve_taps() != self.quality.resolve_taps();
+        let shadows_changed = q.shadows != self.quality.shadows;
+        self.quality = q;
+        if taps_changed {
+            self.post_pipeline = make_post_pipeline(device, &self.post_bgl, &self.post_lut_bgl, q.resolve_taps());
+        }
+        if scale_changed {
+            self.lum_pipeline = make_lum_pipeline(device, &self.lum_bgl, self.lum_meter_scale, q.scene_scale);
+            self.rebuild_targets(device);
+        }
+        if shadows_changed {
+            // A smaller/larger sun map is a real reallocation (the texel-snap math divides by the
+            // side), and turning shadows OFF must leave the maps CLEARED TO FAR: the mesh shaders
+            // sample them unconditionally, so a stale map would freeze the last frame's shadows
+            // onto the scene instead of removing them.
+            self.rebuild_shadow_maps(device, queue);
+        }
+    }
+
+    /// The sun shadow map side currently allocated. `SHADOW_MAP_SIZE` (2048) is the default and
+    /// the value `Off` reports, so the texel math never divides by zero.
+    fn shadow_map_size(&self) -> u32 {
+        self.quality.shadows.map_size().unwrap_or(SHADOW_MAP_SIZE)
+    }
+
+    /// Reallocate the sun shadow map at the current quality's size and clear both depth maps to
+    /// the far plane. Only on a shadow-quality change — never per frame.
+    fn rebuild_shadow_maps(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        let n = self.shadow_map_size();
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shadow-map"),
+            size: wgpu::Extent3d { width: n, height: n, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.shadow_view = tex.create_view(&Default::default());
+        self.rebuild_camera_bg(device);
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("shadow-clear") });
+        for view in [&self.shadow_view, &self.h4_cascade_view] {
+            let _ = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("shadow-clear-pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        queue.submit(std::iter::once(enc.finish()));
+    }
+
+    /// Turn per-pass GPU timestamp timing on/off (the in-app graphics benchmark). Returns true
+    /// when timing is actually available — the adapter has to expose `TIMESTAMP_QUERY`.
+    pub fn set_gpu_timer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, on: bool) -> bool {
+        if !on {
+            self.gpu_timer = None;
+            return false;
+        }
+        if self.gpu_timer.is_none() {
+            self.gpu_timer = gputimer::GpuTimer::new(device, queue);
+        }
+        self.gpu_timer.is_some()
+    }
+
+    pub fn gpu_timer(&self) -> Option<&gputimer::GpuTimer> {
+        self.gpu_timer.as_ref()
+    }
     /// Append a chunk of water meshes (incremental/chunked map load).
     pub fn append_water_meshes(&mut self, mut meshes: Vec<GpuMesh>) {
         self.water_meshes.append(&mut meshes);
@@ -2670,6 +3031,73 @@ impl SceneRenderer {
     /// Dynamic (forge/object) meshes — set whenever the object set changes.
     pub fn set_dynamic_meshes(&mut self, meshes: Vec<GpuMesh>) {
         self.dynamic_meshes = meshes;
+    }
+
+    /// SKIN-1: the posed Reach actor meshes (skinned bipeds + held weapons). `opaque` is drawn
+    /// in the object opaque pass, `cutout` through the alpha-test pass. Replaced whole on every
+    /// actor rebuild; independent of `set_dynamic_meshes`.
+    ///
+    /// #sword-blade SKIN-2: `holo` / `holo_solid` / `blend` are the actor's transparent thirds —
+    /// the SAME three lanes a world-placed object is routed into by `maybe_rebuild`, drawn in the
+    /// shared sorted transparent sequence through the skinned pipelines.
+    pub fn set_actor_meshes(
+        &mut self,
+        opaque: Vec<GpuMesh>,
+        cutout: Vec<GpuMesh>,
+        holo: Vec<GpuMesh>,
+        holo_solid: Vec<GpuMesh>,
+        blend: Vec<GpuMesh>,
+    ) {
+        self.actor_meshes = opaque;
+        self.actor_cutout_meshes = cutout;
+        self.actor_holo_meshes = holo;
+        self.actor_holo_solid_meshes = holo_solid;
+        self.actor_blend_meshes = blend;
+    }
+    /// #fp-fov The FIRST-PERSON RIG's five lanes — the arms and the weapon mounted on the camera.
+    /// Drawn exactly like the actor lanes but through [`SceneRenderer::fp_camera_bg`], so they get
+    /// the engine's narrower first-person projection; see [`SceneRenderer::set_first_person_fov_scale`].
+    pub fn set_first_person_meshes(
+        &mut self,
+        opaque: Vec<GpuMesh>,
+        cutout: Vec<GpuMesh>,
+        holo: Vec<GpuMesh>,
+        holo_solid: Vec<GpuMesh>,
+        blend: Vec<GpuMesh>,
+    ) {
+        self.fp_meshes = opaque;
+        self.fp_cutout_meshes = cutout;
+        self.fp_holo_meshes = holo;
+        self.fp_holo_solid_meshes = holo_solid;
+        self.fp_blend_meshes = blend;
+    }
+
+    /// #fp-fov The factor the first-person MODEL's vertical field of view is the world camera's
+    /// times. Reach's is 0.88 (`0.6908 / vfov_scale`, `haloreach.dll+0x286CFC`); 1.0 draws the rig
+    /// through the world camera, which is what HMS did before and what makes a viewmodel splay as
+    /// the FOV slider widens. Clamped to a sane band so a bad value cannot invert the projection.
+    pub fn set_first_person_fov_scale(&mut self, scale: f32) {
+        self.fp_fov_scale = if scale.is_finite() { scale.clamp(0.25, 4.0) } else { 1.0 };
+    }
+
+    /// The factor in force, and how many meshes ride it (status line / gates).
+    pub fn first_person_view(&self) -> (f32, usize) {
+        (
+            self.fp_fov_scale,
+            self.fp_meshes.len() + self.fp_cutout_meshes.len() + self.fp_holo_meshes.len()
+                + self.fp_holo_solid_meshes.len() + self.fp_blend_meshes.len(),
+        )
+    }
+
+    /// SKIN-1: how many actor meshes are live (status line / headless diagnostics).
+    pub fn actor_mesh_count(&self) -> (usize, usize) {
+        (self.actor_meshes.len(), self.actor_cutout_meshes.len())
+    }
+    /// #sword-blade SKIN-2: how many actor meshes are live in the three TRANSPARENT lanes
+    /// (additive holo, solid holo, alpha-blend). The gate on "the held sword reaches a
+    /// transparent pipeline at all" reads this.
+    pub fn actor_transparent_counts(&self) -> (usize, usize, usize) {
+        (self.actor_holo_meshes.len(), self.actor_holo_solid_meshes.len(), self.actor_blend_meshes.len())
     }
 
     /// Cutout objects (tree canopies/plants) drawn through the alpha-test pass.
@@ -2770,6 +3198,16 @@ impl SceneRenderer {
     /// Per-map: does the scenario author atmosphere (fogg)? Gates the procedural horizon
     /// gradient so space maps (no fogg, e.g. Zealot) show only the sky model over a
     /// near-black clear instead of an invented blue gradient.
+    /// Explicit fallback-sky colours for the Halo 4 / H2A path: `horizon` = the map's fogg sky
+    /// inscatter colour (bypasses `set_fog`'s warm-colour guard, which is a Reach heuristic),
+    /// `ground` = its ground-fog colour (what fogged geometry dissolves into below the horizon).
+    pub fn set_sky_colors(&mut self, horizon: [f32; 3], ground: Option<[f32; 3]>) {
+        let ok = |c: [f32; 3]| c.iter().all(|v| v.is_finite() && *v >= 0.0);
+        if ok(horizon) && horizon.iter().any(|v| *v > 1e-4) { self.sky_tint = horizon; }
+        self.sky_ground_color = ground.filter(|c| ok(*c));
+    }
+    /// Below-horizon level of the fallback sky gradient (see `sky_ground_level`).
+    pub fn set_sky_ground_level(&mut self, level: f32) { self.sky_ground_level = level.clamp(0.0, 1.0); }
     pub fn set_sky_atmosphere(&mut self, has_atmosphere: bool) {
         self.sky_has_atmosphere = has_atmosphere;
     }
@@ -2807,13 +3245,75 @@ impl SceneRenderer {
     }
     /// Per-buffer draw state (vertex counts of the overlay lanes, mesh counts per transparent
     /// list) for the headless diagnostics.
+    /// Draw-call census: meshes and INSTANCES per list, for the benchmark report. The CPU cost
+    /// of a frame in this renderer is dominated by the number of recorded draws (the render
+    /// pass's end-of-pass replay), so this is the number any encode-time optimisation has to move.
+    pub fn draw_call_census(&self) -> String {
+        let n = |l: &[GpuMesh]| -> (usize, u32) { (l.len(), l.iter().map(|m| m.instance_count).sum()) };
+        // #film-perf  Which lanes are REPLAYED FROM A CACHED BUNDLE and which are re-encoded
+        // into the live pass every frame is the whole question when the scene pass's end costs
+        // 8.5 ms of a Theater frame, so the census says which is which. `bundle:` lanes are
+        // recorded once by `static_bundles` and replayed; `live:` lanes go through wgpu-core's
+        // validated pass path on every frame. The actor and first-person lanes were missing
+        // entirely, which is exactly the set a Theater frame adds.
+        let lists: [(&str, (usize, u32)); 22] = [
+            ("bundle:static", n(&self.static_meshes)),
+            ("bundle:terrain", n(&self.terrain_meshes)),
+            ("bundle:alphatest", n(&self.alphatest_meshes)),
+            ("bundle:foliage", n(&self.foliage_meshes)),
+            ("bundle:decals", (self.decal_meshes.len(), self.decal_meshes.iter().map(|(m, _)| m.instance_count).sum())),
+            ("bundle:water", n(&self.water_meshes)),
+            ("bundle:additive", n(&self.additive_meshes)),
+            ("bundle:markers", n(&self.marker_meshes)),
+            ("bundle:imported", n(&self.imported_meshes)),
+            ("bundle:imported_cutout", n(&self.imported_cutout_meshes)),
+            ("live:blend", n(&self.blend_meshes)),
+            ("live:dyn_opaque", n(&self.dynamic_meshes)),
+            ("live:dyn_cutout", n(&self.dynamic_cutout_meshes)),
+            ("live:dyn_holo", n(&self.dynamic_holo_meshes)),
+            ("live:dyn_holo_solid", n(&self.dynamic_holo_solid_meshes)),
+            ("live:dyn_blend", n(&self.dynamic_blend_meshes)),
+            ("live:actor_opaque", n(&self.actor_meshes)),
+            ("live:actor_cutout", n(&self.actor_cutout_meshes)),
+            ("live:actor_transparent", (
+                self.actor_holo_meshes.len() + self.actor_holo_solid_meshes.len() + self.actor_blend_meshes.len(),
+                self.actor_holo_meshes.iter().chain(self.actor_holo_solid_meshes.iter()).chain(self.actor_blend_meshes.iter()).map(|m| m.instance_count).sum(),
+            )),
+            ("live:first_person", (
+                self.fp_meshes.len() + self.fp_cutout_meshes.len() + self.fp_holo_meshes.len()
+                    + self.fp_holo_solid_meshes.len() + self.fp_blend_meshes.len(),
+                self.fp_meshes.iter().chain(self.fp_cutout_meshes.iter()).chain(self.fp_holo_meshes.iter())
+                    .chain(self.fp_holo_solid_meshes.iter()).chain(self.fp_blend_meshes.iter()).map(|m| m.instance_count).sum(),
+            )),
+            ("live:marker_transparent", (
+                self.marker_holo_meshes.len() + self.marker_blend_meshes.len(),
+                self.marker_holo_meshes.iter().chain(self.marker_blend_meshes.iter()).map(|m| m.instance_count).sum(),
+            )),
+            ("live:particles", n(&self.particle_meshes)),
+        ];
+        let (tm, ti) = lists.iter().fold((0usize, 0u32), |a, (_, (m, i))| (a.0 + m, a.1 + i));
+        let body: Vec<String> = lists.iter().filter(|(_, (m, _))| *m > 0).map(|(k, (m, i))| format!("{k}={m}/{i}")).collect();
+        let live: usize = lists.iter().filter(|(k, _)| k.starts_with("live:")).map(|(_, (m, _))| *m).sum();
+        format!(
+            "draws {tm} meshes / {ti} instances ({live} re-encoded live every frame, {} replayed from a bundle)  [{}]",
+            tm - live,
+            body.join(" ")
+        )
+    }
+
     pub fn debug_draw_counts(&self) -> String {
         format!(
-            "zone_vtx={} overlay_vtx={} xray_vtx={} highlight_vtx={} gizmo_ln={} gizmo_tri={} | water={} blend={} additive={} decal={} | dyn_op={} dyn_cut={} dyn_holo={} dyn_holo_solid={} dyn_blend={}",
+            "zone_vtx={} overlay_vtx={} xray_vtx={} highlight_vtx={} gizmo_ln={} gizmo_tri={} | water={} blend={} additive={} decal={} | dyn_op={} dyn_cut={} dyn_holo={} dyn_holo_solid={} dyn_blend={} | act_op={} act_cut={} act_holo={} act_holo_solid={} act_blend={}",
             self.zone_vcount, self.overlay_vcount, self.xray_vcount, self.highlight_vcount, self.gizmo_vcount, self.gizmo_tri_vcount,
             self.water_meshes.len(), self.blend_meshes.len(), self.additive_meshes.len(), self.decal_meshes.len(),
             self.dynamic_meshes.len(), self.dynamic_cutout_meshes.len(), self.dynamic_holo_meshes.len(),
             self.dynamic_holo_solid_meshes.len(), self.dynamic_blend_meshes.len(),
+            self.actor_meshes.len(), self.actor_cutout_meshes.len(), self.actor_holo_meshes.len(),
+            self.actor_holo_solid_meshes.len(), self.actor_blend_meshes.len(),
+        ) + &format!(
+            " | fp_op={} fp_cut={} fp_holo={} fp_holo_solid={} fp_blend={} fp_fov_scale={:.3}",
+            self.fp_meshes.len(), self.fp_cutout_meshes.len(), self.fp_holo_meshes.len(),
+            self.fp_holo_solid_meshes.len(), self.fp_blend_meshes.len(), self.fp_fov_scale,
         )
     }
     /// How much of the object set goes into the sun shadow pass — (caster meshes,
@@ -2935,6 +3435,16 @@ impl SceneRenderer {
         if size == self.size {
             return;
         }
+        self.size = size;
+        self.rebuild_targets(device);
+    }
+
+    /// Reallocate every viewport-sized target and the bind groups that point at them, from
+    /// `self.size` and `self.quality.scene_scale`. Split out of `resize` so a RENDER-SCALE
+    /// change (which resizes the scene targets while the viewport stays put) runs the identical
+    /// path instead of a second, drifting copy of it.
+    fn rebuild_targets(&mut self, device: &wgpu::Device) {
+        let size = self.size;
         let Targets {
             color_tex: c,
             color_view: cv,
@@ -2944,7 +3454,7 @@ impl SceneRenderer {
             depth_copy_view: dcv,
             hdr_view: hv,
             hdr_tex: ht,
-        } = make_targets(device, size);
+        } = make_targets(device, size, self.quality.scene_target(size));
         let bloom = make_bloom_pyramid(device, size);
         self.color_view_srgb = c.create_view(&wgpu::TextureViewDescriptor {
             format: Some(COLOR_FORMAT_SRGB),
@@ -2991,21 +3501,211 @@ impl SceneRenderer {
         self.hdr_view = hv;
         self.hdr_tex = ht;
         self.bloom = bloom;
-        self.size = size;
+        self.flat.retarget(device, &self.hdr_view, &self.depth_copy_view);
+    }
+
+
+    /// The editor's own overlay draws — boundary-zone fill, overlay lines, the selection
+    /// wireframe, x-ray lines and the transform gizmo. Factored out of the transparent pass so
+    /// the FLAT / white-mesh view can draw the identical set: a view that cannot show you what
+    /// is selected or let you grab the gizmo is not a view you can build in.
+    fn draw_editor_overlays(&self, pass: &mut wgpu::RenderPass<'_>) {
+        // Translucent zone volume fill (selected object's boundary shape) — before the
+        // overlay lines so the bright wireframe outline draws on top of the holographic fill.
+        if let Some(zv) = &self.zone_vbuf {
+            pass.set_pipeline(&self.zone_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_vertex_buffer(0, zv.slice(..));
+            pass.draw(0..self.zone_vcount, 0..1);
+        }
+        // Overlay lines (boundary shapes, trigger volumes, etc.) + selection highlight box.
+        // #wire-visible: drawn through the WIRE pipeline (black halo + exposure-compensated
+        // core, instances 0-11) - the same treatment as the selection wireframe - so a pale
+        // gold zone outline still reads over the blown-out white Forge pieces of a Halo 4
+        // scene, where a plain line saturates into the background. Per-vertex colour (amber
+        // zones / cyan teleporters) is preserved; the wire vertex layout matches `Vertex`.
+        if let Some(ov) = &self.overlay_vbuf {
+            pass.set_pipeline(&self.wire_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_bind_group(1, &self.wire_bg, &[]);
+            pass.set_vertex_buffer(0, ov.slice(..));
+            pass.draw(0..self.overlay_vcount, 0..12);
+        }
+        // #wire-visible  Selection wireframe: instances 0-7 = the black halo ring, 8-11 =
+        // the exposure-compensated bright core (WIRE_WGSL). A very large selection (Ctrl+A on a
+        // full variant) skips the halo and draws the core alone so the instance count can't run
+        // away. `highlight_xray` swaps in the depth-ALWAYS pipeline (View menu).
+        if let (Some(hl), false) = (&self.highlight_vbuf, self.highlight_hidden) {
+            const WIRE_HALO_MAX_VERTS: u32 = 4_000_000;
+            let insts = if self.highlight_vcount > WIRE_HALO_MAX_VERTS { 8..12 } else { 0..12 };
+            pass.set_pipeline(if self.highlight_xray { &self.wire_xray_pipeline } else { &self.wire_pipeline });
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_bind_group(1, &self.wire_bg, &[]);
+            pass.set_vertex_buffer(0, hl.slice(..));
+            pass.draw(0..self.highlight_vcount, insts);
+        }
+        // #quant-error  The save-precision ghost, through the depth-ALWAYS wire pipeline (the same
+        // halo + exposure-compensated core as the selection wireframe, so its violet survives a
+        // blown-out sky instead of saturating to white) and on its own buffer, so it coexists with
+        // the selection wireframe it is meant to be compared against.
+        if let Some(gv) = &self.ghost_vbuf {
+            pass.set_pipeline(&self.wire_xray_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_bind_group(1, &self.wire_bg, &[]);
+            pass.set_vertex_buffer(0, gv.slice(..));
+            pass.draw(0..self.ghost_vcount, 0..12);
+        }
+        // X-ray lines (no depth test) -- the soft-ceiling edges through the map.
+        if let Some(xv) = &self.xray_vbuf {
+            pass.set_pipeline(&self.gizmo_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_vertex_buffer(0, xv.slice(..));
+            pass.draw(0..self.xray_vcount, 0..1);
+        }
+        // Transform gizmo LAST, with the always-on-top pipeline so it's grabbable
+        // through other geometry. Solid triangles first, then any thin guide lines.
+        if let Some(gz) = &self.gizmo_tri_vbuf {
+            pass.set_pipeline(&self.gizmo_tri_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_vertex_buffer(0, gz.slice(..));
+            pass.draw(0..self.gizmo_tri_vcount, 0..1);
+        }
+        if let Some(gz) = &self.gizmo_vbuf {
+            pass.set_pipeline(&self.gizmo_pipeline);
+            pass.set_bind_group(0, &self.camera_bg, &[]);
+            pass.set_vertex_buffer(0, gz.slice(..));
+            pass.draw(0..self.gizmo_vcount, 0..1);
+        }
+    }
+
+    /// FLAT / white-mesh frame (Settings ▸ Graphics ▸ Flat). One unlit geometry pass, the editor
+    /// overlays, and a depth-outline resolve straight into the egui-visible colour target — no
+    /// sky model, no shadow maps, no material/lightmap shading, no water, no decals, no
+    /// particles, no flares, no fog, no exposure meter, no bloom pyramid, no tonemap.
+    fn render_flat_frame(&self, device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, vp: Mat4) {
+        let scene = self.scene_size();
+        // A fixed three-quarter key in world space (Z-up): independent of the map's sun, so the
+        // flat view reads the same on every map and cannot be flattened by a map whose sun is
+        // straight overhead.
+        const FLAT_KEY: Vec3 = Vec3::new(0.45, 0.35, 0.82);
+        // The distance shade reaches the whole far plane of a big Forge map.
+        self.flat.write_uniforms(queue, vp.to_cols_array_2d(), FLAT_KEY, camera.pos, 900.0, 1.0, scene);
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene-flat") });
+        let bundles = self.static_bundles(device);
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("flat-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.hdr_view,
+                    resolve_target: None,
+                    // A light neutral backdrop, slightly cool, so white geometry reads against it.
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.74, g: 0.76, b: 0.80, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("flat-pass")),
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(self.flat.geom_pipeline());
+            pass.set_bind_group(0, self.flat.geom_bind_group(), &[]);
+            // Solid, layout-bearing geometry only. Alpha-test lists (leaf cards, grates) are
+            // drawn solid — a tree reads as a block, which is honest about where it is — while
+            // decorators, particles, water surfaces and transparent lanes are dropped: they are
+            // the expensive lists and they tell you nothing about the layout.
+            if self.show_bsp {
+                flat::FlatRenderer::draw_list(&mut pass, &self.static_meshes);
+                flat::FlatRenderer::draw_list(&mut pass, &self.alphatest_meshes);
+            }
+            if self.show_terrain {
+                flat::FlatRenderer::draw_list(&mut pass, &self.terrain_meshes);
+            }
+            if self.show_objects {
+                flat::FlatRenderer::draw_list(&mut pass, &self.dynamic_meshes);
+                flat::FlatRenderer::draw_list(&mut pass, &self.dynamic_cutout_meshes);
+                flat::FlatRenderer::draw_list(&mut pass, &self.actor_meshes);
+                flat::FlatRenderer::draw_list(&mut pass, &self.actor_cutout_meshes);
+                // #fp-fov The flat view is one unlit pass through ONE camera, so the rig is drawn
+                // through the world camera here; it is a debug/geometry view, not a picture of
+                // what the game looks like.
+                flat::FlatRenderer::draw_list(&mut pass, &self.fp_meshes);
+                flat::FlatRenderer::draw_list(&mut pass, &self.fp_cutout_meshes);
+            }
+            flat::FlatRenderer::draw_list(&mut pass, &self.imported_meshes);
+            flat::FlatRenderer::draw_list(&mut pass, &self.imported_cutout_meshes);
+            if self.show_markers {
+                flat::FlatRenderer::draw_list(&mut pass, &self.marker_meshes);
+            }
+            drop(pass);
+        }
+        // The outline needs a SAMPLEABLE depth buffer, and `depth_tex` is render-attachment only.
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.depth_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::DepthOnly },
+            wgpu::TexelCopyTextureInfo { texture: &self.depth_copy_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::DepthOnly },
+            wgpu::Extent3d { width: scene.0, height: scene.1, depth_or_array_layers: 1 },
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("flat-overlay-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.hdr_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("flat-overlay-pass")),
+                occlusion_query_set: None,
+            });
+            if self.show_grid {
+                pass.set_pipeline(&self.grid_pipeline);
+                pass.set_bind_group(0, &self.camera_bg, &[]);
+                pass.set_vertex_buffer(0, self.grid_vbuf.slice(..));
+                pass.draw(0..self.grid_vcount, 0..1);
+            }
+            self.draw_editor_overlays(&mut pass);
+        }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("flat-resolve-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("flat-resolve-pass")),
+                occlusion_query_set: None,
+            });
+            self.flat.resolve(&mut pass, self.quality.resolve_taps());
+        }
+        if let Some(t) = &self.gpu_timer { t.resolve(&mut encoder); }
+        queue.submit(std::iter::once(encoder.finish()));
+        if let Some(t) = &self.gpu_timer { t.collect(device); }
+        drop(bundles);
     }
 
     /// Render one frame to the offscreen texture. `time` (seconds) drives the
     /// decorator wind sway.
     pub fn render(&self, device: &wgpu::Device, queue: &wgpu::Queue, camera: &Camera, time: f32) {
         let t_render_entry = std::time::Instant::now(); // HMS_RENDER_PROF prologue lap
+        if let Some(t) = &self.gpu_timer { t.begin_frame(); }
         let aspect = self.size.0 as f32 / self.size.1 as f32;
         let vp = camera.view_proj(aspect);
         // Camera-underwater flag → cam.time.y (water_shading:1112). The water shader flips the
         // fresnel normal (−n) when the eye is below a water surface. Physical test (submerged_plane),
         // independent of the optional underwater-fog pass. HMS_FORCE_UW forces it on.
-        let underwater_flag = if self.submerged_plane(camera.pos).is_some() || std::env::var("HMS_FORCE_UW").is_ok() { 1.0 } else { 0.0 };
+        let underwater_flag = if self.submerged_plane(camera.pos).is_some() || self.env.force_underwater { 1.0 } else { 0.0 };
         // cam.time = [seconds, underwater flag, FOG_WU override (0 = shader const; HMS_FOG_WU), unused]
-        let fog_wu = if self.fog_wu > 0.0 { self.fog_wu } else { std::env::var("HMS_FOG_WU").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0) };
+        let fog_wu = if self.fog_wu > 0.0 { self.fog_wu } else { self.env.fog_wu };
         let cam = CameraUniform {
             view_proj: vp.to_cols_array_2d(),
             cam_pos: [camera.pos.x, camera.pos.y, camera.pos.z, 1.0],
@@ -3013,6 +3713,21 @@ impl SceneRenderer {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
         };
         queue.write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
+        // #fp-fov The FIRST-PERSON MODEL camera: the same eye, the same orientation, the same
+        // near/far — only the vertical field of view is narrower, which is exactly what the engine
+        // does (`render_first_person_view`: copy the world camera, then `vfov *= 0.6908 /
+        // vfov_scale`). Written every frame; nothing reads it unless the rig has meshes.
+        let fp_vp = {
+            let mut c = *camera;
+            c.fov_y = (c.fov_y * self.fp_fov_scale).clamp(0.01, 3.0);
+            c.view_proj(aspect)
+        };
+        queue.write_buffer(&self.fp_camera_buf, 0, bytemuck::bytes_of(&CameraUniform {
+            view_proj: fp_vp.to_cols_array_2d(),
+            cam_pos: cam.cam_pos,
+            time: cam.time,
+            inv_view_proj: fp_vp.inverse().to_cols_array_2d(),
+        }));
         // #wire-visible  Selection-wireframe params: xy = 1 / HDR target size (the halo offset is
         // in HDR pixels, and the HDR target is SS x the output), z = halo radius, w = the exposed
         // value the core aims for. Cheap enough to write every frame.
@@ -3025,8 +3740,16 @@ impl SceneRenderer {
             // the scene exposure, and the black halo (not the core's brightness) carries the
             // contrast against a blown-out background.
             const WIRE_CORE_TARGET: f32 = 1.00;
-            let (tw, th) = ((self.size.0 * SS).max(1) as f32, (self.size.1 * SS).max(1) as f32);
+            let (tw, th) = { let s = self.scene_size(); (s.0.max(1) as f32, s.1.max(1) as f32) };
             queue.write_buffer(&self.wire_buf, 0, bytemuck::cast_slice(&[1.0 / tw, 1.0 / th, WIRE_HALO_R, WIRE_CORE_TARGET]));
+        }
+        // ---- FLAT / white-mesh view (Settings ▸ Graphics) ----------------------------------
+        // Takes over the whole frame. Placed here, before the lens-flare vertex build, the
+        // lensfx occlusion build and the shadow-frustum solve, so none of that prologue runs
+        // either: the point of the mode is that nothing expensive happens at all.
+        if self.quality.flat {
+            self.render_flat_frame(device, queue, camera, vp);
+            return;
         }
         // Sun lens flare: project the (per-map) sun direction to screen; if it's on
         // screen and in front, build a transient NDC vertex buffer of additive sprites
@@ -3085,7 +3808,7 @@ impl SceneRenderer {
         let lensfx_batches = {
             let view = Mat4::look_at_rh(camera.pos, camera.pos + camera.forward(), Vec3::Z);
             let proj = Mat4::perspective_rh(camera.fov_y, aspect.max(0.01), camera.near, camera.far);
-            self.lensfx.build(device, camera.pos, camera.forward(), &view, &proj, (self.size.0 * SS, self.size.1 * SS), std::env::var("HMS_LENSFX_DIAG").is_ok())
+            self.lensfx.build(device, camera.pos, camera.forward(), &view, &proj, self.scene_size(), self.env.lensfx_diag)
         };
         // Camera-centred sun shadow frustum, updated per-frame. A tight radius keeps the
         // 2048² shadow map crisp near the viewer (fitting the whole map AABB — r~5000 —
@@ -3132,8 +3855,8 @@ impl SceneRenderer {
                 }
                 // square footprint at the engine texel (0.025 wu) or coarser when the casters need it
                 let side = ((x1 - x0).max(y1 - y0) + 1.0).max(0.025 * 64.0);
-                let texel = (side / SHADOW_MAP_SIZE as f32).max(0.025);
-                let side = texel * SHADOW_MAP_SIZE as f32;
+                let texel = (side / self.shadow_map_size() as f32).max(0.025);
+                let side = texel * self.shadow_map_size() as f32;
                 let cx = ((x0 + x1) * 0.5 / texel).round() * texel;
                 let cy = ((y0 + y1) * 0.5 / texel).round() * texel;
                 // depth range = the casters' extent along the light (+0.5 wu each side); receivers
@@ -3147,7 +3870,7 @@ impl SceneRenderer {
                 lvp = (proj * view).to_cols_array();
                 // h4s0 = (texel uv, bias inner, bias edge, bias corner): the burn PS's per-tap receiver
                 // biases in normalized depth (0.002 / 0.002·sqrt(1.25) / 0.004).
-                lb[44] = 1.0 / SHADOW_MAP_SIZE as f32; lb[45] = 0.002; lb[46] = 0.0022360680; lb[47] = 0.004;
+                lb[44] = 1.0 / self.shadow_map_size() as f32; lb[45] = 0.002; lb[46] = 0.0022360680; lb[47] = 0.004;
                 // h4s1 = (burn active, depth range wu, texel wu, 0)
                 lb[48] = 1.0; lb[49] = near_d - far_d; lb[50] = texel; lb[51] = 0.0;
                 self.h4_shadow_diag.set([texel, near_d - far_d, side, 1.0]);
@@ -3216,9 +3939,11 @@ impl SceneRenderer {
         let sky = SkyUniform {
             inv_view_proj: vp.inverse().to_cols_array_2d(),
             cam_pos: [camera.pos.x, camera.pos.y, camera.pos.z, 1.0],
-            sun_dir: [self.sun_dir.x, self.sun_dir.y, self.sun_dir.z, 0.0],
+            // sun_dir.w = the gradient's below-horizon ground level (x horizon colour)
+            sun_dir: [self.sun_dir.x, self.sun_dir.y, self.sun_dir.z, self.sky_ground_level],
             horizon: [self.sky_tint[0], self.sky_tint[1], self.sky_tint[2],
                       if self.sky_has_atmosphere { 1.0 } else { 0.0 }],
+            ground: match self.sky_ground_color { Some(g) => [g[0], g[1], g[2], 1.0], None => [0.0; 4] },
         };
         queue.write_buffer(&self.sky_buf, 0, bytemuck::bytes_of(&sky));
 
@@ -3240,7 +3965,7 @@ impl SceneRenderer {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene") });
         // Real-time GI: advance the probe field one step before anything samples it this frame.
-        if self.rtgi.enabled && self.rtgi.has_scene() && std::env::var("HMS_RTGI_FREEZE").is_err() {
+        if self.rtgi.enabled && self.rtgi.has_scene() && !self.env.rtgi_freeze {
             let parts = self.rtgi.parts_per_frame();
             let part = self.rtgi.updates.get() % parts;
             self.rtgi.dispatch_part(&mut encoder, queue, None, parts, part);
@@ -3344,6 +4069,11 @@ impl SceneRenderer {
                 self.env_capture_pending.set(false);
             }
         }
+        // Settings ▸ Graphics ▸ Shadows = Off skips both depth passes below (the sun map and the
+        // Halo 4 cascade). The shader still samples the maps; they keep whatever the last
+        // enabled frame left, so `set_shadow_strength`-style gating is not needed — `apply_quality`
+        // clears them once on the transition (see `clear_shadow_maps`).
+        let shadows_on = self.quality.shadows != quality::ShadowQuality::Off;
         // Shadow pass: render casters from the sun POV into the shadow depth map. ONLY OBJECTS
         // cast (engine-exact): the engine's sun shadow is the screen-space `shadow_mask` of
         // DYNAMIC casters (shadows\shadow_mask.hlsl_include: `.a` gates the analytical light,
@@ -3354,7 +4084,7 @@ impl SceneRenderer {
         // bake's own occlusion, and (b) draw crisp slat/ceiling shadow streaks through openings
         // that the engine shows only as a soft lightmap-resolution visibility patch (Zealot's
         // "sun through a window"). Objects still drop grounding shadows onto the world.
-        if self.show_bsp {
+        if self.show_bsp && shadows_on {
             let mut sp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("shadow-pass"),
                 color_attachments: &[],
@@ -3366,7 +4096,7 @@ impl SceneRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("shadow-pass")),
                 occlusion_query_set: None,
             });
             if self.h4_shadow_bounds.is_some() {
@@ -3394,7 +4124,7 @@ impl SceneRenderer {
         // The Halo 4 floating-shadow cascade depth pass (halo4.dll sub_18035ECB4): the objects
         // AND the BSP (the engine takes the sbsp instances whose sphere meets the box; HMS draws every
         // static mesh - the clusters too, a superset) from the sun into the res x res cascade map.
-        if self.show_bsp && self.h4_cascade.is_some() {
+        if self.show_bsp && shadows_on && self.h4_cascade.is_some() {
             let res = self.h4_cascade.map_or(H4_CASCADE_TEX, |c| c.resolution.clamp(64, H4_CASCADE_TEX)) as f32;
             let mut cp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("h4-cascade-shadow-pass"),
@@ -3404,7 +4134,7 @@ impl SceneRenderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("h4-cascade-shadow-pass")),
                 occlusion_query_set: None,
             });
             cp.set_viewport(0.0, 0.0, res, res, 0.0, 1.0);
@@ -3448,7 +4178,7 @@ impl SceneRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("sky-pass")),
                 occlusion_query_set: None,
             });
             // Prefer the real Reach sky render_model (dome + cloud panels); fall back to the
@@ -3460,10 +4190,15 @@ impl SceneRenderer {
                 // its daytime sky instead of the near-black clear. SPACE maps (no fogg →
                 // sky_has_atmosphere=false) skip it entirely and keep the black clear behind
                 // their starfield sky model. The real sky render_model then composites on top.
-                if self.sky_has_atmosphere && !self.space_sky && std::env::var("HMS_NO_SKYGRAD").is_err() {
+                if self.sky_has_atmosphere && !self.space_sky && !self.env.no_skygrad {
                     sky_pass.set_pipeline(&self.sky_pipeline);
                     sky_pass.set_bind_group(0, &self.sky_bg, &[]);
                     sky_pass.draw(0..3, 0..1);
+                }
+                if self.env.skydbg {
+                    eprintln!("SKYDBG show_sky={} space_sky={} atmo={} segments={} grad_drawn={}",
+                        self.show_sky, self.space_sky, self.sky_has_atmosphere, self.sky_segments.len(),
+                        self.sky_has_atmosphere && !self.space_sky);
                 }
                 if !self.sky_segments.is_empty() {
                     self.mesh_renderer.draw_sky(&mut sky_pass, &self.camera_bg, &self.sky_segments);
@@ -3490,7 +4225,7 @@ impl SceneRenderer {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("scene-pass")),
                 occlusion_query_set: None,
             });
 
@@ -3509,6 +4244,8 @@ impl SceneRenderer {
             }
             // Imported external geometry (persistent base to forge over) — always drawn.
             bundles.imported.execute(&mut pass);
+            // #model-import: the imported lane's alpha-test (MASK) sub-meshes.
+            bundles.imported_cutout.execute(&mut pass);
             // A Halo 4 map's own spawn markers: only while the View toggle is on.
             if self.show_markers && !self.marker_meshes.is_empty() {
                 bundles.markers.execute(&mut pass);
@@ -3529,6 +4266,22 @@ impl SceneRenderer {
                 // their transparent leaf texels are discarded.
                 self.mesh_renderer
                     .draw_alphatest(&mut pass, &self.camera_bg, &self.dynamic_cutout_meshes);
+                // SKIN-1: posed Reach actors (skinned bipeds + held weapons). Same pipelines
+                // as the objects above, switched per mesh by GpuMesh::skin.
+                if !self.actor_meshes.is_empty() {
+                    self.mesh_renderer.draw(&mut pass, &self.camera_bg, &self.actor_meshes);
+                }
+                if !self.actor_cutout_meshes.is_empty() {
+                    self.mesh_renderer.draw_alphatest(&mut pass, &self.camera_bg, &self.actor_cutout_meshes);
+                }
+                // #fp-fov The first-person RIG, through its own (narrower) camera. Same
+                // pipelines, same depth buffer, same place in the pass — only binding 0 differs.
+                if !self.fp_meshes.is_empty() {
+                    self.mesh_renderer.draw(&mut pass, &self.fp_camera_bg, &self.fp_meshes);
+                }
+                if !self.fp_cutout_meshes.is_empty() {
+                    self.mesh_renderer.draw_alphatest(&mut pass, &self.fp_camera_bg, &self.fp_cutout_meshes);
+                }
             }
             // Alpha-test foliage (cutout) — opaque pass, discards transparent texels. Draws
             // BEFORE the object markers (transparent pass): the markers are alpha-blended with NO
@@ -3540,15 +4293,15 @@ impl SceneRenderer {
             }
             // Decorators (grass/flowers) — multiplicative foliage pipeline (engine
             // decorator model; no specular/white-sun/sky-fill).
-            if self.show_bsp {
+            if self.show_bsp && self.quality.foliage {
                 // HMS_DECO_BUDGET=<n>: draw decorator groups nearest-first up to a total instance
                 // budget (the engine's decimation is a runtime quality setting, not on disk; a
                 // global distance budget over-culls legitimate foliage, so the default is 0 =
                 // draw all). The default replays the cached bundle; the opt-in budget needs the
                 // per-frame nearest-first walk, so it keeps the live path.
-                let budget: u32 = std::env::var("HMS_DECO_BUDGET").ok()
-                    .and_then(|s| s.trim().parse().ok())
-                    .unwrap_or(0);
+                // Settings ▸ Graphics ▸ Foliage density drives this now; HMS_DECO_BUDGET stays
+                // as a development override.
+                let budget: u32 = if self.quality.deco_budget > 0 { self.quality.deco_budget } else { self.env.deco_budget };
                 if budget == 0 {
                     bundles.foliage.execute(&mut pass);
                     lap(12, &mut prof_clock);
@@ -3567,21 +4320,46 @@ impl SceneRenderer {
             drop(pass);
             lap(13, &mut t_end);
             lap(3, &mut prof_clock);
-            encoder.copy_texture_to_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.depth_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::DepthOnly,
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.depth_copy_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::DepthOnly,
-                },
-                wgpu::Extent3d { width: self.size.0 * SS, height: self.size.1 * SS, depth_or_array_layers: 1 },
-            );
+            // #gfx-perf: this full-resolution depth blit used to be UNCONDITIONAL — at the
+            // default 2× render scale that is a 1920×1080 → 3840×2160 `Depth32Float` copy, ~32 MB
+            // of write bandwidth, on every frame of every map. Only these consumers sample the
+            // copy (camera bind group binding 5 / the fog passes / the flare occlusion), and each
+            // of them is gated on exactly the same condition, so skipping it when none is present
+            // cannot leave a shader reading a stale buffer. Deliberately a superset.
+            let need_depth_copy = (self.show_water && !self.water_meshes.is_empty())
+                || !self.planar_fog_volumes.is_empty()
+                || self.underwater_enabled
+                || (self.quality.particles && !self.particle_meshes.is_empty())
+                || !self.dynamic_holo_meshes.is_empty()
+                || !self.marker_holo_meshes.is_empty()
+                || !self.blend_meshes.is_empty()
+                || !self.dynamic_blend_meshes.is_empty()
+                // #sword-blade SKIN-2: the actors' transparent lanes read the depth copy through
+                // the same fs_holo / fs_blend shaders, so they need it taken as well.
+                || !self.actor_holo_meshes.is_empty()
+                || !self.actor_holo_solid_meshes.is_empty()
+                || !self.actor_blend_meshes.is_empty()
+                || !self.fp_holo_meshes.is_empty()
+                || !self.fp_holo_solid_meshes.is_empty()
+                || !self.fp_blend_meshes.is_empty()
+                || (self.quality.lens_flares && !self.lensfx.instances.is_empty());
+            if need_depth_copy {
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.depth_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::DepthOnly,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.depth_copy_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::DepthOnly,
+                    },
+                    { let s = self.scene_size(); wgpu::Extent3d { width: s.0, height: s.1, depth_or_array_layers: 1 } },
+                );
+            }
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene-transparent-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3594,7 +4372,7 @@ impl SceneRenderer {
                     depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("scene-transparent-pass")),
                 occlusion_query_set: None,
             });
             // Transparent water pass (after opaque, no depth write).
@@ -3604,7 +4382,7 @@ impl SceneRenderer {
             // Decals: unlit, per-decal blend (multiply scorch darkens the ground), onto opaque
             // surfaces. Drawn BEFORE the sorted transparents — they sit on opaque geometry
             // (depth-tested at the surface), so a marker/pane in front of a decal must paint over it.
-            if self.show_bsp {
+            if self.show_bsp && self.quality.decals {
                 bundles.decals.execute(&mut pass);
             }
             // Object markers (fs_holo_solid), additive holos (fs_holo: hill globes, armor icons,
@@ -3622,6 +4400,13 @@ impl SceneRenderer {
                 if self.show_objects {
                     lists.push((&self.dynamic_holo_solid_meshes, K::HoloSolid));
                     lists.push((&self.dynamic_holo_meshes, K::Additive));
+                    // #sword-blade SKIN-2: the posed actors' transparent thirds join the SAME
+                    // back-to-front sequence (their opaque/cutout halves already share the object
+                    // opaque pass above), so an energy-sword blade composites over whatever is
+                    // behind it instead of being drawn as a solid grey slab in the opaque pass.
+                    lists.push((&self.actor_holo_solid_meshes, K::HoloSolid));
+                    lists.push((&self.actor_holo_meshes, K::Additive));
+                    lists.push((&self.actor_blend_meshes, K::Blend));
                 }
                 if self.show_bsp {
                     lists.push((&self.blend_meshes, K::Blend));
@@ -3634,6 +4419,20 @@ impl SceneRenderer {
                     lists.push((&self.marker_blend_meshes, K::Blend));
                 }
                 self.mesh_renderer.draw_transparent_sorted(&mut pass, &self.camera_bg, &lists, eye);
+                // #fp-fov The first-person rig's transparent thirds (a held energy sword's blade),
+                // through the rig's own camera. They are drawn AFTER the world's sorted sequence
+                // rather than inside it: the rig is mounted on the eye, so it is nearer than
+                // anything in the world and would sort last anyway, and it cannot share one
+                // back-to-front pass with lists drawn through a different projection.
+                if self.show_objects {
+                    let mut fp_lists: Vec<(&[GpuMesh], K)> = Vec::with_capacity(3);
+                    fp_lists.push((&self.fp_holo_solid_meshes, K::HoloSolid));
+                    fp_lists.push((&self.fp_holo_meshes, K::Additive));
+                    fp_lists.push((&self.fp_blend_meshes, K::Blend));
+                    if fp_lists.iter().any(|(l, _)| !l.is_empty()) {
+                        self.mesh_renderer.draw_transparent_sorted(&mut pass, &self.fp_camera_bg, &fp_lists, eye);
+                    }
+                }
             }
             // Additive holograms/force-fields/energy (blend==1) — additive glow, last.
             if self.show_bsp {
@@ -3641,14 +4440,16 @@ impl SceneRenderer {
             }
             // Effect particle sprites (grav-lift plasma/sparks, waterfall sheets/mist) —
             // depth-tested, no depth write, per-prt3 blend routing, sorted back-to-front.
-            if !self.particle_meshes.is_empty() {
+            if self.quality.particles && !self.particle_meshes.is_empty() {
                 self.mesh_renderer
                     .draw_particles(&mut pass, &self.camera_bg, &self.particle_meshes, [camera.pos.x, camera.pos.y, camera.pos.z]);
             }
             // World lens flares (after the particles, before the sun flare).
-            self.lensfx.draw(&mut pass, &lensfx_batches);
+            if self.quality.lens_flares {
+                self.lensfx.draw(&mut pass, &lensfx_batches);
+            }
             // Sun lens flare: screen-space additive sprites over the scene.
-            if self.show_sky {
+            if self.show_sky && self.quality.lens_flares {
                 if let Some(vb) = &lens_vbuf {
                     pass.set_pipeline(&self.lens_pipeline);
                     pass.set_vertex_buffer(0, vb.slice(..));
@@ -3656,55 +4457,7 @@ impl SceneRenderer {
                 }
             }
 
-            // Translucent zone volume fill (selected object's boundary shape) — before the
-            // overlay lines so the bright wireframe outline draws on top of the holographic fill.
-            if let Some(zv) = &self.zone_vbuf {
-                pass.set_pipeline(&self.zone_pipeline);
-                pass.set_bind_group(0, &self.camera_bg, &[]);
-                pass.set_vertex_buffer(0, zv.slice(..));
-                pass.draw(0..self.zone_vcount, 0..1);
-            }
-            // Overlay lines (trigger volumes etc.) + selection highlight box.
-            if let Some(ov) = &self.overlay_vbuf {
-                pass.set_pipeline(&self.grid_pipeline);
-                pass.set_bind_group(0, &self.camera_bg, &[]);
-                pass.set_vertex_buffer(0, ov.slice(..));
-                pass.draw(0..self.overlay_vcount, 0..1);
-            }
-            // #wire-visible  Selection wireframe: instances 0-7 = the black halo ring, 8-11 =
-            // the exposure-compensated bright core (WIRE_WGSL). A very large selection (Ctrl+A on a
-            // full variant) skips the halo and draws the core alone so the instance count can't run
-            // away. `highlight_xray` swaps in the depth-ALWAYS pipeline (View menu).
-            if let (Some(hl), false) = (&self.highlight_vbuf, self.highlight_hidden) {
-                const WIRE_HALO_MAX_VERTS: u32 = 4_000_000;
-                let insts = if self.highlight_vcount > WIRE_HALO_MAX_VERTS { 8..12 } else { 0..12 };
-                pass.set_pipeline(if self.highlight_xray { &self.wire_xray_pipeline } else { &self.wire_pipeline });
-                pass.set_bind_group(0, &self.camera_bg, &[]);
-                pass.set_bind_group(1, &self.wire_bg, &[]);
-                pass.set_vertex_buffer(0, hl.slice(..));
-                pass.draw(0..self.highlight_vcount, insts);
-            }
-            // X-ray lines (no depth test) -- the soft-ceiling edges through the map.
-            if let Some(xv) = &self.xray_vbuf {
-                pass.set_pipeline(&self.gizmo_pipeline);
-                pass.set_bind_group(0, &self.camera_bg, &[]);
-                pass.set_vertex_buffer(0, xv.slice(..));
-                pass.draw(0..self.xray_vcount, 0..1);
-            }
-            // Transform gizmo LAST, with the always-on-top pipeline so it's grabbable
-            // through other geometry. Solid triangles first, then any thin guide lines.
-            if let Some(gz) = &self.gizmo_tri_vbuf {
-                pass.set_pipeline(&self.gizmo_tri_pipeline);
-                pass.set_bind_group(0, &self.camera_bg, &[]);
-                pass.set_vertex_buffer(0, gz.slice(..));
-                pass.draw(0..self.gizmo_tri_vcount, 0..1);
-            }
-            if let Some(gz) = &self.gizmo_vbuf {
-                pass.set_pipeline(&self.gizmo_pipeline);
-                pass.set_bind_group(0, &self.camera_bg, &[]);
-                pass.set_vertex_buffer(0, gz.slice(..));
-                pass.draw(0..self.gizmo_vcount, 0..1);
-            }
+            self.draw_editor_overlays(&mut pass);
         }
         lap(4, &mut prof_clock);
         // Underwater fog: when the camera is submerged in a water volume, tint the HDR scene
@@ -3726,7 +4479,7 @@ impl SceneRenderer {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("underwater-fog-pass")),
                 occlusion_query_set: None,
             });
             p.set_pipeline(&self.underwater_pipeline);
@@ -3760,7 +4513,7 @@ impl SceneRenderer {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("planar-fog-pass")),
                 occlusion_query_set: None,
             });
             p.set_pipeline(&self.planar_fog_pipeline);
@@ -3781,7 +4534,7 @@ impl SceneRenderer {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("h4pre-pass")),
                 occlusion_query_set: None,
             });
             pp.set_pipeline(&self.h4pre_pipeline);
@@ -3797,13 +4550,15 @@ impl SceneRenderer {
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("lum-pass")),
                 occlusion_query_set: None,
             });
             lp.set_pipeline(&self.lum_pipeline);
             lp.set_bind_group(0, &self.lum_bg, &[]);
             lp.draw(0..3, 0..1);
         }
+        // The interactive auto-exposure's non-blocking readback rides THIS command buffer.
+        self.enqueue_meter_copy(&mut encoder);
         // Halo 4 bloom output-size lanes: sfx.zw = 1 / size (blur_11_horizontal's stale
         // `vs_texture_size`), bcs.w = the intensity resolution scale min(1, 921600 / (w h)).
         if self.h4_bloom_on.get() {
@@ -3820,7 +4575,23 @@ impl SceneRenderer {
         //   P5  1/16: intensity*M + up(G')   P6  blur11 at 1/16
         //   P7  1/4:  intensity*S + up(T')   P8  blur11 at 1/4  -> composite adds it (bilinear up)
         // every pass output is clamped at 2.0 (the engine stores min(4x,8)/32 in fp16).
-        {
+        if !self.quality.bloom {
+            // Settings ▸ Graphics ▸ Bloom off. The post pass unconditionally composites
+            // `bloom.out`, so the eleven pyramid passes are replaced by ONE quarter-resolution
+            // clear of the composite target — which is what "no bloom" means numerically, and
+            // costs about a thousandth of the chain.
+            let _ = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("bloom-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.bloom.out,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("bloom-pass")),
+                occlusion_query_set: None,
+            });
+        } else {
             let mut fs = |pipeline: &wgpu::RenderPipeline,
                           bg: &wgpu::BindGroup,
                           target: &wgpu::TextureView,
@@ -3833,7 +4604,7 @@ impl SceneRenderer {
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("bloom-pass")),
                     occlusion_query_set: None,
                 });
                 p.set_pipeline(pipeline);
@@ -3879,16 +4650,22 @@ impl SceneRenderer {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: self.gpu_timer.as_ref().and_then(|t| t.pass("post-pass")),
                 occlusion_query_set: None,
             });
             post.set_pipeline(&self.post_pipeline);
             post.set_bind_group(0, &self.post_bg, &[]);
-            post.set_bind_group(1, &self.post_lut_bg, &[]); // grading LUT
+            // Settings ▸ Graphics ▸ Colour grading off binds the IDENTITY LUT instead of the
+            // map's, which is a free switch (same pipeline, same sample, neutral table).
+            post.set_bind_group(1, if self.quality.color_grading { &self.post_lut_bg } else { &self.post_lut_identity_bg }, &[]);
             post.draw(0..3, 0..1);
         }
         lap(5, &mut prof_clock);
+        if let Some(t) = &self.gpu_timer { t.resolve(&mut encoder); }
         queue.submit(std::iter::once(encoder.finish()));
+        // Benchmark only: blocks until the frame has executed so the per-pass timestamps belong
+        // to the frame just submitted (and so the GPU numbers are free of cross-frame overlap).
+        if let Some(t) = &self.gpu_timer { t.collect(device); }
         lap(6, &mut prof_clock);
         // explicit drops so the profiler can see what releasing the per-frame resources costs
         let t_drop = std::time::Instant::now();
@@ -3914,6 +4691,14 @@ impl SceneRenderer {
     }
 }
 
+/// #model-import: where one imported MODEL's sub-meshes live in the renderer's two flat
+/// imported lists, as (start, count) pairs. See `SceneRenderer::append_imported_model`.
+#[derive(Clone, Copy, Default)]
+struct ImportSpan {
+    opaque: (u32, u32),
+    cutout: (u32, u32),
+}
+
 /// The cached static-list render bundles (see `SceneRenderer::static_bundles`).
 /// Each list gets its own bundle chain so the show_* toggles just pick which to execute. Bundles
 /// are recorded against the scene/transparent pass attachments (HDR colour + writable depth),
@@ -3922,6 +4707,7 @@ struct StaticBundles {
     gen: u64,
     opaque: BundleChain,
     imported: BundleChain,
+    imported_cutout: BundleChain,
     markers: BundleChain,
     terrain: BundleChain,
     alphatest: BundleChain,
@@ -3973,7 +4759,8 @@ impl SceneRenderer {
         if cur.as_ref().map_or(true, |b| b.gen != self.static_gen) {
             *cur = Some(StaticBundles {
                 gen: self.static_gen,
-                opaque: BundleChain::default(), imported: BundleChain::default(), markers: BundleChain::default(), terrain: BundleChain::default(),
+                opaque: BundleChain::default(), imported: BundleChain::default(), imported_cutout: BundleChain::default(),
+                markers: BundleChain::default(), terrain: BundleChain::default(),
                 alphatest: BundleChain::default(), foliage: BundleChain::default(), water: BundleChain::default(),
                 decals: BundleChain::default(), additive: BundleChain::default(),
             });
@@ -3983,6 +4770,7 @@ impl SceneRenderer {
         let cb = &self.camera_bg;
         b.opaque.extend(device, "bundle-opaque", self.static_meshes.len(), |e, from| mr.draw(e, cb, &self.static_meshes[from..]));
         b.imported.extend(device, "bundle-imported", self.imported_meshes.len(), |e, from| mr.draw(e, cb, &self.imported_meshes[from..]));
+        b.imported_cutout.extend(device, "bundle-imported-cutout", self.imported_cutout_meshes.len(), |e, from| mr.draw_alphatest(e, cb, &self.imported_cutout_meshes[from..]));
         b.markers.extend(device, "bundle-markers", self.marker_meshes.len(), |e, from| mr.draw(e, cb, &self.marker_meshes[from..]));
         b.terrain.extend(device, "bundle-terrain", self.terrain_meshes.len(), |e, from| mr.draw_terrain(e, cb, &self.terrain_meshes[from..]));
         b.alphatest.extend(device, "bundle-alphatest", self.alphatest_meshes.len(), |e, from| mr.draw_alphatest(e, cb, &self.alphatest_meshes[from..]));
@@ -4045,9 +4833,146 @@ struct Targets {
 // mip-LOD floors and MSAA can't fix it (shading runs per fragment), but supersampling runs the
 // fragment per sub-sample and matches the engine (a 2× render downscaled is smooth like Sapien's
 // bb_8). Color stays 1× so egui/headless capture are unchanged.
-const SS: u32 = 2;
+//
+// This used to be `const SS: u32 = 2` and is now the DEFAULT of a runtime knob
+// (`quality::RenderQuality::scene_scale`, Settings ▸ Graphics ▸ Render scale): at 2× the scene
+// pass shades FOUR fragments per output pixel and the resolve runs the whole composite four
+// times, which is by far the biggest single GPU cost in the renderer — and the one thing a user
+// on a weak GPU most needs to be able to turn down. 2.0 remains the default, so the shipped
+// picture is unchanged.
+const SS_DEFAULT: f32 = 2.0;
 
-fn make_targets(device: &wgpu::Device, size: (u32, u32)) -> Targets {
+/// The lum (exposure-meter) shader source for a given meter blend scale and render scale.
+/// `__SS__` is the supersample ratio the Halo 4 meter needs to convert its footprint, which is
+/// defined in quarter-resolution texels of the OUTPUT target, into HDR texels. Because it is
+/// baked, changing the render scale has to rebuild the lum pipeline (`apply_quality`).
+fn lum_source(meter_scale: f32, scene_scale: f32) -> String {
+    LUM_WGSL
+        .replace("__METER_SCALE__", &format!("{:.4}", meter_scale))
+        .replace("__SS__", &format!("{:.4}", scene_scale.max(0.0625)))
+}
+
+/// The post (resolve + tonemap) shader source for a given supersample tap count. 4 taps is the
+/// shipped SSAA resolve; 1 tap is the cheap resolve used below 1.75× render scale. Baking it as
+/// a `const` (rather than branching on a uniform) keeps the 4-tap pipeline's generated code
+/// byte-for-byte what it was before the knob existed.
+fn post_source(taps: u32) -> String {
+    POST_WGSL.replace("__TAPS__", &taps.to_string())
+}
+
+/// The post (resolve + tonemap) pipeline for a tap count. Rebuilt — not branched — when the
+/// render scale crosses the 4-tap boundary, so the default pipeline's generated code is
+/// unchanged by the knob's existence.
+fn make_post_pipeline(
+    device: &wgpu::Device,
+    post_bgl: &wgpu::BindGroupLayout,
+    post_lut_bgl: &wgpu::BindGroupLayout,
+    taps: u32,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("post"),
+        source: wgpu::ShaderSource::Wgsl(post_source(taps).into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("post-pl"),
+        bind_group_layouts: &[post_bgl, post_lut_bgl], // group 1 = the grading LUT
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("post-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: COLOR_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// The exposure-meter pipeline. Rebuilt when the render scale changes, because the Halo 4
+/// meter's footprint conversion bakes the supersample ratio (`// #h4-expo-2`).
+fn make_lum_pipeline(
+    device: &wgpu::Device,
+    lum_bgl: &wgpu::BindGroupLayout,
+    meter_scale: f32,
+    scene_scale: f32,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("lum"),
+        source: wgpu::ShaderSource::Wgsl(lum_source(meter_scale, scene_scale).into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("lum-pl"),
+        bind_group_layouts: &[lum_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("lum-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState { module: &shader, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::R32Float, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+            compilation_options: Default::default(),
+        }),
+        multiview: None,
+        cache: None,
+    })
+}
+
+/// Development-only env switches, read once. See `SceneRenderer::env`.
+struct EnvSnapshot {
+    force_underwater: bool,
+    fog_wu: f32,
+    lensfx_diag: bool,
+    rtgi_freeze: bool,
+    no_skygrad: bool,
+    skydbg: bool,
+    diag: bool,
+    /// `HMS_DECO_BUDGET` — superseded by Settings ▸ Graphics ▸ Foliage density, kept as an
+    /// override for the development A/B that produced the setting.
+    deco_budget: u32,
+}
+
+impl EnvSnapshot {
+    fn read() -> Self {
+        Self {
+            force_underwater: std::env::var("HMS_FORCE_UW").is_ok(),
+            fog_wu: std::env::var("HMS_FOG_WU").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0),
+            lensfx_diag: std::env::var("HMS_LENSFX_DIAG").is_ok(),
+            rtgi_freeze: std::env::var("HMS_RTGI_FREEZE").is_ok(),
+            no_skygrad: std::env::var("HMS_NO_SKYGRAD").is_ok(),
+            skydbg: std::env::var("HMS_SKYDBG").is_ok(),
+            diag: std::env::var("HMS_DIAG").is_ok(),
+            deco_budget: std::env::var("HMS_DECO_BUDGET").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+        }
+    }
+}
+
+fn make_targets(device: &wgpu::Device, size: (u32, u32), scene: (u32, u32)) -> Targets {
     let extent = wgpu::Extent3d {
         width: size.0,
         height: size.1,
@@ -4055,8 +4980,8 @@ fn make_targets(device: &wgpu::Device, size: (u32, u32)) -> Targets {
     };
     // Scene render targets (hdr + depth) are supersampled; color output stays at `size`.
     let ss_extent = wgpu::Extent3d {
-        width: size.0 * SS,
-        height: size.1 * SS,
+        width: scene.0.max(1),
+        height: scene.1.max(1),
         depth_or_array_layers: 1,
     };
     let color_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -4492,7 +5417,7 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
 /// ground) coloured from the map's atmosphere fog, plus a pinpoint HDR sun that bloom spreads.
 /// Drawn behind the sky render_model on maps that author atmosphere.
 const SKY_WGSL: &str = r#"
-struct Sky { inv_view_proj: mat4x4<f32>, cam_pos: vec4<f32>, sun_dir: vec4<f32>, horizon: vec4<f32> };
+struct Sky { inv_view_proj: mat4x4<f32>, cam_pos: vec4<f32>, sun_dir: vec4<f32>, horizon: vec4<f32>, ground: vec4<f32> };
 @group(0) @binding(0) var<uniform> sky: Sky;
 
 struct VOut {
@@ -4529,7 +5454,9 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     // maps WITH atmosphere (space maps stay on the near-black clear).
     let horizon = sky.horizon.rgb;
     let zenith  = horizon * 0.35;
-    let ground  = horizon * 0.20;
+    // below-horizon haze: the explicit ground-fog colour when the app set one (H4/H2A), else a
+    // fraction of the horizon colour (sun_dir.w, lib.rs render)
+    let ground  = select(horizon * max(sky.sun_dir.w, 0.20), sky.ground.rgb, sky.ground.w > 0.5);
 
     var col: vec3<f32>;
     if (up >= 0.0) {
@@ -4671,7 +5598,7 @@ const POST_EXPOSURE_CAL: f32 = 1.0;
 @group(0) @binding(1) var hdr_samp: sampler;
 @group(0) @binding(2) var bloom_tex: texture_2d<f32>;
 // p = (stops_gain = pow(2,camera_exposure_stops), auto_key, exp_min_log2, exp_max_log2).
-struct Post { p: vec4<f32>, grade: vec4<f32>, bloom: vec4<f32>, bloom2: vec4<f32>, sfx: vec4<f32>, sfx2: vec4<f32>, bcl: vec4<f32>, bcm: vec4<f32>, bcs: vec4<f32>, cm0: vec4<f32>, cm1: vec4<f32>, cm2: vec4<f32>, h4a: vec4<f32>, h4b: vec4<f32> };
+struct Post { p: vec4<f32>, grade: vec4<f32>, bloom: vec4<f32>, bloom2: vec4<f32>, sfx: vec4<f32>, sfx2: vec4<f32>, bcl: vec4<f32>, bcm: vec4<f32>, bcs: vec4<f32>, cm0: vec4<f32>, cm1: vec4<f32>, cm2: vec4<f32>, h4a: vec4<f32>, h4b: vec4<f32>, h3: vec4<f32> };
 @group(0) @binding(3) var<uniform> post: Post;
 // 1×1 luminance meter: r = mean log2(scene luminance) (engine exposure_downsample).
 @group(0) @binding(4) var lum_tex: texture_2d<f32>;
@@ -4748,7 +5675,21 @@ fn resolve(uv: vec2<f32>) -> vec3<f32> {
         let c0 = max(col, vec3<f32>(0.0));
         col = c0 * (post.bloom2.z * c0 + post.bloom2.w) / (c0 * (post.sfx2.w * c0 + post.bcl.w) + post.bcm.w);
     }
-    var outc = pow(max(col, vec3<f32>(0.0)), vec3<f32>(post.sfx.y));
+    // HALO 3 tone curve (`halo3.dll` copy_accumulation_target @0x18029A1C0 builds
+    // `tone_curve_constants` = (WHITE, k 1.0041494, 0, -0.15 k^3) with k = 1.4938016 / WHITE and
+    // uploads it to cbuffer 0x1D0001; final_composite_base evaluates the Horner cubic
+    // `((c tcc.w + tcc.z) c + tcc.y) c` on `c = min(blend, tcc.x)`). At the engine default
+    // WHITE = 1 (the 64-byte `c_screen_postprocess` static initialiser at .data:0x1808AD040+0x2C)
+    // that is exactly `1.5 c - 0.5 c^3`: a shoulder with t'(1) = 0 instead of a hard clip, and
+    // ~1.22x the gamma-2 `sqrt` through the whole mid-tone range. Reach has NO tone curve (its
+    // `final_composite_base.hlsl_include` never mentions one, and `haloreach.dll` carries neither
+    // constant) - this lane is Halo 3's alone, which is why it is a flag and not the default.
+    var toned = max(col, vec3<f32>(0.0));
+    if (post.h3.x > 0.5) {
+        let c3 = min(toned, vec3<f32>(post.h3.y));
+        toned = max((c3 * c3 * post.h3.w + post.h3.z) * c3, vec3<f32>(0.0));
+    }
+    var outc = pow(toned, vec3<f32>(post.sfx.y));
     // Halo 4 final_composite: `sample_l(lut, sqrt_t * scale + offset, 0)` with scale = (n-1)/n,
     // offset = 0.5/n (sub_180381578 ps_color_grading_scale_offset) - the LUT is the LAST op.
     if (post.h4b.z > 0.5) {
@@ -4764,18 +5705,28 @@ fn resolve(uv: vec2<f32>) -> vec3<f32> {
     return saturate(outc);
 }
 
+// Supersample resolve taps, baked at pipeline-build time (see `post_source`). 4 = the shipped
+// SSAA resolve; 1 = the cheap resolve selected below 1.75x render scale, where the output pixel
+// no longer straddles four distinct HDR sub-texels and a single bilinear tap is both cheaper and
+// no blurrier. A `const` (not a uniform) so the 4-tap pipeline compiles to exactly what it did
+// before the knob existed.
+const TAPS: i32 = __TAPS__;
+
 @fragment
 fn fs(i: VOut) -> @location(0) vec4<f32> {
-    // SSAA box downsample. The hdr target is SS(=2)× the output, so each output pixel covers a
-    // 2×2 hdr sub-block. Run the full composite at the 4 sub-texel centres (uv ± half an hdr
-    // texel) and average → true supersampling (per-sub-sample shading kills the terrain
+    // SSAA box downsample. The hdr target is SS(=2)x the output, so each output pixel covers a
+    // 2x2 hdr sub-block. Run the full composite at the 4 sub-texel centres (uv +- half an hdr
+    // texel) and average -> true supersampling (per-sub-sample shading kills the terrain
     // rock/foliage bump/detail shading aliasing; the box average also anti-aliases edges).
-    let o = 0.5 / vec2<f32>(textureDimensions(hdr_tex));
-    let a = resolve(i.uv + vec2<f32>(-o.x, -o.y));
-    let b = resolve(i.uv + vec2<f32>( o.x, -o.y));
-    let c = resolve(i.uv + vec2<f32>(-o.x,  o.y));
-    let d = resolve(i.uv + vec2<f32>( o.x,  o.y));
-    return vec4<f32>((a + b + c + d) * 0.25, 1.0);
+    if (TAPS == 4) {
+        let o = 0.5 / vec2<f32>(textureDimensions(hdr_tex));
+        let a = resolve(i.uv + vec2<f32>(-o.x, -o.y));
+        let b = resolve(i.uv + vec2<f32>( o.x, -o.y));
+        let c = resolve(i.uv + vec2<f32>(-o.x,  o.y));
+        let d = resolve(i.uv + vec2<f32>( o.x,  o.y));
+        return vec4<f32>((a + b + c + d) * 0.25, 1.0);
+    }
+    return vec4<f32>(resolve(i.uv), 1.0);
 }
 "#;
 
@@ -5303,6 +6254,21 @@ mod wgsl_tests {
     //! caught in CI without a GPU.
     use naga::valid::{Capabilities, ValidationFlags, Validator};
 
+    /// Settings ▸ Graphics shaders, in their own test: the whole-suite test aborts on its first
+    /// failure, so an unrelated in-progress shader elsewhere would otherwise hide a real defect
+    /// in these. Both tap variants of the post resolve and of the flat resolve are validated,
+    /// because each is a separately compiled pipeline.
+    #[test]
+    fn graphics_quality_shaders_valid() {
+        check("POST_WGSL(4 tap)", &super::post_source(4));
+        check("POST_WGSL(1 tap)", &super::post_source(1));
+        check("LUM_WGSL(2x)", &super::lum_source(0.5, 2.0));
+        check("LUM_WGSL(1x)", &super::lum_source(0.5, 1.0));
+        check("FLAT_GEOM_WGSL", super::flat::GEOM_WGSL_FOR_TEST);
+        check("FLAT_RESOLVE_WGSL(4 tap)", &super::flat::resolve_wgsl_for_test(4));
+        check("FLAT_RESOLVE_WGSL(1 tap)", &super::flat::resolve_wgsl_for_test(1));
+    }
+
     fn check(name: &str, src: &str) {
         let module = naga::front::wgsl::parse_str(src)
             .unwrap_or_else(|e| panic!("{name}: WGSL parse error:\n{}", e.emit_to_string(src)));
@@ -5334,15 +6300,46 @@ mod wgsl_tests {
         assert!(crate::mesh::FOG_WGSL.contains(&want), "FOG_WGSL no longer declares `{want}`");
     }
 
+    /// `// #objmask` The object material lane's specular mask is the engine's COMPOSED albedo
+    /// alpha (`albedo.hlsl_include:121` `albedo.w = base.w*detail.w*albedo_color.w`, saturated by
+    /// `entry_points.hlsl_include:102`), which `calc_specular_mask_from_diffuse_ps` hands to BOTH
+    /// the Cook-Torrance lobe and the environment reflection. mesh_shade used the base alpha
+    /// alone, which over-reflected every Forge piece by 1/(detail.a x albedo_color.a) — 2.3x on
+    /// the coliseum wall. Pin the single `albedo_w` and that both consumers read it: the pre-fix
+    /// source (`select(1.0, tex.a * detail_a, …)` for the object mask) fails every assert here.
+    #[test]
+    fn object_specular_mask_is_the_composed_albedo_alpha() {
+        let src = crate::mesh::MESH_WGSL;
+        assert!(
+            src.contains("let albedo_w = min(tex.a * select(1.0, detail_a, obj_mat_lane) * mask_alb_a, 1.0);"),
+            "mesh_shade no longer composes the engine albedo alpha (base.a x detail.a x albedo_color.a, saturated)"
+        );
+        assert!(src.contains("let mask_alb_a = select(1.0, max(i.fine_xform.y, 0.0), obj_mat_lane);"),
+            "albedo_color.a no longer rides fine_xform.y on the object material lane");
+        // Both consumers — the analytical lobe and the object-lane environment/area mask.
+        assert_eq!(src.matches("select(1.0, albedo_w, sfa_on)").count(), 3,
+            "the Cook-Torrance mask, the object `omask` and the MDBG-23 probe must all read albedo_w");
+        // The pre-fix forms must be gone.
+        assert!(!src.contains("tex.a * detail_a, i.spec_from_alpha > 0.5"),
+            "the object specular mask is reading base.a x detail.a again (albedo_color.a dropped)");
+        assert!(!src.contains("tex.a * i.spec_from_alpha"),
+            "spec_from_alpha is a 3-state lane (0/1/2), not a 0/1 multiplier");
+        // The alpha-only detail binding must keep the Forge albedo where it was.
+        assert!(src.contains("let det_alpha_only = i.spec_from_alpha > 1.5;")
+            && src.contains("detail_c = select(detail_c, vec3<f32>(1.0), det_alpha_only);"),
+            "the alpha-only detail binding would leak the detail COLOUR into a Forge piece's albedo");
+    }
+
     #[test]
     fn all_shaders_valid() {
         check("BASIC_WGSL", super::BASIC_WGSL);
         check("WIRE_WGSL", super::WIRE_WGSL);
         check("ZONE_WGSL", super::ZONE_WGSL);
         check("SKY_WGSL", super::SKY_WGSL);
-        check("POST_WGSL", super::POST_WGSL);
+        check("POST_WGSL", &super::post_source(4));
         check("BLOOM_WGSL", super::BLOOM_WGSL);
-        check("LUM_WGSL", &super::LUM_WGSL.replace("__METER_SCALE__", "0.5").replace("__SS__", "2.0"));
+        check("LUM_WGSL", &super::lum_source(0.5, 2.0));
+        check("LUM_WGSL(1x)", &super::lum_source(0.5, 1.0));
         check("H4PRE_WGSL", super::H4PRE_WGSL);
         // Fog / shadow / GI are shared modules prepended at pipeline creation; validate the same
         // concatenated + substituted form the GPU sees.
@@ -5350,10 +6347,94 @@ mod wgsl_tests {
         let shad = crate::mesh::SHADOW_SAMPLE_WGSL;
         let gi = format!("{}{}", crate::rtgi::GI_FRAGMENT_WGSL, crate::rtgi::GI_SHARED_WGSL);
         // the Halo 4 material lane is appended to the mesh module at pipeline creation
-        check("MESH_WGSL", &subst(&format!("{fog}{shad}{gi}{}{}", crate::mesh::MESH_WGSL, crate::mesh::H4_MESH_WGSL)).replace("__H4DBG__", "0.0"));
+        //
+        // The mesh module is compiled TWICE — once skinned (bipeds) and once not (everything
+        // else) — and the two differ in four `__SKIN_*__` placeholders. Validate BOTH expansions
+        // through the pipeline's own substitution helper. Validating the raw template instead is
+        // what made this test fail on `__SKIN_V9__`, which is not a legal WGSL identifier and is
+        // never handed to naga in that form.
+        let mesh_tpl = subst(&format!("{fog}{shad}{gi}{}{}", crate::mesh::MESH_WGSL, crate::mesh::H4_MESH_WGSL))
+            .replace("__H4DBG__", "0.0");
+        check("MESH_WGSL(unskinned)", &crate::mesh::apply_skin_subst(&mesh_tpl, false));
+        check("MESH_WGSL(skinned)", &crate::mesh::apply_skin_subst(&mesh_tpl, true));
         check("WATER_WGSL", &subst(&format!("{fog}{gi}{}", crate::mesh::WATER_WGSL)));
         check("TERRAIN_WGSL", &subst(&format!("{fog}{shad}{gi}{}", crate::mesh::TERRAIN_WGSL)));
         check("SKY_MESH_WGSL", crate::mesh::SKY_MESH_WGSL);
         check("SHADOW_WGSL", crate::mesh::SHADOW_WGSL);
+    }
+}
+
+/// #sword-blade SKIN-2: the transparent pipeline routing, gated without a GPU.
+///
+/// The defect these exist for: a posed actor's TRANSPARENT parts (the energy sword's five
+/// additive blade layers, two of them `rmhg` halograms) had no skinned pipeline to go to, so the
+/// actor build folded all of them into the OPAQUE list and the blade drew as a solid grey slab.
+/// The fix adds one skinned pipeline per transparent family; these assert the routing table that
+/// picks between them, which is the half that can be checked offline.
+#[cfg(test)]
+mod transparent_routing_tests {
+    use crate::mesh::{transparent_pipe, TransparentKind, TransparentPipe};
+
+    /// Every family x blend_mode a mesh can carry, in both skinning states.
+    fn all_cases() -> Vec<(TransparentKind, u8)> {
+        let mut v = Vec::new();
+        for k in [TransparentKind::HoloSolid, TransparentKind::Additive, TransparentKind::Blend] {
+            for bm in 0..=4u8 {
+                v.push((k, bm));
+            }
+        }
+        v
+    }
+
+    /// A SKINNED transparent mesh must never land on an unskinned pipeline, and an unskinned one
+    /// must never land on a skinned pipeline. This is the assertion that bites: the unskinned
+    /// pipelines are built on the TWO-group layout and cannot bind the bone palette at
+    /// `@group(2)` at all, so a skinned part routed to one would draw at the bind pose (a sword
+    /// blade lying at the model origin) rather than in the hand.
+    #[test]
+    fn a_skinned_transparent_mesh_never_takes_an_unskinned_pipeline() {
+        for (kind, bm) in all_cases() {
+            let sk = transparent_pipe(kind, bm, true);
+            let un = transparent_pipe(kind, bm, false);
+            assert!(sk.is_skinned(), "{kind:?}/blend {bm} skinned -> {sk:?}, which binds no palette");
+            assert!(!un.is_skinned(), "{kind:?}/blend {bm} unskinned -> {un:?}, which needs a palette");
+            // The two must be the SAME family: a skinned part composites exactly as the same part
+            // would unskinned, so the only difference may be where the vertex came from.
+            assert_eq!(sk, un.flip_skin(), "{kind:?}/blend {bm}: the skinned route changed family");
+            assert_eq!(un, sk.flip_skin(), "{kind:?}/blend {bm}: the unskinned route changed family");
+        }
+    }
+
+    /// The `Blend` family routes by the engine's render_method BLEND_TYPE (1 premul, 2 multiply,
+    /// 3 double_multiply, everything else straight alpha) and the other two families ignore it —
+    /// identically in both skinning states.
+    #[test]
+    fn the_blend_mode_routing_is_the_same_skinned_and_unskinned() {
+        use TransparentPipe as P;
+        for (bm, want) in [(0u8, P::BlendAlpha), (1, P::BlendPremul), (2, P::BlendMultiply),
+                           (3, P::BlendDoubleMultiply), (4, P::BlendAlpha)] {
+            assert_eq!(transparent_pipe(TransparentKind::Blend, bm, false), want, "blend_mode {bm}");
+            assert_eq!(transparent_pipe(TransparentKind::Blend, bm, true), want.flip_skin(), "blend_mode {bm} skinned");
+        }
+        // The energy sword's blade layers are ADDITIVE (`blend_mode` is irrelevant there): the
+        // additive family must stay additive whatever blend_mode the mesh happens to carry.
+        for bm in 0..=4u8 {
+            assert_eq!(transparent_pipe(TransparentKind::Additive, bm, true), P::AdditiveSkinned);
+            assert_eq!(transparent_pipe(TransparentKind::HoloSolid, bm, true), P::HoloSolidSkinned);
+        }
+    }
+
+    /// Twelve distinct pipelines — six families, each in two skinning states. A collision would
+    /// mean one of the new skinned pipelines is not actually reachable (the bug would come back
+    /// silently for whichever family aliased).
+    #[test]
+    fn every_transparent_family_has_its_own_skinned_pipeline() {
+        let mut seen = std::collections::HashSet::new();
+        for (kind, bm) in all_cases() {
+            seen.insert(transparent_pipe(kind, bm, false));
+            seen.insert(transparent_pipe(kind, bm, true));
+        }
+        assert_eq!(seen.len(), 12, "expected 6 families x 2 skinning states, got {seen:?}");
+        assert_eq!(seen.iter().filter(|p| p.is_skinned()).count(), 6);
     }
 }

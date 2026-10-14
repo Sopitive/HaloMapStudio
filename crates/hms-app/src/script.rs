@@ -14,6 +14,8 @@ pub const DEFAULT_SCRIPT: &str = "\
 #     radius|width|length|top|bottom <wu>   b0..b3 <raw>
 #     scaled on|off|default   shadow on|off|default   (per-object PSEUDO-flags, not saved to the .mvar;
 #     default = auto: scaled <- has the 'scale' label, shadow <- GREEN team + 'scale' label)
+#     damage default|minor|medium|major|destroyed (or 0..4)   DISPLAY the object in one of the damage
+#     states its model authors (hlmt variant permutation states); a pseudo-flag too, display only
 #     team also takes a name: red blue green orange purple yellow brown pink neutral none
 #     Halo 4 objects: spawnseq (-100..100, the Forge menu's 'spawn sequence') spawntime label|label2|label3|label4 <name|#|none>
 #       traitzone userdata placement_hi locked clips channel passability
@@ -23,7 +25,7 @@ pub const DEFAULT_SCRIPT: &str = "\
 #                      label scale + spawnseq = the scaling-gametype rule (SCALED flag), as in Reach
 # set selection <field> <value>    edits every selected object (e.g. set selection shadow on)
 # select <datum|all|none>   select box X1 Y1 Z1 X2 Y2 Z2 [add]   deselect
-# delete [datum]   dup [datum] [DX DY DZ]   settle [datum|all]
+# delete [datum]   dup [datum] [DX DY DZ]   settle [datum|all]   (settle = physics: drop the phmo hull, step to rest)
 # pick [delete] [radius R]  select (or delete) what is under the crosshair (+ everything within R)
 # coincident <datumA> <faceA> <datumB> <faceB> [centered] [noturn]   face-to-face mate (CAD)
 # snapto [<datum>|selection] [to <datum>] [axis <+x|-x|+y|-y|+z|-z>]   the Ctrl magnet, scripted:
@@ -43,6 +45,8 @@ pub const DEFAULT_SCRIPT: &str = "\
 # mapspawns on|off|get        show the MAP's own (scenario) spawn markers; off (default) hides them
 # outlines on|off|get         hidden-block physics hulls (View > Show hidden-block physics hulls); on by default
 # wirexray on|off|get        draw the SELECTION wireframe through other objects (View menu); off by default
+# precision [get] | precision <datum> | precision worst [n] | precision snap [selection|all|<datum>]
+#     | precision ghost [on|off] [<factor>]   predicted .mvar save error (quantisation) + the viewport ghost
 # softceilings on|off|get     the map's soft ceilings / kill floor (View > Soft ceilings); get lists them
 # triggers on|off|get         the scenario's trigger volumes (View > Trigger volumes)
 # hardfloor on|off|get        the map's world box (Havok broadphase: every BSP's bounds +-64) + its floor (View > Hard floor); get lists the BSPs
@@ -52,15 +56,46 @@ pub const DEFAULT_SCRIPT: &str = "\
 # preview team <t> | color <c|inherit> | off | get   pin the dropdown-hover colour preview on the selection
 # preview move X Y [frames] | click X Y | drag X1 Y1 X2 Y2 | key <name> | type <text> | where
 #     pointer / keyboard simulation for UI testing (interactive app only)
+# --- Reach character actors (#reach-skin) ---
+# actor add <bipd>@x,y,z[,yawDeg][:anim=<name>][:frame=<n>][:weapon=<weap>]   place a posed biped
+# actor list | bipeds [f] | weapons [f] | anims <id|bipd> [f]
+# actor anim <id> <name|none>   weapon <id> <name|none>   moveto <id> X Y Z   yaw <id> DEG
+# actor frame <id> N   play <id> on|off   remove <id>   clear
+#   the same spec also works headlessly: HMS_ACTOR=<spec> alongside HMS_SHOT
 # --- camera ---
 # camera to X Y Z | lookat X Y Z | nudge DX DY DZ | spawn | frame | get
 # camera clearance                 how close is the nearest surface, in any direction
 # camera standoff [N]              push the camera until nothing solid is within N units
 # camera orbit <datum|selection|X Y Z> <dist> [yaw] [pitch]
+# --- external model import (#4) ---
+# import <path.obj|glb|gltf>   import a model from ANYWHERE on disk (no models\\ folder needed)
+# import browse                open the model file browser (same dialog style as opening a .mvar)
+# import panel [on|off]        the Tools > Import geometry panel (position / rotation / scale fields)
+# import list | select <n> | remove [n] | clear
+# import moveto X Y Z | move DX DY DZ | rotate <x|y|z> DEG | scale <f>
+#     the imported model is a real movable thing: gizmo / G / R in the viewport, numeric fields in
+#     the Tools > Import geometry panel, and its triangles follow (snap-to-surface + settle)
 # --- maps / variants / capture ---
 # loadmap <name|path>       loadvariant <path>       newvariant       wait
 # screenshot <path|dir> [WxH]   (dir or trailing / auto-names <stem>.png; supports $stem)
 # mapid [current | <mapname> | variant <path>]
+# --- prefabs (#prefab, saved object groups you can reuse and share) ---
+# prefab save <name>             save the current SELECTION as a prefab (one shareable file)
+# prefab list [filter]           what is saved: objects, game, canvas, date
+# prefab show <name>             what one prefab contains
+# prefab place <name> [at X Y Z] [yaw DEG] [mirror x|y|z] [report] [dry]
+#     [nocrossgame] [noquota] [nobudget] [minconf exact|close|approximate]
+#     no `at` = the camera; one undo step; selected as a group afterwards; a prefab that does not
+#     fit (slots / per-object limit / budget) places NOTHING and says why
+# prefab rename <old> <new>   prefab delete <name>   prefab where
+# prefab import <path>        copy a prefab someone shared into your prefabs folder
+# prefab export <name> <path> write a prefab out as a file you can hand to someone
+# dialog convert <src.mvar> [game] | dialog convertpreview [canvas] | dialog shot <png>
+#     open / drive / capture the cross-game conversion window (GUI only, no input synthesised)
+# convertvariant <src.mvar> <reach|halo4|halo3> <canvas> [as <out.mvar>]   #xgame cross-game port
+#     [offset x,y,z] [yaw <deg>] [scale <s>] [keeporigin] [minconf exact|close|approximate]
+#     [noquota] [nobudget] [template <file.mvar>] [report] [bykind] [dry]
+# xgame catalog [filter]    xgame table [filter]    xgame canvases [game]   what can be converted
 # variant get [field]       every global field of the open variant (or one), by its engine name
 # variant set <field> <value...>   name description author editor category budget bounds quotamin quotamax quota
 # --- queries (filter with: type <t>  name <s>  label <s>) ---
@@ -121,6 +156,9 @@ pub enum CameraCmd {
     Orbit { target: OrbitTarget, dist: f32, yaw: f32, pitch: f32 },
     /// Print the current pose.
     Get,
+    /// #fp-frame  Print-only diagnostic: set (or just report) the VERTICAL field of view in
+    /// degrees. Scripts use it to measure how a view frames; nothing shipping depends on it.
+    Fov(Option<f32>),
 }
 
 /// What `camera orbit` frames.
@@ -226,6 +264,11 @@ pub enum EditorCommand {
     /// cluster). With `delete`, remove the selection instead of just selecting it.
     Pick { delete: bool, radius: Option<f32> },
     Echo(String),
+    /// #reach-skin `actor <subcommand> ...` - place / pose / arm Reach character bipeds
+    /// (see `reach_actor::run_actor_command` for the grammar). The whole tail is carried
+    /// verbatim because animation names contain spaces-free colons and the sub-grammar lives
+    /// with the actor code.
+    Actor(String),
     /// Write the open variant back to disk (`save`), or to a new path (`save as <path>`). The
     /// scripted counterpart of File ▸ Save — without it a batch edit could not be persisted.
     Save { path: Option<String> },
@@ -264,12 +307,48 @@ pub enum EditorCommand {
     ///   `dialog savebrowser [name]`  open the browser in SAVE mode directly (bypasses the gates;
     ///                                pre-seeds the file name field when `name` is given)
     ///   `dialog size <W> <H>|reset`  pin / release the window size for a screenshot
+    ///   `dialog models`              open the browser in MODEL purpose (Import geometry)
+    ///   `dialog select <file>`       select a row; `dialog doopen` presses Open/Import
     ///   `dialog shot <path>`         write a PNG of the whole egui frame (dialog included)
     ///   `dialog close` / `dialog`    close / report seeded dir + file + resolved path
     DialogDbg { sub: String, a1: Option<String>, a2: Option<String> },
+    /// File ▸ Open recent, scripted (GUI only; print-only apart from what the menu's own
+    /// entries do) so a regression run can prove the store, its order and the missing-file path
+    /// without a mouse. `a2` is the rest of the line, so a path may contain spaces.
+    ///   `recent list`                     every entry, in order, MISSING ones flagged
+    ///   `recent menu`                     what the submenu draws, grouped by kind
+    ///   `recent open <n|path>`            open entry n (or that path) as the menu would
+    ///   `recent note <kind> <path>`       record an entry (kind = variant|map|film|model)
+    ///   `recent gone remove|keep`        answer the "that file is no longer there" window
+    ///   `recent remove <n|path>` / `recent missing` / `recent sweep` / `recent clear` / `recent reload`
+    RecentDbg { sub: String, a1: Option<String>, a2: Option<String> },
+    /// #model-import / #4 `import …`: the external-model workflow, scripted (GUI only — the
+    /// headless batch host has no imported-mesh lane).
+    ///   `import <path>`                 import an .obj/.glb/.gltf from ANYWHERE on disk
+    ///   `import browse`                 open the model file browser (Tools ▸ Import geometry ▸ Browse…)
+    ///   `import panel [on|off]`         show/hide the Import geometry panel (the transform fields)
+    ///   `import list`                   every imported model with its index, path and pose
+    ///   `import select <n>`             select model n (so the gizmo / G / R act on it)
+    ///   `import moveto X Y Z`           place the selected model's origin
+    ///   `import move DX DY DZ`          nudge it
+    ///   `import rotate <x|y|z> DEG`     turn it about a world axis
+    ///   `import scale <f>`              uniform scale
+    ///   `import remove [n]` / `import clear`
+    ImportModel { sub: String, args: Vec<String> },
+    /// `film <path> | info | scene | extract variant|gametype [path] | records` -- Reach Theater
+    /// saved films (#film).
+    Film { sub: String, args: Vec<String> },
     /// #wire-visible  `wirexray on|off`: draw the selection wireframe THROUGH other objects
     /// (View > "Selection wireframe through objects", default off); `wirexray get` (None) reports.
     WireXray(Option<bool>),
+    /// #quant-error  `precision …`: the save-precision prediction -- what pose the `.mvar` will
+    /// actually hold once the game's quantisers have had their way with it.
+    ///   `precision` / `precision get`      the open variant's grid + aggregate error stats
+    ///   `precision <datum>`                one object's predicted pose + its deltas
+    ///   `precision worst [n]`              the n worst offenders, by position and by rotation
+    ///   `precision snap [selection|all|<datum>]`  move onto the nearest exactly-storable pose
+    ///   `precision ghost [on|off] [<factor>]`     the viewport ghost + its exaggeration factor
+    Precision { sub: String, args: Vec<String> },
     /// `softceilings on|off`: show/hide the structure-design soft ceilings (the
     /// kill floor / acceleration / slip planes; View > "Soft ceilings"); `get` (None) lists them.
     SoftCeilings(Option<bool>),
@@ -294,6 +373,10 @@ pub enum EditorCommand {
     /// `bspwarn [list]`: the map's structure BSP playable flags + every object whose
     /// position is in a BSP marked "not normally playable space in MP" (the save-time warning list).
     BspWarnList,
+    /// #play  TEST MODE: `play get | spartan | elite | off | view first|third | melee |
+    /// step <n> | look <yaw> <pitch> | phys`. The SAME entry points the Play menu uses, so
+    /// a scripted run drives the production path rather than a copy of it.
+    Play(Vec<String>),
     /// `variant get [field]`: every global field of the open variant (both games) with its
     /// engine name, or one field; `variant set <field> <value...>`: edit one
     /// (name, description, author, editor, category, budget, bounds, quotamin/quotamax/quota),
@@ -313,6 +396,18 @@ pub enum EditorCommand {
     /// clicks read, plus a read-back of what a click would find. `construct` reports; the rest
     /// set the tool exactly as the toolbar and the CAD panel do.
     Construct(ConstructCmd),
+    /// #xgame `convertvariant <src.mvar> <game> <canvas> [options]`: re-create a Forge variant of
+    /// one title on a Forge canvas of another. The whole option grammar is parsed by
+    /// `xgame::convert_cli`, so the CLI flag, this verb and the GUI dialog cannot drift; the
+    /// tokens are passed through verbatim. Needs no loaded map (it reads the caches itself).
+    ConvertVariant(Vec<String>),
+    /// #prefab `prefab save|list|show|place|rename|delete|import|export|where …`: saved object
+    /// groups (GitHub issue #5). The whole sub-grammar is parsed by `prefab::command`, so the
+    /// panel, this verb and the headless host cannot drift; the tail is passed through verbatim.
+    Prefab(String),
+    /// #xgame `xgame catalog|table|canvases [filter]`: list the cross-game object catalog, the
+    /// equivalence table, or the canvases a title can be converted onto. Print-only.
+    XGame { what: String, filter: Option<String> },
 }
 
 /// What the `construct` verb asks for (see [`EditorCommand::Construct`]).
@@ -342,7 +437,20 @@ pub enum PointerSim {
     Drag { x1: f32, y1: f32, x2: f32, y2: f32 },
     /// A key press + release (`preview key r`), by egui key name -- the modal transforms and
     /// every other hotkey are keys, so a script can only reach them this way.
-    Key { name: String },
+    ///
+    /// `hold = Some(true)` presses and HOLDS it (`preview key w down`), `Some(false)` releases
+    /// it (`preview key w up`). A held key is what the camera fly keys read -- they are
+    /// `key_down`, not `key_pressed`, so a press+release in one frame moves the camera for a
+    /// single frame and proves nothing about a rebind.
+    /// `mods` are the modifiers the injected event carries, e.g. `preview key w down ctrl`.
+    /// Empty = none, which is what every existing caller gets. egui takes `InputState::modifiers`
+    /// from the event stream, so this is the only way to drive a binding that IS a modifier chord
+    /// (Ctrl crouch, Shift sprint) or a Ctrl+key shortcut through the real input path.
+    Key { name: String, hold: Option<bool>, mods: Vec<String> },
+    /// A mouse BUTTON held down or released (`preview button right down`) at the pointer's
+    /// current spot. The fly keys only move the camera while the fly button is held, so a
+    /// scripted fly needs this.
+    Button { button: u8, pressed: bool },
     /// Typed TEXT (`preview type 90-`), as the keyboard would deliver it: the modal transform's
     /// numeric entry and any focused text field read this.
     Type { text: String },
@@ -381,7 +489,7 @@ fn parse_onoff_get(t: Option<&str>, what: &str) -> Result<Option<bool>, String> 
     }
 }
 
-fn parse_datum(s: &str) -> Result<u32, String> {
+pub(crate) fn parse_datum(s: &str) -> Result<u32, String> {
     let s = s.trim();
     let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u32::from_str_radix(h, 16)
@@ -650,6 +758,7 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
                     CameraCmd::Standoff(t.get(2).map(|v| parse_f32(v)).transpose()?)
                 }
                 Some("nudge") | Some("by") => CameraCmd::Nudge(parse_vec3(&t[2..])?),
+                Some("fov") => CameraCmd::Fov(t.get(2).map(|v| parse_f32(v)).transpose()?),
                 Some("orbit") => {
                     let target = match t.get(2).map(|s| s.to_lowercase()) {
                         Some(ref k) if k == "selection" || k == "sel" => OrbitTarget::Selection,
@@ -666,7 +775,7 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
                     let pitch = t.get(base + 2).map(|v| parse_f32(v)).transpose()?.unwrap_or(-25.0);
                     CameraCmd::Orbit { target, dist, yaw, pitch }
                 }
-                _ => return Err("camera <to X Y Z | lookat X Y Z | nudge DX DY DZ | spawn | frame | get | clearance | standoff [N] | orbit <datum|selection|X Y Z> <dist> [yaw] [pitch]>".into()),
+                _ => return Err("camera <to X Y Z | lookat X Y Z | nudge DX DY DZ | fov [deg] | spawn | frame | get | clearance | standoff [N] | orbit <datum|selection|X Y Z> <dist> [yaw] [pitch]>".into()),
             };
             EditorCommand::Camera(c)
         }
@@ -697,6 +806,11 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
             EditorCommand::MapId(r)
         }
         "get" | "info" => EditorCommand::Get(parse_datum(t.get(1).ok_or("get <datum>")?)?),
+        // #loadstatus  `loadstatus` / `loadmap status` — not-started | in-flight | done | failed.
+        // A load in flight is otherwise invisible: every scene verb says "no map open" for its
+        // whole duration, which is indistinguishable from never having started one.
+        "loadstatus" | "load_status" => EditorCommand::Wait,
+        "loadmap" | "openmap" if t.get(1).map(|v| v.eq_ignore_ascii_case("status")).unwrap_or(false) => EditorCommand::Wait,
         "loadmap" | "openmap" => EditorCommand::LoadMap(t.get(1..).map(|v| v.join(" ")).filter(|s| !s.is_empty()).ok_or("loadmap <name|path>")?),
         "loadvariant" | "openvariant" | "loadmvar" => {
             EditorCommand::LoadVariant(t.get(1..).map(|v| v.join(" ")).filter(|s| !s.is_empty()).ok_or("loadvariant <path>")?)
@@ -747,12 +861,42 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
         "settings" | "settingspanel" | "lightingpanel" => {
             EditorCommand::SettingsPanel(parse_onoff_get(t.get(1).copied(), "settings")?)
         }
+        // File ▸ Open recent, scripted (the recent-items store).
+        "recent" | "recentitems" => {
+            let sub = t.get(1).map(|s| s.to_lowercase()).unwrap_or_else(|| "list".into());
+            let a1 = t.get(2).map(|s| s.to_string());
+            // the REST of the line, so a path with spaces survives the whitespace split
+            let a2 = t.get(3..).filter(|v| !v.is_empty()).map(|v| v.join(" "));
+            EditorCommand::RecentDbg { sub, a1, a2 }
+        }
         // #dialogs test hook — drive the variant browser (open/save) from a script.
         "dialog" | "dialogdbg" => {
             let sub = t.get(1).map(|s| s.to_lowercase()).unwrap_or_else(|| "status".into());
             let a1 = t.get(2).map(|s| s.to_string());
             let a2 = t.get(3).map(|s| s.to_string());
             EditorCommand::DialogDbg { sub, a1, a2 }
+        }
+        // #model-import / #4 the external-model import + transform verbs.
+        "import" | "importmodel" | "importgeometry" => {
+            let sub = t.get(1).map(|s| s.to_string()).ok_or(
+                "import <path> | browse | list | select <n> | moveto X Y Z | move DX DY DZ | rotate <x|y|z> DEG | scale <f> | remove [n] | clear",
+            )?;
+            let args = t.get(2..).map(|v| v.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+            EditorCommand::ImportModel { sub, args }
+        }
+        // #film  Reach Theater saved films.
+        "film" | "theater" | "clip" => {
+            let sub = t.get(1).map(|s| s.to_string()).ok_or(
+                "film <path> | info | scene | index | seek <s> | step <n> | speed <x> | play | pause | show | ragdoll [on|off] | extract variant|gametype [dir] | records | folders",
+            )?;
+            let args = t.get(2..).map(|v| v.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+            EditorCommand::Film { sub, args }
+        }
+        // #quant-error  the save-precision prediction (ghost + numbers + snap).
+        "precision" | "quant" | "saveerror" | "save_error" | "drift" => {
+            let sub = t.get(1).map(|s| s.to_lowercase()).unwrap_or_default();
+            let args = t.get(2..).map(|v| v.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
+            EditorCommand::Precision { sub, args }
         }
         // #wire-visible  the selection wireframe's depth mode (View menu).
         "wirexray" | "wire_xray" | "wirethrough" | "xraywire" => {
@@ -805,8 +949,33 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
             }
             Some("where") | Some("rects") => EditorCommand::PointerSim(PointerSim::Where),
             Some("key") => {
-                let name = t.get(2).ok_or("preview key <name>  (a, r, enter, escape, backspace, ...)")?.to_string();
-                EditorCommand::PointerSim(PointerSim::Key { name })
+                let name = t.get(2).ok_or("preview key <name> [down|up]  (a, r, enter, escape, backspace, ...)")?.to_string();
+                let hold = match t.get(3).map(|v| v.to_ascii_lowercase()).as_deref() {
+                    None | Some("tap") | Some("press") => None,
+                    Some("down") | Some("hold") => Some(true),
+                    Some("up") | Some("release") => Some(false),
+                    Some(x) => return Err(format!("preview key <name> [down|up|tap], got '{x}'")),
+                };
+                let mods: Vec<String> = t
+                    .get(4..)
+                    .map(|v| v.iter().map(|s| s.to_ascii_lowercase()).collect())
+                    .unwrap_or_default();
+                EditorCommand::PointerSim(PointerSim::Key { name, hold, mods })
+            }
+            Some("button") | Some("btn") => {
+                let which = t.get(2).map(|v| v.to_ascii_lowercase()).ok_or("preview button left|right|middle down|up")?;
+                let button = match which.as_str() {
+                    "left" | "primary" | "lmb" | "1" => 0u8,
+                    "right" | "secondary" | "rmb" | "2" => 1u8,
+                    "middle" | "mmb" | "3" => 2u8,
+                    x => return Err(format!("preview button left|right|middle, got '{x}'")),
+                };
+                let pressed = match t.get(3).map(|v| v.to_ascii_lowercase()).as_deref() {
+                    Some("down") | Some("hold") | Some("press") => true,
+                    Some("up") | Some("release") => false,
+                    _ => return Err("preview button <which> down|up".into()),
+                };
+                EditorCommand::PointerSim(PointerSim::Button { button, pressed })
             }
             Some("type") | Some("text") => {
                 let text = t.get(2..).map(|v| v.join(" ")).filter(|s| !s.is_empty()).ok_or("preview type <text>")?;
@@ -829,7 +998,7 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
                     PointerSim::Move { x, y, frames: t.get(4).and_then(|v| v.parse().ok()).unwrap_or(4) }
                 })
             }
-            Some(x) => return Err(format!("preview: expected team <t> | color <c> | off | get | move x y | click x y | drag x1 y1 x2 y2 | key <name> | type <text> | where, got '{x}'")),
+            Some(x) => return Err(format!("preview: expected team <t> | color <c> | off | get | move x y | click x y | drag x1 y1 x2 y2 | key <name> [down|up] | button <which> down|up | type <text> | where, got '{x}'")),
         },
         // #construct-h4: the Construct (CAD) tool, scripted. The viewport clicks themselves stay
         // clicks (`preview click x y`); this is the toolbar + panel state they read, plus
@@ -848,6 +1017,8 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
             };
             EditorCommand::Construct(c)
         }
+        // #play  `play ...` — test mode (play_mode.rs).
+        "play" | "testmode" | "test_mode" => EditorCommand::Play(t[1..].iter().map(|s| s.to_string()).collect()),
         // `bspwarn` / `bspwarn list`
         "bspwarn" | "bsp_warn" | "bspflags" => match t.get(1).map(|s| s.to_lowercase()).as_deref() {
             None | Some("list") | Some("get") => EditorCommand::BspWarnList,
@@ -872,6 +1043,17 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
             EditorCommand::Pick { delete, radius }
         }
         "echo" => EditorCommand::Echo(t.get(1..).map(|v| v.join(" ")).unwrap_or_default()),
+        "actor" | "actors" | "biped" => EditorCommand::Actor(t.get(1..).map(|v| v.join(" ")).unwrap_or_default()),
+        "prefab" | "prefabs" => EditorCommand::Prefab(t.get(1..).map(|v| v.join(" ")).unwrap_or_default()),
+        "convertvariant" | "convert" | "portvariant" => {
+            if t.len() < 4 { return Err("convertvariant <src.mvar> <reach|halo4|halo3> <canvas> [options]".into()); }
+            EditorCommand::ConvertVariant(t[1..].iter().map(|s| s.to_string()).collect())
+        }
+        "xgame" => {
+            let what = t.get(1).map(|s| s.to_ascii_lowercase()).unwrap_or_else(|| "catalog".into());
+            if !matches!(what.as_str(), "catalog" | "table" | "canvases") { return Err("xgame catalog|table|canvases [filter]".into()); }
+            EditorCommand::XGame { what, filter: t.get(2..).map(|v| v.join(" ")).filter(|s| !s.is_empty()) }
+        }
         other => return Err(format!("unknown command '{other}'")),
     };
     Ok(Some(cmd))
@@ -1102,6 +1284,16 @@ mod obj_flag_grammar {
             _ => panic!("expected DialogDbg"),
         }
         assert!(matches!(parse_line("dialog"), Ok(Some(EditorCommand::DialogDbg { .. }))));
+        // #quant-error
+        assert!(matches!(parse_line("precision"), Ok(Some(EditorCommand::Precision { .. }))));
+        match parse_line("precision worst 5").unwrap().unwrap() {
+            EditorCommand::Precision { sub, args } => { assert_eq!(sub, "worst"); assert_eq!(args, vec!["5".to_string()]); }
+            c => panic!("{c:?}"),
+        }
+        match parse_line("drift ghost on x40").unwrap().unwrap() {
+            EditorCommand::Precision { sub, args } => { assert_eq!(sub, "ghost"); assert_eq!(args, vec!["on".to_string(), "x40".to_string()]); }
+            c => panic!("{c:?}"),
+        }
         assert!(matches!(parse_line("wirexray on"), Ok(Some(EditorCommand::WireXray(Some(true))))));
         assert!(matches!(parse_line("wirexray off"), Ok(Some(EditorCommand::WireXray(Some(false))))));
         assert!(matches!(parse_line("wirexray"), Ok(Some(EditorCommand::WireXray(None)))));
@@ -1178,6 +1370,26 @@ mod obj_flag_grammar {
         }
         // `set <d> scale <n>` (the X330 size field) is a `set`, not the global `scale` verb
         assert!(matches!(parse_line("set 5 scale 2.5"), Ok(Some(EditorCommand::Set { .. }))));
+        // #damage the DAMAGE display state is a `set` field like the other pseudo-flags, on one
+        // object or the whole selection, by NAME or by the model_state_enum index.
+        match parse_line("set 0xD0000003 damage destroyed") {
+            Ok(Some(EditorCommand::Set { datum, field, value })) => {
+                assert_eq!(datum, 0xD0000003);
+                assert_eq!((field.as_str(), value.as_str()), ("damage", "destroyed"));
+                assert_eq!(crate::forge_scale::parse_damage_value(&value), Ok(Some(4)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse_line("set selection damage 2") {
+            Ok(Some(EditorCommand::Set { datum, field, value })) => {
+                assert_eq!(datum, SET_SELECTION);
+                assert_eq!((field.as_str(), value.as_str()), ("damage", "2"));
+                assert_eq!(crate::forge_scale::parse_damage_value(&value), Ok(Some(2)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // `default` clears the override back to the undamaged model
+        assert_eq!(crate::forge_scale::parse_damage_value("default"), Ok(None));
     }
 
     #[test]

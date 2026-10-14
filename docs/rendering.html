@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html" class="cur" aria-current="page">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -92,6 +93,7 @@
 <tr><td><em>Collision (selected)</em>, <em>Physics (selected)</em></td><td>off</td><td>Overlay the selected object's collision model (cyan) and physics model (orange) as a wireframe hull. Works on <strong>Reach, Halo 4 and Halo 2 Anniversary</strong>; a piece that ships no such model draws nothing (Halo 4's Forge blockers, for instance, carry only a physics model). Script: <code>collision on|off</code>, <code>physics on|off</code>.</td></tr>
 <tr><td><em>Show map spawn points</em></td><td>off (persisted)</td><td>The base map's built-in spawn markers. <code>map_spawns.txt</code>, script <code>mapspawns</code>, headless <code>HMS_MAP_SPAWNS=1</code>.</td></tr>
 <tr><td><em>Show hidden-block physics hulls</em></td><td>on (persisted)</td><td>Orange physics hulls of the variant's invisible blocks. <code>physics_outlines.txt</code>, script <code>outlines</code>, headless <code>HMS_PHYSICS_OUTLINES=0</code> to hide.</td></tr>
+<tr><td><em>Save-precision ghost</em></td><td>off (persisted)</td><td>Draw the selected object(s) a second time, in violet, at the pose the <code>.mvar</code> will actually hold after the game's position / rotation quantisers &mdash; so the drift a save costs is visible before you save. It rides the depth-ALWAYS line lane, because at true scale the ghost sits inside the object's own surface. An <em>exaggerate</em> factor beside the checkbox amplifies the drift (&times;1 = the truth); the status bar says the ghost is on and says <em>EXAGGERATED &times;N</em> whenever the factor is not 1, so an amplified ghost is never read as the real result. An exactly-representable pose draws no ghost. <code>quant_ghost.txt</code>, script <code>precision ghost on|off|&lt;factor&gt;</code>, script-host <code>HMS_QUANT_GHOST=1</code> (or <code>1x40</code>). See <a href="editing.html#precision">Save precision</a>.</td></tr>
 <tr><td><em>Selection wireframe through objects</em></td><td>off (persisted)</td><td>Draw the selected object's wireframe THROUGH anything in front of it (the depth test is switched off for that lane), so a piece buried in the terrain or behind a wall still shows its whole outline. Off = the wireframe is hidden where geometry covers it. Independent of this switch, every selection wireframe is drawn as a near-black outline under a bright gold core, and the core is held at a fixed brightness whatever the scene exposure is doing &mdash; so it reads on a white Halo 4 Forge piece under a blown-out sky as well as in a dark interior. <code>wire_xray.txt</code>, script <code>wirexray on|off|get</code>, script-host <code>HMS_WIRE_XRAY=1</code>.</td></tr>
 <tr><td><em>Trigger volumes</em></td><td>off</td><td>The scenario's trigger volumes as wireframe boxes: red = kill, green = safe, amber = plain. Script <code>triggers on|off|get</code>.</td></tr>
 <tr><td><em>Soft ceilings (map floor)</em></td><td>off (persisted)</td><td>The invisible planes that bound the playable space — the "map floor" under Forge World, the outer walls and the sky ceiling. Each is drawn as a translucent fill plus its edges; the edges are drawn through the terrain and the water, so the floor is readable from above. Red = soft kill, orange = acceleration (pushes you back; the shipped maps checked — Forge World, Sword Base, Boneyard, Prisoner — use this kind for their floor and walls), yellow = slip surface. Hover the menu item for the per-map count. <code>soft_ceilings.txt</code>, script <code>softceilings on|off|get</code> (<code>get</code> lists every ceiling with its kind, triangle count and height range), headless <code>HMS_SOFT_CEILINGS=1</code>.</td></tr>
@@ -120,11 +122,11 @@
   <li><strong>Sun and shadows</strong> — the sun direction comes from the map; the sun shadow map covers objects only, since the level's own sun shadowing is already baked into the lightmap, exactly as in the game.</li>
   <li><strong>Fog</strong> — atmospheric fog uses the engine's scattering model and the map's fog parameters.</li>
 </ul>
-<p>Much of this has been checked pixel-for-pixel against frames captured from the game with the same camera. Known remaining differences (v0.1.0): some indoor mid-tones render darker than the game (the engine's wide bloom "pedestal" is only partially reproduced), instanced geometry lit by per-vertex lighting can read too dark on some maps, a few water hues and the Forge World tide pools are slightly off, and a handful of exotic shader templates fall back to a neutral material. None of this affects what is written to a variant — rendering is for viewing only.</p>
+<p>Much of this has been checked pixel-for-pixel against frames captured from the game with the same camera. Known remaining differences (v1.4.0): some indoor mid-tones render darker than the game (the engine's wide bloom "pedestal" is only partially reproduced), instanced geometry lit by per-vertex lighting can read too dark on some maps, a few water hues and the Forge World tide pools are slightly off, and a handful of exotic shader templates fall back to a neutral material. None of this affects what is written to a variant — rendering is for viewing only.</p>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

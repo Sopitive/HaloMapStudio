@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -56,7 +57,7 @@
 <div class="note"><p>Steam Workshop maps are listed separately from the built-in ones. Xbox / Microsoft Store installs are probed only when no Steam install is found (see <a href="maps-and-variants.html#discovery">map discovery</a>).</p></div>
 
 <h2 id="install">Install</h2>
-<p>Download the archive for your platform from <a href="https://github.com/Sopitive/HaloMapStudio/releases">GitHub Releases</a> (<code>halo-map-studio-rust-0.1.0-windows-x64-&lt;date&gt;.zip</code> / <code>…-linux-x64-&lt;date&gt;.zip</code>). There is no installer.</p>
+<p>Download the archive for your platform from <a href="https://github.com/Sopitive/HaloMapStudio/releases">GitHub Releases</a> (<code>HaloMapStudio-1.4.0-windows-x64.zip</code> / <code>HaloMapStudio-1.4.0-linux-x64.zip</code>; each has a matching <code>.sha256</code> checksum file). There is no installer.</p>
 <h3>Windows</h3>
 <ol>
   <li>Unzip anywhere (for example <code>%USERPROFILE%\Tools\HaloMapStudio\</code>).</li>
@@ -70,19 +71,31 @@
 </ol>
 <p>The archive also contains <code>LICENSE.md</code>, <code>COMMERCIAL-LICENSE.md</code>, <code>THIRD-PARTY-NOTICES.md</code> and a short <code>README.md</code>.</p>
 
+<h2 id="updating">Updating</h2>
+<p>The app can keep itself current. Nothing is downloaded or installed unless you click it.</p>
+<ul>
+  <li><strong>The check.</strong> A few seconds after the window opens (and then once a day while it runs) the app asks <a href="https://github.com/Sopitive/HaloMapStudio/releases">GitHub Releases</a> for the newest version. No network, or GitHub's rate limit, simply means no badge. Turn the automatic check off under <em>Settings ▸ Updates</em> (which also shows when it last ran and has a <em>Check now</em> button); <em>Help ▸ Check for updates now</em> does the same on demand.</li>
+  <li><strong>The badge.</strong> When a newer version exists, a small <em>● Update X.Y.Z available</em> pill appears next to the <em>Help</em> menu. No pop-ups. Click it for the Update window; right-click it (or <em>Skip this version</em> in the window) and it stays hidden for that version.</li>
+  <li><strong>The Update window</strong> (<em>Help ▸ Software update…</em>) shows the installed and the latest version with the release notes. <em>Download</em> fetches the archive for your platform (<code>HaloMapStudio-X.Y.Z-linux-x64.zip</code> / <code>…-windows-x64.zip</code>; a Windows build running under Wine or Proton takes the Windows archive and says so), checks its size and SHA-256 and unpacks it next to the program. Then <em>Install now and restart</em> — or tick <em>Install automatically when the download completes</em> before downloading.</li>
+  <li><strong>The restart.</strong> Installing closes the app, swaps the files and opens the new build. Before closing, the app writes a <strong>recovery snapshot</strong> to the settings folder: the open map, the camera, per-object overrides and an exact copy of the open variant <em>including unsaved edits</em> (your real <code>.mvar</code> is not touched). The new build restores it and shows <em>Updated to X.Y.Z — your session was restored</em>; <em>File ▸ Save</em> still points at your real file. If the relaunch did not happen, the next start offers the snapshot with <em>Restore</em> / <em>Discard</em>.</li>
+  <li><strong>Going back.</strong> The previous version's files are kept in <code>.hms-backup</code> next to the program until the next ordinary start — copy them back over if a new build misbehaves.</li>
+  <li><strong>If the program folder is read-only</strong> (for example under <code>Program Files</code>), the unpack step fails with a message and an <em>Open download folder</em> button: close the app and unzip the archive over the folder yourself.</li>
+</ul>
+
 <h2 id="first-launch">First launch</h2>
 <ol>
-  <li>The app scans your Steam libraries for MCC and lists every playable map in the <strong>Map</strong> section of the left panel: first pick the <em>game</em> (<em>Reach</em>, <em>Halo 4</em>, <em>Halo 2 Anniversary</em> — only the ones you have), then <em>Built-in</em> or <em>Modded</em> within it. If nothing is listed, see <a href="faq.html#no-maps">No maps detected</a>.</li>
+  <li>The app scans your Steam libraries for MCC and lists every playable map in the <strong>Map</strong> section of the left panel: first pick the <em>game</em> (<em>Reach</em>, <em>Halo 4</em>, <em>Halo 2 Anniversary</em>, <em>Halo 3</em> — only the ones you have), then <em>Built-in</em> or <em>Modded</em> within it. If nothing is listed, see <a href="faq.html#no-maps">No maps detected</a>.</li>
   <li>Pick a map from the drop-down and press <strong>Load selected map</strong>. Forge World takes a few seconds; a progress bar runs along the bottom.</li>
-  <li>Hold the <strong>right mouse button</strong> in the viewport and use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> to fly (see <a href="camera.html">Camera &amp; navigation</a>).</li>
+  <li>Hold the <strong>right mouse button</strong> in the viewport and use <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> to fly (see <a href="camera.html">Camera &amp; navigation</a>). Left-handed, or on a non-QWERTY keyboard? <em>Settings ▸ Controls &amp; keyboard…</em> changes any key, with a left-handed preset — <a href="shortcuts.html#rebind">details</a>.</li>
   <li>To edit a Forge map: <strong>File ▸ Open .mvar…</strong>, pick a variant, and the base map is loaded automatically if it is not already open. See <a href="maps-and-variants.html">Maps &amp; variants</a>.</li>
 </ol>
 <p>The last map and the last variant you opened are remembered and reopened on the next launch.</p>
+<p><strong>File ▸ Open recent</strong> lists everything you have opened before — map variants, base maps, saved films and imported models — newest first, grouped by kind and labelled with the game it belongs to (the full path is on hover). One click reopens the item: a variant loads its own base map if that is not the one in the viewport. An entry whose file has since been moved or deleted is marked ✕ and, if you click it, says so and offers to remove it from the list; <em>Clear recent items</em> at the bottom forgets the lot (your files are never touched). With no variant open, the left panel's <em>Variant</em> section offers the same recent variants.</p>
 
 <h2 id="layout">The main window</h2>
 <div class="warn"><p><strong>UI is being reorganised.</strong> The layout below is the target layout of the current development branch; labels and screenshots may lag the build you have.</p></div>
 <ul>
-  <li><strong>Menu bar:</strong> <em>File</em> (variants and projects), <em>Edit</em> (undo/redo, select all, deselect, delete, remove all placed objects), <em>View</em> (frame selected object, screenshot, Construction panel, Script console, then everything that is DRAWN: geometry — BSP, Terrain, Forge objects, Water, Sky; Forge extras — Forge special FX, Scaled objects, Shadow casters; overlays — Grid, Lights, Boundary shapes, Collision and Physics of the selection, Show map spawn points, hidden-block physics hulls, Selection wireframe through objects, Trigger volumes, Soft ceilings, Hard floor, Playable BSP bounds), <em>Tools</em> (placement Line/Fill tools, Scale converter, Light bake map, Construction (CAD), Model Painter, Import geometry, Script console), <em>Settings</em> (Lighting &amp; rendering…), <em>Help</em> (Keyboard shortcuts…). The open variant's file name is shown at the right of the bar.</li>
+  <li><strong>Menu bar:</strong> <em>File</em> (variants, <em>Open recent</em>, and projects), <em>Edit</em> (undo/redo, select all, deselect, delete, remove all placed objects), <em>View</em> (frame selected object, screenshot, Construction panel, Script console, then everything that is DRAWN: geometry — BSP, Terrain, Forge objects, Water, Sky; Forge extras — Forge special FX, Scaled objects, Shadow casters; overlays — Grid, Lights, Boundary shapes, Collision and Physics of the selection, Show map spawn points, hidden-block physics hulls, Selection wireframe through objects, Trigger volumes, Soft ceilings, Hard floor, Playable BSP bounds), <em>Tools</em> (placement Line/Fill tools, Scale converter, Light bake map, Construction (CAD), Model Painter, Import geometry, Script console), <em>Settings</em> (Lighting &amp; rendering…), <em>Help</em> (Keyboard shortcuts…). The open variant's file name is shown at the right of the bar.</li>
   <li><strong>Left panel:</strong> the map picker, the <em>Map Variant (.mvar)</em> section (variant info, Forge labels), a searchable list of the objects in the open variant, and the <em>Add Object</em> palette with a 3D preview (lit like the viewport) you can drag into the scene. The fly-speed slider is in <em>Settings ▸ Lighting &amp; rendering…</em>.</li>
   <li><strong>Viewport:</strong> the 3D view with a small floating toolbar (Select / Move / Rotate / Construct) in the top-left corner.</li>
   <li><strong>Object window:</strong> a floating properties panel on the right that appears when something is selected.</li>
@@ -100,7 +113,10 @@
 <tr><th>File</th><th>Purpose</th></tr>
 <tr><td><code>project.mmsproj</code></td><td>The single "quick-save" slot (<em>File ▸ Quick-save session</em> / <em>Restore last session</em>, also the Quick-save / Restore buttons). A project stores the map path, camera position and an informational object list; it is JSON.</td></tr>
 <tr><td><code>last_map.txt</code>, <code>last_variant.txt</code></td><td>What to reopen on the next launch.</td></tr>
+<tr><td><code>recent_items.json</code></td><td>The <em>File ▸ Open recent</em> list: the map variants, base maps, saved films and imported models you opened, newest first (up to 12 of each), with the name, game and title used to label each row. Delete the file, or use <em>Clear recent items</em>, to forget it.</td></tr>
 <tr><td><code>browser_bookmarks.txt</code></td><td>Bookmarked folders in the variant browser, one path per line.</td></tr>
+<tr><td><code>updates.json</code>, <code>updates/</code></td><td>The <a href="#updating">updater</a>'s state (automatic check on/off, last check time, last seen and skipped versions) and its downloaded archives.</td></tr>
+<tr><td><code>recovery/</code></td><td>Session snapshots written before an update restart (<code>&lt;stamp&gt;.mmsproj</code> + <code>&lt;stamp&gt;.mvar</code> + <code>&lt;stamp&gt;.recovery.json</code>); removed once restored or discarded.</td></tr>
 <tr><td><code>forge_fx.txt</code>, <code>scaled_objects.txt</code>, <code>shadow_casters.txt</code></td><td>The Settings window's <em>Forge special FX</em>, <em>Scaled objects</em> and <em>Shadow casters (Forge)</em> switches (<code>1</code> / <code>0</code>; missing = on).</td></tr>
 <tr><td><code>map_spawns.txt</code>, <code>physics_outlines.txt</code>, <code>wire_xray.txt</code>, <code>soft_ceilings.txt</code>, <code>hard_floor.txt</code>, <code>playable_bounds.txt</code></td><td>The View menu's <em>Show map spawn points</em>, <em>Show physics outlines</em>, <em>Selection wireframe through objects</em>, <em>Soft ceilings</em>, <em>Hard floor</em> and <em>Playable BSP bounds</em> overlays (<code>1</code> / <code>0</code>; missing = the default).</td></tr>
 </table></div>
@@ -119,7 +135,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

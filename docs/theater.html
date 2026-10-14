@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Theater — Halo Map Studio</title>
+<meta name="description" content="Watch Halo: Reach saved films in Halo Map Studio: open a clip, play it back on the real Forge map, follow a player, read the gametype's settings and pull per-player statistics from the command line.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html" class="cur" aria-current="page">Theater</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Theater -->
+<!-- desc: Watch Halo: Reach saved films in Halo Map Studio: open a clip, play it back on the real Forge map, follow a player, read the gametype's settings and pull per-player statistics from the command line. -->
+<h1>Theater</h1>
+<p class="lead">Halo Map Studio opens <strong>Halo: Reach saved films</strong> and plays them back on the map they were recorded on — the players, the vehicles and the Forge scene they were fighting in. It also reads the gametype the match was played under, and can pull per-player statistics out of a film with no window and no graphics card at all.</p>
+
+<div class="note"><strong>Reach only.</strong> Halo 3, Halo 4 and Halo 2 Anniversary films are not read. A clip from another title is reported as such when you open it rather than failing silently.</div>
+
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#open">Opening a film</a></li>
+<li><a href="#transport">Playing it back</a></li>
+<li><a href="#camera">Cameras: free, follow, first person</a></li>
+<li><a href="#cast">Who is who</a></li>
+<li><a href="#gametype">The gametype it was played under</a></li>
+<li><a href="#stats">Statistics, in the app and on the command line</a></li>
+<li><a href="#scripting">Scripting</a></li>
+<li><a href="#truth">What a recording actually contains</a></li>
+</ul></div>
+
+<h2 id="open">Opening a film</h2>
+<p><em>File &#9656; Open saved film…</em> opens a clip, and films you have opened before are listed in <em>File &#9656; Recent</em> alongside maps and variants. The browser starts in the folders MCC actually writes films to, so in most installations you do not have to go looking.</p>
+<p>Three kinds of file are read:</p>
+<div class="tablewrap"><table>
+<tr><th>Extension</th><th>What it is</th></tr>
+<tr><td><code>.mov</code></td><td>A saved film. This is what MCC writes when you save a clip from Theater.</td></tr>
+<tr><td><code>.film</code></td><td>The same container under a different name, used by some MCC builds.</td></tr>
+<tr><td><code>.temp</code></td><td>A recording <strong>still in progress</strong> — the film of the match you are playing right now. See below.</td></tr>
+</table></div>
+
+<h3 id="where">Where films live</h3>
+<p>On Windows, under your MCC local data:</p>
+<pre><code>%LOCALAPPDATA%Low\MCC\Temporary\UserContent\HaloReach\Movie\
+%LOCALAPPDATA%Low\MCC\LocalFiles\&lt;account&gt;\HaloReach\Movie\</code></pre>
+<p>On Linux, MCC runs under Proton, so the same folders sit inside the game's prefix:</p>
+<pre><code>~/.steam/steam/steamapps/compatdata/976730/pfx/drive_c/users/steamuser/
+    AppData/LocalLow/MCC/Temporary/UserContent/HaloReach/Movie/</code></pre>
+<p>HMS also scans mounted drives (<code>/mnt</code>, <code>/media</code>, <code>/run/media</code>) for MCC data directories, so films on a Windows partition you still have mounted are found without being told where they are. <em>File &#9656; Open saved film…</em> lists every folder it found, with a film count beside each.</p>
+
+<h3 id="live">Watching a match you are still recording</h3>
+<p>A <code>.temp</code> file is the film MCC is writing <em>as you play</em>. HMS can open one and play back everything recorded so far, so a good moment can be re-watched without leaving the match first. Two things differ from a finished film:</p>
+<ul>
+  <li>The length written in the header is a placeholder, so HMS measures the clip from the data that is actually there rather than trusting it.</li>
+  <li>An in-progress film has no author record, so player names and armour are bound by a different route (the recording player is identified by the live aim the file carries). It works, but on some clips fewer players are named than in the finished version of the same film.</li>
+</ul>
+
+<h2 id="transport">Playing it back</h2>
+<p>The transport sits in a fixed strip under the viewport: <strong>play / pause</strong>, <strong>step</strong> a frame at a time, a <strong>scrubber</strong>, the clock, a playback <strong>speed</strong>, and the number of players alive at the current moment. The strip never changes height, so the play button does not move under the cursor while a clip runs.</p>
+<p>The cast and detail panels live in a side panel that is <strong>closed by default</strong>, and the Forge editing column folds away while a clip is open (the <em>Editor</em> toggle brings it back), so the picture gets essentially the whole window.</p>
+<p>The map the film was recorded on is loaded automatically when it can be found, and the <strong>map variant is read out of the film itself</strong> — a saved film embeds the whole Forge variant, so the arena you are watching is the one that was actually played, not the stock map.</p>
+
+<h2 id="camera">Cameras: free, follow, first person</h2>
+<div class="tablewrap"><table>
+<tr><th>Camera</th><th>Behaviour</th></tr>
+<tr><td><strong>Free</strong></td><td>The ordinary HMS camera (see <a href="camera.html">Camera &amp; navigation</a>) — fly anywhere while the clip plays.</td></tr>
+<tr><td><strong>Follow</strong></td><td>Sits behind and slightly above a chosen player and tracks them. The mouse orbits around them at a fixed distance; <em>recenter</em> puts the camera back behind them.</td></tr>
+<tr><td><strong>First person</strong></td><td>Puts the camera at that player's eye, looking along their own recorded aim, and draws Reach's dedicated first-person arm model holding their weapon. The player you are watching through is not drawn, so you are not looking at the inside of their helmet.</td></tr>
+</table></div>
+<p>The first-person arms are posed by the first-person animation of the weapon the player is carrying. Where a weapon gives the arms no pose to play, the arms are not drawn and the panel says so rather than showing a frozen pose.</p>
+
+<h2 id="cast">Who is who</h2>
+<p>The cast list names every player in the match, with their service tag and team colour, and gives each one a <em>follow</em> and a <em>1st person</em> button. Floating name tags above the players use the same team colours.</p>
+<p>Bodies are drawn with the <strong>armour each player was actually wearing</strong> — helmet, shoulders, chest, wrist, utility, knees and the armour effects, with their own primary and secondary colours — read out of the film's own player records.</p>
+<p>Players are matched to bodies through the owner stamp the recording puts on each body. On a clip where that stamp cannot be resolved for someone, HMS says <em>"no biped could be matched to that player in this film"</em> instead of guessing or silently doing nothing.</p>
+
+<h2 id="gametype">The gametype it was played under</h2>
+<p>A saved film embeds the <strong>entire game variant</strong>, and HMS decodes its settings, not just its name: the loadout palettes (name, primary and secondary weapon, armour ability and grenades for all thirty loadouts), the base player traits, the respawn and round settings, the social and map settings, the eight team configurations and the player species rule. They are listed on the Theater card under the gametype's title.</p>
+<p>This is also where the weapons in players' hands come from. A recording only names the weapon a player is holding when it <em>changes</em>, so for most of a match nobody's weapon is ever mentioned. The gametype states what everyone spawned with, so bodies are given that weapon from the moment they appear, and a real pickup takes over from the tick the recording reports it.</p>
+<p>Weapons are drawn at the size the game draws them, which is not one size: Reach authors a separate scale for a weapon lying on the ground and for a weapon in the hands of each size of character, so an energy sword is smaller in a Spartan's hands than it is on the floor, and larger in an Elite's.</p>
+<div class="note">Where the gametype cannot answer — its selectable loadouts disagree and a film does not record which loadout a player chose, or it leaves the weapon to the map's own default — the card says exactly that. It does not invent a weapon, and it does not report a setting that says nothing as though it were a measurement.</div>
+
+<h2 id="stats">Statistics, in the app and on the command line</h2>
+<p>The <strong>Player statistics</strong> section of the side panel gives one row per player: score, lives, deaths, time alive, longest life, distance travelled, top speed on foot, time sprinting, airborne and standing still, time in a vehicle and which one, and the weapons the recording named.</p>
+<p>The same numbers come out of the command line with no window and no GPU, so they work over SSH, in a script, or while the app is already running:</p>
+<pre><code>hms-app --film-stats &lt;film or folder&gt; [--json] [--map &lt;cache.map&gt;]</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Argument</th><th>Meaning</th></tr>
+<tr><td><code>&lt;film or folder&gt;</code></td><td>One film, or a folder — every film in it is processed, a file that cannot be read is reported and the rest carry on. Several paths may be given.</td></tr>
+<tr><td><code>--json</code></td><td>Machine-readable output instead of the table.</td></tr>
+<tr><td><code>--map &lt;cache.map&gt;</code></td><td>Optional. Only used to turn vehicle, weapon and loadout ids into names.</td></tr>
+</table></div>
+<p>Every figure in the JSON carries a <strong>provenance</strong> label — <em>decoded</em> (read from the file), <em>derived</em> (computed from what was read, with the rule stated) or <em>not available</em> — so a consumer can filter on confidence without reading this page.</p>
+
+<h2 id="scripting">Scripting</h2>
+<p>The same operations are available to the <a href="scripting.html">script host</a> and the command server:</p>
+<pre><code>film &lt;path&gt;              open a clip
+film info | scene | index what was read: header, map variant, decoded stream
+film play | pause
+film seek &lt;seconds&gt;      SECONDS, not ticks
+film step &lt;n&gt;            n frames (negative steps back)
+film speed &lt;x&gt;           playback rate
+film camera free | follow &lt;slot&gt; | first &lt;slot&gt;
+film stats [json]        the same statistics as --film-stats
+film extract variant|gametype [dir]   write the embedded map variant / game variant out
+film folders | records   where films were found; raw record listing</code></pre>
+<p>Playback draws the film&rsquo;s own Forge scene automatically. The first <code>film index</code>, <code>film seek</code> or <code>film play</code> after a film is opened rebuilds the map the recording was made on, from the variant the film carries, and reports it next to the actor count &mdash; <code>Forge scene: 452 object(s) from "Xenon // Castle"</code>. If it cannot, it says so in the same line and why: the film was recorded on a stock map, or HMS has no saved <code>.mvar</code> for that map to use as a canvas. <code>film scene</code> forces a redraw.</p>
+<p>Opening a film with <code>film &lt;path&gt;</code> reads the header only and needs no map loaded, so <code>film info</code>, <code>film stats</code>, <code>film records</code> and <code>film extract</code> all work on a machine that has no maps installed at all.</p>
+<p><code>film extract variant</code> is worth knowing about on its own: it writes the Forge map variant embedded in the film out as a <code>.mvar</code>, so a map you only have a clip of can be opened in the editor.</p>
+
+<h2 id="truth">What a recording actually contains</h2>
+<p>A Reach saved film is not a video. It is a recording of the game's <strong>network traffic</strong> — the same stream the other players' consoles were sent — replayed against the same map and the same gametype. That shapes what HMS can and cannot tell you, and HMS is explicit about the difference everywhere it matters:</p>
+<ul>
+  <li><strong>Positions are sparse.</strong> A body's position is only transmitted on some ticks; in between, every machine integrates velocity. Distance travelled is therefore a lower bound, and it is labelled as one.</li>
+  <li><strong>Movement is reconstructed.</strong> Which animation a player was playing is not something the stream states for every body on every tick, so a player's gait — idle, walking, running, sprinting, airborne — is derived from how they actually moved and which way they were facing.</li>
+  <li><strong>Some things the stream does state outright</strong>, and those are read rather than guessed: vehicle entry and exit with the seat index, scores, and which character model each body was spawned as.</li>
+  <li><strong>The kill feed is one player's, not the match's.</strong> A film is a recording of what one machine was sent, and in Reach the medal and kill feed is personal, so the recording names the kills of <em>the player who saved the clip</em> and nobody else's. On a measured example: 163 bodies destroyed, 16 kill rows, every one naming the same player &mdash; the recorder. Where the recording states a kill, HMS says so and can name the killer, the victim and the tick; for every other death it has the death but not the story. The damage record names a responsible unit for many of the rest, and where that is used it is labelled as derived rather than stated.</li>
+  <li><strong>Some things are simply not in the file.</strong> Which loadout a player chose is player-side state and was never transmitted. A weapon the gametype leaves to "the map's default" is resolved from a tag the film does not carry. Where that is the case, HMS says so instead of filling the gap.</li>
+</ul>
+<p>The general rule this feature is built on: a number that was read from the file and a number that was worked out from it are different kinds of fact, and the one that was worked out always says so.</p>
+
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</main>
+</div>
+</body>
+</html>

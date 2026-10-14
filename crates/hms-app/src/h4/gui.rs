@@ -47,7 +47,11 @@ impl crate::App {
             if let Some(h) = l.handle.take() { let _ = h.join(); }
         }
         self.h4_active = false;
+        self.renderer.set_sky_ground_level(0.2);
         self.h4_scene = None;
+        // #forge-fx-h4: drop the per-map screen-FX decode cache and force a re-push next map
+        self.h4_screenfx_cache.clear();
+        self.screenfx_pushed = None;
         // `// #h4-expo-3` the cfxs adaptation block belongs to the map being unloaded
         self.h4_cfxs = None;
         self.h4_ae_stops = None;
@@ -91,6 +95,7 @@ impl crate::App {
         let queue = self.render_state.queue.clone();
         self.renderer.set_fog(&queue, &[0.0f32; 28]);
         self.renderer.set_sky_atmosphere(true);
+        self.renderer.set_sky_ground_level(0.6); // H4/H2A post crushes the 0.2 ground to black
         self.renderer.set_space_sky(false);
         self.renderer.set_scene_tints([1.0; 3], [1.0; 3]);
         self.renderer.set_screen_fx(&queue, 1.0, 0.5, crate::screenfx::ScreenFxRender::identity().cols);
@@ -150,6 +155,7 @@ impl crate::App {
                     Lane::AlphaTest => self.renderer.append_alphatest_meshes(v),
                     Lane::Blend => self.renderer.append_blend_meshes(v),
                     Lane::Additive => self.renderer.append_additive_meshes(v),
+                    Lane::Water => self.renderer.append_water_meshes(v),
                     Lane::Sky => self.renderer.set_sky_meshes(v.into_iter().map(|m| { let b = m.blend_mode(); let k = m.centroid()[0]; (m, b, k) }).collect()),
                 },
                 Ok(H4Msg::Progress(d, t)) => {
@@ -189,6 +195,7 @@ impl crate::App {
                 log::info!("h4 shadows: static caster bounds {:?}, cascade {:?}", stats.caster_bounds.map(|(a, b)| (a.to_array(), b.to_array())), stats.cascade);
                 // the map's atmosphere fog (lighting.rs)
                 if let Some(f) = stats.fog { let q = self.render_state.queue.clone(); self.renderer.set_fog(&q, &f); }
+                if let Some(sky) = stats.fog_sky_color { self.renderer.set_sky_colors(sky, stats.fog_ground_color); } // fallback-sky colours from the fogg
                 // cfxs: exposure band + engine meter, filmic, bloom, colour
                 // grading LUT, self-illum exposure (lighting.rs `apply_post`)
                 {
@@ -218,7 +225,7 @@ impl crate::App {
                     // camera / initial spawn, else the scenario's starting location / spawn
                     // placements (spawncam.rs, stood off the geometry); the bounds overview only
                     // when the map has none of those.
-                    let spawn = self.h4_scene.as_deref().and_then(super::spawncam::spawn_camera);
+                    let spawn = self.h4_scene.as_deref().and_then(|es| super::spawncam::spawn_camera_framed(es, Some((fmin, fmax))));
                     if let Some(c) = spawn {
                         self.camera.pos = c.pos;
                         self.camera.yaw = c.yaw;
@@ -229,7 +236,9 @@ impl crate::App {
                         self.camera.pos = cam.pos;
                         self.camera.yaw = cam.yaw;
                         self.camera.pitch = cam.pitch;
-                        log::info!("h4 camera (bounds overview, no spawn found): pos={:?} yaw={:.1} pitch={:.1}", cam.pos.to_array(), cam.yaw.to_degrees(), cam.pitch.to_degrees());
+                        log::info!("h4 camera (bounds overview, no spawn / starting location / bounds source): pos={:?} yaw={:.1} pitch={:.1}", cam.pos.to_array(), cam.yaw.to_degrees(), cam.pitch.to_degrees());
+                        // HMS_AUTOSHOT: capture the live viewport once the map is framed (same hook as Reach/H3)
+                        if self.autoshot.is_some() { self.autoshot_frames = 6; }
                     }
                 }
                 let lanes: Vec<String> = { let mut v: Vec<(Lane, usize)> = stats.lanes.iter().map(|(l, n)| (*l, *n)).collect(); v.sort_by_key(|(l, _)| format!("{l:?}")); v.iter().map(|(l, n)| format!("{l:?} {n}")).collect() };
@@ -239,6 +248,7 @@ impl crate::App {
                     load.game, load.map, stats.draws, stats.tris, stats.objects_placed, variant_note, stats.tex_ok, lanes.join(", "), secs, if stats.sun.is_some() { "Baked" } else { "Placeholder" },
                     if stats.lm_instances > 0 { format!("PROVISIONAL lightmap atlas on {} instances (HMS_H4_LIGHTMAP)", stats.lm_instances) } else { "flat lighting (no lightmaps)".to_string() });
                 log::info!("{}", self.map_status);
+                self.note_recent_map(); // File ▸ Open recent
             }
             Some(Err(e)) => { self.h4_active = false; self.map_status = format!("{} load failed: {e}", load.game); log::error!("{}", self.map_status); }
             None => { self.h4_active = false; self.map_status = format!("{} load worker died", load.game); log::error!("{}", self.map_status); }
@@ -256,16 +266,24 @@ impl crate::App {
             Ok(v) => v,
             Err(e) => { self.spawn_status = format!("{name}: not a readable Halo 4 variant ({e})"); return; }
         };
-        let Some(idx) = self.map_candidates.iter().position(|c| c.game == crate::mapcat::Game::Halo4 && c.map_id == Some(variant.map_id)) else {
-            self.spawn_status = format!("{name}: base map id {} is not among the detected Halo 4 maps", variant.map_id);
+        // #h2a-mvar: an H2A variant (mvar chunk v52) targets an H2A (`groundhog`) base map, not a
+        // Halo 4 one - both share this editor path (h4::cache is engine-generic) but the base map
+        // must be opened with the matching engine, so pick the candidate of the variant's OWN game.
+        let want_game = if variant.chunk_version == super::mvar::H2A_MVAR_VERSION {
+            crate::mapcat::Game::H2A
+        } else {
+            crate::mapcat::Game::Halo4
+        };
+        let Some(idx) = self.map_candidates.iter().position(|c| c.game == want_game && c.map_id == Some(variant.map_id)) else {
+            self.spawn_status = format!("{name}: base map id {} is not among the detected {} maps", variant.map_id, want_game.display_name());
             return;
         };
         let label = self.map_candidates[idx].label();
-        self.picker_game = crate::mapcat::Game::Halo4; // #map-picker
+        self.picker_game = want_game; // #map-picker
         self.show_modded_maps = self.map_candidates[idx].modded;
         self.selected_map = Some(idx);
         self.h4_pending_mvar = Some(path);
-        self.spawn_status = format!("{name} ('{}', {} objects): loading Halo 4 base map {label} (map id {}) with the variant (editor scene)...", variant.title, variant.objects.len(), variant.map_id);
+        self.spawn_status = format!("{name} ('{}', {} objects): loading {} base map {label} (map id {}) with the variant (editor scene)...", variant.title, variant.objects.len(), want_game.display_name(), variant.map_id);
         self.load_map();
     }
 }

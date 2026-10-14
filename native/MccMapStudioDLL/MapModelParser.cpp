@@ -131,6 +131,13 @@ struct ModelSubmesh {
     uint32_t indexLength;
     uint32_t flags;        // SubmeshFlags @ submeshBlock+0x12 (Reclaimer);
                            // bit 0 = IsWaterSurface, bit 8 = IsTransparent.
+    // The AUTHORED range, as the tag states it: an offset into the section's RAW index buffer,
+    // which for Reach is a triangle STRIP. `DecodeIndices` overwrites indexStart/indexLength
+    // with the list-relative range it produces, so without a pristine copy that function is not
+    // idempotent - a second call would slice the raw strip with list offsets. Decoding a section
+    // twice is ordinary (geometry, then the triangle-origin map), so keep the original.
+    uint32_t rawIndexStart;
+    uint32_t rawIndexLength;
 };
 
 struct ShaderEntry {
@@ -227,6 +234,8 @@ bool ParseSubmeshes(CacheHandle* cache, uint32_t submeshesPointer, int32_t subme
         m.shaderIndex  = R16(sm + 0);
         m.indexStart   = (uint32_t)R32(sm + 4);
         m.indexLength  = (uint32_t)R32(sm + 8);
+        m.rawIndexStart  = m.indexStart;   // pristine; see ModelSubmesh
+        m.rawIndexLength = m.indexLength;
         m.flags        = (uint32_t)(uint16_t)R16(sm + 18); // SubmeshFlags
         outAll.push_back(m);
     }
@@ -1191,8 +1200,17 @@ inline uint32_t ReadIdx(const uint8_t* src, uint32_t i) {
 // Without restart handling we'd emit triangles like (last_a, 0xFFFF, first_b)
 // which the viewer remaps to vertex 0 (OOB), producing the characteristic
 // "spider web" triangles spanning each section back to vertex 0.
+//
+// `originOut`, when non-null, receives ONE entry per emitted triangle: the
+// absolute index (in the SECTION's raw strip buffer) of the window that
+// produced it, i.e. `originBase + i`. That is the only thing a caller needs to
+// translate any raw-strip range into the expanded list, and keeping it here
+// means the strip semantics - restart sentinels, dropped degenerates, winding
+// parity - stay in one place instead of being reimplemented by every consumer.
 template <typename Idx>
-size_t StripToList(const uint8_t* src, uint32_t srcCount, uint8_t* dst) {
+size_t StripToList(const uint8_t* src, uint32_t srcCount, uint8_t* dst,
+                   uint32_t* originOut = nullptr, uint32_t originBase = 0,
+                   uint32_t* originCount = nullptr) {
     if (srcCount < 3) return 0;
     constexpr Idx kRestart = (Idx)~(Idx)0;  // 0xFFFF or 0xFFFFFFFF
     uint32_t outCount = 0;
@@ -1229,6 +1247,7 @@ size_t StripToList(const uint8_t* src, uint32_t srcCount, uint8_t* dst) {
             memcpy(dst + (outCount + 1) * sizeof(Idx), &c, sizeof(Idx));
             memcpy(dst + (outCount + 2) * sizeof(Idx), &b, sizeof(Idx));
         }
+        if (originOut && originCount) originOut[(*originCount)++] = originBase + i;
         outCount += 3;
     }
     return outCount;
@@ -1251,12 +1270,22 @@ size_t StripToList(const uint8_t* src, uint32_t srcCount, uint8_t* dst) {
 // `model` is mutated: each submesh whose sectionIndex == sec's index has its
 // indexStart / indexLength rewritten in place. Caller is `DecodeGeometryInner`
 // which already holds the model handle.
+// `originOut` / `originCount`, when both non-null, additionally receive one
+// uint32 per EMITTED TRIANGLE: the absolute raw-strip index of the window that
+// produced it. The caller allocates `originOut` with room for srcCount entries
+// (a strip can never emit more triangles than it has indices). This is what
+// lets a consumer translate a raw-strip range - a `s_subpart`'s, say, which the
+// tag states in strip space and which nothing here rewrites - into the expanded
+// list. Pass nullptr to skip it; the pass-through and unindexed paths fill it
+// with the identity, so a caller never has to care which format a section used.
 uint8_t* DecodeIndices(ModelData* model, uint32_t sectionIndex,
                        const uint8_t* indexSrc,
-                       uint32_t* outCount, uint32_t* outStride)
+                       uint32_t* outCount, uint32_t* outStride,
+                       uint32_t* originOut = nullptr, uint32_t* originCount = nullptr)
 {
     *outCount  = 0;
     *outStride = 0;
+    if (originCount) *originCount = 0;
     const ModelSection& sec = model->sections[sectionIndex];
     uint32_t srcStride = (sec.vertexCount > 0xFFFF) ? 4u : 2u;
     *outStride = srcStride;
@@ -1279,6 +1308,10 @@ uint8_t* DecodeIndices(ModelData* model, uint32_t sectionIndex,
                 memcpy(buf + i * 4, &i, 4);
             }
         }
+        if (originOut && originCount) {
+            for (uint32_t t = 0; t + 2 < sec.vertexCount; t += 3)
+                originOut[(*originCount)++] = t;
+        }
         *outCount = sec.vertexCount;
         return buf;
     }
@@ -1296,6 +1329,10 @@ uint8_t* DecodeIndices(ModelData* model, uint32_t sectionIndex,
         uint8_t* buf = (uint8_t*)malloc(outBytes);
         if (!buf) return nullptr;
         memcpy(buf, indexSrc, outBytes);
+        if (originOut && originCount) {
+            for (uint32_t t = 0; t + 2 < srcCount; t += 3)
+                originOut[(*originCount)++] = t;
+        }
         *outCount = srcCount;
         return buf;
     }
@@ -1317,9 +1354,9 @@ uint8_t* DecodeIndices(ModelData* model, uint32_t sectionIndex,
         if (sec.submeshCount == 0) {
             size_t produced;
             if (srcStride == 2)
-                produced = StripToList<uint16_t>(indexSrc, srcCount, buf);
+                produced = StripToList<uint16_t>(indexSrc, srcCount, buf, originOut, 0, originCount);
             else
-                produced = StripToList<uint32_t>(indexSrc, srcCount, buf);
+                produced = StripToList<uint32_t>(indexSrc, srcCount, buf, originOut, 0, originCount);
             *outCount = (uint32_t)produced;
             return buf;
         }
@@ -1330,8 +1367,10 @@ uint8_t* DecodeIndices(ModelData* model, uint32_t sectionIndex,
             uint32_t smIndex = sec.submeshStart + si;
             ModelSubmesh& sm = model->submeshes[smIndex];
 
-            uint32_t sliceStart = sm.indexStart;
-            uint32_t sliceLen   = sm.indexLength;
+            // Always slice with the AUTHORED range, never the one a previous decode wrote back,
+            // so decoding a section twice gives the same answer both times.
+            uint32_t sliceStart = sm.rawIndexStart;
+            uint32_t sliceLen   = sm.rawIndexLength;
 
             // Bounds-check the strip slice. Out-of-range submeshes get
             // zeroed - better than crashing and lets the rest of the
@@ -1346,12 +1385,17 @@ uint8_t* DecodeIndices(ModelData* model, uint32_t sectionIndex,
 
             const uint8_t* sliceSrc = indexSrc + (size_t)sliceStart * srcStride;
             size_t produced;
+            // `sliceStart` is the origin BASE: the window indices this slice
+            // reports are absolute positions in the section's raw strip, which
+            // is the space `s_subpart` and `s_part` state their ranges in.
             if (srcStride == 2)
                 produced = StripToList<uint16_t>(sliceSrc, sliceLen,
-                                                 buf + (size_t)outIdx * srcStride);
+                                                 buf + (size_t)outIdx * srcStride,
+                                                 originOut, sliceStart, originCount);
             else
                 produced = StripToList<uint32_t>(sliceSrc, sliceLen,
-                                                 buf + (size_t)outIdx * srcStride);
+                                                 buf + (size_t)outIdx * srcStride,
+                                                 originOut, sliceStart, originCount);
 
             sm.indexStart  = outIdx;
             sm.indexLength = (uint32_t)produced;
@@ -1523,6 +1567,44 @@ bool DecodeNormalsInner(ModelData* model, uint32_t sectionIndex,
     }
     *outNrm = buf;
     *outNrmFloatCount = sec.vertexCount * 3;
+    return true;
+}
+
+// SKIN-1: decode the per-vertex BONE PALETTE of a SKINNED section (vertex format
+// 0x02 s_skinned_vertex / 0x06 s_flat_skinned, stride 0x2C). Layout per the
+// MccHaloReach vertex catalog at the top of this file:
+//     +0x24 UInt8_4   blendindices  (indices into this MESH's `per mesh node map`
+//                                    byte run, NOT absolute render_model node indices)
+//     +0x28 UInt8_N4  blendweight   (/255; the four weights sum to 255 when the
+//                                    vertex uses fewer than 4 bones the unused
+//                                    slots are 0)
+// Output is 8 bytes per vertex, VERBATIM from the vertex buffer: i0 i1 i2 i3 w0 w1
+// w2 w3. Keeping it raw lets the caller decide the weight normalisation and lets
+// the GPU take the bytes unchanged. Returns false (no allocation) for any
+// non-skinned format, so a rigid section is distinguishable from a decode failure.
+bool DecodeBlendInner(ModelData* model, uint32_t sectionIndex,
+                      uint8_t** outBlend, uint32_t* outBlendLen)
+{
+    if (sectionIndex >= model->sections.size()) return false;
+    const ModelSection& sec = model->sections[sectionIndex];
+    if (sec.vertexFormat != VFMT_SKINNED && sec.vertexFormat != VFMT_FLAT_SKINNED) return false;
+    if (sec.vertexCount == 0) return false;
+    if ((size_t)sec.vbResourceOffset + (size_t)sec.vbDataLength > model->resourceSize) return false;
+    const uint8_t* vbSrc = model->resourceData + sec.vbResourceOffset;
+
+    const uint32_t stride = StrideForFormat(sec.vertexFormat);
+    if ((size_t)sec.vertexCount * stride > sec.vbDataLength) return false;
+
+    const size_t bytes = (size_t)sec.vertexCount * 8;
+    uint8_t* buf = (uint8_t*)malloc(bytes);
+    if (!buf) return false;
+    for (uint32_t i = 0; i < sec.vertexCount; ++i) {
+        const uint8_t* v = vbSrc + (size_t)i * stride;
+        memcpy(buf + (size_t)i * 8 + 0, v + 0x24, 4);   // blend indices
+        memcpy(buf + (size_t)i * 8 + 4, v + 0x28, 4);   // blend weights
+    }
+    *outBlend    = buf;
+    *outBlendLen = (uint32_t)bytes;
     return true;
 }
 
@@ -2544,6 +2626,14 @@ bool SehDecodeColors(ModelData* model, uint32_t sectionIndex,
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// SKIN-1 sibling of SehDecodeColors.
+bool SehDecodeBlend(ModelData* model, uint32_t sectionIndex,
+                    uint8_t** outBlend, uint32_t* outBlendLen)
+{
+    __try { return DecodeBlendInner(model, sectionIndex, outBlend, outBlendLen); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 uint32_t SehResolveDiffuse(CacheHandle* cache, int32_t shaderIndex,
                            int32_t shaderTagId)
 {
@@ -3512,6 +3602,69 @@ extern "C" __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionGeometry(
     return ok;
 }
 
+// #instmesh-space Per EMITTED TRIANGLE, the index of the raw-strip window that
+// produced it.
+//
+// Why this exists. A render_model states `s_part` and `s_subpart` index ranges
+// in the section's RAW index space, and Reach stores that index buffer as a
+// TRIANGLE STRIP. `ZH_MMP_DecodeSectionGeometry` hands back the EXPANDED
+// TRIANGLE LIST - a different, longer buffer (132,529 strip indices become
+// 204,069 list indices on the Spartan's armour mesh). This function rewrites
+// the submeshes it expands per-slice, so THOSE ranges come back list-relative,
+// but the subpart ranges are read straight out of the tag by the caller and
+// nothing translates them. Applying a strip offset to the list addresses a
+// different attachment's triangles, which is exactly the fault it caused:
+// 74 of the Spartan's 105 armour attachments were drawn on the wrong bone.
+//
+// Rather than have the caller reimplement strip expansion (restart sentinels,
+// dropped degenerates, winding parity) to rebuild the mapping, the expansion
+// reports it. `outOrigin[t]` is the absolute raw-strip index whose window
+// produced triangle `t`, so a raw range [a, b) owns exactly the triangles whose
+// origin lies in [a, b-2). The values are non-decreasing within a slice.
+//
+// Caller frees `*outOrigin` with ZH_MMP_Free. Returns false when the section
+// cannot be decoded, exactly as ZH_MMP_DecodeSectionGeometry does.
+extern "C" __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionTriangleOrigins(
+    ZH_ModelHandle h, uint32_t sectionIndex,
+    uint32_t** outOrigin, uint32_t* outOriginCount)
+{
+    if (!outOrigin || !outOriginCount) return false;
+    *outOrigin = nullptr;
+    *outOriginCount = 0;
+
+    ModelData* model = LookupModel(h);
+    if (!model) return false;
+    if (sectionIndex >= model->sections.size()) return false;
+    const ModelSection& sec = model->sections[sectionIndex];
+    if (sec.vertexCount == 0) return false;
+
+    const uint8_t* ibSrc = nullptr;
+    if (!sec.isUnindexed) {
+        if ((size_t)sec.ibResourceOffset + (size_t)sec.ibDataLength > model->resourceSize)
+            return false;
+        ibSrc = model->resourceData + sec.ibResourceOffset;
+    }
+    // A strip can never emit more triangles than it has indices, and an
+    // unindexed section emits vertexCount/3; vertexCount is the looser bound.
+    uint32_t cap = sec.indexCount > sec.vertexCount ? sec.indexCount : sec.vertexCount;
+    if (cap == 0) return false;
+    uint32_t* origin = (uint32_t*)malloc((size_t)cap * sizeof(uint32_t));
+    if (!origin) return false;
+
+    uint32_t count = 0, stride = 0, originCount = 0;
+    // Re-runs the SAME expansion the geometry call runs, so the mapping can
+    // never drift from the buffer it describes. The index buffer it produces is
+    // discarded; only the origins are wanted here.
+    uint8_t* iBuf = DecodeIndices(model, sectionIndex, ibSrc, &count, &stride,
+                                  origin, &originCount);
+    if (!iBuf) { free(origin); return false; }
+    free(iBuf);
+
+    *outOrigin = origin;
+    *outOriginCount = originCount;
+    return true;
+}
+
 extern "C" __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionUVs(
     ZH_ModelHandle h, uint32_t sectionIndex,
     float** outUvFloat2, uint32_t* outUvFloatCount)
@@ -3567,6 +3720,27 @@ extern "C" __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionColors(
     if (!ok) {
         if (*outColFloat3) { free(*outColFloat3); *outColFloat3 = nullptr; }
         *outColFloatCount = 0;
+    }
+    return ok;
+}
+
+// SKIN-1: per-vertex bone indices + weights for a skinned section. 8 bytes per
+// vertex (4 node-map indices, then 4 /255 weights). False = this section is not
+// skinned (or the decode failed); see DecodeBlendInner.
+extern "C" __declspec(dllexport) bool __stdcall ZH_MMP_DecodeSectionBlendData(
+    ZH_ModelHandle h, uint32_t sectionIndex,
+    uint8_t** outBlendBytes, uint32_t* outBlendBytesLen)
+{
+    if (!outBlendBytes || !outBlendBytesLen) return false;
+    *outBlendBytes = nullptr;
+    *outBlendBytesLen = 0;
+
+    ModelData* model = LookupModel(h);
+    if (!model) return false;
+    bool ok = SehDecodeBlend(model, sectionIndex, outBlendBytes, outBlendBytesLen);
+    if (!ok) {
+        if (*outBlendBytes) { free(*outBlendBytes); *outBlendBytes = nullptr; }
+        *outBlendBytesLen = 0;
     }
     return ok;
 }

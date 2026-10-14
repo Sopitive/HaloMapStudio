@@ -206,6 +206,20 @@ impl HullGeom {
         }
         out
     }
+    /// #settle Every triangle transformed by `m` (the static-collider form of the hull).
+    pub fn world_tris(&self, m: &Mat4) -> Vec<[Vec3; 3]> {
+        let n = self.verts.len();
+        let mut out = Vec::with_capacity(self.indices.len() / 3);
+        for t in self.indices.chunks_exact(3) {
+            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            if a >= n || b >= n || c >= n { continue; }
+            let pa = m.transform_point3(Vec3::from(self.verts[a]));
+            let pb = m.transform_point3(Vec3::from(self.verts[b]));
+            let pc = m.transform_point3(Vec3::from(self.verts[c]));
+            if pa.is_finite() && pb.is_finite() && pc.is_finite() { out.push([pa, pb, pc]); }
+        }
+        out
+    }
     fn push_tri(&mut self, a: u32, b: u32, c: u32) {
         self.indices.extend_from_slice(&[a, b, c]);
     }
@@ -277,6 +291,59 @@ pub fn object_physics_hull(c: &H4Cache, obje_tag: usize) -> Option<HullGeom> {
     let nodes = model_of(c, obje_tag).map(|m| model_node_xforms(c, m)).unwrap_or_default();
     let g = phmo_geometry(c, phmo, &nodes)?;
     (!g.is_empty()).then_some(g)
+}
+
+/// #settle The raw shape blocks of a `phmo` for the settle walker (`phmo_shapes`, Halo 4 layout).
+pub fn phmo_blocks(c: &H4Cache, phmo_tag: usize) -> Option<crate::phmo_shapes::PhmoBlocks> {
+    if c.tag_class(phmo_tag).as_ref() != Some(b"phmo") { return None; }
+    let pm = c.tag_meta(phmo_tag)?;
+    let d = c.data();
+    Some(crate::phmo_shapes::PhmoBlocks::read(&crate::phmo_shapes::HALO4, |off, elem| match c.block(pm + off) {
+        Some((n, o)) if n > 0 && n <= 0x10000 && o + n * elem <= d.len() => d[o..o + n * elem].to_vec(),
+        _ => Vec::new(),
+    }))
+}
+
+/// #settle The object's settle body in MODEL space, unscaled: every rigid body of its `phmo`
+/// (shapes posed by their node frames) welded into one `PhysBody`; an object without a `phmo`
+/// falls back to a convex hull of its `coll` model. `None` = neither model resolves.
+pub fn object_physics_body(c: &H4Cache, obje_tag: usize) -> Option<crate::physics_settle::PhysBody> {
+    let nodes = model_of(c, obje_tag).map(|m| model_node_xforms(c, m)).unwrap_or_default();
+    if let Some(b) = phmo_of(c, obje_tag).and_then(|p| phmo_blocks(c, p)) {
+        let (defs, counts) = crate::phmo_shapes::rigid_bodies(&b, &crate::phmo_shapes::HALO4, &nodes);
+        let desc = crate::phmo_shapes::describe(&defs, &counts);
+        if let Some(mut body) = crate::physics_settle::PhysBody::from_rigid_bodies(&defs, desc) {
+            body.add_support_spheres(&vehicle_support_spheres(c, obje_tag));
+            return Some(body);
+        }
+    }
+    let g = coll_geometry(c, coll_of(c, obje_tag)?, &nodes)?;
+    crate::physics_settle::collision_fallback_body(&g.verts)
+}
+
+/// #settle A `vehi`'s ground-contact spheres in MODEL space: (marker position, radius, hover)
+/// for every friction point (tyre) and anti-gravity point (hover pad) at every instance of its
+/// marker group. Empty for anything that is not a vehicle.
+pub fn vehicle_support_spheres(c: &H4Cache, obje_tag: usize) -> Vec<(Vec3, f32, bool)> {
+    use crate::phmo_shapes::{vehicle_support_points, H4_VEHI_ANTIGRAV, H4_VEHI_FRICTION};
+    let mut out = Vec::new();
+    if c.tag_class(obje_tag).as_ref() != Some(b"vehi") { return out; }
+    let (Some(vm), Some(mode)) = (c.tag_meta(obje_tag), model_of(c, obje_tag)) else { return out };
+    let d = c.data();
+    let blk = |(off, elem): (usize, usize)| -> Vec<u8> {
+        match c.block(vm + off) {
+            Some((n, o)) if n > 0 && n <= 64 && o + n * elem <= d.len() => d[o..o + n * elem].to_vec(),
+            _ => Vec::new(),
+        }
+    };
+    let (fr, ag) = (blk(H4_VEHI_FRICTION), blk(H4_VEHI_ANTIGRAV));
+    for p in vehicle_support_points(&fr, H4_VEHI_FRICTION.1, &ag) {
+        for m in super::attach::marker_frames_all(c, mode, p.marker) {
+            let pos = m.transform_point3(Vec3::ZERO);
+            if pos.is_finite() { out.push((pos, p.radius, p.hover)); }
+        }
+    }
+    out
 }
 
 // ---- coll decode -----------------------------------------------------------------------------
@@ -893,6 +960,111 @@ mod tests {
             }
             assert!(g.tri_count() >= 12, "{nm} tris {}", g.tri_count());
         }
+    }
+
+    /// #settle The settle body of the Warthog and of the hidden blockers on Ravine: welded from
+    /// the phmo rigid bodies, with the tag's mass / friction and the Havok convex radius padding
+    /// the core box to the full 1.0 wu block. The rest heights the settle produces follow from
+    /// these numbers, so they are pinned here.
+    #[test]
+    fn ravine_physics_bodies_for_the_settle() {
+        use crate::physics_settle::{settle, ConvexShape, PhysBody, SettleParams, SettleStatus, ShapeGeom};
+        let Some(c) = open(Engine::Halo4, "ca_forge_ravine.map") else { return };
+        let by_name = |suffix: &str| -> usize {
+            for cls in [b"vehi", b"bloc", b"scen"] {
+                if let Some(t) = c.find_tags(cls).into_iter().find(|&t| c.tag_name(t).ends_with(suffix)) { return t; }
+            }
+            panic!("{suffix} not in ca_forge_ravine");
+        };
+        let wh = by_name("storm_warthog\\storm_warthog");
+        let body = object_physics_body(&c, wh).expect("warthog settle body");
+        eprintln!("warthog: {} | mass {:.3} com {:?} inertia diag ({:.3},{:.3},{:.3}) damping {:.3}/{:.3} shapes {}",
+            body.desc, body.mass, body.com, body.inertia.x_axis.x, body.inertia.y_axis.y, body.inertia.z_axis.z, body.lin_damping, body.ang_damping, body.shapes.len());
+        let blocks = phmo_blocks(&c, phmo_of(&c, wh).unwrap()).unwrap();
+        let (defs, _) = crate::phmo_shapes::rigid_bodies(&blocks, &crate::phmo_shapes::HALO4, &model_node_xforms(&c, model_of(&c, wh).unwrap()));
+        for d in &defs {
+            eprintln!("  rb node {} motion {} flags {:#06x} mass {:.3} com {:?} tag inertia {:?} scale {:?} shapes {}", d.node, d.motion_type, d.flags, d.mass, d.com, d.inertia.map(|i| (i.x_axis, i.y_axis, i.z_axis)), d.inertia_scale, d.shapes.len());
+            for s in &d.shapes { eprintln!("    shape {:?} mat {:?}", match &s.geom { ShapeGeom::Hull { pts, r, .. } => format!("hull {} pts r {r}", pts.len()), ShapeGeom::Sphere { r, .. } => format!("sphere r {r}"), ShapeGeom::Capsule { r, .. } => format!("pill r {r}") }, s.mat); }
+        }
+        assert!(body.desc.starts_with("phmo:"), "{}", body.desc);
+        assert!(body.mass > 0.0 && body.shapes.len() >= 1);
+        let hull = object_physics_hull(&c, wh).unwrap();
+        let (hmn, hmx) = hull.bounds().unwrap();
+        // the chassis (phmo shapes only; the wheel spheres added from the vehi come after them)
+        let n_wheels = vehicle_support_spheres(&c, wh).len();
+        let chassis_only = { let mut b = body.clone(); b.shapes.truncate(b.shapes.len() - n_wheels); b };
+        let (bmn, bmx) = chassis_only.aabb();
+        // the body is the overlay hull padded by the convex radius (<= 0.05 wu per side)
+        for k in 0..3 {
+            assert!(bmn[k] <= hmn[k] + 1e-4 && bmn[k] >= hmn[k] - 0.05, "min {k}: body {bmn:?} hull {hmn:?}");
+            assert!(bmx[k] >= hmx[k] - 1e-4 && bmx[k] <= hmx[k] + 0.05, "max {k}: body {bmx:?} hull {hmx:?}");
+        }
+        assert!(body.com.is_finite() && (0..3).all(|k| body.com[k] > bmn[k] && body.com[k] < bmx[k]), "com {:?} inside {bmn:?}..{bmx:?}", body.com);
+        // the tag inertia is the full tensor: within 2x of mass x the hull box's formula
+        let e = bmx - bmn;
+        let box_zz = body.mass * (e.x * e.x + e.y * e.y) / 12.0;
+        let ratio = body.inertia.z_axis.z / box_zz;
+        assert!(ratio > 0.5 && ratio < 2.5, "Izz {} vs mass x box {} (ratio {ratio})", body.inertia.z_axis.z, box_zz);
+        // the vehi's four tyres: friction-point spheres at the wheel markers, below the hull
+        let wheels = vehicle_support_spheres(&c, wh);
+        eprintln!("warthog support spheres: {wheels:?}");
+        assert_eq!(wheels.len(), 4, "four wheels: {wheels:?}");
+        // the tag: tyre radius 0.25 at wheel markers 0.199 wu above the origin, so the tyres
+        // reach 0.051 wu below the origin plane and the origin rests that much above the ground
+        let mut wheel_drop = f32::MIN;
+        for (p, r, hover) in &wheels {
+            assert!(!hover && *r > 0.1 && *r < 0.5 && (p.z - r).abs() < 0.15, "a tyre of radius {r} near the origin plane: {p:?}");
+            wheel_drop = wheel_drop.max(r - p.z);
+        }
+        assert!(body.desc.ends_with(", 4 wheels"), "{}", body.desc);
+        // dropped onto a flat floor it rests on its WHEELS: the model origin (the wheel-contact
+        // plane of a Halo vehicle) lands on the floor, the hull bottom stays above it - the
+        // in-game rest, matched on Ravine's shipped Settler Warthog (z -2.08) to 2 cm.
+        let floor = vec![[Vec3::new(-20.0, -20.0, 0.0), Vec3::new(20.0, -20.0, 0.0), Vec3::new(20.0, 20.0, 0.0)], [Vec3::new(-20.0, -20.0, 0.0), Vec3::new(20.0, 20.0, 0.0), Vec3::new(-20.0, 20.0, 0.0)]];
+        let r = settle(&body, Vec3::new(0.0, 0.0, 3.0), glam::Quat::IDENTITY, &floor, &SettleParams::default());
+        eprintln!("warthog settle: {} -> origin z {:.4}", r.summary(), r.pos.z);
+        assert_eq!(r.status, SettleStatus::Settled);
+        assert!((r.pos.z - wheel_drop).abs() < 0.03, "origin {wheel_drop:.3} above the floor (wheels touching): origin z {}", r.pos.z);
+        assert!(r.tilt_deg < 1.0, "level: {}", r.tilt_deg);
+        // the chassis alone (no wheels) rests with its hull bottom on the floor
+        let chassis = { let mut b = body.clone(); b.shapes.truncate(b.shapes.len() - 4); b };
+        let rc = settle(&chassis, Vec3::new(0.0, 0.0, 3.0), glam::Quat::IDENTITY, &floor, &SettleParams::default());
+        assert_eq!(rc.status, SettleStatus::Settled);
+        let rest_bottom = rc.pos.z + bmn.z;
+        assert!(rest_bottom.abs() < 0.02, "hull bottom on the floor: origin z {} bottom {}", rc.pos.z, rest_bottom);
+        // x2: the wheel spheres scale too, the origin still lands on the floor
+        let r2 = settle(&body.scaled(2.0), Vec3::new(0.0, 0.0, 3.0), glam::Quat::IDENTITY, &floor, &SettleParams::default());
+        assert_eq!(r2.status, SettleStatus::Settled);
+        assert!((r2.pos.z - 2.0 * wheel_drop).abs() < 0.04, "x2 origin z {}", r2.pos.z);
+        // a hover vehicle: the Ghost's anti-gravity points (every tag field, for the hover law)
+        let ghost = c.find_tags(b"vehi").into_iter().find(|&t| c.tag_name(t).contains("ghost")).expect("a ghost vehi");
+        let gb = object_physics_body(&c, ghost).expect("ghost body");
+        let gs = vehicle_support_spheres(&c, ghost);
+        eprintln!("ghost: {} | support {gs:?}", gb.desc);
+        if let Some((n, o)) = c.block(c.tag_meta(ghost).unwrap() + crate::phmo_shapes::H4_VEHI_ANTIGRAV.0) {
+            let d = c.data();
+            for i in 0..n {
+                let e = o + i * 0x48;
+                eprintln!("  antigrav {i}: marker {:#x} flags {:#x} damping {} strength {} height {} comp/ext damping {}/{} normal k1/k0 {}/{} radius {}",
+                    d.u32_at(e), d.u32_at(e + 4), d.u32_at(e + 8), d.f32_at(e + 0x0C), d.f32_at(e + 0x10), d.f32_at(e + 0x14), d.f32_at(e + 0x18), d.f32_at(e + 0x1C), d.f32_at(e + 0x20), d.f32_at(e + 0x24));
+            }
+        }
+        assert!(gs.iter().any(|(_, _, hover)| *hover), "the Ghost hovers on anti-gravity points: {gs:?}");
+
+        // hidden blockers: one box each, core half extents + radius = the round block size
+        for (nm, want) in [("wall_m", [0.4, 1.0, 1.0]), ("box_m", [1.0, 1.0, 1.0]), ("box_xxl", [2.0, 4.0, 4.0])] {
+            let t = by_name(&format!("nut_blockers\\{nm}\\{nm}"));
+            let b = object_physics_body(&c, t).unwrap_or_else(|| panic!("{nm} body"));
+            assert_eq!(b.shapes.len(), 1, "{nm}: one box, {}", b.desc);
+            let (mn, mx) = b.aabb();
+            let ext = mx - mn;
+            eprintln!("  {nm}: {} ext {ext:?} mass {:.3} friction {:.2} restitution {:.2}", b.desc, b.mass, b.shapes[0].mat.friction, b.shapes[0].mat.restitution);
+            for k in 0..3 { assert!((ext[k] - want[k]).abs() < 0.01, "{nm} settle extent {ext:?} (want {want:?})"); }
+            let ConvexShape { geom: ShapeGeom::Hull { planes, .. }, .. } = &b.shapes[0] else { panic!("{nm}: hull") };
+            assert_eq!(planes.len(), 6, "{nm}: six faces");
+        }
+        // an object with a coll but no phmo still gets a fallback body
+        let _ = PhysBody::from_shape(ConvexShape::sphere(Vec3::ZERO, 1.0, Default::default()).unwrap(), "x".into());
     }
 
     /// Every vehicle, block and a slice of the scenery of every shipped Halo 4 map decodes both

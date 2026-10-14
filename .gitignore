@@ -23,10 +23,13 @@ Cargo.lock.orig
 /runtime/
 /staging/
 
-# Binary release staging (dist/README.md is tracked)
+# Binary release staging (dist/README.md and dist/linux/ — the desktop entry, icons and
+# installer script — ARE tracked; everything below is build output)
 /dist/*.zip
 /dist/linux-x64/
 /dist/windows-x64/
+/dist/linux-x64-portable/
+/dist/release/
 /dist/github-root/
 /dist/repaired/
 
@@ -42,7 +45,23 @@ Cargo.lock.orig
 /knowledge/
 
 
-# reverse-engineering notes / internal docs (not published)
-/docs/
+# NOTE: /docs/ is the PUBLISHED website (changelog.html, faq.html, editing.html, camera.html,
+# assets/) and all 23 of its files are tracked. It used to be listed here as "internal docs",
+# which was stale and dangerous: an ignore rule does not affect already-tracked files, so the
+# rule did nothing today but would have silently swallowed the next NEW page added under docs/
+# — exactly what RELEASING.md step 0 asks you to add at release. Rule removed deliberately.
+# Reverse-engineering write-ups: how the engine was decoded (lighting, .mvar formats, the
+# saved-film layout). Kept LOCAL by decision — the shipped source does not publish the method.
+/re-notes/
+
 # editor/backup files
 *.bak
+
+# Claude Code agent worktrees: full checkouts of this repo (2 GB), created per agent run.
+# Only the worktrees are ignored, so .claude/settings.json or .claude/agents/ can still be
+# tracked deliberately if you ever want them shared.
+/.claude/worktrees/
+/.claude/settings.local.json
+
+# JetBrains (RustRover) project state
+/.idea/

@@ -101,8 +101,42 @@ pub struct ScriptHost {
     cands: Vec<MapCandidate>,
 
     scene: Option<Box<SceneController>>,
+    /// #reach-skin The posed Reach character actors (`actor ...`). Survives between commands so
+    /// a script can place, pose, arm and then `screenshot`.
+    actors: crate::reach_actor::ActorScene,
     map_path: String,
     map_id: Option<u32>,
+    /// #film  the saved film the `film` verb last opened (header only).
+    film: Option<Box<crate::film::Film>>,
+    film_path: Option<std::path::PathBuf>,
+    /// #film  the decoded playback index + clock, once `film index` has run.
+    film_play: Option<crate::film_play::Playback>,
+    /// #film-action  Has this film's Forge scene been drawn (or refused, with a reason)? The
+    /// GUI draws it when a film is OPENED; a script opens films header-only on purpose, so the
+    /// scene is drawn on the first playback command instead and the outcome is reported there.
+    film_scene: Option<String>,
+    film_driver: crate::film_play::ActorDriver,
+    /// #projectile  What the FILM effect lane installed last frame, for `film status`.
+    film_fx: crate::film_projectile::FxReport,
+    /// #gamevariant  Has the film's own loadout table been resolved onto the tracks yet? `Some`
+    /// once it has landed (or once it cannot), so the attempt is made once and not per command.
+    film_spawn_weapon: Option<crate::film_variant::SpawnWeaponApplied>,
+    /// #fp-arms  Which player's armour the first-person arm models are currently wearing.
+    film_fp_armour: Option<(u32, u8)>,
+    /// #fp-frame  Print-only diagnostic state for `film fp`: the aspect the framing report
+    /// projects through, and whether it lists every node. Nothing in the render reads either.
+    shot_aspect: f32,
+    fp_verbose: bool,
+    /// #fp-fov  The script camera's own vertical FOV, parked while a first-person film camera is
+    /// live. Mirrors the window.
+    fov_before_first_person: Option<f32>,
+    /// #film-camera  Did the last `apply_film_camera` actually SOLVE the requested camera? A
+    /// camera naming a slot or owner group this film does not have solves to nothing, and the
+    /// capture then shows a stale view. `shot` says so rather than labelling it with the request.
+    film_camera_resolved: bool,
+    /// #fp-fov  The first-person field of view in the game's own degrees, the SAME persisted
+    /// value the window's slider drives -- so a scripted capture frames like the window.
+    fp_fov_deg: f32,
 
     // Halo 4 editing state (empty while a Reach map is loaded; `scene` is None while
     // `h4_scene` is Some - a Halo 4 load drops the Reach controller).
@@ -150,6 +184,10 @@ pub struct ScriptHost {
     /// #wire-visible  Draw the SELECTION wireframe through other objects (HMS_WIRE_XRAY seeds
     /// it, default off; `wirexray on|off` changes it for this run).
     wire_xray: bool,
+    /// #quant-error  The save-precision ghost (run-local; `HMS_QUANT_GHOST=1` / `1x40` seeds it,
+    /// `precision ghost on|off|<factor>` changes it), so a batch capture can show the predicted
+    /// pose exactly as the interactive viewport does.
+    quant_ghost: crate::quant_error_ui::GhostSetting,
     /// Draw the structure-design soft ceilings (HMS_SOFT_CEILINGS seeds it,
     /// default off; `softceilings on|off` changes it for this run).
     show_soft_ceilings: bool,
@@ -175,6 +213,8 @@ pub struct ScriptHost {
     /// `screenfx on|off` changes it) + the per-map decode cache and the last-pushed key.
     forge_fx_enabled: bool,
     screenfx_cache: crate::screenfx::ScreenFxCache,
+    /// Halo 4 / H2A decode cache (its tag reader differs; composition is shared). #forge-fx-h4
+    h4_screenfx_cache: crate::h4::screenfx::H4ScreenFxCache,
     screenfx_pushed: Option<(bool, u32, Vec<u32>)>,
     active_screenfx: crate::screenfx::ActiveScreenFx,
     /// The global "Scaled objects" / "Shadow casters (Forge)" switches: the persisted
@@ -252,8 +292,22 @@ impl ScriptHost {
             dll_path,
             cands: mapcat::enumerate(),
             scene: None,
+            actors: Default::default(),
             map_path: String::new(),
             map_id: None,
+            film: None,
+            film_path: None,
+            film_play: None,
+            film_scene: None,
+            film_driver: Default::default(),
+            film_fx: Default::default(),
+            film_spawn_weapon: None,
+            film_fp_armour: None,
+            shot_aspect: 16.0 / 9.0,
+            fp_verbose: false,
+            fov_before_first_person: None,
+            film_camera_resolved: false,
+            fp_fov_deg: crate::film_play::load_fov_setting(),
             h4_scene: None,
             h4_pal: None,
             h4_items: Vec::new(),
@@ -276,6 +330,7 @@ impl ScriptHost {
             show_collision_hull: false,
             show_physics_hull: false,
             wire_xray: crate::wire_xray::env_wire_xray(),
+            quant_ghost: crate::quant_error_ui::env_setting().unwrap_or_default(),
             show_soft_ceilings: crate::soft_ceilings::env_show_soft_ceilings(),
             show_triggers: false,
             show_hard_floor: crate::hard_floor::env_show_hard_floor(),
@@ -291,6 +346,7 @@ impl ScriptHost {
             dirty: false,
             forge_fx_enabled: crate::screenfx::env_forge_fx_enabled(),
             screenfx_cache: crate::screenfx::ScreenFxCache::default(),
+            h4_screenfx_cache: crate::h4::screenfx::H4ScreenFxCache::default(),
             globals: forge_scale::GlobalFlags::load(),
             screenfx_pushed: None,
             active_screenfx: crate::screenfx::ActiveScreenFx::default(),
@@ -301,6 +357,24 @@ impl ScriptHost {
     /// object set and upload when the set changed (the scenario default is part of it: Zealot's
     /// blue filter belongs in a scripted capture).
     fn refresh_screen_fx(&mut self) {
+        // Halo 4 / H2A path (#forge-fx-h4): decode through the pure-Rust reader; no scenario default.
+        if let Some(cache) = self.h4_scene.as_deref().map(|s| s.cache().clone()) {
+            let mut obje_tags: Vec<usize> = Vec::new();
+            for o in &self.objects {
+                if let Some(idx) = crate::h4::edit::h4_tag_index(o.primary_tag) {
+                    if !obje_tags.contains(&idx) { obje_tags.push(idx); }
+                }
+            }
+            let active = crate::h4::screenfx::active_screen_fx(&cache, &mut self.h4_screenfx_cache, obje_tags.into_iter());
+            let key = (self.forge_fx_enabled, 0u32, active.forge_tags.clone());
+            if self.screenfx_pushed.as_ref() != Some(&key) {
+                let line = crate::screenfx::push_to_renderer(&self.renderer, &self.queue, &active, self.forge_fx_enabled);
+                if std::env::var("HMS_DIAG").is_ok() { eprintln!("HMS_DIAG h4 {line}"); }
+                self.screenfx_pushed = Some(key);
+            }
+            self.active_screenfx = active;
+            return;
+        }
         let Some(scene) = self.scene.as_ref() else { return };
         let default_tag = scene.screen_fx().map(|f| f.tag).unwrap_or(0);
         let active = crate::screenfx::active_screen_fx(scene, &mut self.screenfx_cache, default_tag, self.objects.iter().map(|o| (o.datum, o.primary_tag)));
@@ -550,6 +624,7 @@ impl ScriptHost {
         self.colors.clear();
         self.meta.clear();
         self.screenfx_cache.clear();
+        self.h4_screenfx_cache.clear();
         self.screenfx_pushed = None;
         self.cur_stem = std::path::Path::new(path)
             .file_stem().unwrap_or_default().to_string_lossy().into_owned();
@@ -598,15 +673,217 @@ impl ScriptHost {
         crate::wire_xray::status_line(self.wire_xray, n)
     }
 
+    // ===================== #quant-error  save-precision prediction =====================
+
+    /// The quantiser the next save would use. Reach and Halo 4 / H2A both seed `variant_globals`
+    /// on load (`seed_globals`), so the box is the edited one when `variant set bounds` moved it
+    /// and the file's otherwise -- exactly what the encoders write with. Halo 3 has no headless
+    /// path at all, so it cannot appear here.
+    fn pose_quant(&self) -> Option<crate::quant_error::PoseQuant> {
+        let g = self.variant_globals.as_ref()?;
+        let b = if self.global_edits.bounds != g.bounds { self.global_edits.bounds } else { g.bounds };
+        let game = if self.h4_variant.is_some() { crate::quant_error::QuantGame::Halo4 } else { crate::quant_error::QuantGame::Reach };
+        Some(crate::quant_error::PoseQuant::new(game, b))
+    }
+
+    fn pose_quant_game_name(&self) -> &'static str {
+        match self.h4_variant.as_ref() {
+            Some((_, v)) if v.chunk_version == crate::h4::mvar::H2A_MVAR_VERSION => "Halo 2 Anniversary",
+            Some(_) => "Halo 4",
+            None => "Halo: Reach",
+        }
+    }
+
+    /// Every object a save would write (the ones with an editable record), with its predicted
+    /// error. Scenario placements are not in the variant, so they are not here.
+    fn predict_all_pose_errors(&self) -> Vec<crate::quant_error::WorstRow> {
+        let Some(q) = self.pose_quant() else { return Vec::new() };
+        self.objects.iter()
+            .filter(|o| self.meta.contains_key(&o.datum))
+            .map(|o| crate::quant_error::WorstRow {
+                datum: o.datum,
+                name: self.meta.get(&o.datum).map(|m| m.name.clone()).unwrap_or_default(),
+                err: q.predict(o.pos, o.fwd, o.up),
+            })
+            .collect()
+    }
+
+    /// Move objects onto the nearest pose the file stores exactly. The host keeps no undo
+    /// history, so this is a straight edit of the live objects (and of the Halo 4 records a save
+    /// starts from), reported the same way the app reports it.
+    fn snap_datums_to_representable(&mut self, datums: &[u32]) -> Result<String, String> {
+        let q = self.pose_quant().ok_or("no variant is open, so there is no save quantiser to snap to")?;
+        let mut work: Vec<(usize, [f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+        for &d in datums {
+            let Some(i) = self.movable_index(d) else { continue };
+            if !self.meta.contains_key(&d) { continue; }
+            let o = &self.objects[i];
+            let e = q.predict(o.pos, o.fwd, o.up);
+            if e.is_exact() { continue; }
+            work.push((i, e.saved_pos, e.saved_fwd, e.saved_up));
+        }
+        if work.is_empty() {
+            return Ok(format!("snap: {} object(s) already survive the save exactly - nothing to do", datums.len()));
+        }
+        let n = work.len();
+        let (mut moved, mut turned) = (0.0f32, 0.0f32);
+        for (i, p, f, u) in work {
+            let o = &mut self.objects[i];
+            moved = moved.max((glam::Vec3::from(p) - glam::Vec3::from(o.pos)).length());
+            turned = turned.max(crate::quant_error::basis_angle_deg(o.fwd, o.up, f, u));
+            o.pos = p;
+            o.fwd = f;
+            o.up = u;
+            let d = o.datum;
+            if let Some(rec) = self.h4_records.get_mut(&d) {
+                rec.pos = p;
+                rec.set_orientation(f, u);
+            }
+        }
+        self.dirty = true;
+        Ok(format!("snap: {n} object(s) moved onto the nearest representable pose (up to {moved:.6} wu / {turned:.5} deg); predicted save error is now zero"))
+    }
+
+    /// The ghost's violet wireframe for the selected object(s), appended to the depth-ALWAYS
+    /// lane. Mirrors `App::push_quant_ghost` through the shared `ghost_transform`.
+    fn push_quant_ghost(&self, xray: &mut Vec<([f32; 3], [f32; 3], [f32; 3])>) {
+        if !self.quant_ghost.on { return; }
+        let Some(q) = self.pose_quant() else { return };
+        let k = self.quant_ghost.exaggerate;
+        for o in self.objects.iter().filter(|o| self.selected.contains(&o.datum) && self.meta.contains_key(&o.datum)) {
+            let e = q.predict(o.pos, o.fwd, o.up);
+            if e.is_exact() { continue; }
+            let xf = crate::quant_error_ui::ghost_transform(o.pos, o.fwd, o.up, e.saved_pos, e.saved_fwd, e.saved_up, k);
+            match self.objscene().and_then(|s| s.selection_wireframe(o.datum)) {
+                Some(mut w) => {
+                    crate::objscene::fit_wire_budget(&mut w, crate::quant_error_ui::GHOST_MAX_LINES);
+                    for seg in w.chunks_exact(2) {
+                        xray.push((
+                            xf.transform_point3(Vec3::from(seg[0])).to_array(),
+                            xf.transform_point3(Vec3::from(seg[1])).to_array(),
+                            crate::quant_error_ui::GHOST_RGB,
+                        ));
+                    }
+                }
+                None => {
+                    let Some(obb) = self.objscene().and_then(|s| s.object_obb(o.datum)) else { continue };
+                    for (a, b) in obb.edge_segments() {
+                        xray.push((xf.transform_point3(a).to_array(), xf.transform_point3(b).to_array(), crate::quant_error_ui::GHOST_RGB));
+                    }
+                }
+            }
+        }
+    }
+
+    /// `precision [get] | <datum> | worst [n] | snap [selection|all|<datum>] | ghost [...]`
+    fn precision_cmd(&mut self, sub: &str, args: &[String]) -> Result<String, String> {
+        match sub {
+            "" | "get" | "summary" | "variant" => {
+                let q = self.pose_quant().ok_or("no variant is open, so there is no save quantiser")?;
+                let rows = self.predict_all_pose_errors();
+                let mut st = crate::quant_error::ErrStats::default();
+                for r in &rows { st.add(&r.err); }
+                let step = q.pos_step();
+                Ok(format!(
+                    "{} save precision\n  world-bounds x {:.2}..{:.2}  y {:.2}..{:.2}  z {:.2}..{:.2}\n  position {} / {} / {} bits -> grid {:.6} / {:.6} / {:.6} wu (worst error = half of each)\n  rotation worst {:.4} deg\n  {} object(s): {} exactly representable, {} quantising badly\n  position error mean {:.6} wu, max {:.6} wu\n  rotation error mean {:.5} deg, max {:.5} deg",
+                    self.pose_quant_game_name(),
+                    q.bounds[0], q.bounds[1], q.bounds[2], q.bounds[3], q.bounds[4], q.bounds[5],
+                    q.axis_bits[0], q.axis_bits[1], q.axis_bits[2], step[0], step[1], step[2],
+                    q.rot_worst_deg(), st.count, st.exact, st.bad,
+                    st.pos_mean(), st.pos_max, st.rot_mean(), st.rot_max
+                ))
+            }
+            "worst" => {
+                let n = args.first().and_then(|s| s.parse::<usize>().ok()).unwrap_or(10).clamp(1, 200);
+                let rows = self.predict_all_pose_errors();
+                if rows.is_empty() { return Err("no variant is open (or it has no placed objects)".into()); }
+                let (by_pos, by_rot) = crate::quant_error::rank_worst(rows, n);
+                let mut s = format!("worst {n} by POSITION error:\n");
+                for r in &by_pos {
+                    s.push_str(&format!("  0x{:08X}  {:.6} wu  ({:+.6} {:+.6} {:+.6})  {}\n", r.datum, r.err.pos_total, r.err.pos_delta[0], r.err.pos_delta[1], r.err.pos_delta[2], r.name));
+                }
+                s.push_str(&format!("worst {n} by ROTATION error:\n"));
+                for r in &by_rot {
+                    s.push_str(&format!("  0x{:08X}  {:.5} deg  (roll {:+.4} pitch {:+.4} yaw {:+.4})  {}\n", r.datum, r.err.rot_deg, r.err.euler_delta_deg[0], r.err.euler_delta_deg[1], r.err.euler_delta_deg[2], r.name));
+                }
+                Ok(s)
+            }
+            "snap" => {
+                let targets: Vec<u32> = match args.first().map(|s| s.to_lowercase()).as_deref() {
+                    None | Some("selection") | Some("sel") => {
+                        if self.selected.is_empty() { return Err("precision snap: nothing is selected (use `precision snap all`, or a datum)".into()); }
+                        self.selected.clone()
+                    }
+                    Some("all") => self.objects.iter().filter(|o| self.meta.contains_key(&o.datum)).map(|o| o.datum).collect(),
+                    Some(_) => vec![crate::script::parse_datum(&args[0])?],
+                };
+                self.snap_datums_to_representable(&targets)
+            }
+            "ghost" => {
+                let mut g = self.quant_ghost;
+                for a in args {
+                    let al = a.to_lowercase();
+                    if al == "get" { continue; }
+                    if let Some(on) = crate::map_spawns::parse_flag(&al) {
+                        g.on = on;
+                    } else if let Some(f) = al.trim_start_matches('x').parse::<f32>().ok().filter(|v| v.is_finite()) {
+                        g.exaggerate = f.clamp(1.0, crate::quant_error_ui::EXAGGERATE_MAX);
+                    } else {
+                        return Err(format!("precision ghost: '{a}' is not on|off|get or an exaggeration factor"));
+                    }
+                }
+                self.quant_ghost = g;
+                let n = self.objects.iter().filter(|o| self.selected.contains(&o.datum) && self.meta.contains_key(&o.datum)).count();
+                Ok(format!(
+                    "save-precision ghost: {}{} - {n} selected object(s) (run-local in the batch host; the next `screenshot` draws it)",
+                    if g.on { "on" } else { "off" },
+                    if g.on && g.exaggerate > 1.0 { format!(", EXAGGERATED x{:.0}", g.exaggerate) } else { String::new() }
+                ))
+            }
+            other => {
+                let d = crate::script::parse_datum(other)?;
+                let q = self.pose_quant().ok_or("no variant is open, so there is no save quantiser")?;
+                let o = self.objects.iter().find(|o| o.datum == d).ok_or_else(|| format!("no object 0x{d:08X}"))?;
+                let e = q.predict(o.pos, o.fwd, o.up);
+                let step = q.pos_step();
+                Ok(format!(
+                    "0x{d:08X} ({})\n  live    {:.6} {:.6} {:.6}\n  stored  {:.6} {:.6} {:.6}\n  {}\n  grid {:.6} / {:.6} / {:.6} wu; worst-case use {:.0}% of position, {:.0}% of rotation{}",
+                    self.pose_quant_game_name(),
+                    o.pos[0], o.pos[1], o.pos[2], e.saved_pos[0], e.saved_pos[1], e.saved_pos[2],
+                    e.summary(), step[0], step[1], step[2], e.pos_frac * 100.0, e.rot_frac * 100.0,
+                    if e.is_exact() { "  - EXACT, nothing is lost" } else if e.quantises_badly() { "  - QUANTISES BADLY, nudge or snap it" } else { "" }
+                ))
+            }
+        }
+    }
+
     /// #h4-phys "collision hull: shown (2190 edge(s)) | physics hull: hidden (192 edge(s))" -
     /// the counts come from the SELECTED object through the trait, so a batch run can measure the
     /// two overlays on either game without a window.
     fn hull_overlay_status(&self) -> String {
         let (mut ce, mut pe) = (0usize, 0usize);
+        // #settle the world extent of each hull too, so a script can prove a scaled object's hull
+        // is drawn / simulated at its scale
+        let mut ext = String::new();
         if let (Some(&d), Some(s)) = (self.selected.first(), self.objscene()) {
             if let Some(o) = self.objects.iter().find(|o| o.datum == d) {
-                ce = s.collision_world_edges(o).len();
-                pe = s.physics_world_edges(o).len();
+                let extent = |edges: &[([f32; 3], [f32; 3])]| -> String {
+                    if edges.is_empty() { return String::new(); }
+                    let mut mn = Vec3::splat(f32::MAX);
+                    let mut mx = Vec3::splat(f32::MIN);
+                    for (a, b) in edges { mn = mn.min(Vec3::from(*a)).min(Vec3::from(*b)); mx = mx.max(Vec3::from(*a)).max(Vec3::from(*b)); }
+                    let e = mx - mn;
+                    format!(" extent {:.3} x {:.3} x {:.3} wu, z [{:.3}, {:.3}]", e.x, e.y, e.z, mn.z, mx.z)
+                };
+                let cw = s.collision_world_edges(o);
+                let pw = s.physics_world_edges(o);
+                ce = cw.len();
+                pe = pw.len();
+                ext = format!(" | collision{} | physics{}", extent(&cw), extent(&pw));
+                if let Some(b) = s.physics_body(o) {
+                    let (bmn, bmx) = b.aabb();
+                    ext.push_str(&format!(" | settle body: {} at scale x{:.2}, local box {:.3} x {:.3} x {:.3} wu", b.desc, b.scale, bmx.x - bmn.x, bmx.y - bmn.y, bmx.z - bmn.z));
+                }
             }
         }
         let (n, natt) = match (self.selected.first(), self.objscene()) {
@@ -614,7 +891,7 @@ impl ScriptHost {
             _ => (0, 0),
         };
         format!(
-            "collision hull: {} ({ce} edge(s)) | physics hull: {} ({pe} edge(s)) | selection geometry: {n} pick entr(ies), {natt} attachment(s)",
+            "collision hull: {} ({ce} edge(s)) | physics hull: {} ({pe} edge(s)) | selection geometry: {n} pick entr(ies), {natt} attachment(s){ext}",
             if self.show_collision_hull { "shown" } else { "hidden" },
             if self.show_physics_hull { "shown" } else { "hidden" },
         )
@@ -655,11 +932,8 @@ impl ScriptHost {
         // separately ("skip" on reuse).
         let mut t_base = std::time::Duration::ZERO;
         let mut base_loaded = false;
-        if self.scene.is_none() || self.map_id != Some(variant.map_id) {
-            let idx = self
-                .cands
-                .iter()
-                .position(|c| c.game != mapcat::Game::Halo4 && c.map_id == Some(variant.map_id))
+        if self.scene.is_none() || self.map_id != Some(variant.map_id) || mvar::is_unassigned_map_id(variant.map_id) {
+            let idx = mapcat::find_map_for_variant(&self.cands, variant.map_id, variant.mcc_map_id)
                 .ok_or_else(|| format!("no installed base map for variant map_id 0x{:04X}", variant.map_id))?;
             let base = self.cands[idx].path.to_string_lossy().into_owned();
             let t_base0 = Instant::now();
@@ -813,8 +1087,11 @@ impl ScriptHost {
                 casters.insert(*d);
             }
         }
+        // #damage the DISPLAYED damage state per object (only overrides)
+        let damage: HashMap<u32, u8> = self.meta.iter().filter_map(|(d, m)| m.flags.damage.filter(|s| *s > 0).map(|s| (*d, s))).collect();
         scene.set_object_scales(scales);
         scene.set_object_casters(casters);
+        scene.set_object_damage(damage);
         let mut obj_meshes = None;
         for _ in 0..4096 {
             obj_meshes = scene
@@ -834,8 +1111,91 @@ impl ScriptHost {
         self.dirty = false;
     }
 
+    /// #film-camera  Put the VIEW where the film camera is, and give a first-person camera
+    /// Reach's own field of view.
+    ///
+    /// Called from `screenshot`, NOT from the `film scene` handler where this logic used to sit.
+    /// That placement made the effect depend on VERB ORDER: the natural script is
+    /// `film scene` ... then ... `film camera firstbody N`, and selecting the camera after the
+    /// scene meant nothing re-applied it, so every `shot` kept firing from the map-load camera.
+    /// Six different `firstbody` targets produced six frames differing by a maxdiff of 6 — which
+    /// is exactly how a first-person view can be "checked" from a script and found fine while the
+    /// window shows something else. Applying it at capture time makes it order-independent.
+    fn apply_film_camera(&mut self) {
+        let Some(pb) = self.film_play.as_ref() else { return };
+        if matches!(pb.camera, crate::film_play::FilmCamera::Free) {
+            // Leaving free camera restores whatever FOV was parked when first person took over.
+            if let Some(f) = self.fov_before_first_person.take() {
+                self.camera.fov_y = f;
+            }
+            return;
+        }
+        let pbc = pb.clone();
+        // Whether the camera RESOLVED, not merely which one was asked for. A camera naming an
+        // owner group or slot that this film does not have solves to nothing and leaves the view
+        // wherever it was -- and a line that printed the REQUEST would then label a stale frame
+        // with the camera the script wanted, which is the same false confidence that let the
+        // order-dependence bug above go unseen.
+        self.film_camera_resolved = false;
+        if let Some(p) = crate::film_play::solve_camera_at(&pbc, self.film_driver.eye_height(&pbc)) {
+            self.camera.pos = Vec3::from(p.pos);
+            self.camera.yaw = p.yaw;
+            self.camera.pitch = p.pitch;
+            self.film_camera_resolved = true;
+        }
+        if pbc.camera.is_first_person() {
+            if self.fov_before_first_person.is_none() {
+                self.fov_before_first_person = Some(self.camera.fov_y);
+            }
+            self.camera.fov_y = crate::film_play::reach_vertical_fov_for(self.fp_fov_deg);
+        } else if let Some(f) = self.fov_before_first_person.take() {
+            self.camera.fov_y = f;
+        }
+    }
+
+    /// #armour-fx Hand the ACTOR PARTICLE LANE to the scene, from the pose the actors are
+    /// currently in. Called after every `ActorScene::update` here, exactly as the window's
+    /// `update_actors` does it, so a scripted capture and the window simulate the same sources.
+    /// #fp-fov Install one actor rebuild's two lane sets: the world's, and the FIRST-PERSON RIG's
+    /// (drawn through the engine's narrower first-person projection).
+    fn install_actor_build(&mut self, b: crate::reach_actor::ActorBuild) {
+        self.renderer.set_first_person_fov_scale(crate::film_play::first_person_fov_scale());
+        let (l, f) = (b.world, b.first_person);
+        self.renderer.set_actor_meshes(l.opaque, l.cutout, l.holo, l.holo_solid, l.blend);
+        self.renderer.set_first_person_meshes(f.opaque, f.cutout, f.holo, f.holo_solid, f.blend);
+    }
+
+    fn push_actor_particles(&mut self) {
+        let srcs = self.actors.particle_sources();
+        if let Some(sc) = self.scene.as_mut() {
+            if !srcs.is_empty() || sc.actor_particle_source_count() > 0 {
+                sc.set_actor_particle_sources(srcs);
+            }
+        }
+        // #projectile  The FILM lane (muzzle flashes, projectile trails, detonations), from the
+        // pose that has just been written. The same two steps the GUI host takes, so a scripted
+        // capture and the app install the same sources.
+        let want_fx = match (self.film_play.as_ref(), self.scene.as_ref()) {
+            (Some(pb), Some(scene)) => match scene.cache_handle() {
+                Some(cache) => {
+                    let native = scene.native_dll();
+                    self.film_driver.film_effects(pb, &self.actors, native, cache)
+                }
+                None => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        if let Some(sc) = self.scene.as_mut() {
+            if !want_fx.is_empty() || sc.film_particle_source_count() > 0 {
+                self.film_fx = crate::film_projectile::install(sc, &want_fx);
+            }
+        }
+    }
+
     fn screenshot(&mut self, path: &str, size: Option<(u32, u32)>) -> Result<String, String> {
         let t_all = Instant::now();
+        // #film-camera  Order-independent: whatever camera the film is on, apply it NOW.
+        self.apply_film_camera();
         if let Some((w, h)) = size {
             if (w, h) != self.size {
                 self.renderer.resize(&self.device, (w, h));
@@ -853,7 +1213,17 @@ impl ScriptHost {
         }
         // HMS_TIME picks the animation time of the capture (default 0): wave-slope cycling,
         // scrolling textures, flashing lights.
-        let anim_t = std::env::var("HMS_TIME").ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+        //
+        // #blade-anim  With a FILM open the default is the playback position instead of 0, so a
+        // capture shows the animated materials where that tick puts them — a scrolling sword
+        // blade, a flashing light — and two captures of the same tick are identical while
+        // captures of different ticks are not. `HMS_TIME` still overrides, for sweeping one
+        // frame through an animation.
+        let anim_t = std::env::var("HMS_TIME")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .or_else(|| self.film_play.as_ref().map(|pb| pb.anim_seconds()))
+            .unwrap_or(0.0);
         // Forge lights illuminate: pack the nearest to the camera into SimpleLights at the
         // shot's animation time so flashing lights sample their cycle.
         if let Some(scene) = self.scene.as_ref() {
@@ -861,6 +1231,24 @@ impl ScriptHost {
                 let sl = scene.simple_lights_with_forge(self.camera.pos, anim_t);
                 self.renderer.set_simple_lights(&self.queue, (sl.len() / 20) as u32, &sl);
             }
+        }
+        // Simulate the effect PARTICLE systems for this capture. The scripted host never did,
+        // so no `shot` has ever shown a grav-lift plume, a waterfall or (now) a player's armour
+        // effect — the one thing that cannot be checked any other way than by looking. Same call,
+        // same clock (`anim_t`) and same camera basis the window uses, so a capture shows what
+        // the window shows. `HMS_NO_LIFT_PARTICLES=1` still turns it off inside the call.
+        {
+            let fwd = self.camera.forward();
+            let right = self.camera.right();
+            let up = right.cross(fwd).normalize();
+            let pos = self.camera.pos;
+            let pm = {
+                let mr = self.renderer.mesh_renderer();
+                self.scene
+                    .as_mut()
+                    .map(|sc| sc.build_particle_meshes(pos, fwd, right, up, anim_t, mr, &self.device, &self.queue))
+            };
+            if let Some(pm) = pm { self.renderer.set_particle_meshes(pm); }
         }
         let t_render0 = Instant::now();
         self.renderer.render(&self.device, &self.queue, &self.camera, anim_t);
@@ -879,7 +1267,36 @@ impl ScriptHost {
         let t_png = t_png0.elapsed();
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         Ok(format!(
-            "wrote {out} ({rw}x{rh}) | SHOT rebuild={:.1}ms render+capture={:.1}ms png={:.1}ms total={:.1}ms",
+            "wrote {out} ({rw}x{rh}) | cam {} ({:.2},{:.2},{:.2}) yaw {:.1} pitch {:.1} fov {:.1} \
+             | SHOT rebuild={:.1}ms render+capture={:.1}ms png={:.1}ms total={:.1}ms",
+            // #film-camera  Say WHICH camera this frame was shot from, and from where. A capture
+            // that silently used the editor camera while the script had asked for first person is
+            // exactly the failure this line makes impossible to miss.
+            self.film_play
+                .as_ref()
+                .map(|p| match p.camera {
+                    crate::film_play::FilmCamera::Free => "free".to_string(),
+                    crate::film_play::FilmCamera::FirstPerson(s) => format!("first:slot{s}"),
+                    crate::film_play::FilmCamera::Follow(s) => format!("follow:slot{s}"),
+                    crate::film_play::FilmCamera::FirstPersonOwner(o) => format!("first:owner{o}"),
+                    crate::film_play::FilmCamera::FollowOwner(o) => format!("follow:owner{o}"),
+                })
+                .map(|c| {
+                    if matches!(self.film_play.as_ref().map(|p| p.camera), Some(crate::film_play::FilmCamera::Free))
+                        || self.film_camera_resolved
+                    {
+                        c
+                    } else {
+                        format!("{c}!UNRESOLVED-stale-view")
+                    }
+                })
+                .unwrap_or_else(|| "editor".to_string()),
+            self.camera.pos.x,
+            self.camera.pos.y,
+            self.camera.pos.z,
+            self.camera.yaw.to_degrees(),
+            self.camera.pitch.to_degrees(),
+            self.camera.fov_y.to_degrees(),
             ms(t_rebuild), ms(t_render), ms(t_png), ms(t_all.elapsed())
         ))
     }
@@ -934,6 +1351,11 @@ impl ScriptHost {
                 xray.extend(l);
             }
         }
+        // #quant-error  the save-precision ghost of the SELECTED object(s), the same violet
+        // wireframe in the same dedicated depth-ALWAYS lane the interactive viewport uses
+        let mut ghost: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
+        self.push_quant_ghost(&mut ghost);
+        self.renderer.set_ghost_lines(&self.device, &ghost);
         self.renderer.set_xray_lines(&self.device, &xray);
         if self.show_triggers {
             if let Some(scene) = self.scene.as_ref() {
@@ -1036,81 +1458,1146 @@ impl ScriptHost {
         self.objects.iter().position(|o| o.datum == datum)
     }
 
-    /// Gravity settle (headless mirror of App::settle_object): drop `datum` onto the surface
-    /// below and tilt it flush to the slope (all four wheels on the ground). Samples the surface
-    /// under the footprint, averages the hit normals, aligns up to that normal preserving heading.
-    fn settle_one(&mut self, datum: u32) -> bool {
-        let Some(i) = self.movable_index(datum) else { return false };
-        let pos = Vec3::from(self.objects[i].pos);
-        let fwd = Vec3::from(self.objects[i].fwd);
-        let result: Option<(Vec3, Vec3, Vec3)> = {
-            let Some(scene) = self.objscene() else { return false };
-            let (mn, mx) = scene
-                .aabb_of(datum)
-                .map(|(a, b)| (Vec3::from(a), Vec3::from(b)))
-                .unwrap_or((pos - Vec3::ONE, pos + Vec3::ONE));
-            let bottom_offset = (pos.z - mn.z).max(0.0);
-            let cx = (mn.x + mx.x) * 0.5;
-            let cy = (mn.y + mx.y) * 0.5;
-            let hx = (mx.x - mn.x) * 0.35;
-            let hy = (mx.y - mn.y) * 0.35;
-            let samples = [
-                (cx, cy),
-                (cx - hx, cy - hy),
-                (cx + hx, cy - hy),
-                (cx - hx, cy + hy),
-                (cx + hx, cy + hy),
-            ];
-            let top_z = mx.z + 2.0;
-            let dir = Vec3::NEG_Z;
-            let mut center_z = None;
-            let mut nsum = Vec3::ZERO;
-            let mut nhits = 0;
-            for (k, (sx, sy)) in samples.iter().enumerate() {
-                let o = Vec3::new(*sx, *sy, top_z);
-                let mut best: Option<(Vec3, Vec3)> = None;
-                if let Some((p, nn)) = scene.raycast_scene_n(o, dir) {
-                    best = Some((p, nn));
-                }
-                if let Some(p) = scene.raycast_objects_excluding(o, dir, &[datum]) {
-                    if best.map(|(bp, _)| p.z > bp.z).unwrap_or(true) {
-                        best = Some((p, Vec3::Z));
-                    }
-                }
-                if let Some((p, nn)) = best {
-                    let nn = if nn.z < 0.0 { -nn } else { nn };
-                    nsum += nn;
-                    nhits += 1;
-                    if k == 0 {
-                        center_z = Some(p.z);
-                    }
-                }
-            }
-            if nhits == 0 {
-                None
-            } else {
-                let center_z = center_z.unwrap_or(pos.z);
-                let mut up = (nsum / nhits as f32).normalize_or_zero();
-                if !up.is_finite() || up.z < 0.2 {
-                    up = Vec3::Z;
-                }
-                let mut f = fwd - up * fwd.dot(up);
-                if f.length_squared() < 1e-6 {
-                    f = Vec3::X - up * Vec3::X.dot(up);
-                    if f.length_squared() < 1e-6 {
-                        f = Vec3::Y - up * Vec3::Y.dot(up);
-                    }
-                }
-                Some((Vec3::new(pos.x, pos.y, center_z + bottom_offset), f.normalize_or_zero(), up))
-            }
+    /// #settle Physics-only settle, the same driver as `App::settle_object`
+    /// (`physics_settle::settle_in_scene`): the object's phmo rigid-body shapes at its editor
+    /// scale, dropped under gravity onto the level geometry + the other objects' physics hulls,
+    /// stepped until rest. The scene must be built (`ensure_built`) so the scales are in place.
+    fn settle_one(&mut self, datum: u32) -> Result<String, String> {
+        let outcome = {
+            let scene = self.objscene().ok_or_else(|| "no map loaded".to_string())?;
+            crate::physics_settle::settle_in_scene(scene, &self.objects, datum, &[], &crate::physics_settle::SettleParams::default())?
         };
-        if let Some((np, f, up)) = result {
-            self.objects[i].pos = np.into();
-            self.objects[i].fwd = f.into();
-            self.objects[i].up = up.into();
-            true
-        } else {
-            false
+        if outcome.moved() {
+            if let Some(i) = self.movable_index(datum) {
+                self.objects[i].pos = outcome.pos.into();
+                self.objects[i].fwd = outcome.fwd.into();
+                self.objects[i].up = outcome.up.into();
+            }
+            self.dirty = true;
+        }
+        Ok(outcome.summary())
+    }
+
+    /// #film  `film <path> | info | card | machine | extract variant|gametype|both [dir] |
+    /// records | scene`. `scene` loads the film's base map and applies its embedded Forge variant
+    /// through the ordinary variant path, so a headless screenshot of a film's scene is possible.
+    fn film_verb(&mut self, sub: &str, args: &[String]) -> Result<String, String> {
+        use crate::{film, film_export, film_ui};
+        let label = |f: &film::Film| -> Option<String> {
+            let i = crate::mapcat::find_map_for_variant(&self.cands, f.content.map_id, None)?;
+            Some(self.cands[i].label())
+        };
+        let rows = |f: &film::Film, lbl: Option<String>| -> String {
+            film_ui::metadata_rows(f, false, lbl.as_deref())
+                .into_iter()
+                .map(|(k, v)| format!("{k:<18}{v}\n"))
+                .collect()
+        };
+        match sub {
+            "info" | "summary" => {
+                let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                Ok(f.summary())
+            }
+            "card" | "details" => {
+                let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                let l = label(f);
+                Ok(rows(f, l))
+            }
+            // #film-stats  `film stats [json]` -- the headless statistics, also reachable from
+            // the script host. The CLI verb `--film-stats` is the primary interface and needs no
+            // host (and no GPU); this exists so a running session can ask the same question.
+            "stats" | "statistics" => {
+                let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
+                let names = match (self.scene.as_ref(), self.scene.as_ref().and_then(|s| s.cache_handle())) {
+                    (Some(sc), Some(c)) => Some(crate::film_stats::MapNames::build(sc.native_dll(), c)),
+                    _ => None,
+                };
+                let st = match &names {
+                    Some(n) => crate::film_stats::from_path_with(&path, n),
+                    None => crate::film_stats::from_path(&path),
+                }?;
+                Ok(match args.first().map(|a| a.as_str()) {
+                    Some("json") => st.json(),
+                    _ => st.table(),
+                })
+            }
+            "identity" | "bind" | "who" => {
+                // Which recorded player drove which network entity. Nothing in the stream says
+                // so, so this is a measured correlation between each player's aim yaw and each
+                // biped's heading -- the report prints the cost and the runner-up margin so the
+                // match can be judged rather than trusted. One binding per LIFE: a player gets a
+                // new entity on every respawn.
+                let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
+                let f = film::open(&path).map_err(|e| e.to_string())?;
+                let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                let mut out = String::new();
+                let aimed: Vec<usize> =
+                    (0..idx.player_aims.len()).filter(|&i| idx.player_aims[i].len() >= 30).collect();
+                let bipeds = idx.tracks.iter().filter(|t| t.entity_type == 11).count();
+                out.push_str(&format!(
+                    "{} player slots with aim samples, {} biped entities, {} bound ({} confident)\n",
+                    aimed.len(),
+                    bipeds,
+                    idx.bindings.len(),
+                    idx.bindings.iter().filter(|b| b.is_confident()).count()
+                ));
+                for s in 0..16u8 {
+                    let named = f.header.players.get(s as usize).filter(|p| p.present());
+                    let lives = idx.lives_of_slot(s);
+                    let any = idx.bindings.iter().filter(|b| b.slot == s).count();
+                    if named.is_none() && any == 0 {
+                        continue;
+                    }
+                    let name = named.map(|p| p.gamertag.clone()).unwrap_or_else(|| "(empty slot)".into());
+                    let range = idx
+                        .slot_tick_range(s)
+                        .map(|(a, b)| {
+                            format!(
+                                " present {}..{}",
+                                crate::film_play::fmt_time(a as f32 / 60.0),
+                                crate::film_play::fmt_time(b as f32 / 60.0)
+                            )
+                        })
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "slot {s:<2} {name:<20} {} confident live(s) of {any} bound, {} aim samples{range}\n",
+                        lives.len(),
+                        idx.player_aims.get(s as usize).map(|v| v.len()).unwrap_or(0)
+                    ));
+                    for b in lives.iter().take(6) {
+                        // #catchall  SAY HOW the name was arrived at. A body named by elimination
+                        // rather than by its own owner stamp carries no correlation score, and
+                        // printing 0.000 next to it would read like a perfect match.
+                        out.push_str(&match b.origin {
+                            crate::film_decode::BindOrigin::SpeciesElimination => format!(
+                                "     0x{:08X}  {} .. {}  named by ELIMINATION ({})\n",
+                                b.net_id,
+                                crate::film_play::fmt_time(b.first_tick as f32 / 60.0),
+                                crate::film_play::fmt_time(b.last_tick as f32 / 60.0),
+                                b.origin.label()
+                            ),
+                            _ => format!(
+                                "     0x{:08X}  {} .. {}  cost {:.3} margin {:.3} n={} ({}) via {}\n",
+                                b.net_id,
+                                crate::film_play::fmt_time(b.first_tick as f32 / 60.0),
+                                crate::film_play::fmt_time(b.last_tick as f32 / 60.0),
+                                b.cost,
+                                b.margin,
+                                b.samples,
+                                if b.from_facing { "facing" } else { "travel" },
+                                b.origin.label()
+                            ),
+                        });
+                    }
+                    if lives.len() > 6 {
+                        out.push_str(&format!("     ... and {} more\n", lives.len() - 6));
+                    }
+                }
+                self.film_play = Some(crate::film_play::Playback::new(idx));
+                self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
+                Ok(out)
+            }
+            // #reach-hud #crosshair  `film hud [on|off]` / `film crosshair [on|off]` /
+            // `film respawnwidget [on|off]`. The GUI has these as checkboxes under "In first
+            // person"; the verbs exist so a scripted capture can set them, because a toggle that
+            // can only be reached by clicking cannot be put in a screenshot.
+            "hud" | "crosshair" | "reticule" | "respawnwidget" => {
+                let which = sub.to_string();
+                let pb = self.film_play.as_mut().ok_or("film: the recording is not decoded yet (film index)")?;
+                let flag = match which.as_str() {
+                    "hud" => &mut pb.hud,
+                    "respawnwidget" => &mut pb.respawn_widget,
+                    _ => &mut pb.crosshair,
+                };
+                match args.first().map(|s| s.to_lowercase()) {
+                    Some(w) if w == "on" || w == "1" || w == "yes" => *flag = true,
+                    Some(w) if w == "off" || w == "0" || w == "no" => *flag = false,
+                    Some(w) => return Err(format!("film {which} {w}: expected on | off")),
+                    None => *flag = !*flag,
+                }
+                let on = *flag;
+                match which.as_str() {
+                    "hud" => crate::reach_hud::save_hud_setting(on),
+                    "respawnwidget" => crate::reach_hud::save_respawn_setting(on),
+                    _ => crate::reach_hud::save_crosshair_setting(on),
+                }
+                let mut out = format!("film {which}: {}\n", if on { "drawn" } else { "hidden" });
+                for l in crate::film_ui::hud_field_report() {
+                    out.push_str(&format!("  {l}\n"));
+                }
+                Ok(out)
+            }
+            // #film-action  `film assassination [next|prev]` -- the script half of the two
+            // transport buttons, so a capture can frame a kill without a human at the keyboard.
+            "assassination" | "assassinations" => {
+                let pb = self.film_play.as_mut().ok_or("film: the recording is not decoded yet (film index)")?;
+                let total = pb.assassinations().len();
+                let dir = match args.first().map(|s| s.as_str()) {
+                    None | Some("next") => 1,
+                    Some("prev") | Some("previous") | Some("back") => -1,
+                    Some(w) if w == "list" => {
+                        let mut out = format!("{total} assassination(s)\n");
+                        let mut all = pb.assassinations().to_vec();
+                        all.sort_by_key(|a| a.tick);
+                        for a in &all {
+                            out.push_str(&format!(
+                                "  {} {} {}\n",
+                                crate::film_play::fmt_time(a.tick as f32 / 60.0),
+                                a.incident,
+                                if a.stated { "(stated)" } else { "(derived)" }
+                            ));
+                        }
+                        return Ok(out);
+                    }
+                    Some(w) => return Err(format!("film assassination {w}: expected next | prev | list")),
+                };
+                match pb.jump_to_assassination(dir) {
+                    Some(a) => Ok(format!(
+                        "assassination at {} ({}, {}); playhead parked {} ticks early, camera on the victim\n",
+                        crate::film_play::fmt_time(a.tick as f32 / 60.0),
+                        a.incident,
+                        if a.stated { "stated" } else { "derived" },
+                        crate::film_play::Playback::ASSASSINATION_LEAD_TICKS
+                    )),
+                    None => Ok(format!(
+                        "no assassination {} this point ({total} in the clip)\n",
+                        if dir >= 0 { "after" } else { "before" }
+                    )),
+                }
+            }
+            "tags" | "nametags" => {
+                let pb = self.film_play.as_mut().ok_or("film: the recording is not decoded yet (film index)")?;
+                // #nametag-mode  always | lookedat | hidden. `on`/`off` are kept because that is
+                // what this verb took while the setting was a bool; no argument CYCLES.
+                pb.name_tags = match args.first().map(|s| s.as_str()) {
+                    Some(w) => crate::reach_hud::NameTagMode::parse(w)
+                        .ok_or_else(|| format!("film nametags {w}: expected always | lookedat | hidden"))?,
+                    None => match pb.name_tags {
+                        crate::reach_hud::NameTagMode::Always => crate::reach_hud::NameTagMode::LookedAt,
+                        crate::reach_hud::NameTagMode::LookedAt => crate::reach_hud::NameTagMode::Hidden,
+                        crate::reach_hud::NameTagMode::Hidden => crate::reach_hud::NameTagMode::Always,
+                    },
+                };
+                crate::reach_hud::save_name_tag_mode(pb.name_tags);
+                let snapshot = pb.clone();
+                let players: Vec<crate::film::FilmPlayer> =
+                    self.film.as_deref().map(|f| f.header.players.clone()).unwrap_or_default();
+                let tags = crate::film_ui::name_tags(&snapshot, &players, 16);
+                let mut out = format!(
+                    "name tags {}; {} tag(s) at this moment\n",
+                    snapshot.name_tags.keyword(),
+                    tags.len()
+                );
+                // #nametag-mode  Be clear about what this list IS. In `lookedat` the drawing code
+                // culls it to the ONE body inside the engine's own 3-degree cone, and that cull
+                // happens at paint time against the live camera — so the rows below are the
+                // CANDIDATES, not what ends up on screen.
+                if snapshot.name_tags == crate::reach_hud::NameTagMode::LookedAt {
+                    out.push_str(
+                        "  (these are the candidates: in 'lookedat' the draw keeps only the one body inside \
+                         the engine's 3-degree, 40 wu cone, nearest first)\n",
+                    );
+                }
+                for t in tags.iter().take(16) {
+                    // #catchall  A tag whose name was worked out by ELIMINATION rather than read
+                    // off the body's own owner stamp says so, so a name that is an inference is
+                    // never presented as a stated fact.
+                    let how = match snapshot.index.origin_of_entity(t.net_id) {
+                        Some(crate::film_decode::BindOrigin::SpeciesElimination) => {
+                            "  [named by elimination: the only header slot left, and its species]"
+                        }
+                        _ if !t.named => "  [unnamed: no confident player match]",
+                        _ => "",
+                    };
+                    out.push_str(&format!(
+                        "  {:<22} at ({:7.2}, {:7.2}, {:7.2}){how}\n",
+                        t.text,
+                        t.pos[0],
+                        t.pos[1],
+                        t.pos[2],
+                    ));
+                }
+                Ok(out)
+            }
+            "camera" | "cam" => {
+                // #film  `film camera free | first <slot> | follow <slot>`. Headless, so this
+                // reports the solved pose rather than moving a window.
+                if self.film_play.is_none() {
+                    let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
+                    let f = film::open(&path).map_err(|e| e.to_string())?;
+                    let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                    self.film_play = Some(crate::film_play::Playback::new(idx));
+                self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
+                }
+                let pb = self.film_play.as_mut().unwrap();
+                let what = args.first().map(|s| s.as_str()).unwrap_or("free");
+                let slot = |which: &str| -> Result<u8, String> {
+                    args.get(1)
+                        .ok_or_else(|| format!("film camera {which} <player slot>"))?
+                        .parse::<u8>()
+                        .map_err(|_| format!("film camera {which} <player slot 0..15>"))
+                };
+                // #film-camera  `film camera mode` REPORTS which engine camera mode the current
+                // subject is in and why, and `film camera context on|off` sets (and persists)
+                // whether Theater follows the engine into them at all. Both are reports/settings
+                // rather than a camera selection, so they return before the `pb.camera` match.
+                match what {
+                    "mode" | "engine" | "ctx" => {
+                        let mut out = String::new();
+                        out.push_str(&format!(
+                            "context cameras: {}\n",
+                            if pb.context_cameras { "ON" } else { "off" }
+                        ));
+                        match pb.camera_context() {
+                            Some(c) => {
+                                out.push_str(&format!("  {}\n", c.label()));
+                                out.push_str(&format!(
+                                    "  entered at tick {} ({:.0}% through its {} s transition)\n",
+                                    c.entered,
+                                    c.blend * 100.0,
+                                    crate::film_camera::ENTER_VEHICLE_TRANSITION_SECONDS
+                                ));
+                                let tl = pb.camera_timeline();
+                                out.push_str(&format!(
+                                    "  this body has {} override segment(s); the film has {} over {} bodies\n",
+                                    tl.segments(c.subject).len(),
+                                    tl.total_segments(),
+                                    tl.per_body.len()
+                                ));
+                                for s in tl.segments(c.subject) {
+                                    out.push_str(&format!(
+                                        "    {:>7} .. {:<7}  mode {} ({:<14}) {:?}\n",
+                                        s.from_tick,
+                                        s.to_tick,
+                                        s.mode.index(),
+                                        s.mode.name(),
+                                        s.detail
+                                    ));
+                                }
+                            }
+                            None => out.push_str("  no subject (free camera, or that player has no body here)\n"),
+                        }
+                        // Every context camera in the whole film, keyed by the tick it starts, so
+                        // a scripted check can seek straight to one instead of hunting. Printed
+                        // whether or not the current subject has a body, because "which body is
+                        // the camera on right now" and "where are this film's context cameras"
+                        // are different questions and the second is the one a capture needs.
+                        {
+                            let tl = pb.camera_timeline();
+                            let mut rows: Vec<(u32, u32, String)> = Vec::new();
+                            for (net, segs) in &tl.per_body {
+                                for s in segs {
+                                    if let crate::film_camera::ContextDetail::SyncAction { attacker, partner, .. } =
+                                        &s.detail
+                                    {
+                                        rows.push((
+                                            s.from_tick,
+                                            s.to_tick,
+                                            format!(
+                                                "sync action: 0x{net:08X} is the {} of 0x{:08X}",
+                                                if *attacker { "ATTACKER" } else { "victim" },
+                                                partner.unwrap_or(0)
+                                            ),
+                                        ));
+                                    }
+                                }
+                            }
+                            rows.sort();
+                            out.push_str(&format!(
+                                "  this film's SYNC ACTION cameras ({} half-segments = {} kill(s)):\n",
+                                rows.len(),
+                                rows.len() / 2
+                            ));
+                            for (a, b, w) in rows.iter().take(40) {
+                                out.push_str(&format!(
+                                    "    tick {a:>7}..{b:<7} ({:>7.2} s)  {w}\n",
+                                    *a as f32 / crate::film_camera::TICK_HZ
+                                ));
+                            }
+                        }
+                        out.push_str("  the engine's thirteen modes: ");
+                        out.push_str(
+                            &crate::film_camera::ENGINE_CAMERA_MODE_NAMES
+                                .iter()
+                                .enumerate()
+                                .map(|(i, n)| format!("{i}={n}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                        out.push('\n');
+                        return Ok(out);
+                    }
+                    // #film-camera  Which of the OPEN MAP's weapons take the view out of first
+                    // person — `weap +0x204` bit 15, `uses 3rd person camera`. A report rather
+                    // than a setting: the flag is the engine's, and the only honest way to say
+                    // whether a detached turret changes the camera is to read it.
+                    "weapons" | "weapon" => {
+                        let Some(scene) = self.scene.as_ref() else {
+                            return Err("film camera weapons: no map open (openmap <path>)".into());
+                        };
+                        let Some(cache) = scene.cache_handle() else {
+                            return Err("film camera weapons: the open map has no cache".into());
+                        };
+                        let native = scene.native_dll();
+                        let mut rows: Vec<(bool, bool, String)> = Vec::new();
+                        for t in native.tags_by_group(cache, "weap") {
+                            let Some(name) = native.tag_name(cache, t) else { continue };
+                            let third = crate::film_camera::decode_weapon_third_person(native, cache, t);
+                            let support = native.tag_meta(cache, t, 0, 0x208).map(|b| {
+                                u32::from_le_bytes([b[0x204], b[0x205], b[0x206], b[0x207]])
+                                    & crate::film_camera::WEAPON_FLAG_SUPPORT
+                                    != 0
+                            });
+                            rows.push((
+                                third == Some(true),
+                                support == Some(true),
+                                name.rsplit('\\').next().unwrap_or(&name).to_string(),
+                            ));
+                        }
+                        rows.sort();
+                        let n3 = rows.iter().filter(|r| r.0).count();
+                        let mut out = format!(
+                            "{} weapon tag(s) in this map; {n3} set `uses 3rd person camera` \
+                             (weap +0x204 bit 15)\n",
+                            rows.len()
+                        );
+                        for (third, support, name) in rows.iter().rev() {
+                            if !*third && !*support {
+                                continue;
+                            }
+                            out.push_str(&format!(
+                                "  {:<34} {}{}\n",
+                                name,
+                                if *third { "USES 3RD PERSON CAMERA" } else { "" },
+                                if *support { "  [support weapon, bit 8]" } else { "" }
+                            ));
+                        }
+                        return Ok(out);
+                    }
+                    "context" => {
+                        let on = match args.get(1).map(|s| s.as_str()) {
+                            Some("on" | "1" | "true" | "yes") => true,
+                            Some("off" | "0" | "false" | "no") => false,
+                            None => !pb.context_cameras,
+                            Some(o) => return Err(format!("film camera context on|off (got {o})")),
+                        };
+                        pb.context_cameras = on;
+                        crate::film_camera::save_context_setting(on);
+                        return Ok(format!(
+                            "context cameras {} (persisted)\n",
+                            if on { "ON: Theater follows the engine into its assassination, vehicle and death cameras" } else { "off: the plain camera stays where you put it" }
+                        ));
+                    }
+                    _ => {}
+                }
+                pb.camera = match what {
+                    "free" | "off" | "none" => crate::film_play::FilmCamera::Free,
+                    "first" | "fp" | "firstperson" | "eyes" => {
+                        crate::film_play::FilmCamera::FirstPerson(slot("first")?)
+                    }
+                    "follow" | "chase" | "third" => crate::film_play::FilmCamera::Follow(slot("follow")?),
+                    // #film-camera  The OWNER-keyed modes, which are what the window's own camera
+                    // list actually uses -- it offers one camera per owner GROUP so that a body
+                    // the recording never named is still watchable. This host could only select
+                    // the SLOT-keyed modes, so the path the user is really looking through could
+                    // not be reproduced from a script at all.
+                    "firstbody" | "fpbody" | "firstowner" => {
+                        crate::film_play::FilmCamera::FirstPersonOwner(slot("firstbody")?)
+                    }
+                    "followbody" | "chasebody" | "followowner" => {
+                        crate::film_play::FilmCamera::FollowOwner(slot("followbody")?)
+                    }
+                    other => {
+                        return Err(format!(
+                            "film camera {other}: expected free | first <slot> | follow <slot> | firstbody <owner> | followbody <owner> | mode | context on|off"
+                        ))
+                    }
+                };
+                let status = crate::film_play::camera_status(pb);
+                Ok(match crate::film_play::solve_camera(pb) {
+                    Some(p) => format!(
+                        "{status}\n  {} at ({:.2}, {:.2}, {:.2}) yaw {:.1} pitch {:.1}\n",
+                        p.label, p.pos[0], p.pos[1], p.pos[2], p.yaw.to_degrees(), p.pitch.to_degrees()
+                    ),
+                    None => format!("{status}\n"),
+                })
+            }
+            "armour" | "armor" | "appearance" => {
+                // The recorded armour customisation per player. Ten slot bytes, each an index
+                // into one block of `globals\\player_model_customization`.
+                let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                let mut out = String::new();
+                for p in f.present_players() {
+                    match p.appearance() {
+                        Some(a) => {
+                            out.push_str(&format!(
+                                "slot {:<2} {:<20} {}{}\n",
+                                p.index,
+                                p.gamertag,
+                                a.summary(),
+                                if a.in_range() { "" } else { "  [OUT OF RANGE: an index exceeds its option list]" }
+                            ));
+                            for (i, v) in a.slots.iter().enumerate() {
+                                out.push_str(&format!(
+                                    "    {:<16} option {:>3} of {:>3}   -> {}\n",
+                                    crate::film::APPEARANCE_SLOT_NAMES[i],
+                                    v,
+                                    crate::film::APPEARANCE_COUNTS[i],
+                                    crate::film::APPEARANCE_SLOT_REGIONS[i]
+                                ));
+                            }
+                        }
+                        None => out.push_str(&format!("slot {:<2} {:<20} (record too short)\n", p.index, p.gamertag)),
+                    }
+                }
+                if out.is_empty() {
+                    out.push_str("no player slots are occupied in this film\n");
+                }
+                Ok(out)
+            }
+            "scan" | "diagnose" => {
+                // The decoder's own health report on this film: how many records decoded, where
+                // the rest stopped, and what the parameter solver chose. This is the verb to
+                // reach for when a film yields no entities.
+                let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
+                let f = film::open(&path).map_err(|e| e.to_string())?;
+                let st = crate::film_decode::scan(&f.bytes, &f.data);
+                Ok(format!("{}\n", st.report()))
+            }
+            "roster" | "players" | "names" => {
+                let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
+                let mut out = String::new();
+                for p in f.present_players() {
+                    out.push_str(&format!(
+                        "slot {:<2} {:<20} [{:<4}] {}\n",
+                        p.index,
+                        if p.gamertag.is_empty() { "(no gamertag)" } else { p.gamertag.as_str() },
+                        p.service_tag,
+                        film_ui::team_name(p.team)
+                    ));
+                }
+                if out.is_empty() {
+                    out.push_str("no player slots are occupied in this film\n");
+                }
+                // Population over time, so a caller picking a capture timestamp never lands in
+                // the pre-spawn dead zone at the start of a round.
+                if let Some(pb) = self.film_play.as_ref() {
+                    match pb.index.first_player_tick() {
+                        Some(t) => out.push_str(&format!(
+                            "first player biped appears at tick {t} ({})\n",
+                            crate::film_play::fmt_time(t as f32 / 60.0)
+                        )),
+                        None => out.push_str("the entity stream records no player bipeds\n"),
+                    }
+                    for (tick, n) in pb.index.player_population_changes(12) {
+                        out.push_str(&format!(
+                            "  {} -> {n} alive\n",
+                            crate::film_play::fmt_time(tick as f32 / 60.0)
+                        ));
+                    }
+                } else {
+                    out.push_str("(run `film index` first for spawn times)\n");
+                }
+                // The CAMERA list the GUI actually offers, which is built per OWNER GROUP from
+                // the entity stream rather than from the header — so a row here that shows an
+                // entity id instead of a gamertag is a body whose owner HMS could not tie to a
+                // player slot, and that is exactly what the panel shows the user.
+                if let Some(pb) = self.film_play.as_ref() {
+                    let rows = film_ui::roster_lines(f, pb, &self.film_driver.biped_of);
+                    out.push_str(&format!("\ncamera list ({} row(s)):\n", rows.len()));
+                    for r in &rows {
+                        out.push_str(&format!(
+                            "  {:<22} owner {:<6} slot {:<4} named={} lives={} first_tick={}\n",
+                            r.label,
+                            r.owner.map(|o| o.to_string()).unwrap_or_else(|| "-".into()),
+                            r.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                            r.named,
+                            r.lives,
+                            r.first_tick.map(|t| t.to_string()).unwrap_or_else(|| "-".into()),
+                        ));
+                    }
+                    // #species  Cross-check the two independent statements about a player's
+                    // SPECIES: the header record's own `player_model_choice` (+0x4C, 0 Spartan /
+                    // 1 Elite) against the biped the entity stream names for that player's
+                    // bodies. They must agree; where they do not, the body is being dressed from
+                    // one species' loadout while drawn as the other, which is how armour goes
+                    // missing. Needs an open map, because resolving a body's biped does.
+                    let mut rows: Vec<String> = Vec::new();
+                    for p in f.present_players() {
+                        let Some(a) = p.appearance() else { continue };
+                        let said = if a.model_choice == 1 { "elite" } else { "spartan" };
+                        let owner = pb.index.owner_of_slot(p.index as u8);
+                        let mut seen: Vec<&str> = Vec::new();
+                        // #catchall  Ask for the slot's BODIES, not its owner group: a body named
+                        // by elimination sits in a catch-all group that names nobody, so going
+                        // through the group would report "(no body resolved)" for a player whose
+                        // body is in fact identified.
+                        for t in pb.index.bodies_of_slot(p.index as u8) {
+                            if let Some(b) = self.film_driver.biped_of.get(&t.net_id) {
+                                // The LEAF of the biped tag path, not a two-way is_elite test:
+                                // a Forge clip also spawns `monitor_editor` bodies, which an
+                                // elite/not-elite split would mislabel as Spartans.
+                                let k = b.rsplit('\\').next().unwrap_or(b.as_str());
+                                if !seen.contains(&k) { seen.push(k); }
+                            }
+                        }
+                        let drawn = if seen.is_empty() { "(no body resolved)".to_string() } else { seen.join("+") };
+                        let agree = seen.len() == 1 && seen[0].contains(said);
+                        rows.push(format!(
+                            "  slot {:<2} {:<20} record says {:<7} bodies drawn as {:<16} {}\n",
+                            p.index, p.gamertag, said, drawn,
+                            if seen.is_empty() { "-" } else if agree { "agree" } else { "** DISAGREE **" }
+                        ));
+                        // A disagreement is either one player who changed species, or an owner
+                        // group that has collected bodies belonging to more than one player. The
+                        // two look completely different per body, so print them.
+                        if !agree && !seen.is_empty() {
+                            if let Some(o) = owner {
+                                let mut ts: Vec<_> = pb
+                                    .index
+                                    .tracks
+                                    .iter()
+                                    .filter(|t| t.entity_type == 11 && t.owner_raw == Some(o))
+                                    .collect();
+                                ts.sort_by_key(|t| t.first_tick);
+                                for t in ts {
+                                    rows.push(format!(
+                                        "      body {:#010x} ticks {:>6}..{:<6} ({:>5.1}s..{:<5.1}s)  {}\n",
+                                        t.net_id, t.first_tick, t.last_tick,
+                                        t.first_tick as f32 / 60.0, t.last_tick as f32 / 60.0,
+                                        self.film_driver
+                                            .biped_of
+                                            .get(&t.net_id)
+                                            .map(|b| b.rsplit('\\').next().unwrap_or(b.as_str()).to_string())
+                                            .unwrap_or_else(|| "(unresolved)".into())
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    if !rows.is_empty() {
+                        out.push_str("\nspecies cross-check (header `player_model_choice` vs the biped the stream names):\n");
+                        for r in rows { out.push_str(&r); }
+                    }
+                    out.push_str(&film_ui::roster_coverage(pb, f.present_players().count()));
+                    out.push('\n');
+                }
+                Ok(out)
+            }
+            "machine" => {
+                let f = self.film.as_deref().ok_or("film: no film open")?;
+                Ok(format!(
+                    "recording machine: {}\n(the Windows account and computer name of the PC that recorded the film)\n",
+                    f.header.session_id
+                ))
+            }
+            "records" | "stream" => {
+                let path = self.film_path.clone().ok_or("film: no film open")?;
+                let f = film::open(&path).map_err(|e| e.to_string())?;
+                let tick = f.data.records.iter().filter(|r| r.kind == film::RecordKind::Tick).count();
+                let total: usize = f.data.records.iter().map(|r| r.len).sum();
+                Ok(format!(
+                    "{} records ({tick} tick), {total} payload bytes, framing {}, flmh says {} ticks\n",
+                    f.data.records.len(),
+                    if f.data.framing_exact { "exact" } else { "BROKEN" },
+                    f.header.tick_count
+                ))
+            }
+            "extract" => {
+                let f = self.film.clone().ok_or("film: no film open (film <path>)")?;
+                let dir = args
+                    .get(1)
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| self.film_path.as_ref().and_then(|p| p.parent().map(|d| d.to_path_buf())))
+                    .unwrap_or_else(std::env::temp_dir);
+                let what = args.first().map(|s| s.as_str()).unwrap_or("both");
+                let mut out = String::new();
+                if matches!(what, "variant" | "mvar" | "map" | "both") {
+                    let stem = film_export::safe_stem(&f.header.map_variant.metadata.title, "extracted_variant");
+                    match film_export::export_map_variant(&f, &dir.join(format!("{stem}.mvar"))) {
+                        Ok(r) => out.push_str(&format!("map variant: {} objects -> {}\n", r.objects, r.path.display())),
+                        Err(e) => out.push_str(&format!("map variant: {e}\n")),
+                    }
+                }
+                if matches!(what, "gametype" | "gv" | "game" | "both") {
+                    let stem = film_export::safe_stem(&f.header.game_variant.title, "extracted_gametype");
+                    match film_export::export_game_variant(&f, &dir.join(stem)) {
+                        Ok(r) => out.push_str(&format!(
+                            "gametype: {} bytes -> {} (raw struct, NOT a loadable .bin -- see {})\n",
+                            r.bytes, r.struct_path.display(),
+                            r.notes_path.file_name().unwrap_or_default().to_string_lossy()
+                        )),
+                        Err(e) => out.push_str(&format!("gametype: {e}\n")),
+                    }
+                }
+                if out.is_empty() {
+                    return Err(format!("film extract {what}: expected variant | gametype | both"));
+                }
+                Ok(out)
+            }
+            // #ragdoll  `film ragdoll [on|off]`: the ARTICULATED solver for dead bodies, so a
+            // capture can be taken both ways and compared. It is ON by default.
+            "ragdoll" => {
+                if let Some(a) = args.first() {
+                    let on = matches!(a.to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes");
+                    self.film_driver.ragdoll = on;
+                }
+                let mut s = format!(
+                    "ragdoll solver {} -- {} body(ies) simulated at the last sync, furthest simulated {} tick(s){}\n",
+                    if self.film_driver.ragdoll { "on" } else { "off" },
+                    self.film_driver.ragdolls_shown,
+                    self.film_driver.ragdoll_steps,
+                    match &self.film_driver.ragdoll_missing {
+                        Some(w) => format!("; {w}"),
+                        None => String::new(),
+                    }
+                );
+                for (net, p, age) in &self.film_driver.ragdoll_bodies {
+                    s.push_str(&format!(
+                        "  entity {net:#010x} at ({:7.2}, {:7.2}, {:7.2})  dead {:.2}s\n",
+                        p[0], p[1], p[2], *age as f32 / 60.0
+                    ));
+                }
+                // #melee  The replacement lane, reported beside it: which bodies are swinging,
+                // where, and on what clip.
+                s.push_str(&format!(
+                    "melee: {} swinging, the clip carries {} of the skeleton's {} nodes\n",
+                    self.film_driver.melee_shown, self.film_driver.melee_nodes.0, self.film_driver.melee_nodes.1
+                ));
+                for (p, clip) in &self.film_driver.melee_bodies {
+                    s.push_str(&format!("  swing at ({:7.2}, {:7.2}, {:7.2})  {clip}\n", p[0], p[1], p[2]));
+                }
+                Ok(s)
+            }
+            // ---- playback -------------------------------------------------------------
+            "index" => {
+                let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
+                let f = film::open(&path).map_err(|e| e.to_string())?;
+                let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                let text = idx.report();
+                self.film_play = Some(crate::film_play::Playback::new(idx));
+                self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
+                Ok(format!("{text}\n"))
+            }
+            "seek" | "at" | "step" | "speed" | "play" | "pause" | "show" | "frame" => {
+                if self.film_play.is_none() {
+                    // `film seek` implies an index; build it rather than scolding the user.
+                    let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
+                    let f = film::open(&path).map_err(|e| e.to_string())?;
+                    let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                    self.film_play = Some(crate::film_play::Playback::new(idx));
+                self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
+                }
+                let pb = self.film_play.as_mut().unwrap();
+                match sub {
+                    "seek" | "at" => {
+                        let v: f32 = args.first().ok_or("film seek <seconds>")?.parse().map_err(|_| "film seek <seconds>")?;
+                        pb.seek_seconds(v);
+                    }
+                    "step" => {
+                        let n: i32 = args.first().map(|s| s.parse().unwrap_or(1)).unwrap_or(1);
+                        pb.step(n);
+                    }
+                    "speed" => {
+                        let v: f32 = args.first().ok_or("film speed <x>")?.parse().map_err(|_| "film speed <x>")?;
+                        pb.speed = v.clamp(0.25, 4.0);
+                    }
+                    "play" => pb.playing = true,
+                    "pause" => pb.playing = false,
+                    _ => {}
+                }
+                // #film-action  Draw the film's own Forge scene, once, before the first frame
+                // is placed. Without this a scripted or headless capture shows bare BSP with the
+                // players apparently hovering in mid-air -- which is not a playback bug but
+                // looks exactly like one, and it quietly misled our own verification for a
+                // while. `film <path>` stays header-only (it must work with no map loaded at
+                // all), so this is the first point where a scene is both wanted and possible.
+                if self.film_scene.is_none() {
+                    let note = match self.film.as_deref().map(crate::film_export::scene_request) {
+                        None => "no film open".to_string(),
+                        Some(Err(why)) => format!("no Forge scene: {why}"),
+                        Some(Ok(r)) => {
+                            let p = r.path.to_string_lossy().into_owned();
+                            let n = r.objects;
+                            match self.apply_variant(&p) {
+                                Ok(_) => format!("Forge scene: {n} object(s) from {:?}", r.title),
+                                Err(e) => format!("no Forge scene: the variant would not apply ({e})"),
+                            }
+                        }
+                    };
+                    self.film_scene = Some(note);
+                }
+                // #gamevariant  Give every body the weapon its player SPAWNED with, out of the
+                // film's own game variant -- the same step the GUI takes before it places
+                // anything. This host keeps its own driver AND its own `Playback`, so a step
+                // installed on only one of them silently changes the answer: without it every
+                // body here reported no weapon at all (the track's weapon field is only written
+                // when a weapon CHANGES HANDS, and a loadout never does), which is exactly the
+                // "NOBODY is holding a weapon" a scripted seek printed while the GUI showed a
+                // whole team armed.
+                self.film_resolve_spawn_weapon();
+                // #fp-arms  The first-person arm models + their section picks, and the subject
+                // player's own armour on them. Same two calls the GUI makes, and they live in
+                // `film_play` so there is only one implementation of either.
+                self.film_resolve_first_person();
+                // Place the actors for this moment (headless: the same call the GUI makes).
+                let mut placed = String::new();
+                if let Some(scene) = self.scene.as_deref() {
+                    if let Some(cache) = scene.cache_handle() {
+                        let native = scene.native_dll();
+                        let pbc = self.film_play.clone().unwrap();
+                        // #film-action  Name each body's BIPED before placing it, so an Elite
+                        // draws as an Elite here exactly as it does in the GUI. One
+                        // implementation, in `film_play`.
+                        let mp = scene.open_map_path().map(|p| p.to_path_buf());
+                        self.film_driver.resolve_bipeds(&pbc, native, cache, mp.as_deref());
+                        // #corpse-fall  The same landing the GUI does -- this host keeps its own
+                        // driver, so anything installed on one has to be installed on both.
+                        self.film_driver.ground_corpses(&pbc, &|p: [f32; 3]| {
+                            let o = glam::Vec3::new(p[0], p[1], p[2] + 0.05);
+                            scene
+                                .raycast_solid(o, glam::Vec3::NEG_Z, crate::film_play::GROUND_REACH)
+                                .map(|t| o.z - t)
+                        });
+                        let rep = self.film_driver.sync(&pbc, &mut self.actors, native, cache);
+                        // #ragdoll  Then the ARTICULATED solver poses every dead body, after
+                        // `sync` has placed them and chosen their seed clip. Same call the window
+                        // makes -- this host keeps its own driver, so a step installed on one
+                        // only is exactly how a scripted check of a ragdoll can pass while the
+                        // window draws something else.
+                        self.film_driver.simulate_ragdolls(&pbc, &mut self.actors, native, cache, scene, &self.objects);
+                        // #skin  Dress every body in the armour and colours its player actually
+                        // had -- the SAME call the window makes, so a scripted capture and the
+                        // window show the same cast. Runs after `sync`, because it works off the
+                        // actor assignments that call makes.
+                        if self.film.is_some() {
+                            // Split the borrows by field: the driver and the actors are mutable,
+                            // the scene is mutable (the synthetic variants are installed on it),
+                            // and the film is read-only.
+                            let (film, driver, actors, sc) =
+                                (self.film.as_deref(), &mut self.film_driver, &mut self.actors, self.scene.as_mut());
+                            if let (Some(f), Some(sc)) = (film, sc) {
+                                if driver.apply_recorded_appearance(&pbc, f, sc, actors) {
+                                    actors.rebuild = true;
+                                }
+                            }
+                        }
+                        // #film-camera  The camera is applied in `apply_film_camera`, called
+                        // from `screenshot`. It used to be applied HERE, which made it depend on
+                        // verb order: `film camera firstbody N` issued after `film scene` -- the
+                        // natural way to write a script -- never re-ran this, so every `shot`
+                        // fired from the map-load camera and six different targets gave six
+                        // frames differing by a maxdiff of 6. Applying it once, at capture time,
+                        // is order-independent; there must not be a second copy here.
+                        placed = format!(
+                            "  actors: {} shown, {} parked, {} created  |  {}\n",
+                            rep.shown,
+                            rep.parked,
+                            rep.created,
+                            self.film_scene.as_deref().unwrap_or("scene not attempted")
+                        );
+                        if self.actors.rebuild {
+                            let b = crate::reach_actor::build_actor_meshes(
+                                &mut self.actors, self.scene.as_mut().unwrap(),
+                                self.renderer.mesh_renderer(), &self.device, &self.queue);
+                            self.install_actor_build(b);
+                        }
+                        // #fp-frame  A scripted seek is a jump: settle the cross-fades before
+                        // posing, or `dt = 0` leaves every actor frozen part-way between clips.
+                        self.actors.settle_blends();
+                        self.actors.update(0.0, &self.queue);
+                        self.push_actor_particles();
+                    }
+                }
+                let pb = self.film_play.as_ref().unwrap();
+                let mut out = format!("{}\n{placed}", pb.status());
+                out.push_str(&format!("  {}\n", self.film_driver.caption(pb)));
+                // #fp-frame  Print-only: where the first-person rig lands IN THE FRAME. A posed
+                // rig that sits below the frustum is invisible to every other report here.
+                if pb.camera.is_first_person() {
+                    let aspect = self.shot_aspect;
+                    out.push_str(&self.film_driver.fp_framing(&self.actors, &self.camera, aspect, self.fp_verbose));
+                }
+                if sub == "show" || sub == "frame" {
+                    for p in pb.frame().iter().take(24) {
+                        // The BIPED the recording names for this body, so "which of these is an
+                        // Elite" is answerable from the listing instead of by aiming a camera.
+                        let who = match self.film_driver.biped_of.get(&p.net_id) {
+                            Some(b) => format!(" {}", b.rsplit('\\').next().unwrap_or(b.as_str())),
+                            None => String::new(),
+                        };
+                        out.push_str(&format!(
+                            "  entity {:#010x} type {:>2} at ({:7.2}, {:7.2}, {:7.2}) yaw {:6.1}{}{}\n",
+                            p.net_id, p.entity_type, p.pos[0], p.pos[1], p.pos[2], p.yaw,
+                            if p.has_yaw { "" } else { " (no orientation yet)" }, who
+                        ));
+                    }
+                    // #vehicle-rot #vehicle-damage  The VEHICLES the stream draws, with the two
+                    // quantities a yaw-only placement could not show: TILT (how far the recorded
+                    // basis is off level) and the recorded damage state (`W` = a wreck the engine
+                    // had not collected yet). `film show` is how a scripted session checks what is
+                    // on screen, so the vehicle rows belong beside the bodies.
+                    if let Some(vt) = &self.film_driver.vehicles {
+                        let tick = pb.tick.round().max(0.0) as u32;
+                        let wreck = |net: u32| self.film_driver.vehicle_damage_at(net, tick).1;
+                        for (v, pos, orient) in vt.to_draw_at_with(&pb.index, tick, &wreck).iter().take(24) {
+                            let (st, wr) = self.film_driver.vehicle_damage_at(v.net_id, tick);
+                            out.push_str(&format!(
+                                "  vehicle {:#010x} {:<14} at ({:7.2}, {:7.2}, {:7.2}) yaw {:6.1} tilt {:5.1} dmg {}{}{}\n",
+                                v.net_id, v.name, pos[0], pos[1], pos[2],
+                                orient.map(|(f, _)| f[1].atan2(f[0]).to_degrees()).unwrap_or(f32::NAN),
+                                orient.map(|(_, u)| crate::film_vehicle::tilt_degrees(u)).unwrap_or(f32::NAN),
+                                crate::forge_scale::damage_state_name(st),
+                                if wr { " WRECK" } else { "" },
+                                match self.film_driver.wreck_persistence(v.net_id) {
+                                    Some(k) => format!(" (collected {:.1}s after it blew up)", k as f32 / 60.0),
+                                    None => String::new(),
+                                }
+                            ));
+                        }
+                    }
+                    // #film-objects  The OBJECTIVE objects, the loose weapons and the debris the
+                    // stream draws -- the lane that used to drop the flag entirely. Each row
+                    // carries the recorded tilt (what a yaw-only placement would have thrown
+                    // away) and, for an objective, who the recording says is carrying it and
+                    // whether that is STATED or derived.
+                    if let Some(ot) = &self.film_driver.objects {
+                        let tick = pb.tick.round().max(0.0) as u32;
+                        let bipeds: Vec<(u32, [f32; 3])> =
+                            pb.bipeds(self.film_driver.cap).into_iter().map(|p| (p.net_id, p.pos)).collect();
+                        for (o, pos, orient) in
+                            ot.to_draw_capped(&pb.index, tick, self.film_driver.object_cap).iter().take(32)
+                        {
+                            // Only an OBJECTIVE is asked this. A dropped sword lying a world
+                            // unit from a player is not "carried by" him, and printing that it
+                            // is would be a claim the recording does not make.
+                            let carry = match Some(o.draw)
+                                .filter(|d| *d == crate::film_objective::Draw::Objective)
+                                .and_then(|_| {
+                                    crate::film_objective::carrier_at(&pb.index, o.net_id, tick, *pos, &bipeds)
+                                })
+                            {
+                                Some((b, how)) => format!(
+                                    " carried by {:#010x} ({})",
+                                    b,
+                                    match how {
+                                        crate::film_objective::Carry::Stated => "stated",
+                                        crate::film_objective::Carry::Derived => "derived",
+                                    }
+                                ),
+                                None => String::new(),
+                            };
+                            out.push_str(&format!(
+                                "  {:<9} {:#010x} {:<20} at ({:7.2}, {:7.2}, {:7.2}) yaw {:6.1} tilt {:5.1}{}\n",
+                                o.draw.label(),
+                                o.net_id,
+                                o.name,
+                                pos[0],
+                                pos[1],
+                                pos[2],
+                                orient.map(|(f, _)| f[1].atan2(f[0]).to_degrees()).unwrap_or(f32::NAN),
+                                orient.map(|(_, u)| crate::film_vehicle::tilt_degrees(u)).unwrap_or(f32::NAN),
+                                carry
+                            ));
+                        }
+                        // #film-objects  And the WAYPOINT records, which a headless capture
+                        // cannot show: `screenshot` renders the 3D scene only, so the chud
+                        // overlay exists solely in the window. Printing the data -- the anchor,
+                        // the authored colour and where it projects in THIS camera -- is how a
+                        // scripted session checks it without opening one.
+                        let bipeds2: Vec<(u32, [f32; 3])> =
+                            pb.bipeds(self.film_driver.cap).into_iter().map(|p| (p.net_id, p.pos)).collect();
+                        let teams = self
+                            .film
+                            .as_deref()
+                            .and_then(|f| f.header.gametype.as_ref())
+                            .is_some_and(|g| g.misc.teams_enabled());
+                        let players: Vec<crate::film::FilmPlayer> =
+                            self.film.as_deref().map(|f| f.header.players.clone()).unwrap_or_default();
+                        let team_of = |net: u32| -> u8 {
+                            pb.index
+                                .slot_of_entity(net)
+                                .and_then(|s| players.iter().find(|q| q.present() && q.index == s as usize))
+                                .map(|q| q.team)
+                                .unwrap_or(crate::reach_chud::TEAM_NONE)
+                        };
+                        let viewer_team = pb
+                            .camera
+                            .owner(&pb.index)
+                            .and_then(|o| pb.index.slot_of_owner(o))
+                            .or_else(|| self.film.as_deref().and_then(|f| f.recorder_slot()))
+                            .and_then(|s| players.iter().find(|q| q.present() && q.index == s as usize))
+                            .map(|q| q.team)
+                            .unwrap_or(crate::reach_chud::TEAM_NONE);
+                        for w in crate::film_objective::waypoints(
+                            ot, &pb.index, tick, &bipeds2, viewer_team, teams, &team_of,
+                        ) {
+                            let d = (Vec3::from(w.pos) - self.camera.pos).length();
+                            // Where it would land IN THE FRAME. `screenshot` renders the 3D
+                            // scene only -- the chud overlay is painted by egui in the window --
+                            // so a headless capture can never show the waypoint. Printing the
+                            // pixel it projects to, in the SAME camera the next `shot` uses, is
+                            // what makes the record checkable against that capture instead of
+                            // taken on trust.
+                            let (sw, sh) = self.size;
+                            let clip = self.camera.view_proj(sw as f32 / sh.max(1) as f32)
+                                * glam::Vec4::new(w.pos[0], w.pos[1], w.pos[2], 1.0);
+                            let screen = if clip.w > 1e-6 {
+                                let n = clip.truncate() / clip.w;
+                                format!(
+                                    "  screen ({:.0}, {:.0}) of {sw}x{sh}",
+                                    (n.x * 0.5 + 0.5) * sw as f32,
+                                    (0.5 - n.y * 0.5) * sh as f32
+                                )
+                            } else {
+                                "  behind the camera".to_string()
+                            };
+                            out.push_str(&format!(
+                                "  waypoint  {:#010x} {:<10} anchor ({:7.2}, {:7.2}, {:7.2}) colour {} ({}) \
+                                 scale {:.2} at {:.1} wu{}{}\n",
+                                w.net_id,
+                                w.text,
+                                w.pos[0],
+                                w.pos[1],
+                                w.pos[2],
+                                w.color_index,
+                                match w.color_index {
+                                    0 => "navpt normal",
+                                    3 => "navpt enemy",
+                                    _ => "navpt neutral",
+                                },
+                                crate::film_ui::nameplate_scale(d, &crate::film_ui::NamePlateRules::default()),
+                                d,
+                                match w.carrier {
+                                    Some((b, crate::film_objective::Carry::Stated)) =>
+                                        format!("  carried by {b:#010x} (STATED by the recording)"),
+                                    Some((b, crate::film_objective::Carry::Derived)) =>
+                                        format!("  carried by {b:#010x} (derived from the recorded positions)"),
+                                    None => "  on the ground".to_string(),
+                                },
+                                screen
+                            ));
+                        }
+                    }
+                }
+                Ok(out)
+            }
+            // #film-objects  `film objects [on|off]` -- draw the objective objects, the loose
+            // weapons and the debris the recording carries. On by default; this is the toggle.
+            "objects" | "objective" | "objectives" => {
+                match args.first().map(|s| s.to_lowercase()) {
+                    Some(w) if w == "on" || w == "yes" || w == "1" => self.film_driver.show_objects = true,
+                    Some(w) if w == "off" || w == "no" || w == "0" => self.film_driver.show_objects = false,
+                    Some(w) => return Err(format!("film objects {w}: expected on | off")),
+                    None => self.film_driver.show_objects = !self.film_driver.show_objects,
+                }
+                Ok(format!(
+                    "recorded objects: {}  |  {}\n",
+                    if self.film_driver.show_objects { "drawn" } else { "hidden" },
+                    if self.film_driver.object_status.is_empty() {
+                        "nothing resolved yet (seek once with a map open)".to_string()
+                    } else {
+                        self.film_driver.object_status.clone()
+                    }
+                ))
+            }
+            // #fp-frame  Print-only: `film fp [verbose|quiet] [WxH]` steers the first-person
+            // framing report that `film show` prints. Diagnostic only -- nothing in the render
+            // path reads either setting.
+            "fp" => {
+                for a in args {
+                    let a = a.to_lowercase();
+                    match a.as_str() {
+                        "verbose" | "nodes" | "on" => self.fp_verbose = true,
+                        "quiet" | "off" => self.fp_verbose = false,
+                        _ => {
+                            let (w, h) = a.split_once('x').ok_or_else(|| {
+                                format!("film fp {a}: expected verbose | quiet | WxH")
+                            })?;
+                            let w: f32 = w.parse().map_err(|_| format!("film fp {a}: bad width"))?;
+                            let h: f32 = h.parse().map_err(|_| format!("film fp {a}: bad height"))?;
+                            if w <= 0.0 || h <= 0.0 {
+                                return Err(format!("film fp {a}: bad size"));
+                            }
+                            self.shot_aspect = w / h;
+                        }
+                    }
+                }
+                Ok(format!(
+                    "first-person framing report: aspect {:.4}, {}\n",
+                    self.shot_aspect,
+                    if self.fp_verbose { "every node" } else { "summary only" }
+                ))
+            }
+            // #fp-fov  `film fov [degrees]` -- the FIRST-PERSON field of view, in the game's own
+            // units (horizontal at the engine's 4:3 reference, the number MCC's slider shows).
+            // This is the SAME persisted setting the window's slider drives, so a scripted capture
+            // and the window frame alike. (`cam fov` is a different thing: a raw vertical override
+            // of the editor camera, for measurement.)
+            "fov" => {
+                if let Some(a) = args.first() {
+                    let v: f32 = a.parse().map_err(|_| format!("film fov {a}: expected degrees"))?;
+                    if !(crate::film_play::FOV_MIN_DEG..=crate::film_play::FOV_MAX_DEG).contains(&v) {
+                        return Err(format!(
+                            "film fov {v}: expected {}..{} degrees",
+                            crate::film_play::FOV_MIN_DEG,
+                            crate::film_play::FOV_MAX_DEG
+                        ));
+                    }
+                    self.fp_fov_deg = v;
+                    crate::film_play::save_fov_setting(v);
+                }
+                let vert = crate::film_play::reach_vertical_fov_for(self.fp_fov_deg);
+                // #fp-fov ...and the field of view the RIG itself is drawn at, which is not the
+                // world's: the engine renders the first-person model through its own camera at
+                // 0.88 of the world camera's vertical FOV, and that is what stops the arms
+                // splaying as this number climbs.
+                let rig = crate::film_play::reach_first_person_model_fov_for(self.fp_fov_deg);
+                Ok(format!(
+                    "first-person FOV {:.1}\u{00B0} (Reach's own units) = {:.2}\u{00B0} vertical, {:.2}\u{00B0} horizontal at 16:9; \
+                     the arms + weapon are drawn through their own camera at {:.2}\u{00B0} vertical (x{:.3}, the engine's)\n",
+                    self.fp_fov_deg,
+                    vert.to_degrees(),
+                    2.0 * ((16.0 / 9.0) * (vert * 0.5).tan()).atan().to_degrees(),
+                    rig.to_degrees(),
+                    crate::film_play::first_person_fov_scale(),
+                ))
+            }
+            "folders" => {
+                let dirs = crate::film_ui::film_search_folders();
+                if dirs.is_empty() {
+                    return Ok("no MCC saved-film folders found\n".into());
+                }
+                Ok(dirs.iter().map(|d| format!("{}\n", d.display())).collect())
+            }
+            // #film-action  Still here to FORCE a redraw; playback now does it by itself. One
+            // decision, in `film_export::scene_request`.
+            "scene" | "draw" => {
+                let f = self.film.clone().ok_or("film: no film open (film <path>)")?;
+                let r = film_export::scene_request(&f).map_err(|e| format!("film scene: {e}"))?;
+                let applied = self.apply_variant(&r.path.to_string_lossy())?;
+                self.film_scene = Some(format!("Forge scene: {} object(s) from {:?}", r.objects, r.title));
+                Ok(format!("film scene: {} objects from {:?}\n{applied}", r.objects, r.title))
+            }
+            other => {
+                let path = std::path::PathBuf::from(other);
+                if !path.is_file() {
+                    return Err(format!("film: no such file '{}'", path.display()));
+                }
+                // Drop whatever was open BEFORE trying the new file. MCC leaves zero-byte
+                // `.film` stubs in its autosave folder, and a failed open that left the previous
+                // film in place made every later verb silently report the OLD film's numbers.
+                self.film = None;
+                self.film_path = None;
+                self.film_play = None;
+                self.film_scene = None;
+                let f = film::open_header(&path).map_err(|e| e.to_string())?;
+                let text = rows(&f, label(&f));
+                self.film = Some(Box::new(f));
+                self.film_spawn_weapon = None; // #gamevariant a new film has a new variant
+                self.film_path = Some(path);
+                Ok(text)
+            }
         }
     }
 
@@ -1221,16 +2708,35 @@ impl ScriptHost {
                         self.camera.pitch = to.z.clamp(-1.0, 1.0).asin();
                     }
                     CameraCmd::Spawn => {
-                        if let Some((pos, yaw, pitch)) = self.objscene().and_then(|s| s.spawn_camera_pose()) {
-                            self.camera.pos = pos;
-                            self.camera.yaw = yaw;
-                            self.camera.pitch = pitch;
+                        // the shared load / teleport rule (spawn_camera.rs); the source is logged
+                        if let Some(p) = self.objscene().and_then(|s| s.spawn_camera()) {
+                            self.camera.pos = p.pos;
+                            self.camera.yaw = p.yaw;
+                            self.camera.pitch = p.pitch;
+                            eprintln!("camera spawn: {}", p.describe());
                         } else {
+                            eprintln!("camera spawn: no spawn / starting location / soft ceiling / bounds source - framing the scene");
                             self.frame_scene();
                         }
                     }
                     CameraCmd::Frame => self.frame_forge(),
                     CameraCmd::Nudge(d) => self.camera.pos += Vec3::from(d),
+                    // #fp-frame  Print-only diagnostic. The vertical field of view a scripted
+                    // capture shoots at; the app's own default is unchanged by it.
+                    CameraCmd::Fov(deg) => {
+                        if let Some(d) = deg {
+                            if !(1.0..179.0).contains(&d) {
+                                return Err(format!("camera fov {d}: expected 1..179 degrees"));
+                            }
+                            self.camera.fov_y = d.to_radians();
+                        }
+                        return Ok(format!(
+                            "camera fov_y {:.2}° (={:.2}° horizontal at {:.4})\n",
+                            self.camera.fov_y.to_degrees(),
+                            2.0 * ((self.camera.fov_y * 0.5).tan() * self.shot_aspect).atan().to_degrees(),
+                            self.shot_aspect
+                        ));
+                    }
                     CameraCmd::Get => {
                         return Ok(format!(
                             "camera pos {:.2} {:.2} {:.2}  yaw {:.1}°  pitch {:.1}°",
@@ -1458,14 +2964,21 @@ impl ScriptHost {
                 if targets.is_empty() {
                     return Err("settle needs a datum or a selection".into());
                 }
+                // the scales / picks must be current before the bodies are built
+                self.ensure_built();
                 let mut n = 0;
+                let mut lines = Vec::new();
                 for d in &targets {
-                    if self.settle_one(*d) {
-                        n += 1;
+                    match self.settle_one(*d) {
+                        Ok(line) => {
+                            if !line.starts_with("No contact") { n += 1; }
+                            lines.push(format!("0x{d:08X}: {line}"));
+                        }
+                        Err(e) => lines.push(format!("0x{d:08X}: {e}")),
                     }
                 }
                 self.dirty = true;
-                Ok(format!("settled {n}/{} object(s)", targets.len()))
+                Ok(format!("settled {n}/{} object(s)\n{}", targets.len(), lines.join("\n")))
             }
             EditorCommand::Rotate { datum, axis, deg } => {
                 let i = self.movable_index(datum).ok_or_else(|| format!("no object 0x{datum:08X}"))?;
@@ -1509,6 +3022,7 @@ impl ScriptHost {
                     "label" => m.label = value.clone(),
                     "scaled" => m.flags.scaled = forge_scale::parse_flag_value(&value)?,
                     "shadow" | "castshadow" | "shadowcaster" => m.flags.shadow = forge_scale::parse_flag_value(&value)?,
+                    "damage" | "damagestate" | "damage_state" | "state" => m.flags.damage = forge_scale::parse_damage_value(&value)?,
                     "spawnseq" | "spawn_seq" => m.spawn_seq = value.parse().map_err(|_| "spawnseq must be int")?,
                     "scale" => {
                         m.label = "scale".into();
@@ -1554,6 +3068,33 @@ impl ScriptHost {
                 Ok(format!("deleted {} object(s)", dd.len()))
             }
             EditorCommand::Echo(t) => Ok(t),
+            // #reach-skin The headless host has no renderer, so `actor` here resolves and
+            // REPORTS (bipeds, weapons, animation names, the marker pair, the pose state) but
+            // draws nothing; the GUI executor in main.rs does the same commands AND rebuilds
+            // the actor meshes.
+            EditorCommand::Actor(args) => {
+                let Some(scene) = self.scene.as_deref_mut() else {
+                    return Err("`actor` needs an open Reach map".into());
+                };
+                let cache = scene.cache_handle();
+                let r = crate::reach_actor::run_actor_command(&args, &mut self.actors, scene.native_dll(), cache)?;
+                if self.actors.rebuild {
+                    let t0 = std::time::Instant::now();
+                    loop {
+                        let b = crate::reach_actor::build_actor_meshes(
+                            &mut self.actors, scene, self.renderer.mesh_renderer(), &self.device, &self.queue);
+                        let done = !b.pending || t0.elapsed().as_secs() > 120;
+                        if done {
+                            self.install_actor_build(b);
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+                self.actors.update(0.0, &self.queue);
+                self.push_actor_particles();
+                Ok(r)
+            }
             EditorCommand::ScreenFx(set) => {
                 if let Some(on) = set { self.forge_fx_enabled = on; }
                 self.refresh_screen_fx();
@@ -1606,13 +3147,23 @@ impl ScriptHost {
             }
             // The script host has no window; the verb is accepted so a shared script runs on both.
             EditorCommand::SettingsPanel(_) => Ok("settings panel: not applicable (no window)".into()),
+            // File ▸ Open recent is the app's own menu history; the headless host opens
+            // exactly what its script names, so it keeps none.
+            EditorCommand::RecentDbg { .. } => Ok("recent: not applicable (headless, no menus)".into()),
             // #dialogs The browser is GUI-only; the headless host has no window.
             EditorCommand::DialogDbg { .. } => Ok("dialog: not applicable (headless, no window)".into()),
+            // #model-import: the imported-mesh lane and its gizmo live in the GUI only.
+            EditorCommand::ImportModel { .. } => Ok("import: not applicable (headless host has no imported-model lane; run it in the app)".into()),
+            // #film  Reach Theater saved films. Everything but drawing works headless.
+            EditorCommand::Film { sub, args } => self.film_verb(&sub, &args),
             // #wire-visible  Run-local; the selection lane is re-applied on every screenshot.
             EditorCommand::WireXray(set) => {
                 if let Some(on) = set { self.wire_xray = on; }
                 Ok(self.wire_xray_status())
             }
+            // #quant-error  The save-precision prediction, headless. Same numbers and the same
+            // snap as the interactive app (the host has no viewport, so `ghost` only reports).
+            EditorCommand::Precision { sub, args } => self.precision_cmd(&sub, &args),
             // Run-local; the overlay is re-merged on every screenshot.
             EditorCommand::SoftCeilings(set) => {
                 if let Some(on) = set { self.show_soft_ceilings = on; }
@@ -1672,6 +3223,37 @@ impl ScriptHost {
             }
             // `bspwarn list`: structure BSP flags + every variant / placed object (those
             // with meta, i.e. not the base map's scenery) whose position is in a non-playable BSP.
+            // #prefab saved object groups; the same executor the app and the panel use
+            EditorCommand::Prefab(args) => self.prefab_command(&args),
+            EditorCommand::ConvertVariant(args) => crate::xgame::convert_cli(&args),
+            EditorCommand::XGame { what, filter } => {
+                let cat = crate::xgame::catalog::Catalog::load();
+                Ok(match what.as_str() {
+                    "table" => crate::xgame::table::describe(&crate::xgame::table::Table::load(), &cat, filter.as_deref()),
+                    "canvases" => {
+                        let want = filter.as_deref().and_then(crate::xgame::game_from_str);
+                        let mut s = String::new();
+                        for g in crate::xgame::GAMES {
+                            if want.map_or(false, |w| w != g) { continue; }
+                            let cs = crate::xgame::convert::canvases(&cat, g);
+                            s.push_str(&format!("{} - {} canvases\n", g.display_name(), cs.len()));
+                            for (stem, id) in cs {
+                                let n = cat.on_canvas(g, &stem).len();
+                                s.push_str(&format!("  {stem:<28} map id {:<8} {n} placeable objects\n", id.map(|i| i.to_string()).unwrap_or_else(|| "-".into())));
+                            }
+                        }
+                        s
+                    }
+                    _ => crate::xgame::catalog::describe(&cat, filter.as_deref()),
+                })
+            }
+            // #play  Test mode is a WINDOW mode: it needs the viewport's own input, camera and
+            // per-frame clock, none of which the headless host has. Refused in words rather than
+            // silently doing nothing, which is what a "not supported" that returns Ok would be.
+            EditorCommand::Play(_) => Err(
+                "test mode runs in the window (it needs the viewport's input and camera);                  use the GUI's `play` verb over the command server"
+                    .into(),
+            ),
             EditorCommand::BspWarnList => {
                 if self.h4_scene.is_some() { return Ok(self.h4_bounds_report()); }
                 let scene = self.scene.as_ref().ok_or("no map loaded")?;
@@ -1810,6 +3392,14 @@ impl ScriptHost {
                 m.color, m.cached_type, m.spawn_seq, m.respawn, m.label, m.boundary_shape, m.scale()
             ));
             s.push_str(&format!("  {}\n", m.flags_line(datum, &self.globals)));
+            // #damage the DAMAGE display state + the states this object's model (and its
+            // attachments) actually author — what the object panel's DAMAGE dropdown offers.
+            let authored = self.objscene().map(|sc| sc.damage_states_of(o)).unwrap_or_default();
+            s.push_str(&format!(
+                "  damage={} authored=[{}]\n",
+                forge_scale::damage_state_name(m.flags.damage_state()),
+                authored.iter().map(|&st| forge_scale::damage_state_name(st)).collect::<Vec<_>>().join(", ")
+            ));
         }
         if let Some(r) = self.h4_records.get(&datum) { s.push_str(&h4_record_lines(r, &self.h4_labels)); }
         s
@@ -1863,6 +3453,60 @@ fn h4_record_lines(r: &H4PlacedObject, labels: &[String]) -> String {
 // record, `set` / `get` over the record, `dup`, and `save` through `build_h4_save_list_core` ->
 // gates -> `save_objects`.
 impl ScriptHost {
+    /// #fp-arms  The GUI's first-person wiring, for this host: resolve the `@player
+    /// representation` rows once, then dress them in whichever player the camera is riding.
+    fn film_resolve_first_person(&mut self) {
+        let Some(sc) = self.scene.as_deref_mut() else { return };
+        if self.film_driver.fp_reps.is_empty() {
+            self.film_driver.resolve_first_person(sc);
+        }
+        let dress: Option<(u8, Vec<u8>)> = self.film_play.as_ref().and_then(|pb| {
+            if !pb.camera.is_first_person() {
+                return None;
+            }
+            // #fp-arms  The CAMERA's subject, by slot -- including the owner-keyed route the
+            // window's camera list uses. Asking only the body's slot binding returned None for an
+            // owner group the recording never bound, and no armour was installed at all.
+            let slot = pb.subject_slot()?;
+            let a = self.film.as_deref()?.header.players.iter().find(|p| p.index as u8 == slot)?.appearance()?;
+            Some((slot, a.slots.to_vec()))
+        });
+        if let (Some((slot, app)), Some(sc)) = (dress, self.scene.as_deref_mut()) {
+            self.film_fp_armour = self.film_driver.dress_first_person(sc, slot, &app, self.film_fp_armour);
+        }
+    }
+
+    /// #gamevariant  The GUI's `film_resolve_spawn_weapon`, for this host.
+    ///
+    /// Resolving the variant's `motl` loadout collection to a `weap` tag needs an open map, and
+    /// the map and the index arrive in either order, so it is attempted until it lands and is a
+    /// no-op after that. Clearing `film_spawn_weapon` is what re-arms it for the next film.
+    fn film_resolve_spawn_weapon(&mut self) {
+        if self.film_spawn_weapon.is_some() || self.film_play.is_none() {
+            return;
+        }
+        let Some(scene) = self.scene.as_deref() else { return };
+        let Some(cache) = scene.cache_handle() else { return };
+        let native = scene.native_dll();
+        let Some(gv) = self.film.as_deref().and_then(|f| f.header.gametype.clone()) else {
+            self.film_spawn_weapon = Some(crate::film_variant::SpawnWeaponApplied {
+                why: "this recording carries no game variant",
+                ..Default::default()
+            });
+            return;
+        };
+        let names = crate::film_variant::VariantNames::build(native, cache);
+        let weap_tags = native.tags_by_group(cache, "weap");
+        let Some(pb) = self.film_play.as_mut() else { return };
+        self.film_spawn_weapon = Some(crate::film_variant::apply_spawn_weapons(
+            &mut pb.index.tracks,
+            crate::film_play::BIPED_TYPE,
+            &gv,
+            &names,
+            &weap_tags,
+        ));
+    }
+
     /// Drop every Halo 4 state (a Reach load, or before a fresh Halo 4 load).
     fn h4_drop(&mut self) {
         self.h4_scene = None;
@@ -1899,6 +3543,7 @@ impl ScriptHost {
         self.renderer.set_h4_filmic(&self.queue, None);
         self.renderer.set_sun_dir(placeholder_sun_dir());
         self.screenfx_cache.clear();
+        self.h4_screenfx_cache.clear();
         self.screenfx_pushed = None;
 
         let loaded = load_map_with_variant(path, variant).map_err(|e| format!("{e:#}"))?;
@@ -1918,6 +3563,7 @@ impl ScriptHost {
                 Lane::AlphaTest => self.renderer.append_alphatest_meshes(v),
                 Lane::Blend => self.renderer.append_blend_meshes(v),
                 Lane::Additive => self.renderer.append_additive_meshes(v),
+                Lane::Water => self.renderer.append_water_meshes(v),
                 Lane::Sky => self.renderer.set_sky_meshes(v.into_iter().map(|m| { let b = m.blend_mode(); let k = m.centroid()[0]; (m, b, k) }).collect()),
             }
         }
@@ -2157,6 +3803,7 @@ impl ScriptHost {
             "scale_q" | "real6q" => r.scale_q = int("scale_q", 0, 63)? as u8,
             "scaled" => flags.scaled = forge_scale::parse_flag_value(value)?,
             "shadow" | "castshadow" | "shadowcaster" => flags.shadow = forge_scale::parse_flag_value(value)?,
+            "damage" | "damagestate" | "damage_state" | "state" => flags.damage = forge_scale::parse_damage_value(value)?,
             "cachedtype" | "cached_type" | "type" => return Err("the Halo 4 object type is dictated by the palette entry (read-only)".into()),
             other => return Err(format!("unknown Halo 4 field '{other}'")),
         }
@@ -2411,3 +4058,308 @@ fn hide_console() {
 }
 #[cfg(not(windows))]
 fn hide_console() {}
+
+// =================================================================================================
+// #prefab  PREFABS in the headless host
+// =================================================================================================
+//
+// The same prefab core the app uses (`prefab.rs`), over the host's own object lists, so
+// `prefab list / show / place / rename / delete / import / export / where` all work from
+// `--exec` / `--script` with no window - which is how a prefab placement gets a screenshot and a
+// regression test without a human.
+//
+// WHAT THE HOST CANNOT SEE: the host keeps a thin per-object record for Reach (`HMeta`: team,
+// colour, respawn, spawn sequence, label, boundary, the pseudo-flags) because it cannot save a
+// Reach variant at all - the placement flags, the teleporter channel and the spare-clip count
+// only exist on the interactive app's full `ObjMeta`. So a Reach `prefab save` here says what it
+// could not capture instead of pretending. Halo 4 / H2A keep the FULL `.mvar` record
+// (`h4_records`), so a Halo 4 capture here is complete.
+impl crate::prefab::PrefabScene for ScriptHost {
+    fn pf_target(&self) -> Option<(mapcat::Game, String)> {
+        if self.map_path.is_empty() {
+            return None;
+        }
+        let mp = std::path::Path::new(&self.map_path);
+        let stem = mp.file_stem().map(|s| s.to_string_lossy().to_ascii_lowercase())?;
+        let game = self
+            .cands
+            .iter()
+            .find(|c| c.path == mp)
+            .map(|c| c.game)
+            .unwrap_or(if self.h4_scene.is_some() { mapcat::Game::Halo4 } else { mapcat::Game::Reach });
+        Some((game, stem))
+    }
+
+    fn pf_palette(&self) -> Vec<crate::prefab::PalRow> {
+        use crate::prefab::PalRow;
+        if let Some(pal) = self.h4_pal.as_ref() {
+            return self
+                .h4_items
+                .iter()
+                .enumerate()
+                .map(|(i, it)| {
+                    let v = pal.resolve(Some(it.quota), Some(it.variant));
+                    let cat = pal.entries.get(it.quota as usize).map(|e| e.category as u32).unwrap_or(0);
+                    PalRow {
+                        index: i,
+                        key: v.map(|(_, v)| crate::xgame::object_key(&v.tag_path, &v.name, v.variant_sid)).unwrap_or_default(),
+                        display: if it.variant_display.is_empty() { it.display.clone() } else { format!("{} \u{b7} {}", it.display, it.variant_display) },
+                        tag: v.map(|(_, v)| v.tag_path.clone()).unwrap_or_default(),
+                        variant: v.map(|(_, v)| v.name.clone()).unwrap_or_default(),
+                        variant_sid: v.map(|(_, v)| v.variant_sid).unwrap_or(0),
+                        spot: [cat, it.quota as u32, it.variant as u32],
+                        price: it.price as f64,
+                        max_allowed: it.max,
+                    }
+                })
+                .collect();
+        }
+        let Some(scene) = self.scene.as_deref() else { return Vec::new() };
+        self.place_palette
+            .iter()
+            .enumerate()
+            .map(|(i, (_, obj_tag, name, sid))| {
+                let e = self.palette.iter().find(|e| e.tag_short == *obj_tag && e.variant_name_sid == *sid)
+                    .or_else(|| self.palette.iter().find(|e| e.tag_short == *obj_tag));
+                let tag = scene.tag_name_of(*obj_tag);
+                let quota = e
+                    .and_then(|e| self.types.iter().position(|&(p, w)| p == e.palette_index && w == e.entry_within))
+                    .unwrap_or(0) as u32;
+                PalRow {
+                    index: i,
+                    key: crate::xgame::object_key(&tag, e.map(|e| e.variant_name.as_str()).unwrap_or(""), *sid),
+                    display: name.clone(),
+                    tag,
+                    variant: e.map(|e| e.variant_name.clone()).unwrap_or_default(),
+                    variant_sid: *sid,
+                    spot: [e.map(|e| e.palette_index).unwrap_or(0), quota, e.map(|e| e.variant_within).unwrap_or(0)],
+                    price: 0.0,
+                    max_allowed: 0,
+                }
+            })
+            .collect()
+    }
+
+    fn pf_capacity(&self) -> crate::prefab::Capacity {
+        let pal = <Self as crate::prefab::PrefabScene>::pf_palette(self);
+        let mut per_quota = std::collections::HashMap::new();
+        let mut spent = 0.0f64;
+        for (&d, _) in self.meta.iter() {
+            if let Some(row) = self.pf_pal_index(d).and_then(|i| pal.get(i)) {
+                *per_quota.entry(row.spot[1]).or_insert(0u32) += 1;
+                spent += row.price;
+            }
+        }
+        let priced = self.h4_scene.is_some();
+        crate::prefab::Capacity {
+            slots_used: self.meta.len() + self.h4_unresolved.len(),
+            slots_max: crate::h4::mvar::H4_SLOTS,
+            budget_spent: spent,
+            budget_max: self.variant_globals.as_ref().map(|g| g.budget_max as f64).unwrap_or(0.0),
+            budget_priced: priced,
+            per_quota,
+        }
+    }
+
+    fn pf_selection(&self) -> Vec<u32> {
+        self.selected.clone()
+    }
+    fn pf_set_selection(&mut self, datums: Vec<u32>) {
+        self.selected = datums;
+    }
+
+    fn pf_read(&self, datum: u32) -> Option<(Option<usize>, crate::prefab::PrefabObject)> {
+        let o = self.objects.iter().find(|o| o.datum == datum)?;
+        let m = self.meta.get(&datum)?;
+        let team_u8 = self.colors.get(&datum).map(|(t, _)| *t).unwrap_or(m.team);
+        let rec = self.h4_records.get(&datum);
+        let mut labels: Vec<String> = Vec::new();
+        if !m.label.is_empty() {
+            labels.push(m.label.clone());
+        }
+        if let Some(r) = rec {
+            for l in r.labels.iter().skip(1).flatten() {
+                if let Some(s) = self.h4_labels.get(*l as usize).filter(|s| !s.is_empty()) {
+                    if !labels.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+                        labels.push(s.clone());
+                    }
+                }
+            }
+        }
+        let shape_wu = match rec {
+            Some(r) => r.shape_wu(),
+            None => {
+                let n = [0usize, 1, 3, 4][(m.boundary_shape as usize).min(3)];
+                let mut w = [0.0f32; 4];
+                for k in 0..n {
+                    w[k] = (m.boundary[k] as f32 / 2047.0) * 200.0;
+                }
+                w
+            }
+        };
+        let po = crate::prefab::PrefabObject {
+            key: String::new(), // `capture` fills it from the palette row
+            display: m.name.clone(),
+            tag: self.objscene().map(|s| s.tag_name_of(o.primary_tag)).unwrap_or_default(),
+            variant: String::new(),
+            variant_sid: o.variant_name_sid,
+            spot: None,
+            pos: o.pos,
+            fwd: o.fwd,
+            up: o.up,
+            team: if team_u8 == 0xFF { -1 } else { team_u8.min(8) as i16 },
+            color: (m.color >= 0).then(|| m.color as u8),
+            spawn_time: m.respawn,
+            spawn_sequence: m.spawn_seq,
+            user_data: rec.map(|r| r.user_data as i32).unwrap_or(0),
+            placement: rec.map(|r| (r.placement & 0xFF) as u8).unwrap_or(mvar::PLACEMENT_DEFAULT_SPAWNABLE),
+            placement_hi: rec.map(|r| (r.placement >> 8) as u8).unwrap_or(0),
+            shape: m.boundary_shape,
+            shape_wu,
+            labels,
+            tele_channel: 0,
+            tele_passability: 0,
+            weapon_clips: 0,
+            object_type: m.cached_type,
+            scale_q: rec.map(|r| r.scale_q).filter(|q| *q != crate::h4::mvar::SCALE_Q_DEFAULT),
+            locked: rec.map(|r| r.locked).unwrap_or(false),
+            trait_zone: 0,
+            scaled: m.flags.scaled,
+            shadow: m.flags.shadow,
+            damage: m.flags.damage,
+        };
+        Some((self.pf_pal_index(datum), po))
+    }
+
+    fn pf_place(&mut self, pal: usize, o: &crate::prefab::PrefabObject) -> Result<u32, String> {
+        let datum = self.next_datum;
+        let team_u8: u8 = if o.team < 0 { 0xFF } else { o.team.min(8) as u8 };
+        let (mode, obj_tag, name, variant_sid, h4) = match (self.h4_pal.is_some(), self.h4_items.get(pal), self.place_palette.get(pal)) {
+            (true, Some(it), _) => (
+                it.editor_mode_tag,
+                it.obje_tag.map(h4_tag).unwrap_or(0),
+                if it.variant_name.is_empty() { it.name.clone() } else { format!("{}:{}", it.name, it.variant_name) },
+                0u32,
+                Some((it.quota, it.variant)),
+            ),
+            (false, _, Some(t)) => (t.0, t.1, t.2.clone(), t.3, None),
+            _ => return Err(format!("palette row {pal} is out of range")),
+        };
+        let mut hm = HMeta { name: name.clone(), team: team_u8, color: o.color.map(|c| c as i32).unwrap_or(-1),
+            cached_type: o.object_type, spawn_seq: o.spawn_sequence, respawn: o.spawn_time,
+            label: o.labels.first().cloned().unwrap_or_default(), boundary_shape: o.shape, boundary: [0; 4],
+            flags: forge_scale::ObjFlags { scaled: o.scaled, shadow: o.shadow, damage: o.damage }, h4_scale: None };
+        let (mut fwd, mut up) = (o.fwd, o.up);
+        if let Some((quota, variant)) = h4 {
+            let mut rec = self.h4_instantiate(quota, variant, o.pos, o.fwd, o.up)?;
+            rec.team = o.team.clamp(-1, 8) as i8;
+            rec.color = o.color;
+            rec.spawn_time = o.spawn_time;
+            rec.spawn_sequence = o.spawn_sequence.clamp(-100, 100) as i8;
+            rec.user_data = o.user_data.clamp(-100, 100) as i8;
+            rec.placement = ((o.placement_hi as u16) << 8) | o.placement as u16;
+            rec.locked = o.locked;
+            if let Some(q) = o.scale_q {
+                rec.scale_q = q.min(63);
+            }
+            rec.shape = match o.shape { 1 => crate::h4::mvar::H4Shape::Sphere, 2 => crate::h4::mvar::H4Shape::Cylinder, 3 => crate::h4::mvar::H4Shape::Box, _ => crate::h4::mvar::H4Shape::None };
+            rec.shape_values = [0; 4];
+            for k in 0..rec.shape.value_count() {
+                rec.shape_values[k] = crate::h4::edit::shape_wu_to_raw(o.shape_wu[k]);
+            }
+            // Resolve the label indices against a COPY of the table: the closure must not keep a
+            // borrow of `self` alive into the `h4_records.insert` below.
+            let table = self.h4_labels.clone();
+            for k in 0..4 {
+                rec.labels[k] = o.labels.get(k).and_then(|s| table.iter().position(|t| t.eq_ignore_ascii_case(s)).map(|i| i as u8));
+            }
+            fwd = rec.fwd;
+            up = rec.up;
+            hm = h4_hmeta(&rec, &name, &table);
+            hm.flags = forge_scale::ObjFlags { scaled: o.scaled, shadow: o.shadow, damage: o.damage };
+            self.h4_records.insert(datum, rec);
+        } else {
+            let n = [0usize, 1, 3, 4][(o.shape as usize).min(3)];
+            for k in 0..n {
+                hm.boundary[k] = crate::wu_to_bval(o.shape_wu[k]);
+            }
+        }
+        self.next_datum = self.next_datum.wrapping_add(1);
+        self.colors.insert(datum, (team_u8, o.color.unwrap_or(0xFF)));
+        self.meta.insert(datum, hm);
+        self.objects.push(ObjectInfo {
+            datum, type_sig: 0, sig0: 0, sig1: 0, pos: o.pos, health: 1.0, shield: 1.0,
+            mode_tag: mode, fwd, up, attached: [0; 8], primary_tag: obj_tag, variant_name_sid: variant_sid,
+        });
+        self.dirty = true;
+        Ok(datum)
+    }
+
+    fn pf_remove(&mut self, datums: &[u32]) {
+        if datums.is_empty() {
+            return;
+        }
+        self.objects.retain(|o| !datums.contains(&o.datum));
+        for d in datums {
+            self.meta.remove(d);
+            self.colors.remove(d);
+            self.h4_records.remove(d);
+        }
+        self.selected.retain(|d| !datums.contains(d));
+        self.dirty = true;
+    }
+
+    fn pf_labels(&self) -> Vec<String> {
+        if self.h4_scene.is_some() {
+            return self.h4_labels.clone();
+        }
+        // The host does not keep the Reach label table (it cannot save a Reach variant), so a
+        // Reach placement here reports every label as dropped rather than inventing an index.
+        Vec::new()
+    }
+
+    fn pf_drop_point(&self) -> [f32; 3] {
+        let fwd = self.camera.forward();
+        self.objscene()
+            .and_then(|s| s.raycast_scene(self.camera.pos, fwd))
+            .unwrap_or(self.camera.pos + fwd * 12.0)
+            .to_array()
+    }
+
+    fn pf_invalidate(&mut self) {
+        self.dirty = true;
+        if let Some(s) = self.objscene_mut() {
+            s.invalidate();
+        }
+    }
+}
+
+impl ScriptHost {
+    /// #prefab Palette row of a placed object: the Halo 4 record's own (quota, variant), else the
+    /// Reach object tag + model-variant sid.
+    fn pf_pal_index(&self, datum: u32) -> Option<usize> {
+        if let Some(r) = self.h4_records.get(&datum) {
+            let (q, v) = (r.quota?, r.variant.unwrap_or(0));
+            return self.h4_items.iter().position(|it| it.quota == q && it.variant == v);
+        }
+        let o = self.objects.iter().find(|o| o.datum == datum)?;
+        self.place_palette
+            .iter()
+            .position(|(_, t, _, sid)| *t == o.primary_tag && *sid == o.variant_name_sid)
+            .or_else(|| self.place_palette.iter().position(|(_, t, _, _)| *t == o.primary_tag))
+    }
+
+    /// #prefab The `prefab …` verb in the headless host.
+    fn prefab_command(&mut self, args: &str) -> Result<String, String> {
+        let saving = args.trim_start().to_ascii_lowercase().starts_with("save");
+        let reach = self.h4_scene.is_none() && self.scene.is_some();
+        let out = crate::prefab::command(self, args)?;
+        if saving && reach {
+            return Ok(format!(
+                "{out}\n  ! captured headlessly: the placement flags, teleporter channel and spare-clip count are not tracked \
+                 outside the interactive app, so they were left at their defaults. Save the prefab from the app for the full record."
+            ));
+        }
+        Ok(out)
+    }
+}

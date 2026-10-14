@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v0.1.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -26,6 +26,7 @@
 <li><a href="rendering.html">Rendering &amp; settings</a></li>
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -37,11 +38,39 @@
 <!-- title: Keyboard shortcuts -->
 <!-- desc: Every keyboard and mouse shortcut in Halo Map Studio, generated from the application's input handlers. -->
 <h1>Keyboard shortcuts</h1>
-<p class="lead">Verified against the <strong>v0.1.0</strong> source (2026-09-17). In the app, <em>Help ▸ Keyboard shortcuts…</em> opens the same reference; the tables below mirror that window row for row, and it is the source of truth for your build.</p>
+<p class="lead">Verified against the <strong>v1.4.0</strong> source (2026-09-24). In the app, <em>Help ▸ Keyboard shortcuts…</em> opens the same reference, generated from the live binding table — so it always lists <strong>your</strong> keys, and it is the source of truth for your build. The tables below are the <strong>factory defaults</strong>, row for row; <a href="#rebind">every one of them can be changed</a>.</p>
 <p>Keys are ignored while a text field has focus. File, Edit, View and Tools actions live in the menu bar.</p>
 
+<div class="note" id="rebind">
+<h2 style="margin-top:0">Every key here can be changed</h2>
+<p>The keys on this page are the <strong>defaults</strong>. <em>Settings ▸ Controls &amp; keyboard…</em> lets you
+rebind any of them: the camera fly keys, the move / rotate / duplicate keys, the axis locks, undo, redo,
+delete, select-all, the nudges, the held modifiers, and which mouse button flies the camera. Click a key,
+press the new one, and it is saved straight away.</p>
+<p>Two ready-made sets are one click away, for people who hold the mouse in their <strong>left</strong> hand:
+<em>Left-handed — arrow keys</em> flies the camera on the arrow cluster with <kbd>PgUp</kbd> / <kbd>PgDn</kbd>
+for up and down (the nudges move to <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> so they stay under the
+same hand), and <em>Left-handed — I J K L</em> flies on <kbd>I</kbd> <kbd>J</kbd> <kbd>K</kbd> <kbd>L</kbd> with
+<kbd>U</kbd> / <kbd>O</kbd> for up and down, which leaves the arrow keys nudging. <em>Restore all defaults</em>
+puts everything back.</p>
+<p><strong>Non-QWERTY keyboards.</strong> The six fly keys are matched by the key's <strong>position</strong>, not
+by the letter printed on it, so the cluster keeps its shape: on an AZERTY keyboard you fly with
+<kbd>Z</kbd> <kbd>Q</kbd> <kbd>S</kbd> <kbd>D</kbd> and on Dvorak with <kbd>,</kbd> <kbd>A</kbd> <kbd>O</kbd>
+<kbd>E</kbd>, with nothing to set up. Command shortcuts (<kbd>Ctrl</kbd>+<kbd>Z</kbd>, <kbd>G</kbd>,
+<kbd>R</kbd> …) are matched by the letter, because that is the key you went looking for. Each binding has a
+small <code>pos</code> / <code>abc</code> switch on the page if you want the other behaviour.</p>
+<p><strong>Not rebindable:</strong> <kbd>Esc</kbd> (it always cancels — a transform, a half-drawn guide, an open
+menu, or a key capture on the Controls page) and <kbd>Tab</kbd> (it moves between the panel controls).
+A left click always selects, a left drag always box-selects, and <kbd>Ctrl</kbd>+wheel always changes the
+fly speed.</p>
+<p>The bindings live in <code>keybinds.json</code> next to the other settings
+(<code>%LOCALAPPDATA%\HaloMapStudio</code> on Windows, <code>~/.local/share/HaloMapStudio</code> on Linux).
+It is plain text and readable — <code>"cam_forward": ["pos:W"]</code> — and if a line in it is damaged, that
+one action falls back to its default and the page tells you which.</p>
+</div>
+
 <h2>Camera</h2>
-<p>Hold the <strong>right mouse button</strong> over the viewport to fly. While you fly (and while a grab / rotate transform is active) the OS cursor is <strong>hidden and captured</strong> — locked in place on Windows and Wayland, confined to the window on X11 — so it cannot wander onto the side panels; it is released when you let go of the button.</p>
+<p>Hold the <strong>right mouse button</strong> over the viewport to fly (which button that is, and every key below, is yours to change — see <a href="#rebind">above</a>). While you fly (and while a grab / rotate transform is active) the OS cursor is <strong>hidden and captured</strong> — locked in place on Windows and Wayland, confined to the window on X11 — so it cannot wander onto the side panels; it is released when you let go of the button.</p>
 <div class="tablewrap"><table>
 <tr><th>Keys</th><th>Action</th></tr>
 <tr><td>Right-drag</td><td>Look around</td></tr>
@@ -49,9 +78,28 @@
 <tr><td><kbd>E</kbd> or <kbd>R</kbd></td><td>Fly up (RMB held)</td></tr>
 <tr><td><kbd>Q</kbd> or <kbd>F</kbd></td><td>Fly down (RMB held)</td></tr>
 <tr><td><kbd>Shift</kbd> (hold)</td><td>4x fly speed (RMB held)</td></tr>
-<tr><td><kbd>Ctrl</kbd> + wheel</td><td>Change fly speed (viewport hovered)</td></tr>
+<tr><td><kbd>Alt</kbd> (hold)</td><td>Quarter fly speed, for lining up a close shot (RMB held)</td></tr>
+<tr><td><kbd>Ctrl</kbd> + wheel</td><td>Change fly speed (viewport hovered) — not rebindable</td></tr>
 <tr><td><kbd>F</kbd></td><td>Fly the camera to the selected object (not flying, no text field focused)</td></tr>
 <tr><td><kbd>F12</kbd></td><td>Screenshot to the captures folder (<code>captures/viewer_last.png</code>)</td></tr>
+</table></div>
+
+<h2>Test mode (Play menu)</h2>
+<p><strong>Play</strong> &rsaquo; <em>Spartan</em> or <em>Elite</em> puts you in the map as a biped and lets you walk around what you have built. It is a test mode, not a game: there is no damage, no AI and no scoring, and melee plays the swing without hurting anything. Every movement number is the biped's own &mdash; its authored run and walk speeds, its jump velocity, its camera heights, its turning speed and its slope limit all come out of the map. The cursor is captured while you play; <kbd>Esc</kbd> gives it back along with the editor camera you left from.</p>
+<div class="tablewrap"><table>
+<tr><th>Keys</th><th>Action</th></tr>
+<tr><td><kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd></td><td>Walk / strafe &mdash; the same keys that fly the camera, so one rebind covers both</td></tr>
+<tr><td>Mouse</td><td>Look around. Your body turns to follow at the biped's own turning speed, and takes up the difference in its shoulders and head, which is how the game does it</td></tr>
+<tr><td><kbd>Space</kbd></td><td>Jump, at the biped's own authored jump velocity</td></tr>
+<tr><td><kbd>Ctrl</kbd> (hold)</td><td>Crouch &mdash; the view drops to the biped's own crouching camera height</td></tr>
+<tr><td><kbd>Shift</kbd> (hold)</td><td>Sprint, at the globals' own full-speed multiplier</td></tr>
+<tr><td><kbd>Alt</kbd> (hold)</td><td>Walk slowly, at the authored walking speed</td></tr>
+<tr><td>Left mouse</td><td>Fire the weapon in your hands, along the crosshair</td></tr>
+<tr><td><kbd>V</kbd></td><td>Melee &mdash; the weapon class's own swing, at the weapon's own authored lunge range</td></tr>
+<tr><td><kbd>E</kbd></td><td><strong>Use:</strong> get into the vehicle seat you are standing at, get out of the one you are in, or pick up the weapon you are standing next to. A vehicle wins when both are in range, and the prompt you see is the game's own words with this key in it</td></tr>
+<tr><td><kbd>T</kbd></td><td>First / third person. Halo draws no legs in first person, so third person is where you see your whole body</td></tr>
+<tr><td>Play menu</td><td><em>Give weapon</em>: put any of the map's own weapons in your hands &mdash; or just walk up to one lying on the map and press <kbd>E</kbd></td></tr>
+<tr><td><kbd>Esc</kbd></td><td>Leave test mode and put the editor camera back where it was</td></tr>
 </table></div>
 
 <h2>Selection (Select tool)</h2>
@@ -127,6 +175,7 @@
 <tr><td><em>View ▸ Overlays: Grid</em>, <em>Lights</em>, <em>Boundary shapes</em>, <em>Collision (selected)</em>, <em>Physics (selected)</em></td><td>The reference grid, the light markers (marker only — it does not change the lighting), teleporter / objective zones and the selected object's collision and physics hulls.</td></tr>
 <tr><td><em>View ▸ Overlays: Show map spawn points</em></td><td>Draw the base map's own built-in spawn markers (off by default; persisted). Script: <code>mapspawns on|off</code>.</td></tr>
 <tr><td><em>View ▸ Show hidden-block physics hulls</em></td><td>Draw the physics hulls of the variant's hidden (invisible) blocks (on by default; persisted). Script: <code>outlines on|off</code>.</td></tr>
+<tr><td><em>View ▸ Overlays: Save-precision ghost</em></td><td>Draw the selected object(s) in violet at the pose the <code>.mvar</code> will really hold after quantisation, with an <em>exaggerate</em> factor so a sub-millimetre drift is visible (off by default; persisted). The status bar says when it is on and when it is exaggerated. Script: <code>precision ghost on|off|&lt;factor&gt;</code>. See <a href="editing.html#precision">Save precision</a>.</td></tr>
 <tr><td><em>View ▸ Selection wireframe through objects</em></td><td>Draw the selected object's wireframe through anything in front of it, so a buried or hidden piece still shows its whole outline (off by default; persisted). The wireframe itself always has a dark outline under a bright core, so it stays readable on white Forge pieces and in dark interiors alike. Script: <code>wirexray on|off</code>.</td></tr>
 <tr><td><em>View ▸ Trigger volumes</em></td><td>Draw the scenario's trigger volumes as wireframe boxes (off by default). Script: <code>triggers on|off</code>.</td></tr>
 <tr><td><em>View ▸ Soft ceilings (map floor)</em></td><td>Draw the invisible planes that bound the playable space — the map floor, walls and sky ceiling (off by default; persisted). Script: <code>softceilings on|off</code>.</td></tr>
@@ -134,12 +183,13 @@
 <tr><td><em>View ▸ Playable BSP bounds</em></td><td>Draw each playable BSP's own bounds box and floor (off by default; persisted). Script: <code>playablebounds on|off</code>.</td></tr>
 <tr><td><em>Tools ▸ Line tool</em> / <em>Fill tool</em>, <em>Scale converter…</em>, <em>Light bake map…</em>, <em>Construction (CAD)…</em> (<kbd>C</kbd>), <em>Model Painter…</em>, <em>Import geometry…</em>, <em>Script console…</em></td><td>As named</td></tr>
 <tr><td><em>Settings ▸ Lighting &amp; rendering…</em></td><td>The Settings window: <em>Lighting</em>, <em>Camera &amp; rendering</em> (fly speed, camera stand-off, path-traced and real-time lighting) and <em>Advanced (diagnostics)</em> — see <a href="rendering.html">Rendering &amp; settings</a>. What is DRAWN is in the <em>View</em> menu.</td></tr>
-<tr><td><em>Help ▸ Keyboard shortcuts…</em></td><td>The in-app version of this page</td></tr>
+<tr><td><em>Settings ▸ Controls &amp; keyboard…</em></td><td>Rebind any key or the fly mouse button, apply a right-handed / left-handed preset, or restore the defaults — see <a href="#rebind">Every key here can be changed</a>.</td></tr>
+<tr><td><em>Help ▸ Keyboard shortcuts…</em></td><td>The in-app version of this page. It lists <strong>your</strong> current bindings, not the defaults, because it is generated from the same table the editor reads.</td></tr>
 </table></div>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v0.1.0 source (2026-09-17). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

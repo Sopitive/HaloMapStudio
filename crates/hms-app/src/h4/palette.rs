@@ -44,6 +44,38 @@ pub const PALETTE_FLAG_HIDDEN: u8 = 1;
 /// The unic tag carrying the Forge UI strings.
 pub const FORGE_STRINGS_TAG: &str = "ui\\strings\\forge";
 
+/// The scnr Forge-palette block layout, which differs between Halo 4 and Halo 2 Anniversary.
+/// The palette (outer) level is identical (0x14 stride); H2A inserts a `u32` at +0x04 in BOTH the
+/// entry and the variant level, growing their strides by 4 and shifting every field after +0x04.
+/// (VERIFIED on all 10 H2A maps: 3062 variants, 0 unresolved - re-notes/h2a_support_plan.md §7.)
+#[derive(Clone, Copy)]
+pub(crate) struct PaletteLayout {
+    pub(crate) entry_stride: usize,
+    pub(crate) entry_variants: usize, // variants sub-block offset within an entry
+    pub(crate) entry_max: usize,      // i32 "maximum allowed"
+    pub(crate) entry_price: usize,    // i32 price per instance
+    pub(crate) entry_thorage: usize,  // u8 thorage flag (H2A: 0 here, no such field)
+    pub(crate) variant_stride: usize,
+    pub(crate) variant_tag: usize,    // object tag ref
+    pub(crate) variant_hlmt: usize,   // hlmt variant sid
+    pub(crate) variant_pred: [usize; 4], // the four resource-prediction sub-blocks
+}
+
+impl PaletteLayout {
+    pub(crate) fn for_engine(e: super::cache::Engine) -> Self {
+        match e {
+            super::cache::Engine::Halo4 => PaletteLayout {
+                entry_stride: 0x1C, entry_variants: 0x04, entry_max: 0x10, entry_price: 0x14, entry_thorage: 0x18,
+                variant_stride: 0x48, variant_tag: 0x04, variant_hlmt: 0x14, variant_pred: [0x18, 0x24, 0x30, 0x3C],
+            },
+            super::cache::Engine::H2A => PaletteLayout {
+                entry_stride: 0x20, entry_variants: 0x08, entry_max: 0x14, entry_price: 0x18, entry_thorage: 0x1C,
+                variant_stride: 0x4C, variant_tag: 0x08, variant_hlmt: 0x18, variant_pred: [0x1C, 0x28, 0x34, 0x40],
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ForgeCategory {
     /// Index in the scnr palette block.
@@ -153,7 +185,7 @@ impl ForgePalette {
             name: e.name.clone(),
             max: e.max_allowed,
             price: e.price,
-            variants: e.variants.iter().map(|v| H4PaletteVariant { name: v.name.clone(), variant_name: v.variant_name.clone(), tag: v.tag }).collect(),
+            variants: e.variants.iter().map(|v| H4PaletteVariant { name: v.name.clone(), variant_name: v.variant_name.clone(), variant_sid: v.variant_sid, tag: v.tag }).collect(),
         }).collect()
     }
     /// Entries visible in the normal Forge menu (not the hidden superforge palettes).
@@ -193,6 +225,7 @@ pub fn palette(c: &H4Cache) -> ForgePalette {
     let Some(&scnr) = c.find_tags(b"scnr").first() else { return out };
     let Some(sm) = c.tag_meta(scnr) else { return out };
     let Some((np, po)) = c.block(sm + OFF_SCNR_FORGE_PALETTE) else { return out };
+    let lay = PaletteLayout::for_engine(c.engine);
     // English strings of `ui\strings\forge`, then anywhere in the language table
     let loc = LocaleTable::load(c, LANG_ENGLISH);
     let forge = loc.as_ref().and_then(|l| l.window_of(c, FORGE_STRINGS_TAG));
@@ -216,19 +249,19 @@ pub fn palette(c: &H4Cache) -> ForgePalette {
         if let Some((ne, eo)) = c.block(pe + 8) {
             for k in 0..ne.min(256) {
                 if entries.len() >= 256 { break; }
-                let e = eo + k * FORGE_ENTRY_ELEM;
+                let e = eo + k * lay.entry_stride;
                 let esid = d.u32_at(e);
                 let ename = c.sid(esid);
                 let edisplay = display(esid, &ename);
                 let mut variants = Vec::new();
-                if let Some((nv, vo)) = c.block(e + 4) {
+                if let Some((nv, vo)) = c.block(e + lay.entry_variants) {
                     for v in 0..nv.min(32) {
-                        let va = vo + v * FORGE_VARIANT_ELEM;
+                        let va = vo + v * lay.variant_stride;
                         let vsid = d.u32_at(va);
                         let vname = c.sid(vsid);
-                        let tag = c.tag_ref(va + 4).map(|(_, t)| t);
-                        let variant_sid = match d.u32_at(va + 0x14) { 0xFFFF_FFFF => 0, x => x };
-                        let prediction = [0x18usize, 0x24, 0x30, 0x3C].map(|o| c.block(va + o).map(|(n, _)| n).unwrap_or(0));
+                        let tag = c.tag_ref(va + lay.variant_tag).map(|(_, t)| t);
+                        let variant_sid = match d.u32_at(va + lay.variant_hlmt) { 0xFFFF_FFFF => 0, x => x };
+                        let prediction = lay.variant_pred.map(|o| c.block(va + o).map(|(n, _)| n).unwrap_or(0));
                         variants.push(ForgeVariant {
                             index: v,
                             sid: vsid,
@@ -248,7 +281,7 @@ pub fn palette(c: &H4Cache) -> ForgePalette {
                 }
                 entries.push(ForgeEntry {
                     quota: entries.len() as u8, category: i, sid: esid, name: ename, display: edisplay,
-                    max_allowed: d.i32_at(e + 0x10), price: d.i32_at(e + 0x14), thorage: d.u8_at(e + 0x18) != 0, variants,
+                    max_allowed: d.i32_at(e + lay.entry_max), price: d.i32_at(e + lay.entry_price), thorage: d.u8_at(e + lay.entry_thorage) != 0, variants,
                 });
                 cat.entry_count += 1;
             }

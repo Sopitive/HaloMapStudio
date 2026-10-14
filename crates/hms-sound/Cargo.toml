@@ -1,0 +1,25 @@
+# =============================================================================
+# hms-sound — read Halo: Reach (MCC) FMOD sound banks.
+#
+# Reach MCC keeps every sound sample in FSB5 banks beside the game executable
+# (`haloreach/fmod/pc/*.fsb`), encoded as FMOD Vorbis. This crate reads those
+# banks, joins a bank sample to the `snd!`/`ugh!` tag data in a map, and
+# re-frames one sample as a standard Ogg Vorbis bitstream.
+#
+# DELIBERATELY DEPENDENCY-LIGHT. There is no audio decoder and no audio output
+# here: nothing in this crate opens a sound device, so it cannot make a noise
+# and cannot fail on a machine with no audio hardware. Choosing a decoder and
+# an output backend is a separate decision — see re-notes/reach_fmod_sound.md.
+# =============================================================================
+[package]
+name = "hms-sound"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+memmap2.workspace = true
+lewton.workspace = true
+cpal.workspace = true

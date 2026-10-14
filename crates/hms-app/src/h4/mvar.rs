@@ -28,6 +28,12 @@ use super::objects::{model_of, H4Placement};
 
 /// `mvar` chunk major version this decoder understands (Reach = 31).
 pub const H4_MVAR_VERSION: u16 = 50;
+/// Halo 2 Anniversary (groundhog) writes the same BLF/`chdr`/`mvar` container as Halo 4 with the
+/// chunk major bumped to 52 and a body 0x400 bytes larger; the object record is a small delta on
+/// the Halo 4 bitstream (11-bit `placement`, one extra byte in the ordinary-object tail, type 11
+/// in the single-byte tail; quota index is 8 bits in both). See `parse_h4_payload` and
+/// re-notes/h2a_support_plan.md.
+pub const H2A_MVAR_VERSION: u16 = 52;
 /// Bitstream payload size (chunk size 28 712 - 12 header - 20 hash - 4 length - 4).
 pub const H4_MVAR_PAYLOAD: usize = 28_676;
 /// Bytes the engine's bitstream writer owns (0x7000; the chunk's last 4 bytes are a zero u32).
@@ -147,9 +153,20 @@ pub struct H4PlacedObject {
     pub quota: Option<u8>,
     /// Variant index inside the quota's entry, None = default.
     pub variant: Option<u8>,
-    /// Position "in bounds" flag (always set on shipped objects; no bsp escape is read).
+    /// Position "in bounds" flag (set on every shipped Halo 4 object; H2A clears it on a record
+    /// whose position is quantised against a bsp's own bounds instead of the world box, and then
+    /// stores `h2a_bsp_ref` + those bsp-local quanta).
     pub in_bounds: bool,
     pub pos: [f32; 3],
+    /// The RAW position quanta as the file stored them. HMS re-quantises `pos` on save, so this is
+    /// only used for an H2A out-of-bounds record, whose quanta are measured against a bsp box HMS
+    /// does not have: keeping them raw is what lets such a record round-trip. #h2a-inb0
+    pub pos_q: [u32; 3],
+    /// #h2a: the 2-bit bsp reference an H2A (v52) record stores when `in_bounds` is clear
+    /// (groundhog.dll position writer sub_18051759C -> sub_1800C3620, an index over 2 bits).
+    /// `None` = the index's own "none" flag was set. Meaningless - and never written - on an
+    /// in-bounds record or on Halo 4, where the field does not exist at all.
+    pub h2a_bsp_ref: Option<u8>,
     pub up_is_global: bool,
     pub up_quant: u32,
     pub forward_angle_q: u32,
@@ -214,6 +231,12 @@ pub struct H4PlacedObject {
     pub user_data: i8,
     /// Up to four gametype label indices into `H4Variant::labels`.
     pub labels: [Option<u8>; 4],
+    /// #h2a: the THIRD 8-bit field an H2A (v52) ordinary-object record stores between the colour
+    /// index and the four label indices (props codec sub_1800B5D84 writes three bytes there,
+    /// halo4.dll's writes two). Nothing in HMS reads it and its meaning is unknown; it is kept so
+    /// a save reproduces the record bit-for-bit. Always 0 on a Halo 4 record, where the field does
+    /// not exist, and on a new object.
+    pub h2a_extra: u8,
     pub type_data: H4TypeData,
 }
 
@@ -415,14 +438,25 @@ pub fn read_h4_expanded(path: &Path) -> std::io::Result<Vec<u8>> { crate::mvar::
 /// Reads only the chunk headers; a Reach variant (v31) answers false.
 pub fn is_h4_variant(path: &Path) -> bool {
     let Ok(data) = read_h4_expanded(path) else { return false };
-    matches!(blf_h4_mvar_chunk(&data), Some((_, H4_MVAR_VERSION, _)))
+    matches!(blf_h4_mvar_chunk(&data), Some((_, H4_MVAR_VERSION | H2A_MVAR_VERSION, _)))
+}
+
+/// The MCC folder names a variant of this file's game belongs in: `(game folder, account
+/// folder)` - Halo 4's `halo4` / `Halo4`, or Halo 2 Anniversary's `groundhog` / `Halo2A`. Used by
+/// the save messages, which name where a file has to land to be listed. #h2a-mvar
+pub fn variant_folders(path: &Path) -> (&'static str, &'static str) {
+    let Ok(data) = read_h4_expanded(path) else { return ("halo4", "Halo4") };
+    match blf_h4_mvar_chunk(&data) {
+        Some((_, H2A_MVAR_VERSION, _)) => ("groundhog", "Halo2A"),
+        _ => ("halo4", "Halo4"),
+    }
 }
 
 /// Base map id of a Halo 4 variant without decoding the objects (None when not a v50 variant).
 pub fn read_h4_map_id(path: &Path) -> Option<u32> {
     let data = read_h4_expanded(path).ok()?;
     let (payload, major, _) = blf_h4_mvar_chunk(&data)?;
-    if major != H4_MVAR_VERSION { return None; }
+    if major != H4_MVAR_VERSION && major != H2A_MVAR_VERSION { return None; }
     let mut r = Bits::new(payload);
     let (h, _) = read_content_header_spans(&mut r);
     Some(h.map_id)
@@ -575,7 +609,7 @@ fn read_content_header_spans(r: &mut Bits) -> (H4ContentHeader, H4HeaderSpans) {
 
 /// Decode the `mvar` chunk payload (the bitstream after the 36-byte chunk prefix).
 pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant> {
-    if chunk_version != H4_MVAR_VERSION { bail!("mvar chunk v{chunk_version}, expected v{H4_MVAR_VERSION}"); }
+    if chunk_version != H4_MVAR_VERSION && chunk_version != H2A_MVAR_VERSION { bail!("mvar chunk v{chunk_version}, expected v{H4_MVAR_VERSION}/v{H2A_MVAR_VERSION}"); }
     if payload.len() < H4_MVAR_PAYLOAD { bail!("mvar payload {} bytes, expected {}", payload.len(), H4_MVAR_PAYLOAD); }
     let mut r = Bits::new(payload);
     let (hdr, mut spans) = read_content_header_spans(&mut r);
@@ -588,7 +622,10 @@ pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant>
     // layout plus a 16-byte map GUID after the labels (sub_1800B3BD8 reads it via
     // sub_1800F64D0 when version >= 51; a v50 file gets it synthesised from the map id and is
     // relabelled 51 in memory, which is why every save from the game comes out as 51)
-    if version != 50 && version != 51 { bail!("variant body version {version}, expected 50 or 51"); }
+    // H2A: chunk v52 carries body version 52 (the shipped hopper / classic variants) or 53 (what
+    // MCC's own Forge writes - the same layout plus the trailing map GUID, exactly as Halo 4's
+    // v50 -> v51 pair). #h2a-mvar
+    if !matches!(version, 50 | 51 | 52 | 53) { bail!("variant body version {version}, expected 50/51/52/53"); }
     let checksum = r.u32(); // map-variant-checksum
     let palette_crc = r.u32(); // m_scenario_palette_crc
     let num_quotas = r.bits(9) as u16;
@@ -626,13 +663,31 @@ pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant>
         }
     }
     spans.labels.1 = r.pos;
-    // version >= 51: the map GUID (16 raw memory bytes: u32 Data1, u16 Data2,
+    // Halo 4: version >= 51 stores the map GUID here (16 raw memory bytes: u32 Data1, u16 Data2,
     // u16 Data3, 8 bytes Data4 - sub_1800F5DB0 byte-swaps each part before the MSB-first write,
-    // so the stream bytes equal the in-memory GUID); v50 goes straight to the slots
-    let map_guid = if version >= 51 { let mut g = [0u8; 16]; for b in g.iter_mut() { *b = r.u8(); } Some(g) } else { None };
+    // so the stream bytes equal the in-memory GUID); v50 goes straight to the slots.
+    // H2A: the shipped hopper variants are body version 52 and carry NO trailing GUID here - reading
+    // one shifts the whole object array 128 bits and turns the record + quota-table decode to
+    // garbage (RE'd: brute-forcing the object start against the quota-table placed-count oracle
+    // lands exactly 128 bits earlier, and every H2A file then decodes with 0 mismatches). The
+    // engine's H2A writer only emits the GUID at a higher body version, which no shipped file uses. #h2a
+    let read_guid = if chunk_version == H2A_MVAR_VERSION { version >= 53 } else { version >= 51 };
+    let map_guid = if read_guid { let mut g = [0u8; 16]; for b in g.iter_mut() { *b = r.u8(); } Some(g) } else { None };
     let ext = [bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]];
     let axis = h4_axis_bits(21, ext);
     let obj_start_bit = r.pos;
+    // H2A = mvar chunk v52. The object record is the Halo 4 (v50) bitstream with three deltas,
+    // RE'd from groundhog.dll (record encode sub_1800B6A44 -> props encode sub_1800B5D84) against
+    // halo4.dll (record decode sub_1800B7C9C -> props decode sub_1800B7410): (1) the 10-bit
+    // `placement` flags field is 11 bits (props encoder writes `shl 11`, not `shl 10`); (2) the
+    // ordinary-object property branch stores a THIRD 8-bit field after `user_data` (three shl-8
+    // writes between the colour index and the four label indices, vs Halo 4's two); (3) object
+    // type 11 joins types 1/12 in the single-byte type tail (the props switch has an extra
+    // `type==11` case). The quota index is 8 bits in BOTH games (H2A encoder sub_1800B7A70 writes
+    // `shl 8`); the earlier 7-bit guess was wrong and mis-aligned the whole record. Every other
+    // field (present/flags/variant/position/orientation/parent/scale/lock, shape, object type,
+    // ordnance tails, colour=index3, labels=index8) is byte-identical. See re-notes/h2a_support_plan.md.
+    let h2a = chunk_version == H2A_MVAR_VERSION;
     let mut objects = Vec::new();
     for slot in 0..H4_SLOTS {
         let bit = r.pos;
@@ -640,12 +695,19 @@ pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant>
         let flags = r.bits(2) as u8;
         let quota = r.index(8).map(|v| v as u8);
         let variant = r.index(5).map(|v| v as u8);
-        // position: 1 flag, then the 3 quantized axes (bounds are always supplied, so the
-        // engine never reads a bsp index here)
+        // position: 1 flag, then the 3 quantized axes. When the flag is 0 the H2A engine writes an
+        // extra bsp-reference index (groundhog.dll position writer sub_18051759C -> sub_1800C3620:
+        // an index over 2 bits) before the axes, and the axes are then quantised against that bsp's
+        // local bounds rather than the world box. HMS has no bsp bounds here, so it consumes the
+        // index and reads the axes with the world-bounds widths (correct bit-consumption only for
+        // the in-bounds objects that every small map uses). #h2a-inb0
         let in_bounds = r.flag();
+        let h2a_bsp_ref = if h2a && !in_bounds { r.index(2).map(|v| v as u8) } else { None };
         let mut pos = [0f32; 3];
+        let mut pos_q = [0u32; 3];
         for i in 0..3 {
-            let q = r.bits(axis[i]) as f32;
+            pos_q[i] = r.bits(axis[i]) as u32;
+            let q = pos_q[i] as f32;
             let step = ext[i] / (1u64 << axis[i]) as f32;
             pos[i] = bounds[2 * i] + q * step + step * 0.5;
         }
@@ -661,12 +723,13 @@ pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant>
         let mut shape_values = [0u16; 4];
         for v in shape_values.iter_mut().take(shape.value_count()) { *v = r.u16(); }
         let object_type = r.bits(6) as u8;
-        let placement = r.bits(10) as u16;
+        let placement = r.bits(if h2a { 11 } else { 10 }) as u16;
         let mut team = -1i8;
         let mut spawn_time = 0u8;
         let mut color = None;
         let mut spawn_sequence = 0i8;
         let mut user_data = 0i8;
+        let mut h2a_extra = 0u8;
         let mut labels4 = [None; 4];
         let type_data = match object_type {
             32 => {
@@ -693,9 +756,21 @@ pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant>
                 color = r.index(3).map(|v| v as u8);
                 spawn_sequence = r.u8() as i8;
                 user_data = r.i8();
+                // H2A stores an extra 8-bit field here (props encoder sub_1800B5D84 writes three
+                // bytes between the colour index and the labels; Halo 4 writes two). Its meaning is
+                // unknown and no palette/placement code needs it, so it is read only to keep the
+                // bitstream aligned. #h2a
+                if h2a { h2a_extra = r.u8(); }
                 for l in labels4.iter_mut() { *l = r.index(8).map(|v| v as u8); }
                 match t {
                     1 | 12 => H4TypeData::Byte(r.u8()),
+                    // H2A object type 11 reads a TWO-byte tail (props encoder sub_1800B5D84:
+                    // type 11 takes the `loc_B62BF` 8-bit write and then falls through to the
+                    // shared `loc_B6043` 8-bit write = 16 bits; Halo 4 routes type 11 to the
+                    // 5+5 Pair). Getting this wrong (8 or 10 bits) drifts the whole record stream,
+                    // which is what produced the spurious `in_bounds=0` reads on coagulation/awash
+                    // variants. Verified: 16 bits makes the placed-count oracle 0 on every file. #h2a
+                    11 if h2a => { let a = r.u8(); let b = r.u8(); H4TypeData::Pair(a, b) }
                     20 => H4TypeData::Index(r.u8() as i16 - 1),
                     31 => H4TypeData::TraitZone(r.bits(5) as u8),
                     _ => { let a = r.bits(5) as u8; let b = r.bits(5) as u8; H4TypeData::Pair(a, b) }
@@ -703,15 +778,27 @@ pub fn parse_h4_payload(payload: &[u8], chunk_version: u16) -> Result<H4Variant>
             }
         };
         objects.push(H4PlacedObject {
-            slot: slot as u16, bit, flags, quota, variant, in_bounds, pos, up_is_global, up_quant, forward_angle_q, fwd, up,
+            slot: slot as u16, bit, flags, quota, variant, in_bounds, pos, pos_q, h2a_bsp_ref, up_is_global, up_quant, forward_angle_q, fwd, up,
             parent, scale_q, locked, shape, shape_values, object_type, placement, team, spawn_time, color, spawn_sequence,
-            user_data, labels: labels4, type_data,
+            user_data, labels: labels4, h2a_extra, type_data,
         });
     }
     let obj_end_bit = r.pos;
     let mut quotas = Vec::with_capacity(num_quotas as usize);
     for _ in 0..num_quotas {
-        quotas.push(H4Quota { minimum: r.u8(), maximum: r.u8(), placed: r.u8() });
+        // Each quota record is `{minimum, maximum, placed_on_map}`. H2A (v52) stores the three as
+        // 10-bit fields (groundhog.dll quota codec sub_1800B0A20 writes `shl 10` x3 = 30 bits,
+        // range 0..1023, matching H2A's larger object counts); Halo 4 (v50) stores three u8
+        // (24 bits). Reading them as 24 bits was what made the whole quota table decode as garbage.
+        // The bitstream position advances by the full 10 bits per field; the value is narrowed to
+        // the u8 `H4Quota` shares with Halo 4, which truncates the four biggest coagulation
+        // variants' single >255 `placed`/`maximum` count (HMS recomputes `placed` on save, so this
+        // is a display-only loss for those files - the decode/alignment is exact). #h2a
+        if h2a {
+            quotas.push(H4Quota { minimum: r.bits(10) as u8, maximum: r.bits(10) as u8, placed: r.bits(10) as u8 });
+        } else {
+            quotas.push(H4Quota { minimum: r.u8(), maximum: r.u8(), placed: r.u8() });
+        }
     }
     let quota_end_bit = r.pos;
     if quota_end_bit > payload.len() * 8 { bail!("variant bitstream overran the payload"); }
@@ -747,7 +834,7 @@ pub struct H4VariantSummary {
 pub fn read_h4_summary(path: &Path) -> Option<H4VariantSummary> {
     let data = read_h4_expanded(path).ok()?;
     let (payload, major, _) = blf_h4_mvar_chunk(&data)?;
-    if major != H4_MVAR_VERSION { return None; }
+    if major != H4_MVAR_VERSION && major != H2A_MVAR_VERSION { return None; }
     let v = parse_h4_payload(payload, major).ok()?;
     Some(H4VariantSummary { title: v.title, description: v.description, author: v.author, editor: v.editor, map_id: v.map_id, objects: v.objects.len() })
 }
@@ -790,6 +877,8 @@ pub const FORGE_VARIANT_ELEM: usize = 0x48;
 pub struct H4PaletteVariant {
     pub name: String,
     pub variant_name: String,
+    /// hlmt model variant this palette variant spawns (sid; 0 = the object's default model).
+    pub variant_sid: u32,
     /// Object tag (obje class: scen / bloc / vehi / weap / ...), None for a null reference.
     pub tag: Option<usize>,
 }
@@ -814,25 +903,28 @@ pub fn load_forge_palette(c: &H4Cache) -> Vec<H4PaletteEntry> {
     let Some(&scnr) = c.find_tags(b"scnr").first() else { return out };
     let Some(sm) = c.tag_meta(scnr) else { return out };
     let Some((np, po)) = c.block(sm + OFF_SCNR_FORGE_PALETTE) else { return out };
+    let lay = super::palette::PaletteLayout::for_engine(c.engine);
     for i in 0..np.min(64) {
         let pe = po + i * FORGE_PALETTE_ELEM;
         let palette = c.sid(d.u32_at(pe));
         let Some((ne, eo)) = c.block(pe + 8) else { continue };
         for k in 0..ne.min(256) {
-            let e = eo + k * FORGE_ENTRY_ELEM;
+            let e = eo + k * lay.entry_stride;
             let mut variants = Vec::new();
-            if let Some((nv, vo)) = c.block(e + 4) {
+            if let Some((nv, vo)) = c.block(e + lay.entry_variants) {
                 for v in 0..nv.min(32) {
-                    let va = vo + v * FORGE_VARIANT_ELEM;
+                    let va = vo + v * lay.variant_stride;
+                    let vsid = match d.u32_at(va + lay.variant_hlmt) { 0xFFFF_FFFF => 0, x => x };
                     variants.push(H4PaletteVariant {
                         name: c.sid(d.u32_at(va)),
-                        variant_name: c.sid(d.u32_at(va + 0x14)),
-                        tag: c.tag_ref(va + 0x04).map(|(_, t)| t),
+                        variant_name: c.sid(vsid),
+                        variant_sid: vsid,
+                        tag: c.tag_ref(va + lay.variant_tag).map(|(_, t)| t),
                     });
                 }
             }
             if out.len() >= 256 { return out; }
-            out.push(H4PaletteEntry { quota: out.len() as u8, palette: palette.clone(), name: c.sid(d.u32_at(e)), max: d.i32_at(e + 0x10), price: d.i32_at(e + 0x14), variants });
+            out.push(H4PaletteEntry { quota: out.len() as u8, palette: palette.clone(), name: c.sid(d.u32_at(e)), max: d.i32_at(e + lay.entry_max), price: d.i32_at(e + lay.entry_price), variants });
         }
     }
     out
@@ -927,6 +1019,10 @@ pub fn variant_dirs() -> Vec<std::path::PathBuf> {
     if let Ok(v) = std::env::var("HMS_H4_MVAR_DIRS") {
         for p in v.split(';').filter(|s| !s.is_empty()) { let p = std::path::PathBuf::from(p); if p.is_dir() { out.push(p); } }
     }
+    // HALO 4 ONLY. `all_variant_files` builds on this and feeds the Halo 4 palette /
+    // localization / decode gates, which assert Halo 4 facts (payload size, the map-id table) an
+    // H2A file does not satisfy - so the H2A folders live in `h2a_variant_dirs`, and a caller
+    // that wants both (File > New's template search) asks for both. #h2a-mvar
     if let Some(maps) = super::cache::maps_dir() {
         if let Some(h4) = maps.parent() {
             for sub in ["map_variants", "hopper_map_variants"] {
@@ -935,6 +1031,59 @@ pub fn variant_dirs() -> Vec<std::path::PathBuf> {
             }
         }
     }
+    out
+}
+
+/// The H2A (`groundhog`) `map_variants` / `hopper_map_variants` folders of EVERY detected H2A
+/// install, not just the one the loader prefers: a machine can carry the Steam and the Microsoft
+/// Store copy side by side and their variant sets differ. `variant_dirs`' H2A sibling. #h2a-mvar
+pub fn h2a_variant_dirs() -> Vec<std::path::PathBuf> {
+    let mut game_dirs: Vec<std::path::PathBuf> = Vec::new();
+    for c in crate::mapcat::enumerate().into_iter().filter(|c| c.game == crate::mapcat::Game::H2A) {
+        if let Some(game) = c.path.parent().and_then(|m| m.parent()) {
+            if !game_dirs.iter().any(|d| d == game) { game_dirs.push(game.to_path_buf()); }
+        }
+    }
+    if let Some(game) = super::cache::h2a_maps_dir().as_deref().and_then(|m| m.parent()) {
+        if !game_dirs.iter().any(|d| d == game) { game_dirs.push(game.to_path_buf()); }
+    }
+    let mut out = Vec::new();
+    for game in &game_dirs {
+        for sub in ["map_variants", "hopper_map_variants"] {
+            let p = game.join(sub);
+            if p.is_dir() && !out.contains(&p) { out.push(p); }
+        }
+    }
+    out
+}
+
+/// Every `.mvar` under the H2A (`groundhog`) variant folders plus every H2A variant SAVED BY THE
+/// GAME (`MCC/LocalFiles/<xuid>/Halo2A/Map`, and the `tmep` scratch folder MCC leaves beside it),
+/// sorted and de-duplicated. `HMS_H2A_MVAR_DIRS` adds folders. The gate over the H2A encoder
+/// runs on this list. #h2a-mvar
+pub fn h2a_variant_files() -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    // one level of sub-folders is walked: MCC parks in-progress saves in `Map\tmep`
+    fn push_dir(out: &mut Vec<std::path::PathBuf>, d: &Path, depth: u32) {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if depth > 0 { push_dir(out, &p, depth - 1); }
+            } else if p.extension().map_or(false, |x| x.eq_ignore_ascii_case("mvar")) && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    for d in h2a_variant_dirs() { push_dir(&mut out, &d, 0); }
+    for root in crate::mapcat::mcc_localfiles_roots() {
+        for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            push_dir(&mut out, &e.path().join("Halo2A").join("Map"), 1);
+        }
+    }
+    if let Ok(v) = std::env::var("HMS_H2A_MVAR_DIRS") {
+        for p in v.split(';').filter(|s| !s.is_empty()) { push_dir(&mut out, Path::new(p), 1); }
+    }
+    out.sort();
     out
 }
 
@@ -959,6 +1108,8 @@ pub fn user_variant_files() -> Vec<std::path::PathBuf> {
     };
     for root in crate::mapcat::mcc_localfiles_roots() {
         for e in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+            // Halo 4 ONLY (`Halo2A` is H2A's folder - `h2a_variant_files` collects those): the
+            // caller asserts body version 51 and a Halo 4 map GUID, which an H2A file has not.
             let d = e.path().join("Halo4").join("Map");
             if d.is_dir() { push_dir(&d); }
         }
@@ -1224,9 +1375,10 @@ impl H4PlacedObject {
     pub fn new(quota: u8, variant: Option<u8>, object_type: u8, pos: [f32; 3], fwd: [f32; 3], up: [f32; 3]) -> Self {
         let mut o = H4PlacedObject {
             slot: NEW_SLOT, bit: 0, flags: 1, quota: Some(quota), variant: Some(variant.unwrap_or(0)), in_bounds: true, pos,
+            pos_q: [0; 3], h2a_bsp_ref: None,
             up_is_global: true, up_quant: 0, forward_angle_q: 0, fwd, up, parent: -1, scale_q: SCALE_Q_DEFAULT, locked: false,
             shape: H4Shape::None, shape_values: [0; 4], object_type, placement: 12, team: 8, spawn_time: 0,
-            color: None, spawn_sequence: 0, user_data: 0, labels: [None; 4], type_data: H4TypeData::default_for(object_type),
+            color: None, spawn_sequence: 0, user_data: 0, labels: [None; 4], h2a_extra: 0, type_data: H4TypeData::default_for(object_type),
         };
         o.set_orientation(fwd, up);
         o
@@ -1275,7 +1427,12 @@ fn skip_trait_set(r: &mut Bits) {
 
 /// Write one present object slot - the exact mirror of the slot decode in `parse_h4_payload`
 /// and of sub_1800B7A68 / sub_1800B6ED8. `parent` must already be the FINAL slot value.
-fn write_slot(w: &mut BitWriter, o: &H4PlacedObject, parent: i16, bounds: [f32; 6], axis: [u32; 3]) -> Result<()> {
+///
+/// `h2a` selects the Halo 2 Anniversary (mvar chunk v52) record: the three deltas the decoder
+/// documents - 11-bit `placement`, the extra 8-bit field after `user_data`, and the two-byte type
+/// tail on object type 11 - plus the bsp-reference index on an out-of-bounds record. Passing it
+/// wrong shifts every following slot, so it comes from the variant, never a guess. #h2a-mvar
+fn write_slot(w: &mut BitWriter, o: &H4PlacedObject, parent: i16, bounds: [f32; 6], axis: [u32; 3], h2a: bool) -> Result<()> {
     if !o.type_data.matches(o.object_type) { bail!("slot {}: type data {:?} does not fit object type {}", o.slot, o.type_data, o.object_type); }
     w.flag(true);
     w.bits(2, o.flags as u64 & 3);
@@ -1284,7 +1441,14 @@ fn write_slot(w: &mut BitWriter, o: &H4PlacedObject, parent: i16, bounds: [f32; 
     // raw byte (see `H4PlacedObject::new`); an explicit 0 is what the game itself writes
     w.index(Some(o.variant.unwrap_or(0) as u32), 5);
     w.flag(o.in_bounds);
-    for i in 0..3 { w.bits(axis[i], h4_quantize_pos(o.pos[i], bounds[2 * i], bounds[2 * i + 1], axis[i]) as u64); }
+    // An H2A out-of-bounds record carries a bsp reference and quantises against THAT bsp's box,
+    // which HMS does not have: its quanta are written back exactly as they were read. #h2a-inb0
+    if h2a && !o.in_bounds {
+        w.index(o.h2a_bsp_ref.map(|x| x as u32), 2);
+        for i in 0..3 { w.bits(axis[i], o.pos_q[i] as u64); }
+    } else {
+        for i in 0..3 { w.bits(axis[i], h4_quantize_pos(o.pos[i], bounds[2 * i], bounds[2 * i + 1], axis[i]) as u64); }
+    }
     w.flag(o.up_is_global);
     if !o.up_is_global { w.bits(20, o.up_quant as u64); }
     w.bits(14, o.forward_angle_q as u64);
@@ -1294,7 +1458,7 @@ fn write_slot(w: &mut BitWriter, o: &H4PlacedObject, parent: i16, bounds: [f32; 
     w.bits(2, o.shape as u64);
     for &v in o.shape_values.iter().take(o.shape.value_count()) { w.u16(v); }
     w.bits(6, o.object_type as u64);
-    w.bits(10, o.placement as u64);
+    w.bits(if h2a { 11 } else { 10 }, o.placement as u64);
     match &o.type_data {
         H4TypeData::InitialOrdnance { team, weapon, timing } => { w.bits(4, (*team as i32 + 1) as u64 & 15); w.u8(*weapon); w.u16(*timing); }
         H4TypeData::RandomOrdnance(ws) => { for &x in ws { w.u8(x); } }
@@ -1306,11 +1470,15 @@ fn write_slot(w: &mut BitWriter, o: &H4PlacedObject, parent: i16, bounds: [f32; 
             w.index(o.color.map(|c| c as u32), 3);
             w.u8(o.spawn_sequence as u8);
             w.u8(o.user_data as u8);
+            if h2a { w.u8(o.h2a_extra); }
             for l in &o.labels { w.index(l.map(|x| x as u32), 8); }
             match td {
                 H4TypeData::Byte(b) => w.u8(*b),
                 H4TypeData::Index(i) => w.u8((*i + 1) as u8),
                 H4TypeData::TraitZone(t) => w.bits(5, *t as u64),
+                // H2A object type 11 (device) takes a TWO-BYTE tail, not the 5+5 pair - see the
+                // decoder's note on the props codec.
+                H4TypeData::Pair(a, b) if h2a && o.object_type == 11 => { w.u8(*a); w.u8(*b); }
                 H4TypeData::Pair(a, b) => { w.bits(5, *a as u64); w.bits(5, *b as u64); }
                 _ => unreachable!(),
             }
@@ -1384,7 +1552,13 @@ impl H4HeaderEdits {
     /// variant's id on every derived save (30+ user files share one id and all list), so a copy
     /// of the template's id is exactly what a game-made file carries.
     pub fn stamp_new(&mut self, xuid: u64) {
-        self.created = Some((unix_now(), xuid));
+        self.stamp_new_at(xuid, unix_now());
+    }
+    /// The same, with the timestamp SUPPLIED rather than read from the clock — see
+    /// `crate::mvar::HeaderEdits::stamp_new_at`. The stamp is written into the bitstream AND both
+    /// `chdr` mirrors, so a one-second difference moves a scatter of bytes, not four.
+    pub fn stamp_new_at(&mut self, xuid: u64, now: u64) {
+        self.created = Some((now, xuid));
         self.modified = Some((0, 0));
     }
     /// Stamp a re-save of an existing variant the way MCC does: CreatedBy kept, ModifiedBy =
@@ -1427,7 +1601,13 @@ pub struct H4Encoded {
 ///   it when exceeded (`minimum` untouched); `num_quotas` never changes;
 /// * header strings / labels / budget come from `edits`, everything else verbatim.
 pub fn encode_h4_payload(src: &[u8], v: &H4Variant, objects: &[H4PlacedObject], edits: Option<&H4HeaderEdits>) -> Result<H4Encoded> {
-    if v.version != 50 && v.version != 51 { bail!("variant body version {} (encoder handles 50 and 51)", v.version); }
+    if !matches!(v.version, 50 | 51 | 52 | 53) { bail!("variant body version {} (encoder handles 50, 51, 52 and 53)", v.version); }
+    // Which record / quota layout to write. Taken from the CHUNK version, exactly as the decoder
+    // takes it, so the write side can never disagree with the read side. The missing map GUID at
+    // v52 needs no case of its own: the header up to `obj_start_bit` is copied verbatim, so a file
+    // that had none gets none back - the thing that would otherwise shift every slot by 128 bits.
+    // #h2a-mvar
+    let h2a = v.chunk_version == H2A_MVAR_VERSION;
     let e = edits.cloned().unwrap_or_default();
     // an edited box re-quantises every object (write) while the source is read
     // with its own box (the decoded `pos` floats are the bridge)
@@ -1493,22 +1673,50 @@ pub fn encode_h4_payload(src: &[u8], v: &H4Variant, objects: &[H4PlacedObject], 
         let o = &objects[i];
         slots[i] = s as u16;
         let parent = if o.parent < 0 { -1 } else if (o.parent as usize) >= H4_SLOTS && !key_to_slot.contains_key(&(o.parent as u16)) { o.parent } else { key_to_slot.get(&(o.parent as u16)).map_or(-1, |&p| p as i16) };
-        write_slot(&mut w, o, parent, bounds, axis)?;
+        write_slot(&mut w, o, parent, bounds, axis, h2a)?;
         if let Some(q) = o.quota { placed[q as usize] += 1; }
     }
     // --- quota table: source min / max, recomputed placed ---
     let mut r = Bits::new(src);
     r.pos = v.obj_end_bit;
     for i in 0..v.num_quotas as usize {
-        let (mut mn, mut mx, _) = (r.u8(), r.u8(), r.u8());
-        if let Some((a, b)) = e.quotas.as_ref().and_then(|q| q.get(i)) { mn = *a; mx = *b; }
-        let n = placed[i].min(255) as u8;
-        w.u8(mn);
-        w.u8(mx.max(n));
-        w.u8(n);
+        // H2A stores the three counts as 10-bit fields (0..1023), Halo 4 as three u8. The source
+        // minimum / maximum are read back out of the SOURCE BITS at their own width rather than
+        // from `H4Variant::quotas`, whose `u8`s truncate the four biggest coagulation variants'
+        // >255 counts - that is what keeps those files byte-exact. #h2a-mvar
+        let width = if h2a { 10 } else { 8 };
+        let (mut mn, mut mx) = (r.bits(width) as u16, r.bits(width) as u16);
+        r.bits(width); // placed_on_map: always recomputed from the objects
+        if let Some((a, b)) = e.quotas.as_ref().and_then(|q| q.get(i)) { mn = *a as u16; mx = *b as u16; }
+        let n = placed[i].min((1u32 << width) - 1) as u16;
+        w.bits(width, mn as u64);
+        w.bits(width, mx.max(n) as u64);
+        w.bits(width, n as u64);
     }
-    // --- the four trait-set records, verbatim ---
-    w.copy_bits(src, v.quota_end_bit, v.end_bit - v.quota_end_bit);
+    // --- everything past the quota table (the four player-trait-set records), VERBATIM ---
+    //
+    // HMS does not decode those records, it only MEASURES them (`skip_trait_set`), and a
+    // measurement that came out short would silently drop the end of the tail and shrink the
+    // chunk `length`. One shipped H2A variant proves the measurement CAN come out short: a Forge
+    // save with custom player traits in all four sets, where the H2A record is 32 bits longer than
+    // the Reach/Halo 4 layout accounts for (which of the optional reals is wider is not RE'd -
+    // the one sample cannot tell four equally-good candidates apart, so nothing is guessed).
+    //
+    // So the tail is copied WHOLE - out to the end of the stream the SOURCE FILE itself declares
+    // (`chunk_length`, the one authority on how long the stream is) - and the length numerator
+    // falls out of that. On a no-edit re-encode the result is the file's own length to the bit,
+    // which is what the byte-exact gates check; with objects added or removed it moves by exactly
+    // the change in the object region, and the opaque tail survives either way. This is the same
+    // shape the Reach encoder uses (`write_quota_and_tail` carries its tail over verbatim rather
+    // than zeroing it). #h2a-mvar
+    let measured_tail = v.end_bit.saturating_sub(v.quota_end_bit);
+    let declared_tail = (v.chunk_length as usize).saturating_mul(8).saturating_sub(v.quota_end_bit);
+    // The declared length is used ONLY where it contradicts the measurement. On every Halo 4
+    // file and every other H2A file the two agree, so the measured tail is written unchanged and
+    // a save's `length` is exactly what it has always been; on the one file whose trait records
+    // are longer than the measured layout, the file's own figure wins and the tail survives.
+    let tail = if (v.end_bit + 7) / 8 == v.chunk_length as usize { measured_tail } else { declared_tail.max(measured_tail) };
+    w.copy_bits(src, v.quota_end_bit, tail.min((H4_MVAR_BITSTREAM_BYTES * 8).saturating_sub(w.pos)));
     let bits = w.pos;
     if bits > H4_MVAR_BITSTREAM_BYTES * 8 { bail!("encoded variant is {bits} bits, over the 28 672-byte bitstream"); }
     Ok(H4Encoded { payload: w.buf, bits, slots })
@@ -1637,7 +1845,10 @@ pub(crate) fn chdr_put_wstr(body: &mut [u8], at: usize, s: &str, max: usize) {
 /// final slots (index-aligned with `objects`).
 pub fn rebuild_h4_file(src_data: &[u8], objects: &[H4PlacedObject], edits: Option<&H4HeaderEdits>) -> Result<(Vec<u8>, Vec<u16>)> {
     let (payload, major, _) = blf_h4_mvar_chunk(src_data).ok_or_else(|| anyhow!("no mvar chunk"))?;
-    let v = parse_h4_payload(payload, major)?;
+    let mut v = parse_h4_payload(payload, major)?;
+    // the chunk's own stream length: the encoder needs it to carry the opaque trait-set tail over
+    // whole (see `encode_h4_payload`), and `parse_h4_payload` cannot see outside the payload
+    v.chunk_length = mvar_chunk_length(src_data).unwrap_or(0);
     let enc = encode_h4_payload(payload, &v, objects, edits)?;
     let length = ((enc.bits + 7) / 8) as u32;
     let hash = mvar_chunk_hash_kind(&enc.payload, length, detect_hash_kind(src_data).unwrap_or(H4HashKind::PlainLe));
@@ -1705,8 +1916,10 @@ pub fn roundtrip_report(path: &Path, out: Option<&Path>) -> Result<String> {
     let first_diff = data.iter().zip(re.iter()).position(|(a, b)| a != b).or_else(|| (data.len() != re.len()).then_some(data.len().min(re.len())));
     let stored_length = mvar_chunk_length(&data).unwrap_or(0);
     Ok(match first_diff {
-        None => format!("{}: body v{}, {} objects, {} bits (length {} == stored {}), hash {:?}, re-encode BYTE-IDENTICAL ({} bytes){cmp_note}", path.display(), v.version, v.objects.len(), v.end_bit, (v.end_bit + 7) / 8, stored_length, detect_hash_kind(&data), data.len()),
-        Some(i) => format!("{}: {} objects, re-encode DIFFERS at byte {} (original {} bytes, re-encoded {})", path.display(), v.objects.len(), i, data.len(), re.len()),
+        None => format!("{}: body v{}, {} objects, {} bits (length {} == stored {}), bits obj {}..{} quota_end {}, hash {:?}, re-encode BYTE-IDENTICAL ({} bytes){cmp_note}", path.display(), v.version, v.objects.len(), v.end_bit, (v.end_bit + 7) / 8, stored_length, v.obj_start_bit, v.obj_end_bit, v.quota_end_bit, detect_hash_kind(&data), data.len()),
+        Some(i) => format!("{}: body v{}, {} objects, re-encode DIFFERS at byte {} (original {} bytes, re-encoded {}); bits obj {}..{} quota_end {} end {} -> length {} vs stored {}",
+            path.display(), v.version, v.objects.len(), i, data.len(), re.len(),
+            v.obj_start_bit, v.obj_end_bit, v.quota_end_bit, v.end_bit, (v.end_bit + 7) / 8, stored_length),
     })
 }
 
@@ -1716,6 +1929,7 @@ mod tests {
     use crate::h4::cache::maps_dir;
     use crate::h4::geometry::load_bsp;
     use std::collections::{BTreeMap, HashMap};
+
 
     fn open_map(name: &str) -> Option<H4Cache> {
         let p = maps_dir()?.join(format!("{name}.map"));
@@ -2559,7 +2773,9 @@ mod tests {
                     let ns = (nb[2 * i + 1] - nb[2 * i]) / (1u32 << new_axis[i]) as f32;
                     assert!((a.pos[i] - b.pos[i]).abs() <= os + ns, "{}: object moved {} on axis {i}", f.display(), (a.pos[i] - b.pos[i]).abs());
                 }
-                let (mut x, mut y) = (a.clone(), b.clone()); x.bit = 0; y.bit = 0; x.pos = [0.0; 3]; y.pos = [0.0; 3];
+                // `pos` AND the raw `pos_q` quanta are position: both are re-quantised against
+                // the new box, so both are cleared before the "nothing else moved" compare
+                let (mut x, mut y) = (a.clone(), b.clone()); x.bit = 0; y.bit = 0; x.pos = [0.0; 3]; y.pos = [0.0; 3]; x.pos_q = [0; 3]; y.pos_q = [0; 3];
                 assert_eq!(format!("{x:?}"), format!("{y:?}"), "{}: a non-position field changed with the bounds", f.display());
             }
             assert!(wb.hash_ok);
@@ -2586,6 +2802,258 @@ mod tests {
         assert_eq!(h4_map_index(14100), Some(127));
         assert_eq!(h4_map_guid(14100).map(|g| g[..8].to_vec()), Some(vec![0x7f, 0, 0, 0, 0, 0, 0x88, 0x88]));
         assert_eq!(h4_map_index(1), None);
+    }
+
+    // ----- Halo 2 Anniversary (groundhog, mvar chunk v52) -----------------------------------
+
+    /// Groundhog hopper-variant folder and map-id -> base-map stem, for the H2A regression test.
+    fn h2a_variant_dir() -> Option<std::path::PathBuf> {
+        let d = crate::h4::cache::h2a_maps_dir()?.parent()?.join("hopper_map_variants");
+        d.is_dir().then_some(d)
+    }
+    fn h2a_map_ids() -> HashMap<u32, String> {
+        let mut out = HashMap::new();
+        let Some(dir) = crate::h4::cache::h2a_maps_dir() else { return out };
+        for e in std::fs::read_dir(dir.join("info")).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.extension().map_or(false, |x| x == "mapinfo") {
+                let stem = p.file_stem().unwrap().to_string_lossy().into_owned();
+                if let Some(id) = crate::mapcat::read_map_id(&dir.join(&stem).with_extension("map")) { out.insert(id, stem); }
+            }
+        }
+        out
+    }
+    /// Read the `num_quotas` records of the v52 quota table (three 10-bit fields each: minimum,
+    /// maximum, placed_on_map) straight from the payload at `obj_end_bit`. The public `H4Variant`
+    /// keeps these in a `u8`-per-field struct shared with Halo 4, which truncates the four biggest
+    /// coagulation variants' >255 `placed` counts, so the oracle reads the raw 10-bit values here.
+    fn h2a_raw_placed(payload: &[u8], obj_end_bit: usize, num_quotas: usize) -> Vec<u32> {
+        let bits = |start: usize| -> u32 { let mut r = 0u32; for k in 0..10 { let p = start + k; r = (r << 1) | ((payload[p >> 3] >> (7 - (p & 7))) & 1) as u32; } r };
+        (0..num_quotas).map(|i| bits(obj_end_bit + i * 30 + 20)).collect()
+    }
+
+    /// Where the `mvar` chunk's stored SHA-1 sits in a file, and whether it is the one the
+    /// engine's formula produces for that file's own payload. Two of the game-saved H2A files on
+    /// this machine carry a hash that matches NEITHER flavour over their own bytes - MCC's reader
+    /// only enforces the hash behind a `.bss` flag no code ever sets (see the section comment),
+    /// so such a file loads fine and the game never noticed. HMS writes the CORRECT hash, which
+    /// is the one difference the gate below allows, and only where it can prove the source's is
+    /// wrong. #h2a-mvar
+    fn stored_hash(data: &[u8]) -> (usize, bool) {
+        let off = data.windows(4).position(|w| w == b"mvar").unwrap() + 12;
+        (off, detect_hash_kind(data).is_some())
+    }
+
+    /// ★ THE H2A gate: every Halo 2 Anniversary variant on this machine - the shipped
+    /// `classic` / hopper files AND the ones MCC's own Forge saved - re-encodes BYTE-IDENTICAL
+    /// (BLF wrapper, `chdr`, SHA-1, length, bitstream, `_eof`, `_fsm`) from its decoded object
+    /// list with no edits, and every object keeps its slot.
+    ///
+    /// This is the same gate the Reach / Halo 3 / Halo 4 encoders carry, and it is what proves
+    /// the v52 write side mirrors the read side: the 11-bit `placement`, the extra 8-bit record
+    /// field, the two-byte type-11 tail, the three 10-bit quota counts and - the one that would
+    /// silently shift every object by 128 bits if it were backwards - emitting NO map GUID at
+    /// body version 52 while emitting one at 53.
+    ///
+    /// The only tolerated difference is the chunk SHA-1 of a file whose own stored hash matches
+    /// no formula over its own payload (`stored_hash`): those are compared on every other byte,
+    /// and HMS's hash is asserted to be the correct one.
+    #[test]
+    fn h2a_variants_reencode_byte_identical() {
+        let files = h2a_variant_files();
+        if files.is_empty() { eprintln!("skip: no Halo 2 Anniversary variants installed"); return; }
+        let (mut checked, mut bad_source_hash, mut short_measure) = (0usize, 0usize, 0usize);
+        let mut versions: BTreeMap<u8, usize> = BTreeMap::new();
+        for f in &files {
+            let name = f.file_name().unwrap().to_string_lossy().into_owned();
+            let data = crate::mvar::read_expanded(f).unwrap();
+            let Some((payload, major, _)) = blf_h4_mvar_chunk(&data) else { panic!("{name}: no mvar chunk") };
+            assert_eq!(major, H2A_MVAR_VERSION, "{name}: chunk v{major} under the H2A folders");
+            let v = parse_h4_payload(payload, major).unwrap_or_else(|e| panic!("{name}: {e}"));
+            *versions.entry(v.version).or_default() += 1;
+            // the body version decides whether a map GUID is stored, and getting that wrong is
+            // what shifts the object array - so assert the pairing the decoder relies on
+            assert!(matches!(v.version, 52 | 53), "{name}: body version {}", v.version);
+            assert_eq!(v.map_guid.is_some(), v.version >= 53, "{name}: v{} map guid {:?}", v.version, v.map_guid.is_some());
+            let stored_len = mvar_chunk_length(&data).unwrap();
+            // The four player-trait-set records are MEASURED, not decoded, and the H2A record is
+            // wider than the Reach / Halo 4 layout accounts for on a Forge save with custom
+            // traits in every set. The encoder no longer depends on that measurement (it carries
+            // the tail out to the stream length the file declares), so the gate only records how
+            // often the measurement falls short - it must never overshoot the declared stream.
+            assert!(((v.end_bit + 7) / 8) as u32 <= stored_len, "{name}: measured end {} overshoots the {stored_len}-byte stream", v.end_bit);
+            if ((v.end_bit + 7) / 8) as u32 != stored_len { short_measure += 1; }
+            let (re, slots) = rebuild_h4_file(&data, &v.objects, None).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(re.len(), data.len(), "{name}: size");
+            assert!(slots.iter().zip(v.objects.iter()).all(|(s, o)| *s == o.slot), "{name}: slot assignment");
+            let (hash_off, source_hash_ok) = stored_hash(&data);
+            if !source_hash_ok {
+                // compare everything but the 20 hash bytes, and prove ours is the right one
+                bad_source_hash += 1;
+                let re_len = u32::from_be_bytes(re[hash_off + 20..hash_off + 24].try_into().unwrap());
+                assert_eq!(&re[hash_off..hash_off + 20], &mvar_chunk_hash(&re[hash_off + 24..hash_off + 24 + H4_MVAR_BITSTREAM_BYTES], re_len)[..], "{name}: our hash");
+                let same = data[..hash_off] == re[..hash_off] && data[hash_off + 20..] == re[hash_off + 20..];
+                assert!(same, "{name}: differs outside the chunk hash");
+            } else if let Some(i) = data.iter().zip(re.iter()).position(|(a, b)| a != b) {
+                panic!("{name}: re-encode differs at byte {i} (bit {})", i * 8);
+            }
+            checked += 1;
+        }
+        assert!(checked >= 50, "expected the shipped groundhog variants, checked {checked}");
+        assert!(versions.contains_key(&52), "no body-v52 H2A variant seen, saw {versions:?}");
+        // v53 is the layout MCC's own Forge writes (the one that DOES carry a map GUID). It is
+        // only present if this machine has a game-saved H2A variant or the Store copy's
+        // `map_variants`, so its absence is reported, not asserted.
+        if !versions.contains_key(&53) { eprintln!("h2a: NOTE no body-v53 (game-saved) variant on this machine - the GUID-carrying layout was not exercised"); }
+        eprintln!("h2a: {checked} variants re-encode byte-identical (body versions {versions:?}); {bad_source_hash} had a stored chunk hash matching no formula over their own payload (HMS writes the correct one); {short_measure} have trait-set records longer than the measured layout (carried over verbatim)");
+    }
+
+    /// What the EDITOR does to an H2A variant, end to end: delete an object, add a new one, move
+    /// and turn another, save, re-read and check every field came back - then save the re-read
+    /// file again with no edits and get the same bytes (a fixed point, so saving twice is saving
+    /// once). The GUI reaches `h4::mvar::save_objects` through `build_h4_save_list_core`, which is
+    /// engine-agnostic and already gated for Halo 4; what is H2A-specific is everything below it,
+    /// which is what this exercises. Also pins the two fields a v52/v53 save must never drift on:
+    /// the body version and the presence of the map GUID. #h2a-mvar
+    #[test]
+    fn h2a_editor_edits_survive_a_save_and_resave_is_a_fixed_point() {
+        let files = h2a_variant_files();
+        let Some(f) = files.iter().find(|p| parse_h4_variant(p).map_or(false, |v| v.objects.len() > 20)) else {
+            eprintln!("skip: no Halo 2 Anniversary variants installed"); return;
+        };
+        let v = parse_h4_variant(f).unwrap();
+        let dir = scratch_dir();
+        let work = dir.join("h2a-editor.mvar");
+        std::fs::copy(f, &work).unwrap();
+
+        let mut list = v.objects.clone();
+        // (1) DELETE the last TWO records. Two, not one, because a new object takes the LOWEST
+        // free slot: deleting only the top slot and adding one back would simply refill it, and
+        // "the deletion happened" would be unprovable. With two gone and one added, the highest
+        // slot must end up empty.
+        let gone_top = list.pop().unwrap();
+        let _gone_second = list.pop().unwrap();
+        // (2) ADD one: a copy of an existing record in a free slot, which is what the editor
+        //     builds for a newly placed object (`H4PlacedObject::new` + the palette meta)
+        let mut fresh = H4PlacedObject::new(list[0].quota.unwrap(), list[0].variant, list[0].object_type,
+            [v.bounds[0] + 1.0, v.bounds[2] + 1.0, v.bounds[4] + 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]);
+        fresh.placement = list[0].placement;
+        let want_pos = fresh.quantized_pos(&v);
+        list.push(fresh.clone());
+        // (3) MOVE + TURN the first record
+        let moved_slot = list[0].slot;
+        list[0].pos = [v.bounds[1] - 2.0, v.bounds[3] - 2.0, v.bounds[5] - 2.0];
+        list[0].set_orientation([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]);
+        let want_moved = (list[0].quantized_pos(&v), list[0].fwd, list[0].up);
+
+        let slots = save_objects(&work, &work, &list, None).unwrap();
+        let w = parse_h4_variant(&work).unwrap();
+        assert_eq!(w.version, v.version, "body version drifted");
+        assert_eq!(w.map_guid, v.map_guid, "map guid drifted");
+        assert_eq!(w.chunk_version, H2A_MVAR_VERSION);
+        assert_eq!(w.objects.len(), list.len(), "object count");
+        assert_eq!(w.objects.len(), v.objects.len() - 1, "two deleted, one added");
+        assert!(!w.objects.iter().any(|o| o.slot == gone_top.slot), "the deleted record is still in slot {}", gone_top.slot);
+        // the added object landed in the freed slot and reads back as placed
+        let new_slot = *slots.last().unwrap();
+        let got = w.objects.iter().find(|o| o.slot == new_slot).expect("the added object");
+        assert_eq!(got.pos, want_pos, "added object position");
+        assert_eq!((got.quota, got.variant, got.object_type), (fresh.quota, fresh.variant, fresh.object_type));
+        assert_eq!(got.h2a_extra, 0, "a new H2A record carries the default extra field");
+        let m = w.objects.iter().find(|o| o.slot == moved_slot).expect("the moved object");
+        assert_eq!((m.pos, m.fwd, m.up), want_moved, "moved + turned object");
+        // every untouched record came back field-for-field (all but the moved first and the
+        // added last)
+        for o in &list[1..list.len() - 1] {
+            let b = w.objects.iter().find(|x| x.slot == o.slot).unwrap_or_else(|| panic!("slot {} vanished", o.slot));
+            let (mut x, mut y) = (o.clone(), b.clone());
+            x.bit = 0; y.bit = 0;
+            assert_eq!(format!("{x:?}"), format!("{y:?}"), "untouched record in slot {} changed", o.slot);
+        }
+        // a no-edit re-save of the edited file is a fixed point
+        let before = std::fs::read(&work).unwrap();
+        let (again, _) = rebuild_h4_file(&before, &w.objects, None).unwrap();
+        assert_eq!(again, before, "re-save of the edited H2A file drifted");
+        let _ = std::fs::remove_file(&work);
+        eprintln!("h2a: editor delete + add + move/turn survived a save on {} ({} objects), and the re-save is a fixed point",
+            f.file_name().unwrap().to_string_lossy(), w.objects.len());
+    }
+
+    /// The gate BITES: flip one field of one record of a real H2A variant and the re-encode must
+    /// stop matching. Run for each of the v52-specific fields the encoder has a case for, so a
+    /// write side that quietly ignored one of them could not pass the gate above.
+    #[test]
+    fn h2a_gate_bites_on_a_flipped_field() {
+        let files = h2a_variant_files();
+        let Some(f) = files.iter().find(|p| parse_h4_variant(p).map_or(false, |v| v.objects.iter().any(|o| matches!(o.type_data, H4TypeData::Pair(..))))) else {
+            eprintln!("skip: no Halo 2 Anniversary variants installed"); return;
+        };
+        let data = crate::mvar::read_expanded(f).unwrap();
+        let (payload, major, _) = blf_h4_mvar_chunk(&data).unwrap();
+        let v = parse_h4_payload(payload, major).unwrap();
+        // the untouched re-encode is the baseline this file is known to reproduce
+        let (base, _) = rebuild_h4_file(&data, &v.objects, None).unwrap();
+        let i = v.objects.iter().position(|o| matches!(o.type_data, H4TypeData::Pair(..))).unwrap();
+        let mut bitten = 0;
+        for which in ["h2a_extra", "placement", "pair", "quota_placed"] {
+            let mut objs = v.objects.clone();
+            match which {
+                // the extra 8-bit field only H2A stores: a write side that dropped it would make
+                // the record 8 bits short and shift everything after it
+                "h2a_extra" => objs[i].h2a_extra ^= 0x5A,
+                // bit 10 of `placement` exists only in the 11-bit H2A field
+                "placement" => objs[i].placement ^= 0x400,
+                "pair" => objs[i].type_data = match objs[i].type_data { H4TypeData::Pair(a, b) => H4TypeData::Pair(a ^ 1, b ^ 2), ref t => t.clone() },
+                // dropping an object changes a 10-bit quota `placed_on_map` count
+                "quota_placed" => { objs.remove(i); }
+                _ => unreachable!(),
+            }
+            let (re, _) = rebuild_h4_file(&data, &objs, None).unwrap();
+            assert_ne!(re, base, "the gate does not bite on {which}: a flipped field re-encoded identically");
+            bitten += 1;
+        }
+        assert_eq!(bitten, 4);
+        eprintln!("h2a: the byte-exact gate bites on all {bitten} v52-specific record fields ({})", f.file_name().unwrap().to_string_lossy());
+    }
+
+    /// The v52 object-record decode is correct only when, for every groundhog variant, the quota
+    /// table's `placed_on_map[i]` equals the number of decoded objects whose `quota == i` (and the
+    /// total equals the objects-with-quota count) - the alignment oracle from the RE. Also checks
+    /// every object resolves to a palette entry/variant (0 out-of-range) on the maps present.
+    #[test]
+    #[ignore]
+    fn h2a_variant_records_decode() {
+        let Some(dir) = h2a_variant_dir() else { eprintln!("skip: no groundhog hopper_map_variants"); return };
+        let ids = h2a_map_ids();
+        let mut caches: HashMap<String, H4Cache> = HashMap::new();
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().map_or(false, |x| x == "mvar")).collect();
+        files.sort();
+        let (mut checked, mut resolved_checked) = (0, 0);
+        for f in &files {
+            let v = parse_h4_variant(f).unwrap();
+            if v.chunk_version != H2A_MVAR_VERSION { continue; }
+            let name = f.file_name().unwrap().to_string_lossy();
+            // (b)+(c): the placed-count oracle, read straight from the 10-bit quota table.
+            let data = read_h4_expanded(f).unwrap();
+            let (payload, _, _) = blf_h4_mvar_chunk(&data).unwrap();
+            let placed = h2a_raw_placed(payload, v.obj_end_bit, v.num_quotas as usize);
+            let mut counts = vec![0u32; v.num_quotas as usize];
+            for o in &v.objects { if let Some(q) = o.quota { assert!((q as usize) < v.num_quotas as usize, "{name}: quota {q} >= num_quotas"); counts[q as usize] += 1; } }
+            for i in 0..v.num_quotas as usize { assert_eq!(placed[i], counts[i], "{name}: quota {i} placed {} != decoded count {}", placed[i], counts[i]); }
+            let with_quota: u32 = counts.iter().sum();
+            assert_eq!(placed.iter().sum::<u32>(), with_quota, "{name}: sum(placed) != objects with quota");
+            checked += 1;
+            // (a): resolve against the base map's forge palette when the map is on disk.
+            if let Some(stem) = ids.get(&v.map_id) {
+                let mc = caches.entry(stem.clone()).or_insert_with(|| H4Cache::open(&crate::h4::cache::h2a_maps_dir().unwrap().join(format!("{stem}.map"))).expect("open h2a map"));
+                let pal = load_forge_palette(mc);
+                let (_pl, st) = variant_placements(mc, &v, &pal);
+                assert_eq!(st.skipped_quota_range + st.skipped_variant_range, 0, "{name}: {} quota / {} variant indices out of the {}-entry palette range", st.skipped_quota_range, st.skipped_variant_range, pal.len());
+                resolved_checked += 1;
+            }
+        }
+        assert!(checked >= 10, "expected the shipped groundhog variants, checked {checked}");
+        eprintln!("h2a: {checked} variants pass the placed-count oracle, {resolved_checked} resolved against a base-map palette with 0 out-of-range indices");
     }
 }
 

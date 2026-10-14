@@ -23,6 +23,25 @@ MIT, Apache-2.0, BSD, Zlib or similar permissive terms. The full list with
 license texts can be generated from the lock file with
 `cargo about` or `cargo license` (see `Cargo.lock`).
 
+## Documentation consulted (no code used)
+
+### ReachVariantTool documentation — CC0 1.0 (public domain)
+
+`DavidJCobb/ReachVariantEditor` ships its user documentation under **CC0 1.0** (a public-domain
+dedication). HMS's Reach game-variant reader (`crates/hms-app/src/film_variant.rs`) consulted
+that documentation for a FIELD INVENTORY and for the human-readable names of some option values —
+for example which five choices the Reach UI offers for *Player Species*, and what *Loadout Camera
+Time* means.
+
+**No program code from that project was read, copied, ported or translated.** ReachVariantTool's
+program code is GPLv3 and is deliberately not a source here. The binary layout HMS implements was
+established independently from Halo: Reach's own shipped binaries — `haloreach.dll` (the
+base-variant bitstream decode and the loadout accessor) and `reach_tag_test.exe` (the engine's own
+tag reflection data, which names every field) — and is documented with those addresses in
+`re-notes/reach_saved_film_layout.md`. Binary format facts are not copyrightable; code is.
+
+CC0 1.0 Universal: <https://creativecommons.org/publicdomain/zero/1.0/>
+
 ## Game data
 
 No Halo game content (maps, tags, textures, shaders) is distributed with this

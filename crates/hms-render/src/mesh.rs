@@ -75,6 +75,13 @@ pub struct MeshVertex {
     /// falls back to a screen-space-derivative Gram-Schmidt frame. Some lanes re-use the slot
     /// (light-volume ribbons, BSP foliage back-face lighting, particle billboard UV).
     pub tangent: [f32; 4],
+    /// SKIN-1 (Reach actors): the vertex's four (bone, weight) pairs, packed as two u32s —
+    /// `bone[0]` = node indices `i0 | i1<<8 | i2<<16 | i3<<24`, `bone[1]` = the matching /255
+    /// weights. Read ONLY by the skinned mesh pipeline, which binds this field at shader
+    /// location 9 in place of `sway` (the two pipelines share the 32-attribute budget, so the
+    /// skinned layout trades the decorator-wind slot for bone data). `[0, 0]` everywhere else;
+    /// the unskinned pipeline never reads it, so populating it cannot change ordinary objects.
+    pub bone: [u32; 2],
 }
 
 impl Default for MeshVertex {
@@ -87,6 +94,7 @@ impl Default for MeshVertex {
             sway: [0.0; 3],
             uv2: [0.0; 2],
             tangent: [0.0; 4],
+            bone: [0, 0],
         }
     }
 }
@@ -143,6 +151,13 @@ struct InstanceRaw {
     /// zeroes the specular contribution the engine never computes. Halo 4 materials pass
     /// -(1 + specular model) (h4_shade). Location 20.
     matmodel: f32,
+    /// The material's authored `diffuse_coefficient` — the engine multiplies the whole DIFFUSE
+    /// light (lightmap + analytical + simple lights) by it before the albedo multiply
+    /// (`r2 = (lm + simple) * diffuse_coefficient; out = r2 * albedo + spec + env`; 435 of the
+    /// 565 lightmapped BSP pixel shaders in the Sapien capture read it). 1.0 = no-op; rides the
+    /// second component of the `matmodel` vertex attribute (location 20), which the attribute
+    /// budget forced (32/32 locations are in use). Location 20.y.
+    dcoef: f32,
     /// Self-illumination MODE routing [mode, cmul.r, cmul.g, cmul.b]. mode = the engine
     /// self_illumination enum (0 off / 1 simple / 4 from_albedo / …). Only mode==4 (from_albedo)
     /// is routed: mesh_shade emits `albedo · cmul` (= albedo · self_illum_color · intensity) as the
@@ -437,6 +452,11 @@ pub struct GpuMesh {
     /// additive (particles). Mirrors the render_method BLEND_TYPE enum; set by the BSP
     /// transparent routing in scene.rs.
     blend_mode: u8,
+    /// SKIN-1: when set, this mesh's vertices carry bone indices/weights (in the sway /
+    /// uv2.x slots) and the opaque + alpha-test passes draw it through the SKINNED pipeline
+    /// with this palette bound at @group(2). None = an ordinary rigid mesh (every other
+    /// caller). Several parts of one actor share one `Arc`.
+    skin: Option<std::sync::Arc<SkinPalette>>,
 }
 
 /// Which transparent pipeline family a list handed to `draw_transparent_sorted` uses.
@@ -448,6 +468,71 @@ pub enum TransparentKind {
     Additive,
     /// alpha-blended solid marker holo (fs_holo_solid: spawn/hill/kill-safe shapes).
     HoloSolid,
+}
+
+/// #sword-blade SKIN-2: the exact transparent pipeline one mesh takes — the `TransparentKind`
+/// family, narrowed by `GpuMesh::blend_mode` for the alpha-blend family, and doubled by whether
+/// the mesh is SKINNED. The skinned half exists because a posed actor (a biped, or the weapon in
+/// its hand) has its vertices in the bind pose and is moved by the bone palette at `@group(2)`:
+/// an unskinned pipeline cannot even bind that palette, so a skinned mesh sent to one would draw
+/// at the bind pose. Before these existed the actor build had nowhere to put a transparent part
+/// and folded them all into the opaque list — a held energy sword drew as a solid grey blade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TransparentPipe {
+    HoloSolid,
+    HoloSolidSkinned,
+    Additive,
+    AdditiveSkinned,
+    BlendAlpha,
+    BlendAlphaSkinned,
+    BlendPremul,
+    BlendPremulSkinned,
+    BlendMultiply,
+    BlendMultiplySkinned,
+    BlendDoubleMultiply,
+    BlendDoubleMultiplySkinned,
+}
+
+impl TransparentPipe {
+    /// True for the half of the table that binds a bone palette. A mesh with a `SkinPalette` must
+    /// only ever land on one of these.
+    pub fn is_skinned(self) -> bool {
+        use TransparentPipe::*;
+        matches!(self, HoloSolidSkinned | AdditiveSkinned | BlendAlphaSkinned
+            | BlendPremulSkinned | BlendMultiplySkinned | BlendDoubleMultiplySkinned)
+    }
+    /// The same pipeline for the opposite skinning state — the pair a family/blend_mode makes.
+    pub fn flip_skin(self) -> Self {
+        use TransparentPipe::*;
+        match self {
+            HoloSolid => HoloSolidSkinned, HoloSolidSkinned => HoloSolid,
+            Additive => AdditiveSkinned, AdditiveSkinned => Additive,
+            BlendAlpha => BlendAlphaSkinned, BlendAlphaSkinned => BlendAlpha,
+            BlendPremul => BlendPremulSkinned, BlendPremulSkinned => BlendPremul,
+            BlendMultiply => BlendMultiplySkinned, BlendMultiplySkinned => BlendMultiply,
+            BlendDoubleMultiply => BlendDoubleMultiplySkinned,
+            BlendDoubleMultiplySkinned => BlendDoubleMultiply,
+        }
+    }
+}
+
+/// #sword-blade SKIN-2: which transparent pipeline a mesh takes. The ONE place the routing is
+/// decided, so `draw_transparent_sorted` cannot drift from what the gates assert. `blend_mode` is
+/// only read by the `Blend` family (the engine render_method BLEND_TYPE: 1 premul, 2 multiply,
+/// 3 double_multiply, anything else straight alpha).
+pub fn transparent_pipe(kind: TransparentKind, blend_mode: u8, skinned: bool) -> TransparentPipe {
+    use TransparentPipe as P;
+    let unskinned = match kind {
+        TransparentKind::HoloSolid => P::HoloSolid,
+        TransparentKind::Additive => P::Additive,
+        TransparentKind::Blend => match blend_mode {
+            1 => P::BlendPremul,
+            2 => P::BlendMultiply,
+            3 => P::BlendDoubleMultiply,
+            _ => P::BlendAlpha,
+        },
+    };
+    if skinned { unskinned.flip_skin() } else { unskinned }
 }
 
 impl GpuMesh {
@@ -466,6 +551,11 @@ impl GpuMesh {
     pub fn centroid(&self) -> [f32; 3] { self.centroid }
     /// The engine blend mode set by `set_blend_mode` (0 when untagged).
     pub fn blend_mode(&self) -> u8 { self.blend_mode }
+    /// SKIN-1: route this mesh through the skinned opaque / alpha-test pipeline with `palette`
+    /// bound at @group(2). The vertices must already carry packed bone data (see SKIN_FN_WGSL).
+    pub fn set_skin(&mut self, palette: std::sync::Arc<SkinPalette>) { self.skin = Some(palette); }
+    /// SKIN-1: true when `set_skin` tagged this mesh.
+    pub fn is_skinned(&self) -> bool { self.skin.is_some() }
     /// Per-instance colour lane rewrite (Halo 4 objects: probe irradiance + sun vis).
     pub fn set_instance_colors(&mut self, queue: &wgpu::Queue, colors: &[[f32; 4]]) {
         if self.inst_raw.is_empty() { return; }
@@ -481,11 +571,144 @@ impl GpuMesh {
     }
     /// Override the sort centroid (per-frame particle batches are built in world space).
     pub fn set_centroid(&mut self, c: [f32; 3]) { self.centroid = c; }
+    /// Rewrite the per-instance MODEL matrices in place and refresh the sort centroid.
+    ///
+    /// The geometry buffers and the material are untouched, so a mesh whose placement is driven
+    /// live by the user (an imported external model with its own gizmo transform) costs one small
+    /// `write_buffer` per change instead of a re-upload. The vertex shader already rotates the
+    /// normal and the tangent by this matrix (`vs_impl`), so a rotation + UNIFORM scale shades
+    /// correctly with no normal-matrix fix-up; a non-uniform scale would need one.
+    pub fn set_instance_models(&mut self, queue: &wgpu::Queue, models: &[Mat4]) {
+        if self.inst_raw.is_empty() || models.is_empty() { return; }
+        let mut c = glam::Vec3::ZERO;
+        for (r, m) in self.inst_raw.iter_mut().zip(models) {
+            r.model = m.to_cols_array_2d();
+            c += m.w_axis.truncate();
+        }
+        let n = self.inst_raw.len().min(models.len()).max(1) as f32;
+        self.centroid = (c / n).to_array();
+        queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.inst_raw));
+    }
+}
+
+/// SKIN-1: the maximum bone count of one skinned actor. Reach's biggest biped skeleton is far
+/// under this; the value is bounded by the guaranteed 64 KiB uniform-buffer binding size
+/// (256 * 64 B = 16 KiB).
+pub const MAX_SKIN_BONES: usize = 256;
+
+/// WGSL: the bone-palette binding, only in the skinned module (`__SKIN_DECL__`).
+const SKIN_DECL_WGSL: &str = r#"
+struct Bones { m: array<mat4x4<f32>, 256> };
+@group(2) @binding(0) var<uniform> bones: Bones;
+"#;
+
+/// WGSL: shader location 9. The unskinned modules keep the decorator-wind `sway` basis; the
+/// skinned module binds `MeshVertex::bone` there instead (see the attribute swap in the
+/// skinned vertex layout).
+/// Expand the four `__SKIN_*__` placeholders of the mesh module.
+///
+/// Shared by pipeline creation and by the WGSL validity test so the two cannot drift. It has to
+/// be shared: the test used to validate the RAW template, and `__SKIN_V9__` is not a legal WGSL
+/// identifier, so `wgsl_tests::all_shaders_valid` failed on a module the GPU compiles perfectly
+/// well. A shader test that cannot compile the thing it is testing is worse than no test — the
+/// test now validates both expansions, which is what the GPU actually sees.
+pub(crate) fn apply_skin_subst(src: &str, skinned: bool) -> String {
+    src.replace("__SKIN_V9__", if skinned { SKIN_V9_BONE_WGSL } else { SKIN_V9_SWAY_WGSL })
+        .replace("__SKIN_WIND__", if skinned { SKIN_WIND_NONE_WGSL } else { SKIN_WIND_WGSL })
+        .replace("__SKIN_DECL__", if skinned { SKIN_DECL_WGSL } else { "" })
+        .replace("__SKIN_FN__", if skinned { SKIN_FN_WGSL } else { SKIN_FN_IDENTITY_WGSL })
+}
+
+const SKIN_V9_SWAY_WGSL: &str = "    @location(9) sway: vec3<f32>,";
+const SKIN_V9_BONE_WGSL: &str = "    @location(9) bone: vec2<u32>,";
+
+/// WGSL: the decorator wind displacement. A skinned actor has no wind (and no `sway` field).
+const SKIN_WIND_NONE_WGSL: &str = "";
+const SKIN_WIND_WGSL: &str = r#"    let gust = 0.55 + 0.45 * sin(cam.time.x * 0.4 + world.x * 0.04 + world.y * 0.04);
+    let phase = cam.time.x * 1.7 + world.x * 0.35 + world.y * 0.35;
+    let amp = sin(phase) * gust;
+    world.x += v.sway.x * amp;
+    world.y += v.sway.y * amp;
+    world.z += v.sway.z * amp;"#;
+
+/// WGSL: `skin_xf` for every UNSKINNED module - the identity, so the generated code is
+/// equivalent to the pre-skinning shader.
+const SKIN_FN_IDENTITY_WGSL: &str = r#"
+fn skin_xf(v: VIn) -> SkinXf { return SkinXf(v.pos, v.normal, v.tangent.xyz); }
+"#;
+
+/// WGSL: the real linear-blend skin. Four bones per vertex, weights renormalised (a Reach
+/// skinned vertex stores them as UInt8_N4 summing to 255; a zero sum means "rigid to slot 0").
+const SKIN_FN_WGSL: &str = r#"
+fn skin_xf(v: VIn) -> SkinXf {
+    let a = v.bone.x;
+    let c = v.bone.y;
+    var idx = array<u32, 4>(a & 255u, (a >> 8u) & 255u, (a >> 16u) & 255u, (a >> 24u) & 255u);
+    var wt  = array<f32, 4>(f32(c & 255u), f32((c >> 8u) & 255u), f32((c >> 16u) & 255u), f32((c >> 24u) & 255u));
+    var sum = wt[0] + wt[1] + wt[2] + wt[3];
+    if (sum <= 0.0) { wt[0] = 1.0; wt[1] = 0.0; wt[2] = 0.0; wt[3] = 0.0; sum = 1.0; }
+    let inv = 1.0 / sum;
+    var c0 = vec4<f32>(0.0);
+    var c1 = vec4<f32>(0.0);
+    var c2 = vec4<f32>(0.0);
+    var c3 = vec4<f32>(0.0);
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let w = wt[k] * inv;
+        if (w > 0.0) {
+            let bm = bones.m[idx[k]];
+            c0 = c0 + bm[0] * w;
+            c1 = c1 + bm[1] * w;
+            c2 = c2 + bm[2] * w;
+            c3 = c3 + bm[3] * w;
+        }
+    }
+    let m = mat4x4<f32>(c0, c1, c2, c3);
+    var o: SkinXf;
+    o.pos = (m * vec4<f32>(v.pos, 1.0)).xyz;
+    o.nrm = (m * vec4<f32>(v.normal, 0.0)).xyz;
+    o.tan = (m * vec4<f32>(v.tangent.xyz, 0.0)).xyz;
+    return o;
+}
+"#;
+
+/// SKIN-1: one posed actor's bone palette. Entry `i` is `posed_model[i] * inverse_bind[i]`
+/// (the identity palette = the bind pose, because a skinned Reach section's vertices are
+/// already in MODEL space). Shared by every `GpuMesh` of that actor through an `Arc`, so a
+/// many-part Spartan uploads ONE palette per frame.
+pub struct SkinPalette {
+    buf: wgpu::Buffer,
+    bg: wgpu::BindGroup,
+}
+
+impl SkinPalette {
+    /// Overwrite the palette (clamped to `MAX_SKIN_BONES`).
+    pub fn update(&self, queue: &wgpu::Queue, mats: &[Mat4]) {
+        let n = mats.len().min(MAX_SKIN_BONES);
+        if n == 0 { return; }
+        let flat: Vec<[[f32; 4]; 4]> = mats[..n].iter().map(|m| m.to_cols_array_2d()).collect();
+        queue.write_buffer(&self.buf, 0, bytemuck::cast_slice(&flat));
+    }
 }
 
 pub struct MeshRenderer {
     pipeline: wgpu::RenderPipeline,
     alphatest_pipeline: wgpu::RenderPipeline,
+    /// SKIN-1: `pipeline` / `alphatest_pipeline` recompiled from the SKINNED mesh module
+    /// (bone palette at @group(2)). Selected per mesh by `GpuMesh::skin`.
+    skinned_pipeline: wgpu::RenderPipeline,
+    skinned_alphatest_pipeline: wgpu::RenderPipeline,
+    /// #sword-blade SKIN-2: the TRANSPARENT families recompiled from the skinned module, one per
+    /// pipeline `draw_transparent_sorted` can select. Same fragment entry, same blend state and
+    /// the same depth state (tested, never written) as the unskinned twin — so a posed actor's
+    /// additive blade / halogram / glass part composites exactly as a world-placed one does.
+    skinned_additive_pipeline: wgpu::RenderPipeline,
+    skinned_holo_solid_pipeline: wgpu::RenderPipeline,
+    skinned_blend_pipeline: wgpu::RenderPipeline,
+    skinned_blend_premul_pipeline: wgpu::RenderPipeline,
+    skinned_blend_multiply_pipeline: wgpu::RenderPipeline,
+    skinned_blend_double_multiply_pipeline: wgpu::RenderPipeline,
+    /// SKIN-1: bind-group layout of the bone palette (see `SkinPalette`).
+    skin_bgl: wgpu::BindGroupLayout,
     foliage_pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
     /// Non-decal pre_multiplied_alpha transparents (render_method BLEND_TYPE 6). Engine
@@ -539,6 +762,11 @@ pub struct MeshRenderer {
     /// The 1×1 emissive/detail/bump fallbacks + the env cube, built ONCE, lazily (upload_mesh
     /// has the queue; new() does not). Re-creating them per upload_mesh (3 texture creates +
     /// writes per mesh) cost ~30ms/mesh. OnceLock is thread-safe for the parallel prewarm/upload paths.
+    /// One-shot `diffuse_coefficient` for the NEXT `upload_mesh*` call (f32 bits). The vertex
+    /// attribute budget is full (32/32), so the value rides `matmodel.y` and there is no free
+    /// parameter slot in the 30-argument upload signature; the caller sets this immediately
+    /// before the upload and it is consumed (reset to 1.0) by that upload. 1.0 = no-op.
+    pending_dcoef: std::sync::atomic::AtomicU32,
     fallbacks: std::sync::OnceLock<FallbackTex>,
     /// GPU base×detail baker (composite on the GPU instead of a CPU loop). Lazily built
     /// (needs the queue) and thread-safe for the parallel prewarm/bake paths.
@@ -784,7 +1012,11 @@ impl MeshRenderer {
             // can't touch; 16× (the hardware max, auto-clamped to the device limit) samples along
             // the true texel footprint. Shared by ALL scene passes (mesh/decal/foliage bgl
             // binding 1, terrain bgl binding 5, water bgl binding 1).
-            anisotropy_clamp: 16,
+            //
+            // Settings ▸ Graphics ▸ Anisotropic filtering lowers it. Because this ONE sampler is
+            // baked into every material bind group, the setting is read here, once — it takes
+            // effect on the next start, which is what the UI tells the user.
+            anisotropy_clamp: crate::quality::anisotropy(),
             ..Default::default()
         });
 
@@ -830,17 +1062,51 @@ impl MeshRenderer {
         // Print-only probe lanes (read back through HMS_HDR_DUMP): HMS_MDBG (mesh_shade / glass /
         // halogram terms), HMS_TDDBG (two-detail lane), HMS_H4_SHADEDBG (Halo 4 lane).
         let dbg_f = |var: &str| format!("{:.1}", std::env::var(var).ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0));
+        // SKIN-1: the lit mesh shader is compiled TWICE from one source - once unskinned
+        // (`skin_xf` = identity, the decorator sway intact: every existing pipeline) and once
+        // skinned (bone palette at @group(2), sway slots reinterpreted as bone data). See the
+        // SKINNED/__SKIN_FN__ block in MESH_WGSL.
+        let mesh_src = |skinned: bool| {
+            apply_skin_subst(
+                &format!("{FOG_WGSL}{SHADOW_SAMPLE_WGSL}{gi_wgsl}{MESH_WGSL}{H4_MESH_WGSL}")
+                    .replace("__H4DBG__", &dbg_f("HMS_H4_SHADEDBG"))
+                    .replace("__TDDBG__", &dbg_f("HMS_TDDBG"))
+                    .replace("__MDBG__", &dbg_f("HMS_MDBG"))
+                    .replace("__DECO_CX__", &deco_cx)
+                    .replace("__DECO_CY__", &deco_cy),
+                skinned,
+            )
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("mesh-lit"),
-            source: wgpu::ShaderSource::Wgsl(format!("{FOG_WGSL}{SHADOW_SAMPLE_WGSL}{gi_wgsl}{MESH_WGSL}{H4_MESH_WGSL}")
-                .replace("__H4DBG__", &dbg_f("HMS_H4_SHADEDBG"))
-                .replace("__TDDBG__", &dbg_f("HMS_TDDBG"))
-                .replace("__MDBG__", &dbg_f("HMS_MDBG"))
-                .replace("__DECO_CX__", &deco_cx).replace("__DECO_CY__", &deco_cy).into()),
+            source: wgpu::ShaderSource::Wgsl(mesh_src(false).into()),
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("mesh-pl"),
             bind_group_layouts: &[camera_bgl, &material_bgl],
+            push_constant_ranges: &[],
+        });
+        // SKIN-1: the bone palette (one per posed actor, shared by all of its parts).
+        let skin_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("skin-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let skinned_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mesh-lit-skinned"),
+            source: wgpu::ShaderSource::Wgsl(mesh_src(true).into()),
+        });
+        let skinned_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mesh-skinned-pl"),
+            bind_group_layouts: &[camera_bgl, &material_bgl, &skin_bgl],
             push_constant_ranges: &[],
         });
 
@@ -879,17 +1145,17 @@ impl MeshRenderer {
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 176, shader_location: 17 }, // fine_xform
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 192, shader_location: 18 }, // bump_detail_xform
                 wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 208, shader_location: 19 }, // env_ctl [env_tint.rgb, specular_coefficient]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 224, shader_location: 20 }, // matmodel (material_model+1; 0=unset)
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 228, shader_location: 21 }, // si_ctl [mode, cmul.rgb]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 244, shader_location: 23 }, // mattex [black_rough, black_specmult, has_flag, mode]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 260, shader_location: 24 }, // mattex_xform [tile.xy, off.xy]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 276, shader_location: 25 }, // xbump [bd2.tile.xy, bd3.tile.xy]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 292, shader_location: 26 }, // xctl [bd2_present, bd3_present, env_authored, snorm bits]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 308, shader_location: 27 }, // obj_probe0 [dom_dir.xyz, bandwidth]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 324, shader_location: 28 }, // obj_probe1 [dom_rgb, mask]
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 340, shader_location: 29 }, // spec_rgb specular_tint
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 356, shader_location: 30 }, // fres_rgb fresnel_color
-                wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32x4, offset: 372, shader_location: 31 }, // obj_light packed [oct(fill_dir), oct(bounce_dir), bounce.rg, (bounce.b, flag)] — LAST free attribute (32/32)
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 224, shader_location: 20 }, // [matmodel (material_model+1; 0=unset), diffuse_coefficient]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 232, shader_location: 21 }, // si_ctl [mode, cmul.rgb]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 248, shader_location: 23 }, // mattex [black_rough, black_specmult, has_flag, mode]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 264, shader_location: 24 }, // mattex_xform [tile.xy, off.xy]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 280, shader_location: 25 }, // xbump [bd2.tile.xy, bd3.tile.xy]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 296, shader_location: 26 }, // xctl [bd2_present, bd3_present, env_authored, snorm bits]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 312, shader_location: 27 }, // obj_probe0 [dom_dir.xyz, bandwidth]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 328, shader_location: 28 }, // obj_probe1 [dom_rgb, mask]
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 344, shader_location: 29 }, // spec_rgb specular_tint
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 360, shader_location: 30 }, // fres_rgb fresnel_color
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32x4, offset: 376, shader_location: 31 }, // obj_light packed [oct(fill_dir), oct(bounce_dir), bounce.rg, (bounce.b, flag)] — LAST free attribute (32/32)
             ],
         };
 
@@ -971,6 +1237,107 @@ impl MeshRenderer {
             multiview: None,
             cache: None,
         });
+
+        // SKIN-1: the skinned vertex layout is the opaque one with ONE attribute swapped -
+        // location 9 reads `MeshVertex::bone` (Uint32x2 @ 84) instead of `sway` (Float32x3 @ 48).
+        // Both layouts therefore stay at 7 vertex attributes, inside the hardware cap.
+        let svbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MeshVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 2 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 3 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32x2, offset: 84, shader_location: 9 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 60, shader_location: 13 },
+                wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 68, shader_location: 22 },
+            ],
+        };
+        // SKIN-1: the opaque + alpha-test mesh pipelines again, from the SKINNED module and
+        // the 3-group layout. Identical state otherwise, so a skinned part shades exactly as
+        // the same part would unskinned.
+        let make_skinned = |label: &str, fs_entry: &str| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&skinned_layout),
+            vertex: wgpu::VertexState {
+                module: &skinned_shader,
+                entry_point: Some("vs"),
+                buffers: &[svbl.clone(), inst.clone()],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: depth_format,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &skinned_shader,
+                entry_point: Some(fs_entry),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview: None,
+            cache: None,
+        });
+        let skinned_pipeline = make_skinned("mesh-skinned-pipeline", "fs");
+        let skinned_alphatest_pipeline = make_skinned("mesh-skinned-alphatest-pipeline", "fs_alphatest");
+
+        // #sword-blade SKIN-2: the TRANSPARENT families again, from the SKINNED module and the
+        // 3-group layout — depth-tested, NO depth write, cull none, exactly like their unskinned
+        // twins below; only the vertex module/layout differ, so a skinned part composites exactly
+        // as the same part would unskinned. Without these a posed actor had nowhere to put an
+        // additive / halogram / glass part and `build_actor_meshes` folded all of them into the
+        // OPAQUE list — which is why a held energy sword drew as a solid grey blade.
+        let make_skinned_t = |label: &str, fs_entry: &str, blend: wgpu::BlendState| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&skinned_layout),
+                vertex: wgpu::VertexState {
+                    module: &skinned_shader,
+                    entry_point: Some("vs"),
+                    buffers: &[svbl.clone(), inst.clone()],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &skinned_shader,
+                    entry_point: Some(fs_entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
 
         // Foliage (decorator grass/flowers) pipeline: same config as alphatest
         // (cutout, opaque, depth-write) but the MULTIPLICATIVE `fs_foliage` entry —
@@ -1411,6 +1778,16 @@ impl MeshRenderer {
         let blend_multiply_pipeline = make_blend("mesh-blend-multiply-pipeline", multiply, "fs_blend_multiplicative");
         let blend_double_multiply_pipeline = make_blend("mesh-blend-double-multiply-pipeline", double_multiply, "fs_blend_multiplicative");
 
+        // #sword-blade SKIN-2: the six transparent families a posed actor can need, skinned.
+        // One per unskinned pipeline `draw_transparent_sorted` can select, with the SAME fragment
+        // entry and the SAME blend state, so the only difference is where the vertex came from.
+        let skinned_additive_pipeline = make_skinned_t("mesh-skinned-additive-pipeline", "fs_holo", additive_state);
+        let skinned_holo_solid_pipeline = make_skinned_t("mesh-skinned-holo-solid-pipeline", "fs_holo_solid", holo_solid_state);
+        let skinned_blend_pipeline = make_skinned_t("mesh-skinned-blend-pipeline", "fs_blend", wgpu::BlendState::ALPHA_BLENDING);
+        let skinned_blend_premul_pipeline = make_skinned_t("mesh-skinned-blend-premul-pipeline", "fs_blend_premul", decal_premul);
+        let skinned_blend_multiply_pipeline = make_skinned_t("mesh-skinned-blend-multiply-pipeline", "fs_blend_multiplicative", multiply);
+        let skinned_blend_double_multiply_pipeline = make_skinned_t("mesh-skinned-blend-double-multiply-pipeline", "fs_blend_multiplicative", double_multiply);
+
         // Shadow (depth-only) pipeline: renders casters from the sun POV into the
         // shadow depth map. No colour target; front-face cull reduces acne. Uses
         // the shadow bind group (light_view_proj at group0 binding 2).
@@ -1796,7 +2173,7 @@ impl MeshRenderer {
             cache: None,
         });
 
-        Self { pipeline, alphatest_pipeline, foliage_pipeline, blend_pipeline, blend_premul_pipeline, blend_multiply_pipeline, blend_double_multiply_pipeline, additive_pipeline, particle_add_pipeline, particle_alpha_pipeline, particle_premul_pipeline, particle_multiply_pipeline, holo_solid_pipeline, water_pipeline, terrain_pipeline, sky_opaque_pipeline, sky_blend_pipeline, sky_multiply_pipeline, sky_alpha_pipeline, sky_premul_pipeline, decal_alpha_pipeline, decal_additive_pipeline, decal_multiply_pipeline, decal_double_multiply_pipeline, decal_premul_pipeline, decal_invalpha_pipeline, decal_vector_pipeline, shadow_pipeline, shadow_pipeline_h4, material_bgl, terrain_bgl, water_bgl, sampler, lm_sampler, default_white, fallbacks: std::sync::OnceLock::new(), detail_baker: std::sync::OnceLock::new() }
+        Self { pipeline, alphatest_pipeline, skinned_pipeline, skinned_alphatest_pipeline, skinned_additive_pipeline, skinned_holo_solid_pipeline, skinned_blend_pipeline, skinned_blend_premul_pipeline, skinned_blend_multiply_pipeline, skinned_blend_double_multiply_pipeline, skin_bgl, foliage_pipeline, blend_pipeline, blend_premul_pipeline, blend_multiply_pipeline, blend_double_multiply_pipeline, additive_pipeline, particle_add_pipeline, particle_alpha_pipeline, particle_premul_pipeline, particle_multiply_pipeline, holo_solid_pipeline, water_pipeline, terrain_pipeline, sky_opaque_pipeline, sky_blend_pipeline, sky_multiply_pipeline, sky_alpha_pipeline, sky_premul_pipeline, decal_alpha_pipeline, decal_additive_pipeline, decal_multiply_pipeline, decal_double_multiply_pipeline, decal_premul_pipeline, decal_invalpha_pipeline, decal_vector_pipeline, shadow_pipeline, shadow_pipeline_h4, material_bgl, terrain_bgl, water_bgl, sampler, lm_sampler, default_white, pending_dcoef: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), fallbacks: std::sync::OnceLock::new(), detail_baker: std::sync::OnceLock::new() }
     }
 
     /// Build a material bind group from a base texture view + an emissive view.
@@ -1980,6 +2357,13 @@ impl MeshRenderer {
     /// serial per-mesh upload cost) move off the critical path onto the rayon decode. The
     /// resulting GpuMesh is identical to `upload_mesh`'s. All non-BSP callers call
     /// `upload_mesh` (which builds the buffers, then delegates here).
+    /// Set the authored `diffuse_coefficient` for the NEXT `upload_mesh` / `upload_mesh_prebuilt`
+    /// call on this renderer (see `MeshRenderer::pending_dcoef`). Consumed by that upload.
+    pub fn set_next_dcoef(&self, dcoef: f32) {
+        let d = if dcoef.is_finite() && dcoef >= 0.0 { dcoef } else { 1.0 };
+        self.pending_dcoef.store(d.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn upload_mesh_prebuilt(
         &self,
         device: &wgpu::Device,
@@ -2036,6 +2420,8 @@ impl MeshRenderer {
         // authored environment_map cube (opaque per_pixel); None → the captured sky cube.
         env_cube_override: Option<&wgpu::TextureView>,
     ) -> GpuMesh {
+        let _t_prof = std::time::Instant::now();
+        let _g = MeshProfGuard(_t_prof, &upprof::MESH_N, &upprof::MESH_NS);
         use wgpu::util::DeviceExt;
         // per-mesh lightmap scalars — [flag, hdr, k, mode]. flag=1 activates the GPU atlas
         // decode in mesh_shade; 0 keeps the baked i.tint. lm.w=2 flags a dynamic object (no
@@ -2044,6 +2430,10 @@ impl MeshRenderer {
             Some(l) => [1.0, l.hdr, l.k, l.mode],
             None => [0.0, 0.0, 0.0, if is_object { 2.0 } else { 0.0 }],
         };
+        // Consume the one-shot `diffuse_coefficient` (see MeshRenderer::pending_dcoef).
+        let dcoef_now = f32::from_bits(
+            self.pending_dcoef.swap(1.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed));
+        let dcoef_now = if dcoef_now.is_finite() && dcoef_now >= 0.0 { dcoef_now } else { 1.0 };
         let inst_data: Vec<InstanceRaw> = instances
             .iter()
             .enumerate()
@@ -2060,6 +2450,7 @@ impl MeshRenderer {
                 bump_detail_xform,
                 env_ctl,
                 matmodel,
+                dcoef: dcoef_now,
                 si_ctl,
                 mattex: mattex_ctl,
                 mattex_xform,
@@ -2131,6 +2522,7 @@ impl MeshRenderer {
             centroid,
             deco_weight: 0,
             blend_mode: 0,
+            skin: None,
         }
     }
 
@@ -2140,6 +2532,26 @@ impl MeshRenderer {
     // RenderBundleEncoder (SceneRenderer's cached bundles for the static BSP lists). Encoding
     // ~9000 draws through wgpu-core's validated pass path costs 15.8 ms of CPU per frame on
     // Panopticon; a bundle replays them as raw hal calls.
+    /// SKIN-1: allocate a bone palette for one actor, initialised to the BIND POSE (identity
+    /// matrices - a skinned Reach section's vertices are already in model space). Call
+    /// `SkinPalette::update` every time the pose changes.
+    pub fn new_skin_palette(&self, device: &wgpu::Device) -> std::sync::Arc<SkinPalette> {
+        use wgpu::util::DeviceExt;
+        let ident = Mat4::IDENTITY.to_cols_array_2d();
+        let init: Vec<[[f32; 4]; 4]> = vec![ident; MAX_SKIN_BONES];
+        let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("skin-palette"),
+            contents: bytemuck::cast_slice(&init),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("skin-bg"),
+            layout: &self.skin_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }],
+        });
+        std::sync::Arc::new(SkinPalette { buf, bg })
+    }
+
     pub fn draw<'a, E: wgpu::util::RenderEncoder<'a>>(
         &'a self,
         pass: &mut E,
@@ -2148,8 +2560,17 @@ impl MeshRenderer {
     ) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, Some(camera_bg), &[]);
+        // SKIN-1: a skinned mesh (posed actor) swaps to the skinned pipeline + its bone
+        // palette at @group(2); `cur_skinned` keeps the switch to one per run of meshes.
+        let mut cur_skinned = false;
         for m in meshes {
             if m.is_terrain { continue; } // drawn by draw_terrain
+            let want = m.skin.is_some();
+            if want != cur_skinned {
+                pass.set_pipeline(if want { &self.skinned_pipeline } else { &self.pipeline });
+                cur_skinned = want;
+            }
+            if let Some(sk) = &m.skin { pass.set_bind_group(2, Some(&sk.bg), &[]); }
             pass.set_bind_group(1, Some(&m.material.bind_group), &[]);
             pass.set_vertex_buffer(0, m.vbuf.slice(..));
             pass.set_vertex_buffer(1, m.instance_buf.slice(..));
@@ -2167,7 +2588,14 @@ impl MeshRenderer {
     ) {
         pass.set_pipeline(&self.alphatest_pipeline);
         pass.set_bind_group(0, Some(camera_bg), &[]);
+        let mut cur_skinned = false;   // SKIN-1, see `draw`
         for m in meshes {
+            let want = m.skin.is_some();
+            if want != cur_skinned {
+                pass.set_pipeline(if want { &self.skinned_alphatest_pipeline } else { &self.alphatest_pipeline });
+                cur_skinned = want;
+            }
+            if let Some(sk) = &m.skin { pass.set_bind_group(2, Some(&sk.bg), &[]); }
             pass.set_bind_group(1, Some(&m.material.bind_group), &[]);
             pass.set_vertex_buffer(0, m.vbuf.slice(..));
             pass.set_vertex_buffer(1, m.instance_buf.slice(..));
@@ -2308,20 +2736,32 @@ impl MeshRenderer {
         for (li, mi, ii, _) in items {
             let (meshes, kind) = &lists[li];
             let m = &meshes[mi];
-            let pipe: &wgpu::RenderPipeline = match kind {
-                TransparentKind::HoloSolid => &self.holo_solid_pipeline,
-                TransparentKind::Additive => &self.additive_pipeline,
-                TransparentKind::Blend => match m.blend_mode {
-                    1 => &self.blend_premul_pipeline,
-                    2 => &self.blend_multiply_pipeline,
-                    3 => &self.blend_double_multiply_pipeline,
-                    _ => &self.blend_pipeline,
-                },
+            // #sword-blade SKIN-2: a SKINNED transparent part (a posed actor's energy-sword
+            // blade, a held weapon's halogram) picks the same family from the skinned module and
+            // binds its bone palette at @group(2). The unskinned pipelines have a 2-group layout
+            // and must never see group 2, so the bind is inside the `if let`, exactly as the
+            // opaque/alpha-test passes do it.
+            let pipe: &wgpu::RenderPipeline = {
+                match transparent_pipe(*kind, m.blend_mode, m.skin.is_some()) {
+                    TransparentPipe::HoloSolid => &self.holo_solid_pipeline,
+                    TransparentPipe::HoloSolidSkinned => &self.skinned_holo_solid_pipeline,
+                    TransparentPipe::Additive => &self.additive_pipeline,
+                    TransparentPipe::AdditiveSkinned => &self.skinned_additive_pipeline,
+                    TransparentPipe::BlendAlpha => &self.blend_pipeline,
+                    TransparentPipe::BlendAlphaSkinned => &self.skinned_blend_pipeline,
+                    TransparentPipe::BlendPremul => &self.blend_premul_pipeline,
+                    TransparentPipe::BlendPremulSkinned => &self.skinned_blend_premul_pipeline,
+                    TransparentPipe::BlendMultiply => &self.blend_multiply_pipeline,
+                    TransparentPipe::BlendMultiplySkinned => &self.skinned_blend_multiply_pipeline,
+                    TransparentPipe::BlendDoubleMultiply => &self.blend_double_multiply_pipeline,
+                    TransparentPipe::BlendDoubleMultiplySkinned => &self.skinned_blend_double_multiply_pipeline,
+                }
             };
             if !std::ptr::eq(pipe, cur) {
                 pass.set_pipeline(pipe);
                 cur = pipe;
             }
+            if let Some(sk) = &m.skin { pass.set_bind_group(2, &sk.bg, &[]); }
             pass.set_bind_group(1, &m.material.bind_group, &[]);
             pass.set_vertex_buffer(0, m.vbuf.slice(..));
             pass.set_vertex_buffer(1, m.instance_buf.slice(..));
@@ -2372,6 +2812,8 @@ impl MeshRenderer {
         lightmap: Option<LightmapInputs>,
         model: Mat4, // placement matrix (BSP terrain passes IDENTITY; terrain-shaded objects their transform)
     ) -> GpuMesh {
+        let _t_prof = std::time::Instant::now();
+        let _g = MeshProfGuard(_t_prof, &upprof::TERR_N, &upprof::TERR_NS);
         use wgpu::util::DeviceExt;
         let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain-vb"),
@@ -2385,7 +2827,7 @@ impl MeshRenderer {
         });
         memprof::note("buf:terrain-vb/ib", (std::mem::size_of_val(verts) + std::mem::size_of_val(indices)) as u64);
         let tlm = match &lightmap { Some(l) => [1.0, l.hdr, l.k, l.mode], None => [0.0; 4] };
-        let inst = InstanceRaw { model: model.to_cols_array_2d(), color: [1.0; 4], scroll: [0.0; 4], detail_xform: [0.0; 4], aux: [0.0; 4], lm: tlm, spec2: [0.0; 4], bump_xform: [0.0; 4], fine_xform: [0.0; 4], bump_detail_xform: [0.0; 4], env_ctl: [0.0; 4], matmodel: 0.0, si_ctl: [0.0; 4], mattex: [0.0; 4], mattex_xform: [0.0; 4], xbump: [0.0; 4], xctl: [0.0; 4], obj_probe0: [0.0; 4], obj_probe1: [0.0; 4], spec_rgb: [0.0; 4], fres_rgb: [0.0; 4], obj_light: [0; 4] };
+        let inst = InstanceRaw { model: model.to_cols_array_2d(), color: [1.0; 4], scroll: [0.0; 4], detail_xform: [0.0; 4], aux: [0.0; 4], lm: tlm, spec2: [0.0; 4], bump_xform: [0.0; 4], fine_xform: [0.0; 4], bump_detail_xform: [0.0; 4], env_ctl: [0.0; 4], matmodel: 0.0, dcoef: 1.0, si_ctl: [0.0; 4], mattex: [0.0; 4], mattex_xform: [0.0; 4], xbump: [0.0; 4], xctl: [0.0; 4], obj_probe0: [0.0; 4], obj_probe1: [0.0; 4], spec_rgb: [0.0; 4], fres_rgb: [0.0; 4], obj_light: [0; 4] };
         let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("terrain-inst"),
             contents: bytemuck::bytes_of(&inst),
@@ -2517,6 +2959,7 @@ impl MeshRenderer {
             centroid: [0.0; 3],
             deco_weight: 0,
             blend_mode: 0,
+            skin: None,
         }
     }
 
@@ -2558,7 +3001,7 @@ impl MeshRenderer {
         });
         memprof::note("buf:water-vb/ib", (std::mem::size_of_val(verts) + std::mem::size_of_val(indices)) as u64);
         let wlm = match &lightmap { Some(l) => [1.0, l.hdr, l.k, l.mode], None => [0.0; 4] };
-        let inst = InstanceRaw { model: Mat4::IDENTITY.to_cols_array_2d(), color: [1.0; 4], scroll: [0.0; 4], detail_xform: [0.0; 4], aux: [0.0; 4], lm: wlm, spec2: [0.0; 4], bump_xform: [0.0; 4], fine_xform: [0.0; 4], bump_detail_xform: [0.0; 4], env_ctl: [0.0; 4], matmodel: 0.0, si_ctl: [0.0; 4], mattex: [0.0; 4], mattex_xform: [0.0; 4], xbump: [0.0; 4], xctl: [0.0; 4], obj_probe0: [0.0; 4], obj_probe1: [0.0; 4], spec_rgb: [0.0; 4], fres_rgb: [0.0; 4], obj_light: [0; 4] };
+        let inst = InstanceRaw { model: Mat4::IDENTITY.to_cols_array_2d(), color: [1.0; 4], scroll: [0.0; 4], detail_xform: [0.0; 4], aux: [0.0; 4], lm: wlm, spec2: [0.0; 4], bump_xform: [0.0; 4], fine_xform: [0.0; 4], bump_detail_xform: [0.0; 4], env_ctl: [0.0; 4], matmodel: 0.0, dcoef: 1.0, si_ctl: [0.0; 4], mattex: [0.0; 4], mattex_xform: [0.0; 4], xbump: [0.0; 4], xctl: [0.0; 4], obj_probe0: [0.0; 4], obj_probe1: [0.0; 4], spec_rgb: [0.0; 4], fres_rgb: [0.0; 4], obj_light: [0; 4] };
         let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("water-inst"),
             contents: bytemuck::bytes_of(&inst),
@@ -2623,6 +3066,7 @@ impl MeshRenderer {
             centroid: [0.0; 3],
             deco_weight: 0,
             blend_mode: 0,
+            skin: None,
         }
     }
 
@@ -2746,6 +3190,11 @@ impl MeshRenderer {
                     .then(segments[b].2.partial_cmp(&segments[a].2).unwrap_or(std::cmp::Ordering::Equal))
                     .then(a.cmp(&b))
             });
+        }
+        if std::env::var("HMS_SKYDRAWDBG").is_ok() {
+            for (i,(m,b,r)) in segments.iter().enumerate() {
+                eprintln!("SKYDRAWDBG seg {i}: idx_count={} inst_count={} blend={} radius={:.0}", m.index_count, m.instance_count, b, r);
+            }
         }
         for &idx in &order {
             let (m, blend, _radius) = &segments[idx];
@@ -3100,6 +3549,19 @@ pub fn build_hdr_env_cube(
 /// two costs that dominate load time). Returns None when: the device lacks BC support, the
 /// DDS is malformed, or the dxgi format isn't a BC format we map — the caller then falls
 /// back to the CPU decode path, so this is safe to attempt for every bitmap.
+/// Accounts a block-compressed upload on drop, so the function's several early returns do not
+/// have to each remember to.
+struct DdsProfGuard(std::time::Instant);
+impl Drop for DdsProfGuard {
+    fn drop(&mut self) {
+        upprof::DDS_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        upprof::add(&upprof::DDS_NS, self.0);
+    }
+}
+fn scopeguard_dds(t: std::time::Instant) -> DdsProfGuard {
+    DdsProfGuard(t)
+}
+
 pub fn upload_texture_dds(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -3108,6 +3570,10 @@ pub fn upload_texture_dds(
     if !device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
         return None;
     }
+    // Block-compressed: the file already carries its mip chain, so this path never pays the CPU
+    // box filter above. Timed separately so the two can be compared directly.
+    let _t_dds = std::time::Instant::now();
+    let _dds_guard = scopeguard_dds(_t_dds);
     // 148-byte header: magic(4)+DDS_HEADER(124)+DXT10(20). Fields per BuildDdsHeaderDXT10:
     // height@12, width@16, mipCount@28, dxgiFormat@128. Block data begins at 148.
     if dds.len() < 148 || &dds[0..4] != b"DDS " {
@@ -3161,6 +3627,20 @@ pub fn upload_texture_dds(
         return None;
     }
     mips = real_mips;
+    // Settings ▸ Graphics ▸ Texture quality: drop the top mip level(s) so nothing larger than
+    // the cap is ever uploaded. The chain is already on disk, so this is free at load time and
+    // it cuts both VRAM and sampling bandwidth; the bind groups are untouched, which is why it
+    // is a cap at UPLOAD rather than a sampler LOD clamp (every material bind group bakes the
+    // sampler, so a clamp would mean rebuilding all of them). Applies on the next map load.
+    let skip = crate::quality::mip_skip(w, h, mips);
+    let mut base = 148usize;
+    for m in 0..skip {
+        let (mw, mh) = ((w >> m).max(1), (h >> m).max(1));
+        base += ((mw / 4) as usize) * ((mh / 4) as usize) * block_bytes;
+    }
+    let (w, h) = ((w >> skip).max(4), (h >> skip).max(4));
+    let mips = mips - skip;
+    let total = total - (base - 148);
     memprof::add_tex_bc(total as u64); // exact BC bytes committed
     memprof::note("tex:dds-bc", total as u64);
     let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -3173,7 +3653,7 @@ pub fn upload_texture_dds(
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
-    let mut off = 148usize;
+    let mut off = base;
     for m in 0..mips {
         let mw = (w >> m).max(1);
         let mh = (h >> m).max(1);
@@ -3256,6 +3736,59 @@ pub fn upload_texture_rgba16f_nomip(
     (view, tex)
 }
 
+/// Upload a SIGNED two-channel normal map (DXGI 51 = R8G8_SNORM: the Halo 4 / H2A bitmap
+/// format 22, 2 bytes per texel, `x` then `y` as two's-complement i8) with a CPU box-filtered mip
+/// chain. Bound in a normal slot it samples exactly like the BC5_SNORM DXN maps (the Halo 4 lane
+/// reads `.xy` raw as the signed tangent normal, z = sqrt(1 - x^2 - y^2)); the mips are
+/// averaged in the SIGNED domain (averaging the raw bytes would fold -1 and +1 to -1).
+pub fn upload_texture_rg8_snorm(device: &wgpu::Device, queue: &wgpu::Queue, rg: &[u8], w: u32, h: u32) -> (wgpu::TextureView, wgpu::Texture) {
+    let mip_level_count = 32 - w.max(h).max(1).leading_zeros();
+    memprof::add_tex_uncompressed((w as u64) * (h as u64) * 2 * 4 / 3);
+    memprof::note("tex:rg8-snorm", (w as u64) * (h as u64) * 2 * 4 / 3);
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("rg8-snorm-normal"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rg8Snorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let write = |level: u32, data: &[u8], lw: u32, lh: u32| {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: level, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(2 * lw), rows_per_image: Some(lh) },
+            wgpu::Extent3d { width: lw, height: lh, depth_or_array_layers: 1 },
+        );
+    };
+    let n0 = (w * h * 2) as usize;
+    let mut cur: Vec<u8> = rg[..n0.min(rg.len())].to_vec();
+    cur.resize(n0, 0);
+    write(0, &cur, w, h);
+    let (mut cw, mut ch) = (w, h);
+    for level in 1..mip_level_count {
+        let (dw, dh) = ((cw / 2).max(1), (ch / 2).max(1));
+        let mut dst = vec![0u8; (dw * dh * 2) as usize];
+        for y in 0..dh {
+            for x in 0..dw {
+                let (sx0, sy0) = ((x * 2).min(cw - 1), (y * 2).min(ch - 1));
+                let (sx1, sy1) = ((x * 2 + 1).min(cw - 1), (y * 2 + 1).min(ch - 1));
+                let px = |sx: u32, sy: u32, c: usize| cur[((sy * cw + sx) * 2) as usize + c] as i8 as i32;
+                for c in 0..2 {
+                    let sum = px(sx0, sy0, c) + px(sx1, sy0, c) + px(sx0, sy1, c) + px(sx1, sy1, c);
+                    dst[((y * dw + x) * 2) as usize + c] = ((sum as f32 / 4.0).round() as i32).clamp(-128, 127) as i8 as u8;
+                }
+            }
+        }
+        write(level, &dst, dw, dh);
+        cur = dst; cw = dw; ch = dh;
+    }
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (view, tex)
+}
+
 /// Box-filter one 4-byte-per-texel level down to half resolution (min 1). The
 /// average is done in the stored channel order (works identically for RGBA or
 /// BGRA — order is irrelevant to a per-channel box filter).
@@ -3292,6 +3825,82 @@ fn upload_texture_fmt(
     upload_texture_fmt_mips(device, queue, rgba, w, h, format, true, None)
 }
 
+/// Accounts one mesh upload on drop — these functions have many early returns.
+struct MeshProfGuard(std::time::Instant, &'static std::sync::atomic::AtomicU64, &'static std::sync::atomic::AtomicU64);
+impl Drop for MeshProfGuard {
+    fn drop(&mut self) {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        upprof::add(self.2, self.0);
+    }
+}
+
+/// #gpu-build  Upload-path profiling. Print-only, read-and-reset, and costs one relaxed atomic
+/// add per upload — the per-object GPU build in `hms-app::scene` reads it to say where each
+/// model's milliseconds went, which a single wall-clock number around the whole build cannot.
+///
+/// Deliberately NOT behind an env check at the increment site: the check itself would cost more
+/// than the add, and an unread counter is free.
+pub mod upprof {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub static TEX_NS: AtomicU64 = AtomicU64::new(0);
+    /// Of `TEX_NS`, the part spent BUILDING THE MIP CHAIN on the CPU (box filter + the per-level
+    /// copies), as against creating the texture and writing level 0.
+    pub static TEX_MIP_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TEX_N: AtomicU64 = AtomicU64::new(0);
+    /// Base-level pixels uploaded, so a cost can be read per megapixel rather than per call.
+    pub static TEX_PIX: AtomicU64 = AtomicU64::new(0);
+    /// Block-compressed uploads, which carry their own mips and skip the CPU chain entirely.
+    pub static DDS_NS: AtomicU64 = AtomicU64::new(0);
+    pub static DDS_N: AtomicU64 = AtomicU64::new(0);
+    pub static MESH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static MESH_N: AtomicU64 = AtomicU64::new(0);
+    pub static TERR_NS: AtomicU64 = AtomicU64::new(0);
+    pub static TERR_N: AtomicU64 = AtomicU64::new(0);
+
+    /// One upload-path sample, in milliseconds and counts.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct UploadProf {
+        pub tex_ms: f64,
+        pub tex_mip_ms: f64,
+        pub tex_n: u64,
+        pub tex_mpix: f64,
+        pub dds_ms: f64,
+        pub dds_n: u64,
+        pub mesh_ms: f64,
+        pub mesh_n: u64,
+        pub terr_ms: f64,
+        pub terr_n: u64,
+    }
+
+    impl UploadProf {
+        /// Everything this module accounts for, milliseconds.
+        pub fn total_ms(&self) -> f64 {
+            self.tex_ms + self.dds_ms + self.mesh_ms + self.terr_ms
+        }
+    }
+
+    /// Read every counter and reset it, so the caller can bracket one unit of work.
+    pub fn take() -> UploadProf {
+        UploadProf {
+            tex_ms: TEX_NS.swap(0, Relaxed) as f64 / 1e6,
+            tex_mip_ms: TEX_MIP_NS.swap(0, Relaxed) as f64 / 1e6,
+            tex_n: TEX_N.swap(0, Relaxed),
+            tex_mpix: TEX_PIX.swap(0, Relaxed) as f64 / 1e6,
+            dds_ms: DDS_NS.swap(0, Relaxed) as f64 / 1e6,
+            dds_n: DDS_N.swap(0, Relaxed),
+            mesh_ms: MESH_NS.swap(0, Relaxed) as f64 / 1e6,
+            mesh_n: MESH_N.swap(0, Relaxed),
+            terr_ms: TERR_NS.swap(0, Relaxed) as f64 / 1e6,
+            terr_n: TERR_N.swap(0, Relaxed),
+        }
+    }
+
+    pub(crate) fn add(c: &AtomicU64, t: std::time::Instant) {
+        c.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
 fn upload_texture_fmt_mips(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -3306,6 +3915,9 @@ fn upload_texture_fmt_mips(
     // maps and any surface viewed at a grazing angle) alias into salt-and-pepper "graininess".
     // Generate levels on the CPU (box filter) — the bitmaps are already CPU-decoded to 4-byte
     // texels, so no GPU blit pass is needed.
+    let _t_up = std::time::Instant::now();
+    upprof::TEX_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    upprof::TEX_PIX.fetch_add((w as u64) * (h as u64), std::sync::atomic::Ordering::Relaxed);
     let mip_level_count = if mips { 32 - w.max(h).max(1).leading_zeros() } else { 1 }; // floor(log2(max))+1
     // account the committed bytes (base level + ~1/3 for the mip chain).
     memprof::add_tex_uncompressed((w as u64) * (h as u64) * 4 * (if mips { 4 } else { 3 }) / 3);
@@ -3338,6 +3950,10 @@ fn upload_texture_fmt_mips(
         );
     };
     write(0, &remap_rgb(rgba, lut), w, h);
+    // The mip chain is built on the CPU, level by level, with a full copy of the base level to
+    // start and a `remap_rgb` copy per level. Timed apart from the texture creation and the
+    // level-0 write because the two have completely different fixes.
+    let _t_mip = std::time::Instant::now();
     let (mut cur, mut cw, mut ch) = (rgba.to_vec(), w, h);
     for level in 1..mip_level_count {
         let (next, nw, nh) = downsample_2x(&cur, cw, ch);
@@ -3345,6 +3961,9 @@ fn upload_texture_fmt_mips(
         cur = next;
         cw = nw;
         ch = nh;
+    }
+    if mip_level_count > 1 {
+        upprof::add(&upprof::TEX_MIP_NS, _t_mip);
     }
     // HMS_VERIFY: copy back the base level's first rows and compare to the source (print-only).
     // Distinguishes GPU STORAGE corruption (readback ≠ source) from a sampling issue
@@ -3386,6 +4005,7 @@ fn upload_texture_fmt_mips(
         buf.unmap();
     }
     let view = tex.create_view(&Default::default());
+    upprof::add(&upprof::TEX_NS, _t_up);
     (view, tex)
 }
 
@@ -3429,6 +4049,8 @@ pub(crate) fn test_cube() -> (Vec<MeshVertex>, Vec<u32>) {
 //   atm4=(fog_light_rgb, fog_light_dist_falloff);
 //   atm5=(fog_light_ang_falloff, fog_light_near_cut, has_fog_light, _);
 //   atm6=(sun_dir_TO_sun_Zup, sun_valid).
+// HALO 3 re-uses the SAME 28 floats for a completely different law (`h3_fog` below), picked by
+// the `atm3.w == 2` sentinel; see that function for its slot map. #h3-fog
 /// Shared lighting module — prepended to the mesh + terrain shaders. Declares the light uniform
 /// (group 0 binding 2), the sun shadow depth map (3) + comparison sampler (4) and the 1x1
 /// luminance meter (9), and carries: `shadow_strength` (a 3×3-PCF lit factor [0,1] that GATES the
@@ -3643,6 +4265,10 @@ pub(crate) const FOG_WGSL: &str = r#"
 struct Fog {
     atm0: vec4<f32>, atm1: vec4<f32>, atm2: vec4<f32>, atm3: vec4<f32>,
     atm4: vec4<f32>, atm5: vec4<f32>, atm6: vec4<f32>,
+    // Halo 4 lane extension (lib.rs FOG_UNIFORM_LEN): ext[0] = sky layer (base, height, max
+    // distance, density), ext[1] = (sky colour, mode bits), ext[2..18] / ext[18..34] = the 64-entry
+    // sky / ground extinction tables T(x), x = weighted distance / max distance in 0..1.
+    ext: array<vec4<f32>, 34>,
 };
 @group(0) @binding(1) var<uniform> fog: Fog;
 
@@ -3691,8 +4317,69 @@ fn fog_band(dist: f32, vtop: f32, vbot: f32, vdiff: f32, fh: f32, fbase: f32, ft
     r.raw_fvd = raw_fvd;
     return r;
 }
+// --- Halo 3 atmosphere (`atmosphere_fx.hlsl compute_scattering`, engine
+// `c_atmosphere_fog_interface::compute_scattering @ 0x1803AF020`; ported from protomorph
+// `assets/halo_shaders/atmosphere_fx.wgsl:43-112`). TWO scattering species (Rayleigh beta_m at
+// rayleigh_height_scale, Mie beta_p at mie_height_scale) integrated analytically along the view
+// ray between the camera height and the fragment height, with a Rayleigh (1+cos2) and a
+// Henyey-Greenstein phase function driving the inscatter. Reach's two-BAND height fog cannot
+// express it (one species, a quadratic falloff and no phase term), so Halo 3 gets its own path.
+// Distances are RAW world units here - no FOG_WU: the engine's beta / height scales and
+// max_fog_thickness are authored in world units in the `skya` tag, unlike Reach's LUT depth.
+//
+// Slot map (hms-app h3/lighting.rs `fog_uniform`):
+//   atm0 = (representative inscatter rgb [sky-gradient only], distance_bias)
+//   atm1 = (sun_intensity / (beta_m + beta_p) x scene gain, max_fog_thickness)
+//   atm2 = (beta_m x log2e, reference_datum_plane)      atm3 = (beta_p x log2e, 2 = H3 sentinel)
+//   atm4 = (beta_m_angular, mie_height_scale)           atm5 = (beta_p_angular x (1-g2), rayleigh_height_scale)
+//   atm6 = (sun_direction, 2g)
+const K_LOG2_E: f32 = 1.4426950;
+fn h3_fog(shaded: vec3<f32>, wp: vec3<f32>, cp: vec3<f32>) -> vec3<f32> {
+    let dist_bias = fog.atm0.w;
+    let sun_norm = fog.atm1.xyz;
+    let max_thick = fog.atm1.w;
+    if (max_thick < 0.0) { return shaded; }   // engine disable sentinel (atmosphere_fx.hlsl:21)
+    var view_vector = cp - wp;
+    var dist = length(view_vector);
+    if (dist < 1e-6) { return shaded; }
+    view_vector = view_vector / dist;
+    let c_theta = -dot(view_vector, fog.atm6.xyz);
+
+    dist = max(dist + dist_bias, 0.0);
+    dist = min(dist, max_thick);
+
+    let ref_h = fog.atm2.w;
+    var view_height = max(cp.z - ref_h, 0.0);
+    var scene_height = max(wp.z - ref_h, 0.0);
+    let diff = view_height - scene_height;
+    view_height = view_height * K_LOG2_E;
+    scene_height = scene_height * K_LOG2_E;
+    let mie_h = max(fog.atm4.w, 1e-4);
+    let ray_h = max(fog.atm5.w, 1e-4);
+    var dp: f32; var dm: f32;
+    if (diff * diff > 0.001) {
+        dp = -(exp2(-view_height / mie_h) - exp2(-scene_height / mie_h)) * dist * mie_h / diff;
+        dm = -(exp2(-view_height / ray_h) - exp2(-scene_height / ray_h)) * dist * ray_h / diff;
+    } else {
+        dp = exp2(-view_height / mie_h) * dist;
+        dm = exp2(-view_height / ray_h) * dist;
+    }
+    let extinction = exp2(-(fog.atm2.xyz * dm + fog.atm3.xyz * dp));
+
+    // Rayleigh phase x (1 + cos2) and the Mie Henyey-Greenstein lobe (its (1-g2) prefix is
+    // folded into atm5.xyz on the CPU, as the engine's set_constant does).
+    let beta_m_theta = fog.atm4.xyz * (1.0 + c_theta * c_theta);
+    let g2 = fog.atm6.w;
+    let heyey = max((g2 * 0.5 + 1.0) - g2 * c_theta, 1e-4);
+    let beta_p_theta = fog.atm5.xyz * pow(heyey, -1.5);
+    let inscatter = sun_norm * (beta_m_theta + beta_p_theta) * (vec3<f32>(1.0) - extinction);
+    return shaded * extinction + max(inscatter, vec3<f32>(0.0));
+}
+
 fn apply_fog(shaded: vec3<f32>, wp: vec3<f32>, cp: vec3<f32>) -> vec3<f32> {
     if (fog.atm3.w < 0.5) { return shaded; }
+    // Halo 3 maps carry the engine's two-species atmosphere, not Reach's band fog. #h3-fog
+    if (fog.atm3.w > 1.5) { return h3_fog(shaded, wp, cp); }
     // FOG_WU is the effective density/distance scale. cam.time.z (HMS_FOG_WU env) overrides
     // the const for live calibration; 0 → use the const.
     let FW = select(FOG_WU, cam.time.z, cam.time.z > 0.0);
@@ -3872,7 +4559,7 @@ struct VIn {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) vcolor: vec4<f32>,
-    @location(9) sway: vec3<f32>,
+__SKIN_V9__
     @location(13) uv2: vec2<f32>,
     @location(22) tangent: vec4<f32>,  // G1 stored per-vertex tangent frame [T.xyz, handedness]; [0;4]=derivative fallback
     @location(4) m0: vec4<f32>,
@@ -3889,7 +4576,7 @@ struct VIn {
     @location(17) fine_xform: vec4<f32>,  // fine self-detail xform [tile.xy, flag, _]
     @location(18) bump_detail_xform: vec4<f32>,  // bump_detail_map xform [tile.xy, flag, _]
     @location(19) env_ctl: vec4<f32>,  // [env_tint_color.rgb, specular_coefficient]
-    @location(20) matmodel: f32,  // material_model+1 (0=unset); negative = a Halo 4 material
+    @location(20) matmodel: vec2<f32>,  // [material_model+1 (0=unset); negative = a Halo 4 material, diffuse_coefficient]
     @location(21) si_ctl: vec4<f32>,  // [self_illum mode, cmul.rgb]
     @location(23) mattex: vec4<f32>,  // [black_rough, black_specmult, has_flag, mode]
     @location(24) mattex_xform: vec4<f32>,  // material_texture UV xform [tile.xy, off.xy]
@@ -3923,7 +4610,7 @@ struct VOut {
     @location(17) bump_detail_xform: vec4<f32>,  // bump_detail_map xform
     @location(19) itint: vec4<f32>,  // RAW per-instance colour (NO per-vertex baked ambient folded in)
     @location(20) env_ctl: vec4<f32>,  // [env_tint_color.rgb, specular_coefficient]
-    @location(18) matmodel: f32,  // material_model+1 (0=unset); negative = a Halo 4 material
+    @location(18) matmodel: vec2<f32>,  // [material_model+1 (0=unset); negative = a Halo 4 material, diffuse_coefficient]
     @location(21) si_ctl: vec4<f32>,  // [self_illum mode, cmul.rgb]
     @location(22) tangent: vec4<f32>,  // G1 world-space stored tangent [T.xyz, handedness]; [0;4]=derivative fallback
     @location(23) mattex: vec4<f32>,  // [black_rough, black_specmult, has_flag, mode]
@@ -4014,22 +4701,35 @@ fn obj_chmt_apply(col0: vec3<f32>, bw0: f32, col1_raw: vec3<f32>, bounce_raw: ve
     return o;
 }
 
+// SKIN-1 (Reach bipeds): GPU vertex skinning. The skinned module
+// declares a bone-palette uniform at @group(2) and transforms pos/normal/tangent by the
+// weighted bone matrices BEFORE the per-instance model matrix. Every other module compiles
+// the identity below, so the existing pipelines are byte-identical to before.
+//
+// A skinned Reach `mode` section stores its vertices in MODEL space (bind pose), so the
+// palette entry for node i is `posed_model[i] * inverse_bind[i]` and the bind pose is the
+// identity palette.
+//
+// The bone data arrives in `MeshVertex::bone` (two u32s: four packed node indices, four
+// packed /255 weights), bound at shader location 9 IN PLACE OF the decorator-wind `sway`
+// basis - the mesh vertex layout is already at the hardware 32-attribute cap, so the skinned
+// pipeline trades the slot it does not need. A skinned actor therefore has no wind term.
+struct SkinXf { pos: vec3<f32>, nrm: vec3<f32>, tan: vec3<f32> }
+__SKIN_DECL__
+__SKIN_FN__
+
 // Body shared by `vs` (every scene pass) and `vs_decal` (decal pipelines).
 fn vs_impl(v: VIn) -> VOut {
     let model = mat4x4<f32>(v.m0, v.m1, v.m2, v.m3);
-    var world = model * vec4<f32>(v.pos, 1.0);
+    let sk = skin_xf(v);
+    var world = model * vec4<f32>(sk.pos, 1.0);
     // ENGINE decorator wind: a shared WORLD-SPACE wind flow-field — coherent gusts
     // over the whole field, not a per-instance local sway. The phase is already world-XY-coherent (so
     // neighbouring blades move together); add a slow large-scale GUST that modulates the sway amplitude
     // so the field breathes in waves (the engine's DECORATOR_WIND flow-field). Height foreshortening is
     // carried by the per-vertex sway basis (v.sway magnitude ∝ blade height). Zero sway → untouched.
-    let gust = 0.55 + 0.45 * sin(cam.time.x * 0.4 + world.x * 0.04 + world.y * 0.04);
-    let phase = cam.time.x * 1.7 + world.x * 0.35 + world.y * 0.35;
-    let amp = sin(phase) * gust;
-    world.x += v.sway.x * amp;
-    world.y += v.sway.y * amp;
-    world.z += v.sway.z * amp;
-    var nrm = normalize((model * vec4<f32>(v.normal, 0.0)).xyz);
+__SKIN_WIND__
+    var nrm = normalize((model * vec4<f32>(sk.nrm, 0.0)).xyz);
     // LIGHT VOLUME RIBBON (bump_xform.w == 4): the engine's light_volume vertex type builds
     // a camera-facing strip along the volume axis (camera_to_world in light_volume_shared_vertex_shaders).
     // Each vertex carries the CENTERLINE point in v.pos, the world axis in v.tangent.xyz and its signed
@@ -4051,7 +4751,7 @@ fn vs_impl(v: VIn) -> VOut {
     // World-space stored tangent. Rotate T by the model matrix (no-op for BSP's identity
     // instance) and carry the handedness in .w. Not normalized here (zero tangent stays zero →
     // the fragment shader detects it and falls back to the derivative frame).
-    o.tangent = vec4<f32>((model * vec4<f32>(v.tangent.xyz, 0.0)).xyz, v.tangent.w);
+    o.tangent = vec4<f32>((model * vec4<f32>(sk.tan, 0.0)).xyz, v.tangent.w);
     o.uv = v.uv;
     o.tint = v.tint * v.vcolor;   // fold per-vertex baked colour into the tint (lit surfaces)
     o.itint = v.tint;             // RAW instance colour — holo markers must NOT be modulated by the
@@ -4296,13 +4996,180 @@ fn change_color_palette(idx: i32) -> vec3<f32> {
     }
 }
 
+// ===================== HALO 3 OBJECT MATERIAL LANE (#h3-objlight) =====================
+// Reached from mesh_shade through the `matmodel > 99.5` sentinel. A Halo 3 dynamic object
+// (weapon / vehicle / scenery / Forge piece) carries NO lightmap: the engine links its shader's
+// `static_sh` entry point (halo3 entry_points_fx.hlsl `static_sh_ps`, protomorph
+// entry_static_sh.wgsl) and lights it from ONE spherical-harmonic probe sampled out of the
+// structure lightmap under the object (hms-app h3/objlight.rs `H3LightField`), plus that probe's
+// dominant light. The material model is cook_torrance (cook_torrance_fx.hlsl
+// `calc_material_cook_torrance_ps`), whose specular + environment lobes are most of what a metal
+// weapon or vehicle actually shows — their base maps are genuinely dark (mean ~0.003 linear), so
+// a diffuse-only stand-in renders them BLACK.
+//
+//   diffuse_radiance = ravi_order_2_with_dominant_light(N, sh, dom_dir, dom_I)
+//                    = (0.886227·sh0 − 1.023328·N·l1)/π + 0.281·I·sat(dom_dir·N)
+//     (spherical_harmonics_fx.hlsl:130; identical to the BSP per-pixel law in h3/lightmaps.rs
+//      `shade`, so an object and the floor beneath it are lit by ONE law.)
+//   specular_albedo  = albedo·albedo_blend + fresnel_color·(1 − albedo_blend)
+//   analytic lobe    = Beckmann D · sat(G) / (π·N·V) · Cook-Torrance F(IOR), clamped to
+//                      (vertex N·L + 1), × dominant intensity     [cook_torrance_fx.hlsl:234]
+//   area lobe        = the probe's radiance along the reflection direction: the SH evaluated at
+//                      R plus the dominant lobe through the renderer's diffuse_power_specular
+//                      table (the engine's own sh_glossy_ct_2 needs the three pre-integrated
+//                      rasterizer BRDF LUTs, which protomorph leaves unbound too).
+//   specular_color   = specular_mask·specular_coefficient·specular_tint ·
+//                      (analytic·analytical_specular_contribution + max(area,0)·area_specular_contribution)
+//   envmap           = cube(R) · env_specular_contribution·specular_mask·specular_coefficient ·
+//                      env_tint_color · area                    [environment_mapping_fx.hlsl:41]
+//   out = diffuse_radiance·albedo·diffuse_coefficient + specular_color + envmap + self_illum
+//
+// PER-INSTANCE lanes (h3/objlight.rs `H3ObjProbe::lanes`; every placement has its own probe):
+//   tint = [sh0.rgb, l1B.z]   obj_probe0 = [dom_dir.xyz, 1]   obj_probe1 = [dom_I.rgb, 1]
+//   obj_light = f16 pairs [l1R.xyz, l1G.xyz, l1B.xy]
+// PER-MATERIAL lanes (h3/scene.rs `upload_object_part` from h3/materials.rs `H3Shading`):
+//   spec_rgb = [specular_tint.rgb, roughness]   fres_rgb = [fresnel_color.rgb, albedo_blend]
+//   mat_spec2 = [specular_coefficient, analytical_spec, area_spec, env_spec]
+//   env_ctl = [env_tint_color.rgb, env_roughness_scale]
+//   fine_xform = [diffuse_coefficient, spec_mask mode, albedo_color.a, env mode]
+//   xbump = [albedo_color.rgb, 0]   si_ctl = [self_illum on, self_illum colour×intensity]
+//   matmodel = 100 + material_model (0 diffuse_only / 3 foliage / 4 none carry no spec lobe)
+fn h3_object_shade(i: VOut) -> vec4<f32> {
+    let auv = i.uv * i.tile + i.scroll * cam.time.x;
+    let dux = dpdx(auv);
+    let duy = dpdy(auv);
+    let n = normalize(i.normal);
+    let view = normalize(cam.cam_pos.xyz - i.world_pos);
+
+    // --- albedo (albedo_fx `default`): base_map × detail_map × DETAIL_MULTIPLIER × albedo_color ---
+    let tex = textureSampleGrad(base_tex, base_samp, auv, dux, duy);
+    let has_dxf = i.detail_xform.x > 0.01 && i.detail_xform.y > 0.01;
+    let duv = select(auv, i.uv * i.detail_xform.xy + i.detail_xform.zw, has_dxf);
+    let det4 = textureSampleGrad(detail_tex, base_samp, duv, dpdx(duv), dpdy(duv));
+    let detail = select(vec3<f32>(1.0), pow(det4.rgb, vec3<f32>(2.2)) * MESH_DETAIL_MULT, has_dxf);
+    let detail_a = select(1.0, det4.a, has_dxf);
+    let albedo_color = select(vec3<f32>(1.0), i.xbump.rgb, dot(i.xbump.rgb, vec3<f32>(1.0)) > 1e-4);
+    // The engine saturates the composed albedo (entry_points.hlsl_include: `albedo = saturate(...)`).
+    let albedo = clamp(pow(tex.rgb, vec3<f32>(2.2)) * detail * albedo_color, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // --- the object's light probe ---
+    let dom_dir = normalize(select(vec3<f32>(0.0, 0.0, 1.0), i.obj_probe0.xyz, dot(i.obj_probe0.xyz, i.obj_probe0.xyz) > 1e-8));
+    let dom_i = max(i.obj_probe1.rgb, vec3<f32>(0.0));
+    let sh0 = i.tint.rgb;
+    let a = unpack2x16float(i.obj_light.x);
+    let b = unpack2x16float(i.obj_light.y);
+    let c = unpack2x16float(i.obj_light.z);
+    let d = unpack2x16float(i.obj_light.w);
+    let l1r = vec3<f32>(a.x, a.y, b.x);
+    let l1g = vec3<f32>(b.y, c.x, c.y);
+    let l1b = vec3<f32>(d.x, d.y, i.tint.a);
+    // ravi_order_2_with_dominant_light at the shading normal
+    let dom_ndl = max(dot(dom_dir, n), 0.0);
+    let e = vec3<f32>(dot(n, l1r), dot(n, l1g), dot(n, l1b));
+    let diffuse_radiance = max((0.886227 * sh0 - 1.023328 * e) * 0.31830989 + 0.281 * dom_i * dom_ndl, vec3<f32>(0.0));
+
+    // --- material constants ---
+    let model = i32(round(i.matmodel.x - 100.0));
+    let roughness = clamp(i.spec_rgb.w, 0.02, 1.0);
+    let albedo_blend = clamp(i.fres_rgb.w, 0.0, 1.0);
+    let spec_coef = max(i.mat_spec2.x, 0.0);
+    let ana_contrib = max(i.mat_spec2.y, 0.0);
+    let area_contrib = max(i.mat_spec2.z, 0.0);
+    let env_contrib = max(i.mat_spec2.w, 0.0);
+    let diffuse_coef = select(1.0, i.fine_xform.x, i.fine_xform.x > 0.0);
+    // specular_mask option: 0 none, 1 from_diffuse (albedo.w), 2 mult_diffuse, 3 from_texture
+    let smode = i32(round(i.fine_xform.y));
+    let mask_tex = textureSampleGrad(mat_tex, base_samp, auv, dux, duy).a;
+    var spec_mask = 1.0;
+    if (smode == 1 || smode == 2) { spec_mask = tex.a * detail_a; }
+    if (smode == 3) { spec_mask = mask_tex; }
+    // diffuse_only / foliage / none link no analytical or area specular lobe at all.
+    let no_spec = (model == 0) || (model == 3) || (model == 4);
+
+    // --- analytic specular: calc_material_analytic_specular_cook_torrance_ps (line 234) ---
+    let spec_albedo = albedo * albedo_blend + i.fres_rgb.rgb * (1.0 - albedo_blend);
+    let ndl = dot(n, dom_dir);
+    let ndv = dot(n, view);
+    let min_dot = min(ndl, ndv);
+    var fres = spec_albedo;
+    var analytic = vec3<f32>(0.0);
+    if (min_dot > 0.0) {
+        let h = normalize(view + dom_dir);
+        let ndh = dot(n, h);
+        let vdh = dot(view, h);
+        let geom = 2.0 * ndh * min_dot / (saturate(vdh) + 0.00001);
+        // Cook-Torrance Fresnel through the index-of-refraction substitution
+        let f0 = min(spec_albedo, vec3<f32>(0.999));
+        let sq = sqrt(f0);
+        let ior = (vec3<f32>(1.0) + sq) / (vec3<f32>(1.0) - sq);
+        let g = sqrt(max(ior * ior + vec3<f32>(vdh * vdh - 1.0), vec3<f32>(0.0)));
+        let gpc = g + vec3<f32>(vdh);
+        let gmc = g - vec3<f32>(vdh);
+        let r = (vec3<f32>(vdh) * gpc - vec3<f32>(1.0)) / (vec3<f32>(vdh) * gmc + vec3<f32>(1.0));
+        fres = 0.5 * (gmc * gmc / (gpc * gpc + vec3<f32>(0.00001))) * (vec3<f32>(1.0) + r * r);
+        // Beckmann distribution
+        let m2 = roughness * roughness;
+        let ca2 = max(ndh * ndh, 1e-5);
+        let dist = exp((ca2 - 1.0) / (m2 * ca2)) / (m2 * ca2 * ca2 + 0.00001);
+        analytic = dist * saturate(geom) / (3.14159265 * ndv + 0.00001) * fres;
+        // the engine clamp to (vertex N·L + 1) keeps the lobe finite at grazing angles
+        analytic = min(analytic, vec3<f32>(dot(n, dom_dir) + 1.0)) * dom_i;
+    }
+
+    // --- area specular: the probe's radiance along the reflection direction ---
+    let refl = reflect(-view, n);
+    let er = vec3<f32>(dot(refl, l1r), dot(refl, l1g), dot(refl, l1b));
+    let sh_at_r = max((0.886227 * sh0 - 1.023328 * er) * 0.31830989, vec3<f32>(0.0));
+    let lut = textureSampleLevel(dps_lut, vmf_samp, vec3<f32>(dot(dom_dir, refl) * 0.5 + 0.5, 1.0, roughness), 0.0).r * 3.0;
+    let area_radiance = sh_at_r + lut * dom_i;
+    let sh_glossy = spec_albedo * area_radiance;
+
+    let spec_tint = select(vec3<f32>(1.0), i.spec_rgb.rgb, dot(i.spec_rgb.rgb, vec3<f32>(1.0)) > 1e-4);
+    var specular = spec_mask * spec_coef * spec_tint * (analytic * ana_contrib + max(sh_glossy, vec3<f32>(0.0)) * area_contrib);
+    specular = select(specular, vec3<f32>(0.0), no_spec);
+
+    // --- environment reflection (environment_mapping_fx per_pixel / dynamic) ---
+    // env mode 0 = none. env_reflection() decodes an AUTHORED cube (xctl.z) the engine way and
+    // otherwise samples the scene's captured sky cube; the roughness picks the mip.
+    let env_mode = i32(round(i.fine_xform.w));
+    let env_tint = i.env_ctl.rgb;
+    let env_rough = clamp(roughness * max(i.env_ctl.w, 0.0), 0.0, 1.0);
+    let low_freq = max(sh_glossy * spec_tint, vec3<f32>(0.001));
+    var envmap = env_reflection(refl, env_rough, 0.0, env_tint, i.xctl.z) * (env_contrib * spec_mask * spec_coef) * low_freq;
+    envmap = select(vec3<f32>(0.0), envmap, env_mode > 0 && env_contrib > 0.0 && !no_spec);
+
+    // --- self illumination (self_illumination_fx `simple`: map × colour × intensity) ---
+    var emis = vec3<f32>(0.0);
+    if (i.si_ctl.x > 0.5) { emis = pow(textureSampleGrad(emis_tex, base_samp, auv, dux, duy).rgb, vec3<f32>(2.2)) * i.si_ctl.yzw; }
+
+    var out = diffuse_radiance * albedo * diffuse_coef + specular + envmap + emis;
+    // HMS_MDBG probes on this lane (40..47): 40 diffuse_radiance, 41 albedo, 42 specular,
+    // 43 envmap, 44 [spec_mask, spec_coef, roughness], 45 dom_i, 46 sh0, 47 [model, env_mode, area_contrib].
+    let mdbg = __MDBG__;
+    if (mdbg > 39.5 && mdbg < 47.5) {
+        if (mdbg < 40.5) { return vec4<f32>(diffuse_radiance, 1.0); }
+        if (mdbg < 41.5) { return vec4<f32>(albedo, 1.0); }
+        if (mdbg < 42.5) { return vec4<f32>(specular, 1.0); }
+        if (mdbg < 43.5) { return vec4<f32>(envmap, 1.0); }
+        if (mdbg < 44.5) { return vec4<f32>(spec_mask, spec_coef, roughness, 1.0); }
+        if (mdbg < 45.5) { return vec4<f32>(dom_i, 1.0); }
+        if (mdbg < 46.5) { return vec4<f32>(sh0, 1.0); }
+        return vec4<f32>(f32(model), f32(env_mode), area_contrib, 1.0);
+    }
+    out = apply_fog(scene_grade(max(out, vec3<f32>(0.0))), i.world_pos, cam.cam_pos.xyz);
+    return vec4<f32>(out, 1.0);
+}
+
 // Shared shading body — used by the opaque `fs` and the alpha-test `fs_alphatest` (foliage
 // cutout) entry points. The composite is the engine's (entry_points.hlsl_include):
 // albedo·(baked dual-VMF probe + analytical sun/π·visibility) + specular + self-illum + env.
 fn mesh_shade(i: VOut) -> vec4<f32> {
     // Halo 4 materials (matmodel = -(1 + spec model), never < 0 for Reach) take the
     // shipped-shader lane in H4_MESH_WGSL and skip every Reach term below.
-    if (i.matmodel < -0.5) { return h4_shade(i); }
+    if (i.matmodel.x < -0.5) { return h4_shade(i); }
+    // Halo 3 dynamic OBJECTS (matmodel = 100 + material_model) take the H3 object lane below:
+    // the engine `static_sh` probe + cook_torrance_fx specular, not Reach's baked-lightmap path.
+    if (i.matmodel.x > 99.5) { return h3_object_shade(i); }
     // Per-material base-map UV tile (engine base_map_xform.xy), then the animated
     // scroll: waterfalls carry a per-instance rate; everything else scroll=0. Tile
     // defaults to (1,1) so untiled surfaces are unchanged.
@@ -4636,11 +5503,17 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     let no_dist_fade = i.fine_xform.w > 0.5;
     let detail_s4 = textureSampleGrad(detail_tex, base_samp, detail_uv, ddux, dduy);
     let detail = pow(detail_s4.rgb, vec3<f32>(2.2)) * MESH_DETAIL_MULT;
-    // The engine spec mask for specular_mask_from_diffuse is albedo.w = base.a x detail.a (x
-    // albedo_color.a, authored 1 on every vehicle paint; not carried). Object material lane only
+    // The engine spec mask for specular_mask_from_diffuse is the composed albedo ALPHA —
+    // albedo.hlsl_include:121 `albedo.w = base.w * detail.w * albedo_color.w`, saturated by
+    // entry_points.hlsl_include:102 `albedo = saturate(albedo)` and read verbatim by
+    // specular_mask.hlsl_include `calc_specular_mask_from_diffuse_ps`. Object material lane only
     // (flagged below by obj_mat_lane); the fallback 1x1 grey detail has a = 1 so unauthored
     // details are a no-op.
     let detail_a = select(1.0, detail_s4.a, has_dxf);
+    // #objmask A Forge-class object part binds its detail_map for that ALPHA ONLY (spec_from_alpha
+    // == 2 from scene.rs): the detail RGB deliberately stays out of its albedo, which is composed
+    // CPU-side (the unit/item lane, spec_from_alpha == 1, keeps the engine's detail colour).
+    let det_alpha_only = i.spec_from_alpha > 1.5;
     // LIVE fine self-detail (concrete grain): the engine keeps the high-frequency grain as a
     // runtime layer. Sample the BASE texture (self-detail: detail_tag==base_tag) at its high
     // tiling and multiply in, mean-preserving (×MESH_DETAIL_MULT). Gradients computed in
@@ -4658,6 +5531,9 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     if (is_macro_detail) {
         detail_c = vec3<f32>(1.0) + (detail - vec3<f32>(1.0)) * TILE_SURFACE_CONTRAST;
     }
+    // #objmask alpha-only detail binding: the colour layer is a no-op (the part's albedo is the
+    // CPU-composed base × albedo_color, unchanged by this lane).
+    detail_c = select(detail_c, vec3<f32>(1.0), det_alpha_only);
     var albedo = pow(tex.rgb, vec3<f32>(2.2)) * detail_c * fine;
     // two/four_change_color albedo (Forge pallets): mattex.w == 6 → at_tex holds the change_color_map
     // (r = primary mask, g = secondary), the instance colour alpha carries the change-colour index sentinel.
@@ -4756,13 +5632,18 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     // spec_from_alpha). Materials that authored no spec constant (mat_spec==0) take the diffuse
     // alpha alone: Bc1/opaque diffuse have no alpha → sampled a=1.0 would make matte surfaces
     // (sandy ground) reflect the full blue sky as per-pixel sparkle, so no-alpha diffuse reads as
-    // matte (spec_mask=0). The ENGINE OBJECT MATERIAL lane (unit/item objects: fres_rgb.w == 2
-    // from scene.rs) uses the engine's albedo.w = base.a × detail.a mask.
+    // matte (spec_mask=0). The ENGINE OBJECT MATERIAL lane (objects: fres_rgb.w == 2 from
+    // scene.rs) uses the engine's saturated albedo.w = base.a × detail.a × albedo_color.a mask
+    // (#objmask; albedo_color.a rides fine_xform.y on that lane).
     let obj_mat_lane = i.lm.w > 1.5 && obj_probe_lit && i.fres_rgb.w > 1.5;
-    let mask_det = select(1.0, detail_a, obj_mat_lane);
+    let sfa_on = i.spec_from_alpha > 0.5;
+    let mask_alb_a = select(1.0, max(i.fine_xform.y, 0.0), obj_mat_lane);
+    // saturate(base.a · detail.a · albedo_color.a) — the engine's own clamp, which bites where a
+    // material authors albedo_color.a > 1 (four Forge panels author 2.0).
+    let albedo_w = min(tex.a * select(1.0, detail_a, obj_mat_lane) * mask_alb_a, 1.0);
     let spec_mask = select(
-        tex.a * i.spec_from_alpha,
-        i.mat_spec * select(1.0, tex.a * mask_det, i.spec_from_alpha > 0.5),
+        tex.a * select(0.0, 1.0, sfa_on),
+        i.mat_spec * select(1.0, albedo_w, sfa_on),
         i.mat_spec > 0.0,
     );
     let baked_lum = dot(lit * bake.rgb, vec3<f32>(0.299, 0.587, 0.114));
@@ -4853,7 +5734,8 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
         let raised_o = saturate(dot(n, key) * 0.45 + 0.55);
         let seed_o = raised_o * sun_col * obj_b * 0.25 * Fv;
         let area_env = max(sh_glossy + seed_o, vec3<f32>(0.001)) * shadow;
-        let omask = select(1.0, tex.a * detail_a, i.spec_from_alpha > 0.5) * eff_spec_mult;
+        // #objmask engine specular_mask = saturate(base.a x detail.a x albedo_color.a) (albedo_w)
+        let omask = select(1.0, albedo_w, sfa_on) * eff_spec_mult;
         let lod_o = f32(u32(i.xctl.w + 0.5) >> 4u) * 0.25;
         let cube_o = env_reflection(refl, rough, lod_o, i.env_ctl.rgb, i.xctl.z);
         env = select(vec3<f32>(0.0), cube_o * (menv * omask * scoef) * area_env, i.xctl.z > 0.5 && menv > 0.0);
@@ -4898,7 +5780,7 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     // additionally carries no environment reflection. Every other model (1 cook_torrance,
     // 2 two_lobe_phong, 5-9) and the unset sentinel (matmodel==0 → mm<0) keep the Cook-Torrance
     // path. TODO: two_lobe_phong keeps the Cook-Torrance lobe rather than a Phong lobe.
-    let mm = i32(round(i.matmodel)) - 1;
+    let mm = i32(round(i.matmodel.x)) - 1;
     // An rmfl object part (si_ctl sentinel) is the foliage material model too — no Cook-Torrance
     // lobe; its base alpha is alpha-test COVERAGE, which spec_from_alpha=1 would read as a full
     // gloss mask (a white glint film over every leaf card). (The foliage `specular` type's own
@@ -4919,11 +5801,23 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     if (si_from_albedo) {
         emis = albedo * i.si_ctl.yzw;
     }
-    let lit_albedo = select(albedo, vec3<f32>(0.0), si_from_albedo);
-    let simple_d = select(simple, vec3<f32>(0.0), si_from_albedo);
+    // ENGINE `diffuse_coefficient` (ParametersPS offset 16 in the cook_torrance BSP templates;
+    // read by 435 of the 565 lightmapped BSP pixel shaders in the Sapien Ivory capture):
+    //   r2 = (lightmap_diffuse + analytical + simple_lights) * diffuse_coefficient
+    //   out = r2 * albedo + specular + environment + self_illum
+    // Folding it into the albedo of the DIFFUSE terms only is algebraically the same and leaves
+    // specular / environment / self-illum untouched, exactly as the engine does. 1.0 = no-op, and
+    // the templates that do not declare the parameter upload 1.0. Ivory authors 2.0 on its wood
+    // and marble floors (measured: those surfaces rendered 2.0x dark) and 0.0 on the recessed
+    // light panels (pure emitters whose diffuse the engine kills outright).
+    let dcoef = max(i.matmodel.y, 0.0);
+    let lit_albedo = select(albedo, vec3<f32>(0.0), si_from_albedo) * dcoef;
+    let simple_d = select(simple, vec3<f32>(0.0), si_from_albedo) * dcoef;
     var shaded = lit_albedo * (baked_lit + sun_term + bounce) + simple_d + emis * illum_scale + env_d + spec_d + spec_area_d;
     // HMS_MDBG per-term HDR probes (mesh path; read via HMS_HDR_DUMP, pre-fog): 1 bake, 2 baked_lit, 3 sun_term,
     // 4 albedo, 5 tint(fill lane), 6 obj_probe1 (dom rgb), 7 [probe0.w, probe1.w, ol_flag], 8 [shadow, darken, baked_vis]
+    // and, for the OBJECT lane (#objshine), 26 diffuse group, 27 bounce, 28 full composite,
+    // 29/30/31 the lane + specular + environment control values.
     let mdbg = __MDBG__;
     if (mdbg > 0.5) {
         if (mdbg < 1.5) { return vec4<f32>(bake.rgb, 1.0); }
@@ -4946,9 +5840,29 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
         // 22: object AREA specular (probe glossy lobe x area_specular_contribution)
         if (mdbg > 21.5 && mdbg < 22.5) { return vec4<f32>(spec_area_d, 1.0); }
         // 23: [spec mask (tex.a x mattex mult), raw tex.a, lum(Fv)]; 24: Fv rgb; 25: raw cube sample rgb
-        if (mdbg > 22.5 && mdbg < 23.5) { return vec4<f32>(select(1.0, tex.a * mask_det, i.spec_from_alpha > 0.5) * eff_spec_mult, tex.a, dot(Fv, vec3<f32>(0.2126, 0.7152, 0.0722)), 1.0); }
+        if (mdbg > 22.5 && mdbg < 23.5) { return vec4<f32>(select(1.0, albedo_w, sfa_on) * eff_spec_mult, tex.a, dot(Fv, vec3<f32>(0.2126, 0.7152, 0.0722)), 1.0); }
         if (mdbg > 23.5 && mdbg < 24.5) { return vec4<f32>(Fv, 1.0); }
         if (mdbg > 24.5 && mdbg < 25.5) { return vec4<f32>(env_reflection(refl, rough, 0.0, vec3<f32>(1.0), i.xctl.z), 1.0); }
+        // #objshine OBJECT-LANE per-term probes (26..31). A dynamic object (lm.w==2) reaches this
+        // same block, so every term below can be read on object pixels and the four composited
+        // groups (diffuse, self-illum, specular, environment) add back up to probe 28 exactly.
+        // 26 = the whole DIFFUSE group as composited (lit_albedo x (baked_lit + sun_term + bounce));
+        // 27 = the runtime object BOUNCE fill on its own; 28 = `shaded`, the full pre-fog composite,
+        // so each term can be expressed as a fraction of the pixel's radiance.
+        if (mdbg > 25.5 && mdbg < 26.5) { return vec4<f32>(lit_albedo * (baked_lit + sun_term + bounce), 1.0); }
+        if (mdbg > 26.5 && mdbg < 27.5) { return vec4<f32>(bounce, 1.0); }
+        if (mdbg > 27.5 && mdbg < 28.5) { return vec4<f32>(shaded, 1.0); }
+        // 29 = WHICH lane this object pixel took: [lm.w (2 = dynamic object), fres_rgb.w (2 = the
+        // engine object material lane), obj_matte (0 = the plain env term is zeroed for this pixel),
+        // menv (the authored environment_map_specular_contribution)].
+        if (mdbg > 28.5 && mdbg < 29.5) { return vec4<f32>(i.lm.w, i.fres_rgb.w, obj_matte, menv); }
+        // 30 = why the SPECULAR lane is on or off: [matmodel (0 = unset, else material_model+1),
+        // mat_spec (specular_coefficient x analytical_specular_contribution), spec_mask, rough].
+        if (mdbg > 29.5 && mdbg < 30.5) { return vec4<f32>(i.matmodel.x, i.mat_spec, spec_mask, rough); }
+        // 31 = why the ENVIRONMENT lane is on or off: [xctl.z (>0.5 = a cube is bound, so
+        // env_reflection takes the AUTHORED engine decode rgb*a; 0 = the substituted branch),
+        // env_ctl.w (specular_coefficient), sky_vis, spec_from_alpha].
+        if (mdbg > 30.5 && mdbg < 31.5) { return vec4<f32>(i.xctl.z, i.env_ctl.w, sky_vis, i.spec_from_alpha); }
         // 19: [baked_vis, lm.x (>0.5 = lightmap ATLAS, else per-vertex), 1] — both together, so a
         // sweep can compare the ATLAS visibility population against the per-vertex one in ONE pass.
         if (mdbg > 18.5 && mdbg < 19.5) { return vec4<f32>(baked_vis, i.lm.x, 1.0, 1.0); }
@@ -5535,16 +6449,30 @@ fn fs_holo(i: VOut) -> @location(0) vec4<f32> {
     // bump_xform.w flags: >2.5 = STATIC icon (armor-ability icon — no animation at all,
     // crisp alpha-cut, no rim/pulse/vignette); 1.5..2.5 = forcefield energy field. 0 = normal.
     let is_static = i.bump_xform.w > 2.5;
+    // #blade-anim  Lanes 9 and 10 (the additive self-illum families, see below) are NOT static
+    // icons, but `is_static` is a `> 2.5` test and their lane ids are 9 and 10 — so they were
+    // caught by it and drew from a FROZEN UV. That is the whole of "the sword looks right but
+    // the effect that was playing on it is gone": the blade's own
+    // `energy_sword_blade_activation` layer authors a 5 s TranslationY on the very map lane 10
+    // samples, and it was being thrown away. They scroll by their AUTHORED rate only — never the
+    // fabricated drift below, which exists to make generic effect billboards read as alive and
+    // would be a second, invented animation on top of the artist's.
+    let is_si_lane = i.bump_xform.w > 8.5 && i.bump_xform.w < 10.5;
     // effect-scenery billboards were static. cam.time is already bound to this pass,
     // so animate for free — a slow UV drift + a per-sprite breathing pulse (phase offset by
     // world position so effects don't pulse in lockstep) makes mist/spray/glow read as alive.
-    let auv = select(i.uv * i.tile + i.scroll * t + vec2<f32>(0.03, 0.06) * t, i.uv * i.tile, is_static);
+    let auv_drift = i.uv * i.tile + i.scroll * t + vec2<f32>(0.03, 0.06) * t;
+    let auv_authored = i.uv * i.tile + i.scroll * t;
+    let auv = select(select(auv_drift, i.uv * i.tile, is_static), auv_authored, is_si_lane);
     let tex = textureSample(base_tex, base_samp, auv);
     let albedo = pow(tex.rgb, vec3<f32>(2.2)) * i.tint.rgb;
     // Tint the self-illum by the team colour (engine: self_illum × primary_change_color).
     // Holo/objective markers carry their image in the emissive map; without this they glowed
     // GRAY. i.tint carries the forge team colour for objects (blue etc.).
-    let em = pow(textureSample(emis_tex, base_samp, auv).rgb, vec3<f32>(2.2)) * i.tint.rgb;
+    // #sword-blade the raw sample is kept too: HMS bakes object self-illum composites in LINEAR
+    // (mesh_shade reads emis_tex with no decode), so the engine-exact lanes below must not pow it.
+    let em_raw = textureSample(emis_tex, base_samp, auv).rgb;
+    let em = pow(em_raw, vec3<f32>(2.2)) * i.tint.rgb;
     let n = normalize(i.normal);
     let v = normalize(cam.cam_pos.xyz - i.world_pos);
     // screen-space-derivative tangent frame (uniform control flow) for the multilayer
@@ -5895,6 +6823,31 @@ fn fs_holo(i: VOut) -> @location(0) vec4<f32> {
         if (hdbg > 73.5 && hdbg < 74.5) { return vec4<f32>(illum_scale_now(), ff_ext.g, 0.0, 1.0); }
         return vec4<f32>(ff_col * ff_ext, 1.0);
     }
+    // #sword-blade ENGINE-EXACT additive self-illum lanes (bump_xform.w, set in scene.rs):
+    //   9  rmsh GEOMETRY part authored blend_mode additive with a 3_channel_self_illum composite
+    //      (the energy sword's `sword_illum` blade). The engine emits the composite alone
+    //      (albedo_color is 0 on this material family, so the lit-albedo term vanishes), so none
+    //      of the sprite heuristics below apply and the composite stays HDR/linear.
+    //   10 rmhg HALOGRAM part with a from_diffuse self-illum option and no decoded engine lane.
+    //      A halogram's material_model is NONE: the engine emits
+    //      `albedo x self_illum_color x self_illum_intensity x ILLUM_SCALE` and nothing else.
+    //      si_ctl.rgb carries that colour x intensity product.
+    // Both are additive, so the engine's fog is extinction-only (BLEND_FOG_INSCATTER_SCALE = 0).
+    if (i.bump_xform.w > 8.5 && i.bump_xform.w < 10.5) {
+        let insc9 = apply_fog(vec3<f32>(0.0), i.world_pos, cam.cam_pos.xyz);
+        let ext9 = apply_fog(vec3<f32>(1.0), i.world_pos, cam.cam_pos.xyz) - insc9;
+        // si_ctl = [self_illum mode, cmul.rgb] (the lane mesh_shade reads as `i.si_ctl.yzw`).
+        // HMS_MDBG probes on these lanes (read via HMS_HDR_DUMP): 90 = flat coverage (the lane's
+        // true silhouette), 91 = [u, v, 0] (its UVs), 92 = the raw emissive/albedo sample.
+        let dbg9 = __MDBG__;
+        if (dbg9 > 89.5 && dbg9 < 92.5) {
+            if (dbg9 < 90.5) { return vec4<f32>(1.0, 1.0, 1.0, 1.0); }
+            if (dbg9 < 91.5) { return vec4<f32>(auv, 0.0, 1.0); }
+            return vec4<f32>(select(em_raw, albedo, i.bump_xform.w > 9.5), 1.0);
+        }
+        let col9 = select(em_raw * i.tint.rgb, albedo * i.si_ctl.yzw, i.bump_xform.w > 9.5);
+        return vec4<f32>(max(col9, vec3<f32>(0.0)) * illum_scale_now() * ext9, 1.0);
+    }
     let rad = select(clamp(1.0 - length(i.uv - vec2<f32>(0.5, 0.5)) * 2.0, 0.0, 1.0), 1.0, is_ff || is_static);
     let puls = select(pulse, 0.85 + 0.15 * sin(t * 2.0 + i.world_pos.x * 0.5 + i.world_pos.y * 0.5), is_ff);
     var glow = (albedo + em) * (0.55 + 0.9 * edge) * cov * rad * puls;
@@ -6231,7 +7184,13 @@ pub(crate) const H4_MESH_WGSL: &str = r#"
 // Instance lanes (h4/scene.rs `h4_lanes`):
 //   matmodel   -(1 + model): 0 none, 1 Blinn (N.H)^(1/r), 2 Phong (R.L)^p, 3 Phong (R.L)^(1/r)
 //   xctl       [spec_src, srgb_bits, flag_bits, lay]   lay 0 std, 1 snow (2-layer), 2 layered3,
-//              3 srf_char_cov* (the Covenant body ramp, #h4-veh)
+//              3 srf_char_cov* (the Covenant body ramp, #h4-veh), 4 srf_ca_skybox_terrain (the
+//              H2A vista ring terrain, #h2a-vista: base = color_combo_map, mat = mix_map at
+//              fine_xform, detail = tree_color_map, emis = modulate_map at mattex_xform, bump =
+//              macro normal, bump_detail = tree normal, bump_detail3 = the 17 user constants as a
+//              17x1 RGBA16F row; flag 64 = the row is bound; no lightmap / probe / sun lanes),
+//              5 srf_ca_skybox_water (the vista ocean: env_cube = reflection_map, bump_detail3 =
+//              the 9 constants + row 9 = the colour map's mean; same haze law)
 //   spec2      [rough_min | power, rough_max, spec_tint_by_albedo, spec_intensity]
 //   spec_rgb   [spec colour, spec_mask_alpha_weight]      env_ctl  [refl tint, refl intensity]
 //   fres_rgb   [fresnel scale, power, weight, invert]     mattex   [env_lit_by_diffuse, refl_normal_blend, diffuse_intensity, nd_strength]
@@ -6340,8 +7299,49 @@ fn h4_tbn_normal(gn: vec3<f32>, tangent: vec4<f32>, ts: vec2<f32>, dpx: vec3<f32
     return normalize(tng * ts.x + bit * ts.y + gn * tz);
 }
 
+// The same tangent frame for a FULL tangent-space vector (the #h2a-vista family mixes two
+// decoded normals and adds a modulated third, so z is not sqrt(1 - |xy|^2) any more).
+fn h4_tbn_normal3(gn: vec3<f32>, tangent: vec4<f32>, ts: vec3<f32>, dpx: vec3<f32>, dpy: vec3<f32>, dux: vec2<f32>, duy: vec2<f32>) -> vec3<f32> {
+    let t_len = length(tangent.xyz);
+    var tng: vec3<f32>;
+    var bit: vec3<f32>;
+    if (t_len > 1e-4) {
+        tng = normalize(tangent.xyz - gn * dot(gn, tangent.xyz));
+        bit = normalize(cross(gn, tng) * tangent.w);
+    } else {
+        let bdet = dux.x * duy.y - duy.x * dux.y;
+        if (abs(bdet) < 1e-10) { return gn; }
+        let r = 1.0 / bdet;
+        let t = (dpx * duy.y - dpy * dux.y) * r;
+        tng = normalize(t - gn * dot(gn, t));
+        bit = normalize(cross(gn, tng));
+    }
+    return normalize(tng * ts.x + bit * ts.y + gn * ts.z);
+}
+
+// #h2a-vista: user constant k (`user_parameter_16k` = cb13[k]) of a lane-4 material, read back
+// from the 17x1 RGBA16F row bound in the bump_detail3 slot.
+fn h4_sky_p(k: i32) -> vec4<f32> {
+    return textureLoad(bump_detail3_tex, vec2<i32>(k, 0), 0);
+}
+
+// #h2a-vista: the vista families' own haze, inside their lit entries (before the exposure
+// multiply and the deferred atmospheric fog pass): lerp(lit, pb.yzw, f) with
+//   A = 1 - sat((d - near) / (pa.x - near))            (d = |P - eye|, near = 1)
+//   B = sat((P.y - (1 - pa.w)) / (pa.w - pb.x))        C = sat((P.y - pa.w) / (pb.x - pa.w))
+//   D = sat((P.z - pa.y) / (pa.z - pa.y))              f = sat(1 - A + B + C - D)
+// (terrain: near = p14.w, pa = p15, pb = p16; water: p6.w, p7, p8)
+fn h4_sky_haze(lit: vec3<f32>, dist: f32, wp: vec3<f32>, near: f32, pa: vec4<f32>, pb: vec4<f32>) -> vec3<f32> {
+    let fa = 1.0 - clamp((dist - near) / (pa.x - near), 0.0, 1.0);
+    let fb = clamp((wp.y - (1.0 - pa.w)) / (pa.w - pb.x), 0.0, 1.0);
+    let fc = clamp((wp.y - pa.w) / (pb.x - pa.w), 0.0, 1.0);
+    let fd = clamp((wp.z - pa.y) / (pa.z - pa.y), 0.0, 1.0);
+    let f = clamp(1.0 - fa + fb + fc - fd, 0.0, 1.0);
+    return mix(lit, pb.yzw, f);
+}
+
 fn h4_shade(i: VOut) -> vec4<f32> {
-    let model = i32(-i.matmodel - 0.5);       // 0 none, 1 blinn, 2 phong power, 3 phong rough
+    let model = i32(-i.matmodel.x - 0.5);       // 0 none, 1 blinn, 2 phong power, 3 phong rough
     let spec_src = i32(i.xctl.x + 0.5);
     let srgb = u32(i.xctl.y + 0.5);
     let flags = u32(i.xctl.z + 0.5);
@@ -6484,6 +7484,47 @@ fn h4_shade(i: VOut) -> vec4<f32> {
         n_pix = h4_tbn_normal(gn, i.tangent, tsl, dpx, dpy, dux, duy);
         cov = w2;
         spec_mask = w1;
+    } else if (lay == 4 && has_layer) {
+        // ---- #h2a-vista srf_ca_skybox_terrain (h4/shading.rs `SkyboxTerrain`): the H2A vista
+        // ring terrain, entry 01 asm line by line. The combo map is two GREY masks (.r = layer A,
+        // .g = layer B, tinted by p1 / p0), mix_map selects (.g), highlights (.b) and masks the
+        // tree overlay (.r with tree.a), the modulate map brightens the non-highlight part.
+        let p0 = h4_sky_p(0); let p1 = h4_sky_p(1); let p2 = h4_sky_p(2); let p3 = h4_sky_p(3);
+        let p4 = h4_sky_p(4); let p5 = h4_sky_p(5); let p6 = h4_sky_p(6); let p7 = h4_sky_p(7);
+        let mixs = textureSample(mat_tex, base_samp, uv_sp);
+        let mixm = vec4<f32>(h4_srgb(mixs.rgb, (srgb & 4u) != 0u), mixs.a);
+        let tree = textureSample(detail_tex, base_samp, uv_cd);
+        let tree_lin = h4_srgb(tree.rgb, (srgb & 2u) != 0u);
+        let modm = h4_srgb(textureSample(emis_tex, base_samp, uv_si).rgb, (srgb & 16u) != 0u);
+        let cb = base_lin.g * p0.rgb * p0.w;
+        let ca = base_lin.r * p1.rgb * p1.w;
+        let wa = min(pow(max(mixm.g * p2.y, 0.0), p2.y), 1.0) * p2.x;
+        var c = mix(cb, ca, wa);
+        let tw = min(pow(max(mixm.b, 0.0), p3.w), 1.0);
+        c = c + clamp(tw * p3.rgb * p4.x + c, vec3<f32>(0.0), vec3<f32>(1.0));   // `mad_sat` + `add`: the base counts twice
+        let tm = clamp(tree.a + mixm.r - 1.0, 0.0, 1.0);
+        let tweight = min(pow(max(tm, 0.0), 1.0 - p5.z), 1.0) * p5.x;
+        c = mix(c, tree_lin * p4.yzw * p5.y, tweight);
+        let modp = pow(max(modm, vec3<f32>(0.0)), vec3<f32>(p6.w)) * p7.x * p6.rgb;
+        albedo = c * (1.0 + clamp((1.0 - tw) * modp, vec3<f32>(0.0), vec3<f32>(1.0)));
+        // normal = lerp(macro, tree, tree weight) + tree * mod.rgb^2 * p7.y (component-wise),
+        // both maps signed .xy with z = sqrt(1 - |xy|^2) BEFORE the mix
+        let ts_t = select(vec2<f32>(0.0), ndsamp, has_nd);
+        let n_macro = vec3<f32>(ts, sqrt(clamp(1.0 - dot(ts, ts), 0.0, 1.0)));
+        let n_tree = vec3<f32>(ts_t, sqrt(clamp(1.0 - dot(ts_t, ts_t), 0.0, 1.0)));
+        let tsn = mix(n_macro, n_tree, tweight) + n_tree * modm * modm * p7.y;
+        n_pix = h4_tbn_normal3(gn, i.tangent, tsn, dpx, dpy, dux, duy);
+        spec_mask = 0.0;   // o0.w = 0: no specular lane at all
+    } else if (lay == 5 && has_layer) {
+        // ---- #h2a-vista srf_ca_skybox_water (h4/shading.rs `SkyboxWater`): albedo = color_map *
+        // p0.rgb (entry 01). The map is authored on the second uv set the object vertex lacks
+        // (at uv1 it smears into streaks), so row 9 of the constant block carries its MEAN linear
+        // colour (PROVISIONAL); the three wave normals are scaled by p1.y / 12 before the
+        // normalize (|xy| <= 0.025 on Ascension) - the geometric normal stands in; no foam test.
+        albedo = h4_sky_p(9).rgb * h4_sky_p(0).rgb;
+        color_a = h4_sky_p(9).a;   // the map's mean alpha = the reflection / specular mask
+        n_pix = gn;
+        spec_mask = 0.0;
     } else {
         n_pix = h4_tbn_normal(gn, i.tangent, ts, dpx, dpy, dux, duy);
     }
@@ -6595,6 +7636,46 @@ fn h4_shade(i: VOut) -> vec4<f32> {
     vis = vis * lobes.ana_y;   // analytic.y (entry 06: after the cascade lerp)
     let sun_col = light.sun_tint.rgb * vis;
     diffuse = diffuse + sun_col * max(dot(n, sun_dir), 0.0) * H4_INV_PI;
+    if (lay == 4 && has_layer) {
+        // #h2a-vista: every lit entry of srf_ca_skybox_terrain (04/06/09/11/36/37, byte-identical)
+        // ignores the lightmap, the probes AND the scene sun - the ring is lit by two wrap-lit
+        // constant WORLD directions plus an ambient, all from the material's own user constants:
+        //   wrap(N, d, w) = sat(dot(N, normalize(d)) * (1 - w) - (1 - w) + 1)
+        //   light = wrap(N, (p10.w, p11.x, p11.y), p12.w) * p12.rgb * p11.z
+        //         + wrap(N, (p7.z, p7.w, p8.x), p9.w) * p9.rgb * p8.y + p14.rgb
+        let p7 = h4_sky_p(7); let p8 = h4_sky_p(8); let p9 = h4_sky_p(9); let p10 = h4_sky_p(10);
+        let p11 = h4_sky_p(11); let p12 = h4_sky_p(12); let p14 = h4_sky_p(14);
+        let d1 = normalize(vec3<f32>(p10.w, p11.x, p11.y));
+        let d2 = normalize(vec3<f32>(p7.z, p7.w, p8.x));
+        let k1 = 1.0 - p12.w;
+        let k2 = 1.0 - p9.w;
+        let t1 = clamp(dot(n, d1) * k1 - k1 + 1.0, 0.0, 1.0);
+        let t2 = clamp(dot(n, d2) * k2 - k2 + 1.0, 0.0, 1.0);
+        diffuse = t1 * p12.rgb * p11.z + t2 * p9.rgb * p8.y + p14.rgb;
+    }
+    var sky_water = vec3<f32>(0.0);   // #h2a-vista lane 5: the ocean's reflection + specular
+    if (lay == 5 && has_layer) {
+        // entry 06 (SkyboxWater doc): diff = sat(N.L) * p5.rgb * p4.w + p6.rgb; cube fresnel
+        // lerp(0.04, max(p0.w, 0.04), (1 - N.V)^5) * p2.rgb * p1.x * color.a at lod 1 - p0.w;
+        // Blinn S = 2^(9 p0.w) normalised (S / 8 + 1) with a Schlick (L.H) fresnel, x color.a.
+        let p0 = h4_sky_p(0); let p1 = h4_sky_p(1); let p2 = h4_sky_p(2); let p4 = h4_sky_p(4);
+        let p5 = h4_sky_p(5); let p6 = h4_sky_p(6);
+        let l = normalize(p4.xyz);
+        let ndl = clamp(dot(l, n), 0.0, 1.0);
+        diffuse = ndl * p5.rgb * p4.w + p6.rgb;
+        let ndv = clamp(dot(e, n), 0.0, 1.0);
+        let fres = mix(0.04, max(p0.w, 0.04), pow(1.0 - ndv, 5.0));
+        if (has_cube) {
+            let cube = textureSampleLevel(env_cube, env_cube_samp, reflect(-e, n), 1.0 - p0.w).rgb;
+            sky_water = cube * p2.rgb * fres * p1.x * color_a;
+        }
+        let h = normalize(l + e);
+        let ldh = clamp(dot(l, h), 0.0, 1.0);
+        let ndh = clamp(dot(h, n), 0.0, 1.0);
+        let sp = exp2(9.0 * p0.w);
+        let dd = pow(max(ndh, 1e-6), sp) * (sp * 0.125 + 1.0);
+        sky_water = sky_water + ndl * dd * (pow(1.0 - ldh, 5.0) * 0.96 + 0.04) * p5.rgb * p4.w * color_a;
+    }
 
     // specular: the same three lights through the family's lobe
     var spec = vec3<f32>(0.0);
@@ -6655,8 +7736,11 @@ fn h4_shade(i: VOut) -> vec4<f32> {
     else if (si_mode == 4) { si = i.si_ctl.rgb * i.si_ctl.w * color_a; }
     else if (si_mode == 5) { si = i.si_ctl.rgb * i.si_ctl.w; }
 
-    let diffuse_intensity = select(i.mattex.z, 1.0, lay == 1 || lay == 2);
-    var out = albedo * diffuse_intensity * diffuse + spec + env + si;
+    let diffuse_intensity = select(i.mattex.z, 1.0, lay == 1 || lay == 2 || lay == 4 || lay == 5);
+    var out = albedo * diffuse_intensity * diffuse + spec + env + si + sky_water;
+    // #h2a-vista: the vista families' own haze (h4_sky_haze), terrain p14.w / p15 / p16, water p6.w / p7 / p8
+    if (lay == 4 && has_layer) { out = h4_sky_haze(out, dist, i.world_pos, h4_sky_p(14).w, h4_sky_p(15), h4_sky_p(16)); }
+    if (lay == 5 && has_layer) { out = h4_sky_haze(out, dist, i.world_pos, h4_sky_p(6).w, h4_sky_p(7), h4_sky_p(8)); }
     if (H4DBG > 0.5) {
         if (H4DBG < 1.5) { return vec4<f32>(albedo, 1.0); }
         if (H4DBG < 2.5) { return vec4<f32>(n * 0.5 + 0.5, 1.0); }
@@ -6686,24 +7770,80 @@ fn h4_shade(i: VOut) -> vec4<f32> {
     return vec4<f32>(out, 1.0 - si_luma);
 }
 
-// Halo 4 atmospheric fog (h4/lighting.rs module doc: the deferred screen_atmospheric_fog
-// pass, ground layer only - the shipped MP maps author no sky-layer thickness). Uniform packing:
-// atm1.rgb ground colour, atm2.rgb fog-light colour, atm3.x 1/(nearby_cutoff - 1), atm4 = (density,
-// base, height, falloff_end), atm5 = (dist bias, light on, cos radius, angular falloff), atm6 =
-// (light dir xyz, 4.0 marker). final = scene * T + colour * (1 - T) + fog light.
+// Halo 4 / H2A atmospheric fog = the engine's `screen_atmospheric_fog` table pass
+// (H4EK atmosphere_calculate.fxh `compute_scattering_mixed`, ported 1:1; h4/lighting.rs module
+// doc). Two height layers: the SKY layer above the ground layer's top and the GROUND layer, whose
+// segment is attenuated by both the ground table (x its height weight k) and the sky table
+// (`base fog`, no k, max distance = sky max - sky travel). Per layer T(x) is a 64-entry table
+// (fog.ext): exp(-x * max_distance * density) for a thickness layer, 1 - f(x) for an authored
+// mapping-function layer (every H2A map: the thickness field is then IGNORED by the engine).
+// Uniform packing: atm1.rgb ground colour, atm2.rgb fog-light colour, atm3.x 1/(nearby_cutoff - 1),
+// atm4 = (ground density, base, height, max distance), atm5 = (dist bias, light on, cos radius,
+// angular falloff), atm6 = (light dir xyz, 4.0 marker), ext[0] = (sky base, height, max distance,
+// density), ext[1] = (sky colour, mode: 1 sky base is camera-relative, 2 ground base is
+// camera-relative, 4 = any layer active). final = scene * T + inscatter + fog light.
+fn h4_fog_table(x: f32, base: u32) -> f32 {
+    let u = clamp(x, 0.0, 1.0) * 63.0;
+    let i0 = u32(floor(u));
+    let i1 = min(i0 + 1u, 63u);
+    let f = u - floor(u);
+    let a = fog.ext[base + i0 / 4u][i0 % 4u];
+    let b = fog.ext[base + i1 / 4u][i1 % 4u];
+    return mix(a, b, f);
+}
+// get_fog_thickness_weight_at_relative_height: sat((H - h) / H)^2, 0 for a zero-height layer
+fn h4_fog_k(h: f32, hgt: f32) -> f32 {
+    if (hgt == 0.0) { return 0.0; }
+    let w = clamp((hgt - h) / hgt, 0.0, 1.0);
+    return w * w;
+}
 fn h4_fog(shaded: vec3<f32>, wp: vec3<f32>, cp: vec3<f32>) -> vec3<f32> {
-    if (fog.atm6.w < 3.5 || fog.atm4.x <= 0.0) { return shaded; }
-    let dens = fog.atm4.x; let base = fog.atm4.y; let hgt = max(fog.atm4.z, 1e-3); let fend = fog.atm4.w;
+    if (fog.atm6.w < 3.5) { return shaded; }
+    let mode = u32(round(fog.ext[1].w));
+    if ((mode & 4u) == 0u) { return shaded; }
+    // sky layer A (ext[0]), ground layer B (atm4)
+    var base_a = fog.ext[0].x; if ((mode & 1u) != 0u) { base_a += cp.z; }
+    var base_b = fog.atm4.y;   if ((mode & 2u) != 0u) { base_b += cp.z; }
+    let hgt_a = fog.ext[0].y; let max_a = fog.ext[0].z; let dens_a = fog.ext[0].w; let col_a = fog.ext[1].xyz;
+    let hgt_b = fog.atm4.z;   let max_b = fog.atm4.w;   let dens_b = fog.atm4.x;   let col_b = fog.atm1.xyz;
     let rel = wp - cp;
     let dist = length(rel);
-    let lo = min(wp.z, cp.z);
-    let hi = max(wp.z, cp.z) + 1e-3;
-    let dh = min(hi - base, hgt) - (lo - base);
-    let frac = clamp(dh / (hi - lo), 0.0, 1.0);
-    let d = min(max(0.0, frac * (dist + fog.atm5.x)), fend);
-    let k = pow(clamp((hgt - (lo - base)) / hgt, 0.0, 1.0), 2.0);
-    let t = min(1.0, exp2(-d * dens * k));
-    var out = shaded * t + fog.atm1.rgb * (1.0 - t);
+    let top = max(wp.z, cp.z) + 0.001;
+    let bot = min(wp.z, cp.z);
+    let hdiff = top - bot;
+    let top_b = base_b + hgt_b;
+    let biased = dist + fog.atm5.x;
+    // sky solo segment: the part of the ray above the ground layer's top
+    let vt_a = min(top - base_a, hgt_a);
+    let vb_a = max(bot, top_b) - base_a;
+    let ratio_a = clamp((vt_a - vb_a) / hdiff, 0.0, 1.0);
+    let k_a = h4_fog_k(vb_a, hgt_a);
+    let d_a = clamp(biased * ratio_a, 0.0, max_a);
+    let t_a = select(1.0, h4_fog_table(k_a * d_a / max_a, 2u), max_a > 0.0);
+    // mixed segment: inside the ground layer, ground table x sky (base) table
+    let vt_b = min(min(top, top_b) - base_b, hgt_b);
+    let vb_b = bot - base_b;
+    let ratio_b = clamp((vt_b - vb_b) / hdiff, 0.0, 1.0);
+    let k_b = h4_fog_k(vb_b, hgt_b);
+    let d0 = max(biased * ratio_b, 0.0);
+    let d_base = min(d0, max_a - d_a);
+    let d_b = min(d0, max_b);
+    let t_b = select(1.0, h4_fog_table(k_b * d_b / max_b, 18u), max_b > 0.0);
+    let t_base = select(1.0, h4_fog_table(d_base / max_a, 2u), max_a > 0.0);
+    let t_m = t_b * t_base;
+    let w_b = k_b * dens_b * d_b;
+    let w_a = dens_a * d_base;
+    let w_sum = w_b + w_a;
+    let mix_col = select((col_b * w_b + col_a * w_a) / max(w_sum, 1e-30), vec3<f32>(0.0), w_sum <= 0.0);
+    let insc_a = col_a * (1.0 - t_a);
+    let insc_m = mix_col * (1.0 - t_m);
+    let order_a = insc_a * t_m + insc_m;   // sky behind the ground layer
+    let order_b = insc_a + insc_m * t_a;   // ground layer behind the sky
+    let low = clamp((top_b - cp.z) / max(hgt_b, 1e-6) * dens_b / max(dens_a, 0.00001), 0.0, 1.0);
+    // the table stores saturate(sqrt(inscatter)): inscatter is clamped to 1 per channel
+    let insc = min(mix(order_b, order_a, low), vec3<f32>(1.0));
+    let t = t_a * t_m;
+    var out = shaded * t + insc;
     if (fog.atm5.y > 0.5 && dist > 1e-3) {
         let vd = rel / dist;
         let cr = fog.atm5.z;
@@ -8038,3 +9178,18 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(shaded, 1.0);
 }
 "#;
+
+/// Vertex / instance strides of the mesh streams, exported so the FLAT view's own pipeline
+/// (`flat.rs`) can bind the very same buffers without a copy. It declares only locations 0/1
+/// (pos, normal) and 4..8 (model matrix, tint) — a subset that has to agree on STRIDE only.
+pub const MESH_VERTEX_STRIDE: u64 = std::mem::size_of::<MeshVertex>() as u64;
+pub const MESH_INSTANCE_STRIDE: u64 = std::mem::size_of::<InstanceRaw>() as u64;
+
+impl GpuMesh {
+    /// Raw buffers for the FLAT / white-mesh pass: (vertex, index, index_count, instance,
+    /// instance_count). The buffers are private to this module, so a sibling module that draws
+    /// the same geometry through its own pipeline needs this one accessor.
+    pub(crate) fn flat_parts(&self) -> (&wgpu::Buffer, &wgpu::Buffer, u32, &wgpu::Buffer, u32) {
+        (&self.vbuf, &self.ibuf, self.index_count, &self.instance_buf, self.instance_count)
+    }
+}

@@ -250,6 +250,39 @@ impl TriSoup {
         }
     }
 
+    /// #settle Every triangle whose AABB overlaps the world box [mn, mx], appended to `out`
+    /// (each once). Grid cells in the box range + the always-tested big triangles; a box wider
+    /// than 64 cells on a side falls back to a scan of every triangle.
+    pub fn tris_in_aabb(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+        if self.tris.is_empty() || !(mn.is_finite() && mx.is_finite()) { return; }
+        let overlaps = |t: &[Vec3; 3]| {
+            let tmn = t[0].min(t[1]).min(t[2]);
+            let tmx = t[0].max(t[1]).max(t[2]);
+            (0..3).all(|k| tmn[k] <= mx[k] && tmx[k] >= mn[k])
+        };
+        let (k0, k1) = (self.key(mn), self.key(mx));
+        let span = (k1.0 as i64 - k0.0 as i64 + 1) * (k1.1 as i64 - k0.1 as i64 + 1) * (k1.2 as i64 - k0.2 as i64 + 1);
+        if span > 64 * 64 * 64 {
+            for t in &self.tris { if overlaps(t) { out.push(*t); } }
+            return;
+        }
+        let mut seen: Vec<u32> = Vec::new();
+        for x in k0.0..=k1.0 {
+            for y in k0.1..=k1.1 {
+                for z in k0.2..=k1.2 {
+                    seen.extend_from_slice(self.cell_refs((x, y, z)));
+                }
+            }
+        }
+        seen.extend_from_slice(&self.big);
+        seen.sort_unstable();
+        seen.dedup();
+        for i in seen {
+            let t = &self.tris[i as usize];
+            if overlaps(t) { out.push(*t); }
+        }
+    }
+
     /// Nearest ray-triangle hit (Möller–Trumbore, double-sided). Returns (t, geo-normal).
     ///
     /// Uses a 3D DDA (Amanatides–Woo) voxel march along the ray, testing only the grid
@@ -1184,5 +1217,54 @@ mod engine_rule_tests {
         assert!(p.tris.iter().all(|(ps, _)| { let c = (ps[0] + ps[1] + ps[2]) / 3.0; !(c.z < 0.01 && c.x.abs() < 0.9 && c.y.abs() < 0.9) }), "floor under the slab still painted");
         assert!(p.tris.iter().any(|(ps, _)| { let c = (ps[0] + ps[1] + ps[2]) / 3.0; c.z < 0.01 && c.x.abs() > 1.2 }), "the open floor around the slab must be painted");
         assert!(dt.as_secs_f32() < 5.0, "projection took {dt:?} (release: ~50 ms)");
+    }
+
+    /// #settle `tris_in_aabb` returns every triangle overlapping the box exactly once, from the
+    /// build-time grid, the compact (sealed) grid and the out-of-grid "big" list alike.
+    #[test]
+    fn tris_in_aabb_finds_the_same_set_before_and_after_sealing() {
+        let mut soup = TriSoup::new(4.0);
+        // a floor of 8 x 8 cells' worth of small quads at z = 0
+        for i in 0..16 {
+            for j in 0..16 {
+                let (x, y) = (i as f32 * 2.0 - 16.0, j as f32 * 2.0 - 16.0);
+                let (a, b, c, d) = (Vec3::new(x, y, 0.0), Vec3::new(x + 2.0, y, 0.0), Vec3::new(x + 2.0, y + 2.0, 0.0), Vec3::new(x, y + 2.0, 0.0));
+                soup.add_tri_owned(a, b, c, (0, 0, -1), u32::MAX);
+                soup.add_tri_owned(a, c, d, (0, 0, -1), u32::MAX);
+            }
+        }
+        // a map-spanning backdrop triangle (diverted to `big`) and a wall
+        soup.add_tri_owned(Vec3::new(-2000.0, -2000.0, -5.0), Vec3::new(2000.0, -2000.0, -5.0), Vec3::new(0.0, 2000.0, -5.0), (0, 0, -1), u32::MAX);
+        soup.add_tri_owned(Vec3::new(1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 3.0), (0, 0, -1), u32::MAX);
+        let query = |s: &TriSoup, mn: Vec3, mx: Vec3| -> Vec<[Vec3; 3]> { let mut v = Vec::new(); s.tris_in_aabb(mn, mx, &mut v); v };
+        let brute = |s: &TriSoup, mn: Vec3, mx: Vec3| -> usize {
+            s.tris().iter().filter(|t| { let a = t[0].min(t[1]).min(t[2]); let b = t[0].max(t[1]).max(t[2]); (0..3).all(|k| a[k] <= mx[k] && b[k] >= mn[k]) }).count()
+        };
+        let boxes = [
+            (Vec3::new(-0.5, -0.5, -0.1), Vec3::new(0.5, 0.5, 1.0)),      // around the origin, straddles cells
+            (Vec3::new(0.9, -3.0, 0.5), Vec3::new(1.1, 3.0, 2.0)),        // the wall only (above the floor)
+            (Vec3::new(-100.0, -100.0, -6.0), Vec3::new(100.0, 100.0, -4.0)), // the backdrop only
+            (Vec3::new(-20.0, -20.0, -1.0), Vec3::new(20.0, 20.0, 1.0)),  // everything on the floor
+        ];
+        let before: Vec<Vec<[Vec3; 3]>> = boxes.iter().map(|(a, b)| query(&soup, *a, *b)).collect();
+        for (k, (a, b)) in boxes.iter().enumerate() {
+            assert_eq!(before[k].len(), brute(&soup, *a, *b), "box {k}: grid query = brute force");
+        }
+        assert_eq!(before[1].len(), 1, "the wall alone");
+        assert_eq!(before[2].len(), 1, "the big backdrop alone");
+        assert_eq!(before[3].len(), 512 + 1, "the whole floor + the wall (touching z 0)");
+        soup.rebalance(8);
+        soup.shrink();
+        for (k, (a, b)) in boxes.iter().enumerate() {
+            let after = query(&soup, *a, *b);
+            assert_eq!(after.len(), before[k].len(), "box {k}: same count after sealing");
+            for t in &after { assert!(before[k].contains(t), "box {k}: same triangles after sealing"); }
+        }
+        // no duplicates: a triangle spanning several cells is reported once
+        let v = query(&soup, Vec3::new(-0.5, -0.5, -0.1), Vec3::new(0.5, 0.5, 1.0));
+        let mut seen = v.clone();
+        seen.sort_by(|a, b| a[0].x.partial_cmp(&b[0].x).unwrap().then(a[0].y.partial_cmp(&b[0].y).unwrap()).then(a[1].x.partial_cmp(&b[1].x).unwrap()).then(a[1].y.partial_cmp(&b[1].y).unwrap()));
+        seen.dedup();
+        assert_eq!(seen.len(), v.len(), "no duplicate triangles");
     }
 }
