@@ -53,6 +53,9 @@ pub const ONESHOT_LAND: u8 = 3;
 /// locomotion phase (which wraps) it replayed from the start over and over, which is "the
 /// airborne animation is looping, almost like a player is jumping repeatedly".
 pub const ONESHOT_AIR: u8 = 4;
+/// #film-riders  A BOARDING or EXIT clip (`<seat>:enter`, `<seat>:exit`): played once from the tick
+/// the recording's seat link starts or ends, then handed to the seat idle or the standing set.
+pub const ONESHOT_SEAT: u8 = 5;
 
 /// #fp-shake  A clock-driven clip's FRAME at a playhead position, in ticks.
 ///
@@ -190,6 +193,10 @@ pub struct Playback {
     /// call `film_anim::death_from_events` for every track on every frame, which is one pass over
     /// the whole event channel per track per frame.
     deaths: std::cell::OnceCell<std::collections::HashMap<u32, (u32, &'static str, Option<u32>)>>,
+    /// #film-riders  The seat links the recording states ([`crate::film_anim::recorded_rides`]),
+    /// folded ONCE: `corpses()` asks "was this body seated when it died" for every body on every
+    /// frame.
+    stated_rides: std::cell::OnceCell<Vec<crate::film_anim::Ride>>,
     /// Current position in ticks (fractional, so playback is smooth between the 60 Hz keys).
     pub tick: f32,
     pub playing: bool,
@@ -582,6 +589,7 @@ impl Playback {
             index,
             sync: std::cell::OnceCell::new(),
             deaths: std::cell::OnceCell::new(),
+            stated_rides: std::cell::OnceCell::new(),
             tick: 0.0,
             playing: false,
             speed: 1.0,
@@ -645,6 +653,7 @@ impl Playback {
         // Every cache below is a pure function of the index, so all of them have to go.
         self.sync = std::cell::OnceCell::new();
         self.deaths = std::cell::OnceCell::new();
+        self.stated_rides = std::cell::OnceCell::new();
         self.timeline = std::cell::OnceCell::new();
         let end = self.total_ticks().saturating_sub(1) as f32;
         self.tick = self.tick.min(end).max(0.0);
@@ -865,7 +874,12 @@ impl Playback {
             }
             // The stated moment can land after the body's last reported position, so take the
             // last position at or before it rather than demanding one exactly there.
-            let Some(pos) = t.sample(d).or_else(|| t.positions.last().map(|&(_, p)| p)) else { continue };
+            let Some(pos) = self
+                .seated_corpse_origin(t, d)
+                .or_else(|| t.sample(d).or_else(|| t.positions.last().map(|&(_, p)| p)))
+            else {
+                continue;
+            };
             let (yaw, has_yaw) = match t.facing_at(d).or_else(|| t.facings.last().map(|&(_, y)| y)) {
                 Some(y) => (y.to_degrees(), true),
                 None => match t.sample_orientation(d) {
@@ -887,6 +901,29 @@ impl Playback {
         out.sort_by_key(|p| p.net_id);
         out.truncate(cap);
         out
+    }
+
+    /// #film-riders  Where a body that died SEATED lies: at its vehicle.
+    ///
+    /// A seated body stops reporting a position, so its last report is the place it boarded --
+    /// which for a driver killed a minute into a drive is a long way behind the vehicle. When the
+    /// recording's seat link covers the tick of death (or ended on it, which is how a death
+    /// un-seats), the body is placed at the vehicle's recorded position at that tick instead. The
+    /// vehicle's ORIGIN, not the seat: the seat marker needs the map, and the corpse's own rest
+    /// height and ragdoll are found from this point by `ground_corpses`. A turret, which has no
+    /// position of its own, is followed up its parent chain.
+    fn seated_corpse_origin(&self, t: &EntityTrack, death: u32) -> Option<[f32; 3]> {
+        let rides = self.stated_rides.get_or_init(|| crate::film_anim::recorded_rides(&self.index));
+        let r = rides.iter().find(|r| r.biped_net_id == t.net_id && death >= r.from_tick && death <= r.to_tick + 2)?;
+        let mut net = r.vehicle_net_id;
+        for _ in 0..3 {
+            let v = self.index.tracks.iter().find(|x| x.net_id == net)?;
+            match v.attached_at(death) {
+                Some(a) => net = a.parent,
+                None => return v.sample(death),
+            }
+        }
+        None
     }
 
     /// #corpse-fall  What the recording itself says about where a dead body ENDED UP.
@@ -1179,6 +1216,22 @@ impl Playback {
         }
     }
 
+    /// #team-colour  The owner stamp (raw, `index + 1`) of the body the camera is riding: the
+    /// hidden first-person body's own stamp, else the camera's owner when it is keyed by one.
+    pub fn subject_owner(&self) -> Option<u8> {
+        if let Some(o) = self
+            .hidden_entity()
+            .and_then(|net| self.index.tracks.iter().find(|t| t.net_id == net))
+            .and_then(|t| t.owner_raw)
+        {
+            return Some(o);
+        }
+        match self.camera {
+            FilmCamera::FirstPersonOwner(o) | FilmCamera::FollowOwner(o) => Some(o),
+            _ => None,
+        }
+    }
+
     /// A one-line status for the timeline window.
     pub fn status(&self) -> String {
         let f = self.frame();
@@ -1293,6 +1346,37 @@ pub struct FpRep {
     /// everywhere else — the model carries `armor_pieces`, the region the globals' own
     /// `elite selections` block overrides — and never from the tag path.
     pub elite: bool,
+}
+
+/// #team-colour  The armour colours a body wears: its TEAM's when the variant has teams and the
+/// recording names the body's team and the table has an entry for it, else the player's own
+/// customisation. The one place the rule lives, so the gate that checks it checks what is drawn.
+pub fn choose_skin(
+    team_skins: Option<&[Option<[[f32; 3]; 2]>]>,
+    team: Option<u8>,
+    customised: Option<[[f32; 3]; 2]>,
+) -> Option<[[f32; 3]; 2]> {
+    team.and_then(|t| team_skins?.get(t as usize).copied().flatten()).or(customised)
+}
+
+/// #film-riders  `play_vehicle::VehicleIndex` (a tag cache with no `Debug`) behind the interior
+/// mutability the `&self` placement helpers need, with the `Debug` the driver derives.
+#[derive(Default)]
+pub struct RiderIndex(std::cell::RefCell<crate::play_vehicle::VehicleIndex>);
+
+impl std::fmt::Debug for RiderIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RiderIndex")
+    }
+}
+
+impl RiderIndex {
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, crate::play_vehicle::VehicleIndex> {
+        self.0.borrow_mut()
+    }
+    fn reset(&self) {
+        self.0.take();
+    }
 }
 
 /// #film-perf  The five phases of [`ActorDriver::sync`], as a rolling distribution.
@@ -1439,6 +1523,16 @@ pub struct ActorDriver {
     pub vehicle_actor: HashMap<u32, u32>,
     /// Vehicles whose model could not be placed, with the reason — reported, never silent.
     pub vehicle_error: Option<String>,
+    /// #film-riders  The per-`vehi`-tag seat / marker cache the riders are placed with (test mode's
+    /// own `VehicleIndex`). Per cache, so `resolve_bipeds` drops it with the other map-bound tables.
+    rider_index: RiderIndex,
+    /// #film-riders  Seated bodies this sync could not put in their seat (no placement for the
+    /// vehicle yet, or no marker by the seat's name). They keep their reported position.
+    pub riders_unplaced: usize,
+    /// #film-riders  `(rider's biped tag path, seat label) -> the seat's authored clips`, for a
+    /// rider whose weapon class has none of its own. Resolved once per pair: it scans the graph's
+    /// animation names.
+    rider_clips: HashMap<(String, String), crate::film_riders::SeatClips>,
     /// #film-objects  Every OTHER object the film recorded — the flag, the dropped weapons, the
     /// debris — identified through its own 14-bit definition reference. Built once per
     /// (cache, film) by `resolve_objects`; `None` until a map is open to resolve against.
@@ -1623,6 +1717,11 @@ pub struct ActorDriver {
     /// #skin  Per player slot, `(synthetic armour variant sid, [primary, secondary] colours)`.
     /// Built once per film; `None` until the open map can answer.
     pub appearance: Option<HashMap<u8, (u32, Option<[[f32; 3]; 2]>)>>,
+    /// #team-colour  In a TEAM game (the embedded variant's teams bit), `[primary, secondary]`
+    /// armour colours per team index 0..7: what every player body on that team wears instead of
+    /// its customisation. `None` for a free-for-all, a clip with no variant, or before the map can
+    /// answer. Built beside `appearance`, once per film.
+    pub team_skins: Option<Vec<Option<[[f32; 3]; 2]>>>,
     /// #film-action  Every assassination the recording STATES, decoded from the event channel
     /// (`film_anim::assassinations`). Built once per film in `prepare`.
     pub sync: Vec<crate::film_anim::Assassination>,
@@ -1768,6 +1867,9 @@ impl Default for ActorDriver {
             fx_no_effect: 0,
             fx_modelless: 0,
             vehicle_actor: HashMap::new(),
+            rider_index: Default::default(),
+            riders_unplaced: 0,
+            rider_clips: HashMap::new(),
             vehicle_error: None,
             objects: None,
             show_objects: true,
@@ -1802,6 +1904,7 @@ impl Default for ActorDriver {
             fp_subject_elite: false,
             fp_weapon_of: HashMap::new(),
             appearance: None,
+            team_skins: None,
             weap_class: Vec::new(),
             class_ids: vec![crate::film_anim::DEFAULT_WEAPON_CLASS.to_string()],
             graph_ids: vec!["characters\\spartans\\spartans".to_string()],
@@ -1967,6 +2070,8 @@ impl ActorDriver {
             return;
         }
         self.biped_cache = Some(key);
+        self.rider_index.reset();
+        self.rider_clips.clear();
         self.biped_of.clear();
         self.biped_status = "no map is open to resolve the definition each spawn message names".into();
         // #film-objects  The object lane is resolved off the SAME reference table, so it shares
@@ -2332,55 +2437,131 @@ impl ActorDriver {
         self.veh_damage.get(&net_id).and_then(|(_, w)| w.persisted())
     }
 
-    /// Where a rider's body belongs: the vehicle's placement times its SEAT MARKER.
+    /// #film-riders  The `vehi` tag a vehicle track is, from the table when it was identified
+    /// there and from the definition its creation message states otherwise. A Warthog's turret is
+    /// the second kind: it never replicates a position of its own, so the spawn-point search
+    /// cannot place it, but its creation names `warthog_chaingun` outright.
+    fn vehicle_obj_tag(&self, pb: &Playback, net: u32) -> Option<u32> {
+        if let Some(v) = self.vehicles.as_ref().and_then(|vt| vt.vehicles.get(&net)) {
+            return Some(v.obj_tag);
+        }
+        let tr = self.track_of.get(&net).and_then(|&i| pb.index.tracks.get(i))?;
+        let (tag, group, _) = self.vehicle_defs.get(&tr.def_wire?)?;
+        (group == "vehi").then_some(*tag)
+    }
+
+    /// #film-riders  The world transform of the object whose MODEL a seat's markers live in, and
+    /// that object's `vehi` tag.
     ///
-    /// This is the engine's own composition, and both halves of it are authored data, not a
-    /// guess. The seat markers on a Reach vehicle's render model are named exactly like the
-    /// animation modes a rider plays — the mongoose carries `mongoose_d` and `mongoose_p`, the
-    /// ghost `ghost_d`, the scorpion `scorpion_d`, the falcon `falcon_d` and `falcon_p_l1`… — so
-    /// the same string picks the seat and the pose. (The Warthog is the exception: its seats are
-    /// `driver` / `passenger` / `turret`, with `warthog_b_d` reserved for the boarding animation,
-    /// so those are tried too.) The seat animation is authored relative to that marker, which is
-    /// why composing the two is right and placing the body at the vehicle's ORIGIN is not —
-    /// measured by capture, a rider drawn at the mongoose's origin sinks below its seat.
-    ///
-    /// Returns `(position, yaw degrees)`, or `None` when the vehicle is not drawn or has no
-    /// marker by any of those names — in which case the caller leaves the body at its own
-    /// recorded position rather than inventing one.
-    fn seat_world(
+    /// A vehicle with a recorded placement is placed with its FULL recorded basis (the same rule
+    /// the vehicle lane draws it with, at the same fractional clock, so a rider cannot slide in
+    /// his seat). A CHILD vehicle -- the Warthog's chaingun -- states a parent instead of a
+    /// position, and is composed through the parent's tag attachment row exactly as test mode's
+    /// `seat_vehicle_world` does, because a gunner's markers are in the TURRET's model space.
+    fn vehicle_world(
         &self,
-        seat: &crate::film_anim::Seat,
         pb: &Playback,
+        net: u32,
         tick: f32,
-        actors: &crate::reach_actor::ActorScene,
         native: &hms_native::NativeDll,
         cache: hms_native::CacheHandle,
-    ) -> Option<(glam::Vec3, f32)> {
-        let tr = self.track_of.get(&seat.vehicle_net_id).and_then(|&i| pb.index.tracks.get(i))?;
-        // #film-jitter  The rider rides the vehicle's placement at the SAME fractional clock the
-        // vehicle itself is drawn at. Sampling the two at different moments would slide the body
-        // in its own seat every frame.
-        let pos = crate::film_vehicle::position_at(tr, tick)?.to_array();
-        // #vehicle-rot  The rider rides the vehicle's REAL placement, basis and all. This used to
-        // rebuild a yaw-only matrix, so a rider in a banking Falcon or a rolling Warthog sat
-        // bolt upright while the vehicle around him turned.
+        depth: u8,
+    ) -> Option<(glam::Mat4, u32)> {
+        let tr = self.track_of.get(&net).and_then(|&i| pb.index.tracks.get(i))?;
+        let tag = self.vehicle_obj_tag(pb, net)?;
+        if depth < 3 {
+            let parent = tr
+                .attached_at(tick.max(0.0) as u32)
+                .map(|a| a.parent)
+                .filter(|p| self.track_of.get(p).and_then(|&i| pb.index.tracks.get(i)).is_some_and(|t| t.entity_type == crate::film_anim::VEHICLE_TYPE));
+            if let Some(parent) = parent {
+                let (pw, ptag) = self.vehicle_world(pb, parent, tick, native, cache, depth + 1)?;
+                let att = native.enumerate_attachments(cache, ptag).into_iter().find(|a| a.child_obj == tag)?;
+                let mut idx = self.rider_index.borrow_mut();
+                return Some((crate::play_vehicle::attachment_world(&mut idx, native, cache, pw, &att), tag));
+            }
+        }
+        let pos = crate::film_vehicle::position_at(tr, tick)?;
         let orient = crate::film_vehicle::orientation_at(tr, tick);
-        let vehicle_world = crate::film_vehicle::vehicle_basis(glam::Vec3::from(pos), orient).unwrap_or_else(|| {
+        // #vehicle-rot  A vehicle the recording has not oriented yet keeps the yaw-only fallback.
+        let world = crate::film_vehicle::vehicle_basis(pos, orient).unwrap_or_else(|| {
             let yaw = orient.map(|(f, _)| f[1].atan2(f[0])).unwrap_or(0.0);
-            glam::Mat4::from_translation(glam::Vec3::from(pos)) * glam::Mat4::from_rotation_z(yaw)
+            glam::Mat4::from_translation(pos) * glam::Mat4::from_rotation_z(yaw)
         });
-        // The vehicle's own actor carries the render model the marker lives on.
-        let id = self.vehicle_actor.get(&seat.vehicle_net_id)?;
-        let a = actors.actors.iter().find(|a| a.id == *id)?;
-        let fallbacks = ["driver", "passenger"];
-        let mut names: Vec<&str> = vec![seat.mode.as_str()];
-        names.extend_from_slice(&fallbacks);
-        let g = names.iter().find_map(|n| a.def.model.marker_group(native, cache, n))?;
-        let m = g.markers.first()?;
-        let world = vehicle_world * a.pose.marker_model(m);
-        let (_s, r, t) = world.to_scale_rotation_translation();
-        let fwd = r * glam::Vec3::X;
-        Some((t, fwd.y.atan2(fwd.x).to_degrees()))
+        Some((world, tag))
+    }
+
+    /// #film-riders  The seat the recording puts this body in, if it does, with the seat's own
+    /// authored name.
+    ///
+    /// `Seat::mode` is the seat block's `label` -- the jmad mode (`warthog_d`, `ghost_d`,
+    /// `mongoose_p`) -- read from the vehicle the body is PARENTED to at the index the recording
+    /// states. A ride the displacement detector found (older films that never stated a parent)
+    /// still goes through [`ActorDriver::seat_at`] and its driver/gunner/passenger ordering guess.
+    pub(crate) fn rider_at(
+        &self,
+        pb: &Playback,
+        net: u32,
+        tick: u32,
+        native: &hms_native::NativeDll,
+        cache: hms_native::CacheHandle,
+    ) -> Option<crate::film_riders::Rider> {
+        use crate::film_riders::{Rider, SeatState};
+        let vt = self.vehicles.as_ref()?;
+        let state = crate::film_riders::state_at(&vt.rides, net, tick)?;
+        let ride = match state {
+            SeatState::Seated { ride, .. } | SeatState::Leaving { ride, .. } => ride,
+        };
+        let Some(seat_idx) = ride.seat else {
+            // Detected, not stated: the legacy path (with its stated-exit cut) answers.
+            let seat = self.seat_at(pb, net, tick)?;
+            let vehicle_tag = self.vehicle_obj_tag(pb, ride.vehicle_net_id);
+            return Some(Rider { state, seat, vehicle_tag, seat_index: None });
+        };
+        let tag = self.vehicle_obj_tag(pb, ride.vehicle_net_id)?;
+        let mut idx = self.rider_index.borrow_mut();
+        let entry = idx.entry(native, cache, tag)?;
+        let label = entry.seats.seats.get(seat_idx as usize)?.label.clone();
+        let leaf = entry.path.rsplit('\\').next().unwrap_or(&entry.path).to_string();
+        Some(Rider {
+            state,
+            seat: crate::film_anim::Seat { vehicle_net_id: ride.vehicle_net_id, mode: label, vehicle: leaf },
+            vehicle_tag: Some(tag),
+            seat_index: Some(seat_idx as usize),
+        })
+    }
+
+    /// #film-riders  The seat marker's WORLD frame: the seat vehicle's transform times the
+    /// marker the seat block names. This is the body's origin while it is seated, rotation
+    /// included (the seat clips are authored in that frame), and it is `rider_world`'s
+    /// composition in test mode.
+    fn seat_frame(
+        &self,
+        pb: &Playback,
+        rider: &crate::film_riders::Rider,
+        tick: f32,
+        native: &hms_native::NativeDll,
+        cache: hms_native::CacheHandle,
+    ) -> Option<glam::Mat4> {
+        let tag = rider.vehicle_tag?;
+        let ride = rider.ride();
+        let (world, wtag) = self.vehicle_world(pb, ride.vehicle_net_id, tick, native, cache, 0)?;
+        debug_assert_eq!(wtag, tag);
+        let mut idx = self.rider_index.borrow_mut();
+        let entry = idx.entry(native, cache, tag)?;
+        let m = match rider.seat_index {
+            Some(i) => {
+                let seat = entry.seats.seats.get(i)?;
+                entry.marker_frames(native, cache, &seat.marker_name).first().copied()?
+            }
+            // A DETECTED ride knows no seat index. The seat markers on a Reach vehicle's render
+            // model are named like the jmad mode the rider plays (`mongoose_d`, `ghost_d`), and
+            // the Warthog's are `driver` / `passenger`, so those are tried in turn.
+            None => [rider.seat.mode.as_str(), "driver", "passenger"]
+                .iter()
+                .find_map(|n| entry.marker_frames(native, cache, n).first().copied())?,
+        };
+        Some(world * m)
     }
 
     /// Place the pool from the playback's current moment. Grows the pool on demand up to `cap`.
@@ -2959,6 +3140,7 @@ impl ActorDriver {
         // ---- the bodies ---------------------------------------------------------------------
         // Reset the per-sync counters BEFORE anything increments them.
         self.sync_shown = 0;
+        self.riders_unplaced = 0;
         self.species_shown = 0;
         self.corpses_falling = 0;
         self.sync_clips.clear();
@@ -3059,6 +3241,9 @@ impl ActorDriver {
                     // #projectile  Which actor is drawing this body, for the muzzle-flash lane.
                     self.body_actor.insert(p.net_id, slot);
                     a.pos = glam::Vec3::from(p.pos);
+                    // #film-riders  An actor is RECYCLED between bodies, so a seated body's seat
+                    // frame must not outlive the seat: only the rider block below sets one.
+                    a.world_override = None;
                     if p.has_yaw {
                         a.yaw = p.yaw;
                     }
@@ -3073,7 +3258,9 @@ impl ActorDriver {
                     // and the decoded body yaw together give the direction of travel in the
                     // body's frame, which is what picks between the forward, back, left and right
                     // cycles the graph has always had.
-                    let seat = self.seat_at(pb, p.net_id, tick);
+                    // #film-riders  Which seat the RECORDING puts this body in, if any.
+                    let rider = self.rider_at(pb, p.net_id, tick, native, cache);
+                    let seat = rider.as_ref().filter(|r| r.seated()).map(|r| r.seat.clone());
                     let tr = self.track_of.get(&p.net_id).and_then(|&i| pb.index.tracks.get(i));
                     // #corpse-fall  Where this body comes to rest, and how far into the fall
                     // it is at this tick. `None` = it was already on the floor (the common case)
@@ -3186,21 +3373,88 @@ impl ActorDriver {
                             a.yaw = yaw;
                         }
                     }
-                    if st.seat.is_some() {
-                        rep.riders += 1;
-                        // A rider is drawn on the VEHICLE's transform, not on its own replicated
-                        // position. That is what the engine does — a seated unit's world matrix is
-                        // the vehicle's times the seat marker, and the seat animation is authored
-                        // in that frame — and the recorded position cannot substitute for it: a
-                        // rider's own replicated origin sits 0.62-1.55 wu from the vehicle origin
-                        // (measured, p05-p95 over 5,152 ride samples) because it is the body's
-                        // feet, so drawing there puts the Spartan beside the mongoose rather than
-                        // on it. Verified by capture.
-                        if let Some(seat) = st.seat.clone() {
-                            if let Some(w) = self.seat_world(&seat, pb, ftick, actors, native, cache) {
-                                if let Some(a) = actors.get_mut(slot) {
-                                    a.pos = w.0;
-                                    a.yaw = w.1;
+                    // #film-riders  A SEATED body is drawn in its seat, not at the position it
+                    // reports. A seated unit stops replicating a position (its place in the world
+                    // is its parent's), so the last one it sent is the boarding spot -- up to 189 wu
+                    // behind a vehicle that has since driven away. The engine's own composition is
+                    // the seat marker's frame in the seat vehicle's world, and the seat clips are
+                    // authored in that frame. Boarding plays `<seat>:enter` from the tick the link
+                    // starts; the end of the link plays `<seat>:exit` while the body is brought from
+                    // the seat to the place the recording puts it, so there is no snap.
+                    let mut seat_clip: Option<(Vec<String>, u32)> = None;
+                    let mut seat_idle: Option<String> = None;
+                    if let (Some(r), None, None) = (rider.as_ref(), p.dead_ticks, st.sync.as_ref()) {
+                        let class = tr
+                            .and_then(|tr| tr.weapon_at(tick))
+                            .and_then(|w| self.weap_class.get(w as usize))
+                            .and_then(|c| c.as_deref())
+                            .unwrap_or(crate::film_anim::DEFAULT_WEAPON_CLASS);
+                        let frame = self.seat_frame(pb, r, ftick, native, cache);
+                        let def = actors.get(slot).map(|a| a.def.clone());
+                        // What the rider's graph authors for this seat, resolved once per pair.
+                        let clips = def
+                            .as_ref()
+                            .map(|d| {
+                                self.rider_clips
+                                    .entry((d.name.clone(), r.seat.mode.clone()))
+                                    .or_insert_with(|| {
+                                        d.graph.as_ref().map(|g| crate::film_riders::SeatClips::find(g, &r.seat.mode)).unwrap_or_default()
+                                    })
+                                    .clone()
+                            })
+                            .unwrap_or_default();
+                        // The clip to lead with: the first the graph authors under EXACTLY the name
+                        // asked for (see `exact_base_clip`), so `set_anim`'s substring fallback can
+                        // never be handed a name that is not really there.
+                        let authored = |phase: crate::play_vehicle::RidePhase| {
+                            let mut cands = crate::play_vehicle::phase_clip_candidates(&r.seat.mode, class, phase);
+                            // the class-less fallback: any clip the seat authors for this phase
+                            cands.extend(match phase {
+                                crate::play_vehicle::RidePhase::Boarding => clips.enter.clone(),
+                                crate::play_vehicle::RidePhase::Exiting => clips.exit.clone(),
+                                crate::play_vehicle::RidePhase::Seated => None,
+                            });
+                            let g = def.as_ref().and_then(|d| d.graph.as_ref())?;
+                            let (name, secs) = crate::film_riders::exact_base_clip(g, &cands)?;
+                            Some((vec![name], secs))
+                        };
+                        match r.state {
+                            crate::film_riders::SeatState::Seated { age, .. } => {
+                                rep.riders += 1;
+                                // A weapon class the seat has no idle for (`wraith_d` authors
+                                // `rifle` and not every other class) would fall to the STANDING
+                                // clip. Any authored idle for the seat beats standing in it.
+                                seat_idle = clips.idle.clone();
+                                match frame {
+                                    Some(m) => {
+                                        if let Some(a) = actors.get_mut(slot) {
+                                            a.world_override = Some(m);
+                                        }
+                                    }
+                                    None => self.riders_unplaced += 1,
+                                }
+                                if let Some((cands, secs)) = authored(crate::play_vehicle::RidePhase::Boarding) {
+                                    if (age as f32) < secs * 60.0 {
+                                        seat_clip = Some((cands, age));
+                                    }
+                                }
+                            }
+                            crate::film_riders::SeatState::Leaving { age, .. } => {
+                                if let (Some((cands, secs)), Some(m)) = (authored(crate::play_vehicle::RidePhase::Exiting), frame) {
+                                    let len = secs * 60.0;
+                                    if (age as f32) < len {
+                                        let (_, rot, seat_pos) = m.to_scale_rotation_translation();
+                                        let fwd = rot * glam::Vec3::X;
+                                        let w = crate::film_riders::exit_blend(age as f32 + (ftick - tick as f32), len);
+                                        if let Some(a) = actors.get_mut(slot) {
+                                            a.pos = seat_pos.lerp(glam::Vec3::from(p.pos), w);
+                                            let seat_yaw = fwd.y.atan2(fwd.x).to_degrees();
+                                            let to = if p.has_yaw { p.yaw } else { seat_yaw };
+                                            let d = (to - seat_yaw + 540.0).rem_euclid(360.0) - 180.0;
+                                            a.yaw = seat_yaw + d * w;
+                                        }
+                                        seat_clip = Some((cands, age));
+                                    }
                                 }
                             }
                         }
@@ -3283,28 +3537,41 @@ impl ActorDriver {
                             }
                             None => 0.0,
                         };
+                        // #film-riders  The boarding / exit clip leads, and the seat or standing
+                        // clips behind it are what plays once it has finished.
+                        let mut cands = crate::film_anim::anim_candidates(&st, cls);
+                        if let Some(idle) = seat_idle {
+                            // before the standing fallback, which `anim_candidates` puts last
+                            cands.insert(cands.len().saturating_sub(1), idle);
+                        }
+                        if let Some((lead, _)) = &seat_clip {
+                            cands.splice(0..0, lead.iter().cloned());
+                        }
                         want_anim.push((
                             slot,
-                            crate::film_anim::anim_candidates(&st, cls),
+                            cands,
                             phase,
                             st.seat.is_some(),
                             (gid, cid, st.stance as u8, st.gait as u8),
-                            oneshot_for(
-                                st.sync.as_ref().map(|sy| sy.age),
-                                p.dead_ticks.map(|age| match fall {
-                                    Some((_, ft)) if age >= ft => age - ft,
-                                    _ => age,
-                                }),
-                                st.land_ticks,
-                                st.air_ticks,
-                            ),
+                            seat_clip.as_ref().map(|(_, age)| (*age, ONESHOT_SEAT)).or_else(|| {
+                                oneshot_for(
+                                    st.sync.as_ref().map(|sy| sy.age),
+                                    p.dead_ticks.map(|age| match fall {
+                                        Some((_, ft)) if age >= ft => age - ft,
+                                        _ => age,
+                                    }),
+                                    st.land_ticks,
+                                    st.air_ticks,
+                                )
+                            }),
                         ));
                         // #aim / #fire  What to compose on top. The aim is only ever stated for
                         // ONE body per recording (see `aim_offset`); the firing overlay is stated
                         // for every body, because `action_weapon_fire` is replicated.
                         want_overlay.push((
                             slot,
-                            crate::film_anim::aim_candidates(&st, cls),
+                            // An aim overlay would bend the boarding / exit clip it is laid on.
+                            if seat_clip.is_some() { Vec::new() } else { crate::film_anim::aim_candidates(&st, cls) },
                             self.aim_offset(pb, p.net_id, tick, tr.and_then(|t| t.facing_at(tick))),
                             crate::film_anim::fire_candidates(cls),
                             Self::action_age(&self.fire_of, p.net_id, tick, FIRE_TICKS),
@@ -3518,6 +3785,13 @@ impl ActorDriver {
         rep
     }
 
+    /// #team-colour  The team of a PLAYER body ([`crate::film_variant::GameVariant::team_of_body`])
+    /// from its recorded track, or `None` when the track says nothing usable.
+    pub fn team_of_body(&self, gv: &crate::film_variant::GameVariant, pb: &Playback, net: u32) -> Option<u8> {
+        let tr = self.track_of.get(&net).and_then(|&i| pb.index.tracks.get(i))?;
+        gv.team_of_body(tr.appearance, tr.owner_raw)
+    }
+
     /// #skin  Give every drawn body the armour and the colours its player actually had.
     ///
     /// ONE implementation, on the driver, because BOTH hosts need it and they used to disagree:
@@ -3572,13 +3846,30 @@ impl ActorDriver {
             }
             sc.set_player_variants(variants);
             self.appearance = Some(table);
+            // #team-colour  The TEAM's colours, resolved with the same two sources the engine
+            // uses (`sub_1403AC310`): the variant's own per-team override, else `mulg`'s table.
+            let defaults = sc.team_colors();
+            self.team_skins = film
+                .header
+                .gametype
+                .as_ref()
+                .filter(|gv| gv.misc.teams_enabled())
+                .map(|gv| (0..crate::film_variant::off::TEAM_COUNT as u8).map(|t| gv.team_skin(t, &defaults)).collect());
         }
         let Some(table) = self.appearance.as_ref() else { return false };
         let mut dirty = false;
         for (&actor_id, &net) in self.pool.assigned.iter() {
             let want = pb.index.slot_of_entity(net).and_then(|s| table.get(&s)).copied();
             let Some(a) = actors.get_mut(actor_id) else { continue };
-            let (vsid, skin) = want.unwrap_or((0, None));
+            let (vsid, mut skin) = want.unwrap_or((0, None));
+            // #team-colour  In a team game the armour's COLOURS come from the body's TEAM, not
+            // from the player's customisation (the armour pieces stay the recorded ones). Only a
+            // PLAYER's biped -- one whose creation carries an appearance block -- is recoloured;
+            // an AI body keeps its authored colours. A body whose team the recording does not
+            // name keeps the customisation.
+            if let Some(gv) = film.header.gametype.as_ref() {
+                skin = choose_skin(self.team_skins.as_deref(), self.team_of_body(gv, pb, net), skin);
+            }
             // #skin  An actor is RECYCLED between bodies, so "this body has no recorded
             // appearance" has to CLEAR the previous occupant's armour rather than leave it on --
             // that is how one player's armour could follow a pooled actor onto somebody else's
@@ -3626,7 +3917,11 @@ impl ActorDriver {
             .or_else(|| self.fp_reps.first())
             .and_then(|r| self.fp_actor_of.get(&r.hands).copied());
         if let Some(id) = fp_arms {
-            let skin = pb.subject_slot().and_then(|s| table.get(&s)).and_then(|&(_, c)| c);
+            let mut skin = pb.subject_slot().and_then(|s| table.get(&s)).and_then(|&(_, c)| c);
+            // #team-colour  The arms wear the same colours as the body they belong to.
+            if let Some(gv) = film.header.gametype.as_ref() {
+                skin = choose_skin(self.team_skins.as_deref(), pb.subject_owner().and_then(|o| gv.team_of_owner(o)), skin);
+            }
             if let Some(a) = actors.get_mut(id) {
                 if a.skin != skin {
                     a.skin = skin;
@@ -4231,6 +4526,7 @@ impl ActorDriver {
         self.fp_actor_of.clear();
         self.fp_weapon_of.clear();
         self.appearance = None;
+        self.team_skins = None;
         self.fp_status.clear();
         self.clip_frames.clear();
         self.phase_prefix.clear(); // #film-perf  keyed on `clip_frames`, so it goes with it
@@ -4733,16 +5029,17 @@ impl ActorDriver {
                 if vt.no_position > 0 {
                     s.push_str(&format!(
                         "{} more never replicated a position of their own: a child object riding a PARENT reports no position, \
-                         because its place in the world is its parent's. That parent reference is base field 12 of the object \
-                         block and it is not decoded yet, so those are not drawn. ",
+                         because its place in the world is its parent's (base field 12 of the object block). A Warthog's turret is \
+                         one: it is drawn with its Warthog, and its gunner is seated in the turret's own frame. ",
                         vt.no_position
                     ));
                 }
                 s.push_str(&format!(
-                    "{} rider(s) seated now, {} ride(s) in the clip. A vehicle is placed with its FULL recorded basis (the stream's \
+                    "{} rider(s) seated now ({} unplaced), {} ride(s) in the clip. A vehicle is placed with its FULL recorded basis (the stream's \
                      own 19-bit up axis + 8-bit angle about it), so pitch and roll are drawn \u{2014} {} tilted more than 5 degrees \
                      off level at this moment. ",
                     states.iter().filter(|(_, st)| st.seat.is_some()).count(),
+                    self.riders_unplaced,
                     vt.rides.len(),
                     self.veh_tilted
                 ));

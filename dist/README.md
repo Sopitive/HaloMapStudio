@@ -1,4 +1,4 @@
-# Halo Map Studio 1.4.0
+# Halo Map Studio 1.6.0
 
 A standalone map viewer and Forge editor for Halo: Reach, Halo 3, Halo 4 and
 Halo 2 Anniversary from the Master Chief Collection on PC. It reads your installed game's map files directly and renders

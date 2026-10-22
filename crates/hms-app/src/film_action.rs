@@ -1375,7 +1375,7 @@ mod probes {
             let lab = label(p, &f);
             println!(
                 "{:<44} {}  [mask0x36 {m36}]",
-                &lab[..lab.len().min(43)],
+                lab.chars().take(43).collect::<String>(), // char-safe: a gamertag can hold a multi-byte emoji
                 n.iter().map(|v| format!("{v:>10}")).collect::<Vec<_>>().join(" ")
             );
         }

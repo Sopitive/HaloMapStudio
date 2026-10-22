@@ -94,6 +94,12 @@ pub struct H3Loaded {
     pub log: Vec<String>,
     /// A Halo 3 `.mvar` whose Forge objects `build_meshes` places (mvar.rs). #h3
     pub variant: Option<super::mvar::H3Variant>,
+    /// With no variant: the shipped `.mvar` of this map the editor starts a blank canvas from
+    /// (scenario.rs `find_template`). #h3-scenario
+    pub canvas: Option<(std::path::PathBuf, super::mvar::H3Variant)>,
+    /// The variant's (or canvas's) scenario slots are editor objects: the GUI build leaves the
+    /// base map's own vehicles / weapons / equipment / scenery / crates out of the static scenery.
+    pub scenario_owned: bool,
 }
 
 /// Open a Halo 3 cache (no GPU work).
@@ -101,7 +107,7 @@ pub fn load_map(map_path: &str) -> Result<H3Loaded> {
     let cache = Arc::new(H3Cache::open(std::path::Path::new(map_path))?);
     let log = vec![format!("h3: {} ({}) map='{}' scenario='{}' tags={} classes={}",
         map_path, cache.engine.label(), cache.map_name, cache.scenario, cache.tag_count(), cache.class_count())];
-    Ok(H3Loaded { cache, path: map_path.to_string(), log, variant: None })
+    Ok(H3Loaded { cache, path: map_path.to_string(), log, variant: None, canvas: None, scenario_owned: false })
 }
 
 /// Open a Halo 3 cache with a map variant to place (a variant whose base map is another map is
@@ -117,7 +123,16 @@ pub fn load_map_with_variant(map_path: &str, variant: Option<&std::path::Path>) 
         loaded.log.push(format!("h3: variant '{}' by {} ({}): map {} v{}, {} scenario / {} variant slots, {} quotas, {} placed objects, budget {} / {}",
             v.header.name, v.header.author, vp.display(), v.map_id, v.version, v.num_scenario_objects, v.num_variant_objects, v.num_quotas,
             v.placed().count(), v.spent_budget, v.maximum_budget));
+        loaded.scenario_owned = super::scenario::is_editable(&v, &super::scenario::scenario_layout(&loaded.cache));
         loaded.variant = Some(v);
+    } else if let Some(id) = crate::mapcat::read_map_id(std::path::Path::new(map_path)) {
+        // no variant: a blank canvas from one of the map's own, so its objects can be edited
+        if let Some((tpl, v)) = super::scenario::find_template(id, None).and_then(|p| super::mvar::parse_h3_variant(&p).ok().map(|v| (p, v))) {
+            loaded.scenario_owned = super::scenario::is_editable(&v, &super::scenario::scenario_layout(&loaded.cache));
+            loaded.log.push(format!("h3: blank canvas from {} ({} scenario objects{})", tpl.file_name().unwrap_or_default().to_string_lossy(),
+                v.num_scenario_objects, if loaded.scenario_owned { ", editable" } else { ", static: this map's variants register none" }));
+            loaded.canvas = Some((tpl, v));
+        }
     }
     Ok(loaded)
 }
@@ -1125,7 +1140,7 @@ pub fn build_meshes(
         field.tri_count(), field.lightmap_count(), field.fallback));
     if !noobj {
         if cancelled() { anyhow::bail!("cancelled"); }
-        build_objects(c, device, queue, mr, &mut tc, &mut st, obj_color, &field, emit, log);
+        build_objects(c, device, queue, mr, &mut tc, &mut st, obj_color, &field, loaded.scenario_owned && editor.is_some(), emit, log);
         // the map variant's Forge objects, through the same model path #h3 (the GUI editor scene
         // draws them itself: dynamic, pickable lanes)
         if let (Some(v), None) = (loaded.variant.as_ref(), editor.as_ref()) {
@@ -1262,13 +1277,20 @@ fn build_sky(c: &H3Cache, device: &wgpu::Device, queue: &wgpu::Queue, mr: &MeshR
 /// (one model decode + one draw per part, carrying every placement matrix), flat-lit by the
 /// map's exposed mean bake. Unresolved / undecodable objects are counted with their reason.
 fn build_objects(c: &H3Cache, device: &wgpu::Device, queue: &wgpu::Queue, mr: &MeshRenderer, tc: &mut TexCtx, st: &mut H3Stats, color: [f32; 4],
-    field: &super::objlight::H3LightField, emit: &mut dyn FnMut(Lane, Vec<GpuMesh>), log: &mut dyn FnMut(String)) {
+    field: &super::objlight::H3LightField, editor_owns_scenario: bool, emit: &mut dyn FnMut(Lane, Vec<GpuMesh>), log: &mut dyn FnMut(String)) {
     let objdiag = std::env::var("HMS_H3_OBJDIAG").is_ok();
     let placements = load_placements(c);
     // palette tag -> placement matrices (table order kept for the diag)
     let mut groups: Vec<(usize, Vec<Mat4>)> = Vec::new();
     let mut skips: HashMap<&'static str, usize> = HashMap::new();
+    let mut editor_owned = 0usize;
     for p in &placements {
+        // #h3-scenario the base map's own variant-registered objects are editor objects (selectable,
+        // deletable, movable: scenario.rs), so the static scenery must not draw them as well
+        if editor_owns_scenario && super::scenario::editor_owns(c, p.class, p.palette_tag) {
+            editor_owned += 1;
+            continue;
+        }
         let reason = if p.never_placed() { Some("never-placed flag") }
             else if !p.pos.iter().chain(p.rot.iter()).all(|v| v.is_finite()) { Some("non-finite placement") }
             else { None };
@@ -1287,7 +1309,7 @@ fn build_objects(c: &H3Cache, device: &wgpu::Device, queue: &wgpu::Queue, mr: &M
     let (placed, skipped, models) = draw_object_groups(c, &groups, device, queue, mr, tc, st, color, field, emit, &mut skips, objdiag);
     st.objects_placed += placed;
     st.objects_skipped += skipped;
-    log(format!("h3 objects: {} placements -> {} placed over {models} models ({} distinct palette tags), {} skipped {:?}",
+    log(format!("h3 objects: {} placements -> {} placed over {models} models ({} distinct palette tags), {} skipped {:?}, {editor_owned} left to the editor (variant slots)",
         placements.len(), st.objects_placed, groups.len(), st.objects_skipped, skips));
 }
 

@@ -24,6 +24,7 @@
 //!                 layout; decoder + byte-exact encoder + save) and the quota -> palette resolve
 //!   palette.rs  - the scnr sandbox palette rows + the obje multiplayer defaults a placement takes
 //!   edit.rs     - variant records <-> editor objects, the save list
+//!   scenario.rs - the base map's own objects as variant slots (layout, editor objects, blank canvas)
 //!   edit_scene.rs - `ObjectScene` over the Halo 3 reader (dynamic lanes, picks, BSP soup)
 //!   app.rs      - the App side: editor install, palette panel, place, save
 //!   attach.rs   - hlmt model variants + child objects (vehicle turrets) at their markers
@@ -49,6 +50,7 @@ pub mod objects;
 pub mod objlight;
 pub mod render;
 pub mod scene;
+pub mod scenario;
 
 #[allow(unused_imports)]
 pub use cache::{is_halo3_cache, maps_dir, H3Cache};

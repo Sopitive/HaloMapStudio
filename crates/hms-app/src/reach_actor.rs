@@ -2206,6 +2206,13 @@ impl HeldWeapon {
     }
 }
 
+/// #ride-weapon  The bone palette of a HELD weapon: every entry the attach matrix, or -- when the
+/// weapon is hidden -- the zero matrix, which collapses every vertex to a point and draws nothing
+/// without rebuilding a single mesh.
+pub fn held_weapon_palette(attach: Mat4, node_count: usize, hidden: bool) -> Vec<Mat4> {
+    vec![if hidden { Mat4::ZERO } else { attach }; node_count.min(hms_render::MAX_SKIN_BONES)]
+}
+
 /// Print-only (`hms-app --dump-anim <map> <biped-filter> [anim-name] [frames]`): resolve a
 /// biped's `jmad`, load one animation and sample it, printing the codec headers and the decoded
 /// channels at several frames. This is how the codec decode was validated against the engine's
@@ -2905,6 +2912,12 @@ pub struct Actor {
     /// pos/yaw/pitch placement for this frame. Written by [`ActorScene::update`] after the PARENT
     /// has been posed, so it is always one frame's own pose and never a stale one.
     pub world_override: Option<Mat4>,
+    /// #ride-grip  Hands to place after the pose is composed, written per frame by whoever drives
+    /// the actor (a rider gripping a steering wheel). Empty for every other actor, which leaves
+    /// [`Actor::compute_pose`] exactly as it was.
+    pub grips: Vec<crate::reach_grip::Grip>,
+    /// #ride-weapon  The held weapon is not drawn (a seat that does not allow weapons).
+    pub weapon_hidden: bool,
     /// Selected animation (index into `def.graph.anims`) and its loaded blob.
     pub anim: Option<usize>,
     pub anim_name: String,
@@ -2918,6 +2931,14 @@ pub struct Actor {
     /// The clip this actor was playing before the current one, held so the change can be
     /// CROSS-FADED instead of snapping. `(graph index, its data, the frame it was on)`.
     pub prev_anim: Option<(usize, AnimData, f32)>,
+    /// #walk-bob  The pose that was ON SCREEN when the change of clip began -- the outgoing
+    /// clip's gait mix and any fade already in flight, frozen -- which the cross-fade runs out
+    /// of. `prev_anim` alone is one clip at one frame: switching a second time inside a fade
+    /// (idle -> walk -> run in the first tenth of a second, or a crouch begun mid-stride) faded
+    /// out of the PREVIOUS TARGET and the body jumped to it in one frame (measured: a Spartan
+    /// pressing crouch-and-forward moved its pelvis 0.143 wu in one frame, 43 cm; sprint start
+    /// 0.031 wu). Cleared with `prev_anim`.
+    pub prev_pose: Option<Vec<(glam::Quat, Vec3, f32)>>,
     /// Seconds of cross-fade still to run. 0 = none.
     pub blend_left: f32,
     /// #crouch-rate  How long THIS cross-fade was armed for, seconds. [`BLEND_SECONDS`] for an
@@ -3214,31 +3235,10 @@ impl Actor {
         self.refresh_palettes(queue);
     }
 
-    /// #film-perf  Re-evaluate `self.pose` from the current animation, overlays and ragdoll
-    /// override. Split out of [`Actor::refresh_pose`] so it can be gated WITHOUT a GPU device:
-    /// the palettes are a pure function of the pose, so proving the pose is identical through
-    /// both routes proves the upload is too.
-    pub(crate) fn compute_pose(&mut self) {
-        let skel = &self.def.model.skel;
-        // #film-perf  A RAGDOLLED body's node frames come WHOLLY from the solver, so sampling
-        // the clip, blending the cross-fade, composing the overlays, building `locals` and
-        // chaining `pose_model` produced a pose that the `pose_override` copy a few lines below
-        // then overwrote line for line. Up to fourteen corpses lie on the ground at once and
-        // every one of them was paying for a pose nothing could ever see -- six Vec allocations
-        // and a skeleton walk each, twice over (see the `jmad` sample inside `clip_trs`).
-        //
-        // Skipped only when the override covers EVERY node: a partial override still takes the
-        // full path, so the two routes cannot disagree about a single matrix. The `resize` keeps
-        // the invariant the palette below relies on -- `self.pose.model` is always as long as the
-        // skeleton -- for a body that is ragdolled before it has ever been posed from a clip.
-        if self.pose_override.as_ref().is_some_and(|o| o.len() >= skel.len()) {
-            let over = self.pose_override.as_ref().expect("checked above");
-            if self.pose.model.len() != skel.len() {
-                self.pose.model.resize(skel.len(), Mat4::IDENTITY);
-            }
-            self.pose.model.copy_from_slice(&over[..skel.len()]);
-            return;
-        }
+    /// #walk-bob  The base pose as it is DRAWN before the replacement and the overlays: the clip,
+    /// the gait mix and any cross-fade still running. The one place that is computed, so the pose
+    /// a frame draws and the pose a change of clip fades out of cannot disagree.
+    fn on_screen_trs(&self) -> Vec<(glam::Quat, Vec3, f32)> {
         // Evaluate the current clip, and the outgoing one while a cross-fade is running, then
         // blend them per node. Blending (rotation, translation, scale) and composing afterwards
         // is what makes the result a real pose; blending the composed matrices would shear.
@@ -3307,7 +3307,12 @@ impl Actor {
                 let span = if self.blend_span > 1e-4 { self.blend_span } else { BLEND_SECONDS };
                 let lin = (self.blend_left / span).clamp(0.0, 1.0);
                 let w = lin * lin * (3.0 - 2.0 * lin);
-                let old = self.clip_trs(Some(*pi), Some(pd), *pf);
+                // #walk-bob  Out of the pose that WAS on screen when the clip changed, not out of
+                // the previous clip alone (see `Actor::prev_pose`).
+                let old = match &self.prev_pose {
+                    Some(p) => p.clone(),
+                    None => self.clip_trs(Some(*pi), Some(pd), *pf),
+                };
                 for (i, o) in old.iter().enumerate() {
                     if i >= trs.len() {
                         break;
@@ -3319,6 +3324,35 @@ impl Actor {
                 }
             }
         }
+        trs
+    }
+
+    /// #film-perf  Re-evaluate `self.pose` from the current animation, overlays and ragdoll
+    /// override. Split out of [`Actor::refresh_pose`] so it can be gated WITHOUT a GPU device:
+    /// the palettes are a pure function of the pose, so proving the pose is identical through
+    /// both routes proves the upload is too.
+    pub(crate) fn compute_pose(&mut self) {
+        let skel = &self.def.model.skel;
+        // #film-perf  A RAGDOLLED body's node frames come WHOLLY from the solver, so sampling
+        // the clip, blending the cross-fade, composing the overlays, building `locals` and
+        // chaining `pose_model` produced a pose that the `pose_override` copy a few lines below
+        // then overwrote line for line. Up to fourteen corpses lie on the ground at once and
+        // every one of them was paying for a pose nothing could ever see -- six Vec allocations
+        // and a skeleton walk each, twice over (see the `jmad` sample inside `clip_trs`).
+        //
+        // Skipped only when the override covers EVERY node: a partial override still takes the
+        // full path, so the two routes cannot disagree about a single matrix. The `resize` keeps
+        // the invariant the palette below relies on -- `self.pose.model` is always as long as the
+        // skeleton -- for a body that is ragdolled before it has ever been posed from a clip.
+        if self.pose_override.as_ref().is_some_and(|o| o.len() >= skel.len()) {
+            let over = self.pose_override.as_ref().expect("checked above");
+            if self.pose.model.len() != skel.len() {
+                self.pose.model.resize(skel.len(), Mat4::IDENTITY);
+            }
+            self.pose.model.copy_from_slice(&over[..skel.len()]);
+            return;
+        }
+        let mut trs = self.on_screen_trs();
         // #melee  Then the REPLACEMENT lane, which the engine applies between the base and the
         // overlays: it overwrites the channels it carries and leaves every other node on the
         // base clip (see [`Actor::replacement`]).
@@ -3344,6 +3378,13 @@ impl Actor {
             })
             .collect();
         self.pose = Pose { model: skel.pose_model(&locals) };
+        // #ride-grip  Hands on a steering wheel: a two-bone solve over the composed pose.
+        if !self.grips.is_empty() {
+            let parents: Vec<i16> = skel.nodes.iter().map(|n| n.parent).collect();
+            for g in &self.grips {
+                crate::reach_grip::apply_grip(&mut self.pose.model, &parents, g);
+            }
+        }
         // #ragdoll  A simulated body's node frames come from the solver, not from a clip.
         if let Some(over) = &self.pose_override {
             let n = self.pose.model.len().min(over.len());
@@ -3371,7 +3412,7 @@ impl Actor {
             // space, so every palette entry is the same matrix: the engine's attach
             // `unit_world * P_marker * C_marker^-1`, folded through the same anchor delta.
             let m = delta * w.world(Mat4::IDENTITY, &self.pose);
-            let mats = vec![m; w.node_count.min(hms_render::MAX_SKIN_BONES)];
+            let mats = held_weapon_palette(m, w.node_count, self.weapon_hidden);
             wp.update(queue, &mats);
         }
     }
@@ -3635,6 +3676,7 @@ impl Actor {
             self.blend_left = (self.blend_left - dt).max(0.0);
             if self.blend_left == 0.0 {
                 self.prev_anim = None;
+                self.prev_pose = None;
             }
         }
         if !self.playing { return; }
@@ -3752,6 +3794,7 @@ impl ActorScene {
         a.data = None;
         a.anim_name.clear();
         a.prev_anim = None;
+        a.prev_pose = None;
         a.blend_left = 0.0;
         a.frame = 0.0;
         // EVERY LANE KEYED BY GRAPH INDEX GOES TOO, not just the base clip.
@@ -3799,6 +3842,8 @@ impl ActorScene {
             model_yaw: 0.0,
             fp_attach: None,
             world_override: None,
+            grips: Vec::new(),
+            weapon_hidden: false,
             damage: 0,
             graph_tag: jmad_tag,
             anim: None,
@@ -3809,6 +3854,7 @@ impl ActorScene {
             weapon: None,
             weapon_name: String::new(),
             prev_anim: None,
+            prev_pose: None,
             blend_left: 0.0,
             blend_span: BLEND_SECONDS,
             base_blend: Vec::new(),
@@ -3885,6 +3931,8 @@ impl ActorScene {
             model_yaw: 0.0,
             fp_attach: None,
             world_override: None,
+            grips: Vec::new(),
+            weapon_hidden: false,
             damage: 0,
             graph_tag: None,
             anim: None,
@@ -3895,6 +3943,7 @@ impl ActorScene {
             weapon: None,
             weapon_name: String::new(),
             prev_anim: None,
+            prev_pose: None,
             blend_left: 0.0,
             blend_span: BLEND_SECONDS,
             base_blend: Vec::new(),
@@ -3985,6 +4034,7 @@ impl ActorScene {
         // residual pop left after the phase was made continuous.
         if let (Some(pi), Some(pd), Some(span)) = (a.anim, a.data.clone(), fade) {
             if Some(pi) != Some(i) && span > 1e-4 {
+                a.prev_pose = Some(a.on_screen_trs());
                 a.prev_anim = Some((pi, pd, a.frame));
                 a.blend_left = span;
                 a.blend_span = span;
@@ -4018,6 +4068,7 @@ impl ActorScene {
         let a = &mut self.actors[idx];
         if let (Some(pi), Some(pd), Some(span)) = (a.anim, a.data.clone(), fade) {
             if pi != anim && span > 1e-4 {
+                a.prev_pose = Some(a.on_screen_trs());
                 a.prev_anim = Some((pi, pd, a.frame));
                 a.blend_left = span;
                 a.blend_span = span;
@@ -4286,6 +4337,7 @@ impl ActorScene {
         for a in self.actors.iter_mut() {
             a.blend_left = 0.0;
             a.prev_anim = None;
+            a.prev_pose = None;
             // The span the NEXT fade would be armed with is reset too, so a settled actor is in
             // one state rather than two (a zeroed fade carrying a 0.30 s crouch span).
             a.blend_span = BLEND_SECONDS;

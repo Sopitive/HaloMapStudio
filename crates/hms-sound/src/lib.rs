@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 pub use decode::Pcm;
 pub use fsb5::{Bank, Codec, Sample};
 pub use mix::{Cmd, MixerHandle, VoiceId};
-pub use out::{Output, State};
+pub use out::{OutDiag, Output, State};
 pub use fvs::SetupTable;
 pub use info::{BankInfo, InfoRecord};
 

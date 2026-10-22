@@ -1248,6 +1248,24 @@ pub fn run() -> anyhow::Result<()> {
     }
     // HMS_RTGI=1: real-time probe GI replaces the baked lightmaps; HMS_RTGI_WARMUP=<n> update
     // passes before the shot (default 48) so the multi-bounce field has converged.
+    // HMS_RTGI_COMPARE=1 (with HMS_RTGI=1, print-only): measure the real-time probe field against the map's
+    // SHIPPED airprobes twice — BEFORE (the legacy sky model: captured sky cube, flat ambient, gain 1.3) and
+    // AFTER (engine mode: the sky render_model's light list) — then continue with the engine field.
+    if std::env::var("HMS_RTGI").is_ok() && std::env::var("HMS_RTGI_COMPARE").is_ok() {
+        let n: u32 = std::env::var("HMS_RTGI_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
+        let ship = scene.shipped_airprobes();
+        logln!("RTGI_COMPARE {} shipped airprobes", ship.len());
+        for (label, engine) in [("BEFORE (legacy sky model)", false), ("AFTER  (engine sky lights)", true)] {
+            let Some(mut sd) = scene.rtgi_scene_data() else { logln!("RTGI_COMPARE: no occluder geometry"); break };
+            if !engine { sd.sky = None; }
+            renderer.set_rtgi_scene(&device, &queue, &sd);
+            renderer.set_rtgi_enabled(&queue, true);
+            renderer.rtgi_warm_up(&device, &queue, n);
+            let (probes, o, sp, d) = renderer.rtgi_probes(&device, &queue);
+            let st = crate::rtgi_compare::compare(&ship, &probes, o, sp, d);
+            logln!("{}", crate::rtgi_compare::report(label, &st));
+        }
+    }
     if std::env::var("HMS_RTGI").is_ok() {
         let t0 = std::time::Instant::now();
         match scene.rtgi_scene_data() {

@@ -4,7 +4,7 @@
 //! polyhedra, in model space, at the object's EDITOR SCALE) and nothing else -- the render mesh is
 //! never consulted, so a scaled object rests exactly where its scaled physics hull touches the
 //! world. The world is the level's triangle soup plus the physics hulls of every other placed
-//! object. The body is dropped under gravity and stepped at the engine's 30 Hz tick with a
+//! object. The body is dropped under gravity and stepped at the engine's tick ([`TICK_HZ`]) with a
 //! sequential-impulse contact solver (Coulomb friction + restitution from the shape's own tag
 //! fields, split-impulse penetration recovery) until it comes to rest, or reports that it never
 //! touched anything.
@@ -15,7 +15,7 @@
 //!     does (a 0.968 wu `wall_m` core + 2 x 0.016 radius = the 1.0 wu block players touch),
 //!     the rigid body's node frame (`mode` node inverse matrices), the tag mass, centre of mass,
 //!     inertia tensor scale, linear / angular damping, and every shape's friction / restitution;
-//!   * the tick rate (30 Hz), gravity along -Z, sequential impulses (Havok's solver is a PGS /
+//!   * gravity along -Z (at the engine's tick, [`TICK_HZ`]), sequential impulses (Havok's solver is a PGS /
 //!     sequential-impulse solver too), sleeping on a velocity threshold held over several ticks.
 //! What it simplifies (stated so nobody mistakes it for a Havok port):
 //!   * ONE rigid assembly per object: every non-phantom rigid body of the phmo is welded into a
@@ -39,8 +39,12 @@
 
 use glam::{Mat3, Quat, Vec3};
 
-/// The engine's physics tick.
-pub const TICK_HZ: f32 = 30.0;
+/// The tick HMS's settle / ragdoll / biped step assume.
+///
+/// The engine's tick: 60 Hz (`game_time_globals` tick_rate +6 = 60, seconds_per_tick +8 = 1/60;
+/// the whole sim and Havok's one PSI per tick run at it; see [`crate::reach_havok::TICK_HZ`]).
+/// Flipped from 30 on 2026-10-20 by the biped agent, with the havok agent's proof.
+pub const TICK_HZ: f32 = 60.0;
 /// #gravity  **The ENGINE's own world gravity**, from [`crate::reach_physics::WORLD_GRAVITY`].
 ///
 /// This held **3.2147** — Earth's 9.8 m/s^2 at 1 wu = 3.048 m, with two digits transposed from
@@ -101,7 +105,7 @@ pub struct ConvexShape {
 
 /// Above this many vertices a hull's face planes come from its AABB (the O(n^3) face scan is
 /// for the small Forge polyhedra; the vertices are still used for contacts).
-const HULL_PLANE_LIMIT: usize = 64;
+pub(crate) const HULL_PLANE_LIMIT: usize = 64;
 /// Sanity cap on any shape's extent (a corrupt tag never builds a map-sized body).
 const MAX_EXTENT: f32 = 500.0;
 /// How far past a triangle's edge (in its plane) a vertex that crossed the plane still counts as
@@ -291,6 +295,10 @@ pub struct PhysBody {
     pub ang_damping: f32,
     /// Editor scale already applied to the geometry (1.0 = the tag as stored).
     pub scale: f32,
+    /// Every rigid body of the phmo is KEYFRAMED or FIXED (`phmo` motion type 4 / 5): the engine
+    /// never moves it, whatever the placement says. Test mode's rigid-body world treats such an
+    /// object as terrain.
+    pub fixed: bool,
     /// Where the body came from, for the status line ("phmo: 1 rigid body, 1 polyhedron").
     pub desc: String,
 }
@@ -381,6 +389,7 @@ impl PhysBody {
             lin_damping: if nd > 0 { lin_d / nd as f32 } else { 0.0 },
             ang_damping: if nd > 0 { ang_d / nd as f32 } else { 0.0 },
             scale: 1.0,
+            fixed: defs.iter().filter(|d| !d.shapes.is_empty()).all(|d| d.motion_type >= 4),
             desc,
         })
     }
@@ -430,6 +439,7 @@ impl PhysBody {
             lin_damping: self.lin_damping,
             ang_damping: self.ang_damping,
             scale: self.scale * s,
+            fixed: self.fixed,
             desc: self.desc.clone(),
         }
     }
@@ -494,6 +504,76 @@ fn tensor_ok(t: &Mat3) -> bool {
 pub trait StaticWorld {
     /// Append every triangle whose AABB overlaps [mn, mx].
     fn gather(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>);
+    /// Append every CLOSED SHELL (see [`Shell`]) whose box overlaps [mn, mx]. Default: none --
+    /// a world made of bare triangles has no known inside.
+    fn solid_shells(&self, _mn: Vec3, _mx: Vec3, _out: &mut Vec<std::sync::Arc<Shell>>) {}
+}
+
+/// A closed, outward-wound triangle shell: the surface of one convex physics shape. Unlike the
+/// open level surfaces it HAS an inside, which is what lets a body that is somewhere inside it
+/// (placed there, or a block dropped on it) be pushed out the nearest way.
+#[derive(Debug)]
+pub struct Shell {
+    pub mn: Vec3,
+    pub mx: Vec3,
+    pub tris: Vec<[Vec3; 3]>,
+}
+
+impl Shell {
+    pub fn new(tris: Vec<[Vec3; 3]>) -> Shell {
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in tris.iter().flatten() {
+            mn = mn.min(*p);
+            mx = mx.max(*p);
+        }
+        Shell { mn, mx, tris }
+    }
+
+    /// Is `p` inside the shell? Parity of the crossings of a ray with an irrational direction
+    /// (so it never runs along an edge of a box-aligned shell), independent of the winding.
+    pub fn contains(&self, p: Vec3) -> bool {
+        if !(p.cmpge(self.mn).all() && p.cmple(self.mx).all()) {
+            return false;
+        }
+        let d = Vec3::new(0.577_215_7, 0.693_147_2, 0.414_213_56).normalize();
+        let mut n = 0;
+        for t in &self.tris {
+            let (e1, e2) = (t[1] - t[0], t[2] - t[0]);
+            let h = d.cross(e2);
+            let a = e1.dot(h);
+            if a.abs() < 1e-12 {
+                continue;
+            }
+            let f = 1.0 / a;
+            let s = p - t[0];
+            let u = f * s.dot(h);
+            if !(0.0..1.0).contains(&u) {
+                continue;
+            }
+            let q = s.cross(e1);
+            let v = f * d.dot(q);
+            if v < 0.0 || u + v >= 1.0 {
+                continue;
+            }
+            if f * e2.dot(q) > 0.0 {
+                n += 1;
+            }
+        }
+        n % 2 == 1
+    }
+
+    /// The nearest point of the shell's surface to `p`.
+    pub fn nearest_surface_point(&self, p: Vec3) -> Vec3 {
+        let mut best = (f32::MAX, p);
+        for t in &self.tris {
+            let (q, _) = closest_point_on_triangle(p, t[0], t[1], t[2]);
+            let d = q.distance_squared(p);
+            if d < best.0 {
+                best = (d, q);
+            }
+        }
+        best.1
+    }
 }
 
 impl StaticWorld for [[Vec3; 3]] {

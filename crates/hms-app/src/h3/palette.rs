@@ -174,4 +174,21 @@ mod tests {
         eprintln!("guardian MLG placed vs tag defaults: {checked} checked, type {type_ok}, shape {shape_ok}, spawn time {time_ok}");
         assert!(checked > 50 && type_ok == checked, "object type is the tag's on every placement");
     }
+
+    /// Probe (print-only, #[ignore]): palette row names against their multiplayer object type, to
+    /// pin the type numbering the property labels depend on.
+    #[test]
+    #[ignore]
+    fn palette_type_probe() {
+        use std::collections::BTreeMap;
+        let mut by_type: BTreeMap<u8, Vec<String>> = BTreeMap::new();
+        for c in super::super::cache::installed_caches().into_iter().take(40) {
+            let Ok(cache) = H3Cache::open(&c) else { continue };
+            for it in palette(&cache) {
+                let e = by_type.entry(it.object_type()).or_default();
+                if e.len() < 7 && !e.contains(&it.name) { e.push(format!("{}:{}", it.category, it.name)); }
+            }
+        }
+        for (t, names) in &by_type { eprintln!("PTYPE {t:>2}: {}", names.join(" | ")); }
+    }
 }

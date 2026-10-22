@@ -643,6 +643,60 @@ impl GameVariant {
         }
     }
 
+    /// #team-colour  The team a body belongs to, from the owner stamp its creation carries.
+    ///
+    /// The stamp is the object's `owner team` (5 bits, `index + 1`, 0 = nobody), which for a
+    /// player's biped is the player's `m_multiplayer_team` -- the same value the engine's
+    /// `player_refresh_object_appearance_full` hands the colour builder. It is only a TEAM when the
+    /// variant has teams (in a free-for-all every player is a team of one, which is why it looks
+    /// like a player index there), so `None` unless this variant's teams bit is set, and `None`
+    /// for a stamp naming a team the variant does not enable: never guessed.
+    pub fn team_of_owner(&self, owner_raw: u8) -> Option<u8> {
+        if !self.misc.teams_enabled() || owner_raw == 0 {
+            return None;
+        }
+        let team = owner_raw - 1;
+        self.teams.get(team as usize).filter(|t| t.enabled()).map(|_| team)
+    }
+
+    /// #team-colour  The team of a recorded BODY: the owner-stamp rule of
+    /// [`GameVariant::team_of_owner`], for a PLAYER's biped only -- the one whose creation carries
+    /// an appearance block. The gametype's and the AI's bodies keep their authored colours.
+    pub fn team_of_body(&self, has_appearance: bool, owner_raw: Option<u8>) -> Option<u8> {
+        if !has_appearance {
+            return None;
+        }
+        self.team_of_owner(owner_raw?)
+    }
+
+    /// #team-colour  The variant's own colour for `team`, when it overrides the default.
+    ///
+    /// `sub_1404D1F00` (`game_engine_team.cpp`): the variant must have teams enabled, the team
+    /// record must be enabled, and its flag bit 1 (`override color`) must be set; the colour is then
+    /// the record's packed `0x00RRGGBB` at +0x48, each byte times `0.00392156886`, unconverted.
+    pub fn team_color_override(&self, team: u8) -> Option<[f32; 3]> {
+        if !self.misc.teams_enabled() {
+            return None;
+        }
+        let t = self.teams.get(team as usize).filter(|t| t.enabled() && t.flags & 2 != 0)?;
+        let c = t.color_override;
+        let ch = |shift: u32| ((c >> shift) & 0xFF) as f32 * 0.003_921_568_6;
+        Some([ch(16), ch(8), ch(0)])
+    }
+
+    /// #team-colour  The `[primary, secondary]` change colours a body on `team` wears.
+    ///
+    /// `sub_1403AC310`: with a team the engine builds the customisation's colours first and then
+    /// OVERWRITES the primary and the secondary slot with the team colour -- the variant's override
+    /// if it has one, else the multiplayer globals' default table entry (`defaults`, `mulg`
+    /// universal `team colors`). The tertiary and quaternary slots (the visor, the lights) stay the
+    /// player's own, and Theater only draws the first two. `None` when neither source has an
+    /// entry: the caller keeps the customisation rather than invent a colour.
+    pub fn team_skin(&self, team: u8, defaults: &[[f32; 3]]) -> Option<[[f32; 3]; 2]> {
+        let c = self.team_color_override(team).or_else(|| defaults.get(team as usize).copied())?;
+        Some([c, c])
+    }
+
     /// Whether any ENABLED team is set to elite AND the species setting actually consults it.
     /// A team can carry `model override = elite` under *player choice*, where it is inert — 8 of
     /// the 26 elite team records in this machine's corpus are exactly that.
@@ -650,6 +704,32 @@ impl GameVariant {
         self.species == PlayerSpecies::SetByTeam
             && self.teams.iter().any(|t| t.enabled() && t.model_override == 1)
     }
+}
+
+/// #team-colour  The multiplayer globals' default TEAM colours: `mulg` -> `universal` block
+/// (element 76 B) -> `team colors` block at +0x20, 12-byte linear RGB per team (`sub_140AC50F0`).
+/// Indexed by team. Empty when the cache has no readable `mulg`. Same read shape as
+/// `SceneController::profile_colors`, and the same linear-float space.
+pub fn default_team_colors(native: &hms_native::NativeDll, cache: hms_native::CacheHandle) -> Vec<[f32; 3]> {
+    let Some(mulg) = native.tags_by_group(cache, "mulg").first().copied() else { return Vec::new() };
+    let u = |s: &[u8], o: usize| u32::from_le_bytes([s[o], s[o + 1], s[o + 2], s[o + 3]]);
+    let Some(h) = native.tag_meta(cache, mulg, 0, 8) else { return Vec::new() };
+    if u(&h, 0) == 0 {
+        return Vec::new();
+    }
+    let Some(univ) = native.tag_ptr_bytes(cache, u(&h, 4), 0x2C) else { return Vec::new() };
+    let (cnt, ptr) = (u(&univ, 0x20), u(&univ, 0x24));
+    if cnt == 0 || cnt > 32 {
+        return Vec::new();
+    }
+    let Some(b) = native.tag_ptr_bytes(cache, ptr, cnt * 12) else { return Vec::new() };
+    (0..cnt as usize)
+        .map(|i| {
+            let f = |k: usize| f32::from_le_bytes([b[i * 12 + k * 4], b[i * 12 + k * 4 + 1], b[i * 12 + k * 4 + 2], b[i * 12 + k * 4 + 3]]);
+            let c = [f(0), f(1), f(2)];
+            if c.iter().all(|v| v.is_finite() && *v >= 0.0) { c } else { [1.0; 3] }
+        })
+        .collect()
 }
 
 /// The answer to "what is in this player's hands the moment they spawn".
@@ -1562,5 +1642,172 @@ mod tests {
         let names = VariantNames::default();
         assert_eq!(names.weapon_label(WEAPON_UNCHANGED), "unchanged");
         assert_eq!(names.weapon_label(4), "#4");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #team-colour
+    // -----------------------------------------------------------------------------------------
+
+    /// The synthetic variant with team 1 carrying a colour override (`flags` bit 1, packed
+    /// `0x00RRGGBB` at +0x48) and team 2 enabled WITHOUT one. Team 0 is enabled with no override.
+    fn team_variant(teams_on: bool) -> GameVariant {
+        let mut v = synthetic();
+        v[off::MISC] = if teams_on { 0b1001 } else { 0b1000 };
+        v[off::TEAMS + off::TEAM_STRIDE] = 0b11; // team 1: enabled + override colour
+        v[off::TEAMS + off::TEAM_STRIDE + 0x48..off::TEAMS + off::TEAM_STRIDE + 0x4C]
+            .copy_from_slice(&0x0033_66FFu32.to_le_bytes());
+        v[off::TEAMS + 2 * off::TEAM_STRIDE] = 0b01; // team 2: enabled, no override
+        // a colour on team 2 that must be IGNORED because its override bit is clear
+        v[off::TEAMS + 2 * off::TEAM_STRIDE + 0x48..off::TEAMS + 2 * off::TEAM_STRIDE + 0x4C]
+            .copy_from_slice(&0x00FF_0000u32.to_le_bytes());
+        GameVariant::parse(&v).expect("parses")
+    }
+
+    /// `sub_1404D1F00` + `sub_1403AC310`: the variant's override is used only when teams are on,
+    /// the team is enabled AND flag bit 1 is set; the bytes are `R = bits 16..23` and so on, times
+    /// 1/255; both change colours take it; and otherwise the globals' table answers.
+    #[test]
+    fn a_team_wears_the_variants_override_else_the_globals_default() {
+        let defaults = [[0.8, 0.1, 0.1], [0.1, 0.1, 0.8], [0.1, 0.8, 0.1]];
+        let gv = team_variant(true);
+        let c = gv.team_color_override(1).expect("team 1 overrides");
+        assert!((c[0] - 0x33 as f32 / 255.0).abs() < 1e-6 && (c[1] - 0x66 as f32 / 255.0).abs() < 1e-6 && (c[2] - 1.0).abs() < 1e-6, "{c:?}");
+        assert_eq!(gv.team_skin(1, &defaults), Some([c, c]), "primary AND secondary take the team colour");
+        assert_eq!(gv.team_color_override(2), None, "a colour with the override bit clear is not used");
+        assert_eq!(gv.team_skin(2, &defaults), Some([defaults[2], defaults[2]]), "no override: the globals' table");
+        assert_eq!(gv.team_skin(0, &defaults), Some([defaults[0], defaults[0]]));
+        assert_eq!(gv.team_skin(5, &defaults), None, "no entry in either source: keep the customisation");
+    }
+
+    /// The swap is driven by the variant's TEAMS BIT -- never by what the gametype is called. The
+    /// same bytes with that one bit cleared must stop answering, and a team the variant has not
+    /// enabled is not a team.
+    #[test]
+    fn the_owner_stamp_is_a_team_only_when_the_variant_has_teams() {
+        let on = team_variant(true);
+        let off_ = team_variant(false);
+        for stamp in 0..=8u8 {
+            assert_eq!(off_.team_of_owner(stamp), None, "teams off: stamp {stamp} is a player, not a team");
+            assert_eq!(off_.team_color_override(1), None);
+        }
+        assert_eq!(on.team_of_owner(0), None, "wire 0 is nobody");
+        assert_eq!(on.team_of_owner(1), Some(0));
+        assert_eq!(on.team_of_owner(2), Some(1));
+        assert_eq!(on.team_of_owner(3), Some(2));
+        assert_eq!(on.team_of_owner(4), None, "team 3 is not enabled in this variant");
+        assert_eq!(on.team_of_owner(9), None, "past the eight team records");
+    }
+
+    /// **THE GATE for "teams should wear the team's colours".** Every real film, the real `mulg`
+    /// team table, the production rule (`team_of_body` -> `team_skin` -> `choose_skin`):
+    ///
+    /// * in a TEAM game every player body whose owner stamp names an enabled team resolves to that
+    ///   team's `[colour, colour]` and NOT to the customisation; team 0 and team 1 differ, and
+    ///   (unless the variant overrides them) are the table's red and blue;
+    /// * in a free-for-all every body keeps the customisation, whatever the stamp says;
+    /// * the swap follows the variant's teams BIT: clearing it on a team film's variant puts every
+    ///   body back on the customisation, so it cannot be keyed on anything else.
+    ///
+    /// IGNORED BY DEFAULT: it opens a Reach cache for `mulg`.
+    #[test]
+    #[ignore = "opens a Reach cache and reads the saved-film corpus"]
+    fn team_games_wear_the_teams_colours_and_free_for_alls_keep_their_own() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let films = crate::film::find_finished_films();
+        if films.is_empty() {
+            eprintln!("SKIPPED: no Reach saved films on this machine");
+            return;
+        }
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            let mut d = exe.parent().map(|p| p.to_path_buf());
+            for _ in 0..3 {
+                if let Some(p) = &d {
+                    roots.push(p.clone());
+                    d = p.parent().map(|q| q.to_path_buf());
+                }
+            }
+        }
+        let Some(dll) = roots.iter().map(|r| r.join(crate::PAYLOAD_DLL)).find(|p| p.is_file()) else {
+            eprintln!("SKIPPED: no native payload next to the test binary");
+            return;
+        };
+        let Ok(native) = hms_native::NativeDll::load(&dll) else { return };
+        let Some(m) = crate::mapcat::enumerate().into_iter().find(|c| {
+            c.game == crate::mapcat::Game::Reach
+                && c.path.file_stem().map_or(false, |s| s.to_string_lossy().eq_ignore_ascii_case("forge_halo"))
+        }) else {
+            eprintln!("SKIPPED: forge_halo is not available");
+            return;
+        };
+        if let Some(d) = m.path.parent() {
+            native.set_shared_cache_dirs(&[d.to_path_buf()]);
+        }
+        let Ok(cache) = native.open_cache(&m.path.to_string_lossy()) else { return };
+        let defaults = default_team_colors(&native, cache);
+        eprintln!("mulg team colours: {defaults:?}");
+        assert!(defaults.len() >= 2, "liveness: the globals' team table has {} entries", defaults.len());
+        let (r, b) = (defaults[0], defaults[1]);
+        assert!(r[0] > r[1] * 2.0 && r[0] > r[2] * 2.0, "team 0 is the table's red: {r:?}");
+        assert!(b[2] > b[0] * 2.0 && b[2] > b[1], "team 1 is the table's blue: {b:?}");
+
+        // Marks a customisation that must NOT win in a team game, and must win in a free-for-all.
+        let own: [[f32; 3]; 2] = [[9.0; 3], [9.0; 3]];
+        let (mut team_films, mut ffa_films, mut team_bodies, mut ffa_bodies, mut unknown) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut teams_seen = std::collections::BTreeSet::new();
+        for p in &films {
+            let Ok(f) = crate::film::open(p) else { continue };
+            let Some(gv) = f.header.gametype.clone() else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            let skins: Vec<Option<[[f32; 3]; 2]>> = (0..off::TEAM_COUNT as u8).map(|t| gv.team_skin(t, &defaults)).collect();
+            let mut off_bit = gv.clone();
+            off_bit.misc.flags &= !1;
+            let skins_off: Vec<Option<[[f32; 3]; 2]>> = (0..off::TEAM_COUNT as u8).map(|t| off_bit.team_skin(t, &defaults)).collect();
+            let team_game = gv.misc.teams_enabled();
+            let mut counted = false;
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 11 && t.appearance) {
+                let table = team_game.then_some(&skins[..]);
+                let got = crate::film_play::choose_skin(table, gv.team_of_body(t.appearance, t.owner_raw), Some(own));
+                // the same body under the same variant with ONLY the teams bit cleared
+                let cleared = crate::film_play::choose_skin(
+                    (off_bit.misc.teams_enabled()).then_some(&skins_off[..]),
+                    off_bit.team_of_body(t.appearance, t.owner_raw),
+                    Some(own),
+                );
+                assert_eq!(cleared, Some(own), "{}: with the teams bit clear a body keeps its customisation", p.display().to_string().rsplit('/').next().unwrap());
+                counted = true;
+                if team_game {
+                    match gv.team_of_body(t.appearance, t.owner_raw) {
+                        Some(team) => {
+                            team_bodies += 1;
+                            teams_seen.insert(team);
+                            let want = gv.team_skin(team, &defaults);
+                            assert!(want.is_some(), "team {team} has a colour in the variant or the table");
+                            assert_eq!(got, want, "team {team}'s body wears the team colours, not the customisation");
+                            assert_ne!(got, Some(own));
+                        }
+                        None => {
+                            unknown += 1;
+                            assert_eq!(got, Some(own), "a body whose team is not stated keeps the customisation");
+                        }
+                    }
+                } else {
+                    ffa_bodies += 1;
+                    assert_eq!(got, Some(own), "a free-for-all body keeps its customisation");
+                }
+            }
+            if counted {
+                if team_game { team_films += 1 } else { ffa_films += 1 }
+            }
+        }
+        eprintln!(
+            "team colours: {team_films} team film(s) / {team_bodies} bodies on teams {teams_seen:?} ({unknown} with no stated team), {ffa_films} free-for-all film(s) / {ffa_bodies} bodies"
+        );
+        assert!(team_films >= 1 && team_bodies >= 50, "liveness: {team_films} team films / {team_bodies} bodies");
+        assert!(teams_seen.len() >= 2, "both sides of a team game were seen: {teams_seen:?}");
+        assert!(ffa_films >= 1 && ffa_bodies >= 30, "liveness: {ffa_films} free-for-all films / {ffa_bodies} bodies");
     }
 }

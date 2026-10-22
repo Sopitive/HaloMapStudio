@@ -1923,7 +1923,16 @@ pub fn roster_lines(
             },
             named,
             service_tag: player.map(|p| p.service_tag.clone()).unwrap_or_default(),
-            team: player.map(|p| p.team).unwrap_or(0xFF),
+            // #team-colour  In a team game the owner group IS the team (the stamp is the object's
+            // team), which is what the engine feeds the row; the header's per-player `team` is
+            // as stale as its roster, so it is only the fallback.
+            team: f
+                .header
+                .gametype
+                .as_ref()
+                .and_then(|gv| gv.team_of_owner(owner))
+                .or_else(|| player.map(|p| p.team))
+                .unwrap_or(0xFF),
             armour: player.and_then(|p| p.appearance()).map(|a| a.summary()).unwrap_or_default(),
             armour_color: player.and_then(|p| p.appearance()).map(|a| a.color_primary),
             emblem: player.and_then(|p| p.emblem()),

@@ -560,6 +560,7 @@ pub struct FrictionPoint {
     pub moving_friction_velocity_diff: f32,
     pub ebrake_friction: f32,
     pub ebrake_moving_friction: f32,
+    pub ebrake_moving_friction_velocity_diff: f32,
     /// `model state destroyed` and the `region name` whose destruction does it — the same
     /// per-wheel damage [`crate::reach_damage`] measures from the vitality side.
     pub model_state_destroyed: i16,
@@ -609,6 +610,10 @@ pub struct Havok {
     pub gravity_scale_raw: f32,
     pub iteration_count: u32,
     pub suspension_count: u32,
+    /// `update period ticks` / `remote update period ticks` (`havok +0x2C` / `+0x2E`): how often
+    /// the engine re-runs the wheel sphere casts (`sub_1406CE570`); the ticks between reuse the
+    /// cached contact plane. Zero on a vehicle that does not author it.
+    pub update_period_ticks: [u16; 2],
     pub friction_points: Vec<FrictionPoint>,
     pub antigravity_points: Vec<AntiGravityPoint>,
 }
@@ -621,7 +626,7 @@ impl Havok {
     /// that only makes sense because everywhere else in this tag set 0 is the default. The same
     /// reasoning [`crate::reach_physics`] records for `bipd` `gravity scale`.
     pub fn gravity_scale(&self) -> f32 {
-        if self.gravity_scale_raw > 0.0 { self.gravity_scale_raw } else { 1.0 }
+        crate::reach_havok::vehicle_gravity_scale_postprocessed(self.gravity_scale_raw)
     }
     /// The two ground slope limits in DEGREES, from the stored cosines. `(0, 0)` on a hover
     /// vehicle, which authors `1.0, 1.0`.
@@ -994,6 +999,53 @@ impl VehiclePhysics {
     }
 }
 
+/// #vehicle-body  The vehicle's rigid body, from its `phmo`: mass, centre of mass and inertia.
+///
+/// **The wheel law needs the mass and the inertia and nothing else of the physics model.** Every
+/// wheel force is `mass * (...)` (`sub_1406CC8C0`), so the linear acceleration is mass-free, but the
+/// torque those forces make about the centre of mass is turned into an angular acceleration by the
+/// body's own inverse inertia tensor (`sub_1406CF0F0`: `sub_140443EF0` fetches it from the rigid
+/// body) and the engine's load (`sub_140E60130`) is a force, so both the mass and the tensor are
+/// the real ones. The same welding the settle uses ([`crate::physics_settle::PhysBody`]), read the
+/// way `SceneController::physics_body` reads it but from the `vehi` tag alone, because a ride has
+/// no placed `ObjectInfo` to hand.
+pub fn read_rigid_body(native: &NativeDll, cache: CacheHandle, vehi: u32) -> Option<crate::physics_settle::PhysBody> {
+    use crate::phmo_shapes as ph;
+    let phmo = native.resolve_phmo(cache, vehi);
+    if phmo == 0 || phmo == u32::MAX {
+        return None;
+    }
+    let meta = native.tag_meta(cache, phmo, 0, 0x19C)?;
+    let rd = |o: usize| u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]);
+    let blocks = ph::PhmoBlocks::read(&ph::REACH, |off, elem| {
+        let n = rd(off) as i32;
+        let ptr = rd(off + 4);
+        if n <= 0 || n > 0x10000 || ptr == 0 || ptr == u32::MAX {
+            return Vec::new();
+        }
+        native.tag_ptr_bytes(cache, ptr, (n as usize * elem) as u32).unwrap_or_default()
+    });
+    let mode = native.resolve_mode(cache, vehi);
+    let nodes = if mode == 0 || mode == u32::MAX {
+        Vec::new()
+    } else {
+        native
+            .tag_meta(cache, mode, ph::OFF_MODE_NODES as u32, 12)
+            .and_then(|h| {
+                let n = i32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+                let ptr = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+                if n <= 0 || n > 1024 || ptr == 0 || ptr == u32::MAX {
+                    return None;
+                }
+                native.tag_ptr_bytes(cache, ptr, (n as usize * ph::REACH_MODE_NODE_ELEM) as u32)
+            })
+            .map(|b| ph::node_xforms(&b, ph::REACH_MODE_NODE_ELEM))
+            .unwrap_or_default()
+    };
+    let (defs, counts) = ph::rigid_bodies(&blocks, &ph::REACH, &nodes);
+    crate::physics_settle::PhysBody::from_rigid_bodies(&defs, ph::describe(&defs, &counts))
+}
+
 fn leak_kind(name: &str) -> &'static str {
     TYPE_BLOCKS.iter().find(|t| t.1 == name).map(|t| t.1).unwrap_or("unknown")
 }
@@ -1082,6 +1134,10 @@ fn read_havok(native: &NativeDll, cache: CacheHandle, own: &[u8], at: usize) -> 
         gravity_scale_raw: rd_f32(own, at + HV_GRAVITY_SCALE),
         iteration_count: rd_u32(own, at + HV_ITERATION_COUNT),
         suspension_count: rd_u32(own, at + HV_SUSPENSION_COUNT),
+        update_period_ticks: [
+            u16::from_le_bytes([own[at + HV_UPDATE_PERIOD_TICKS], own[at + HV_UPDATE_PERIOD_TICKS + 1]]),
+            u16::from_le_bytes([own[at + HV_REMOTE_UPDATE_PERIOD_TICKS], own[at + HV_REMOTE_UPDATE_PERIOD_TICKS + 1]]),
+        ],
         friction_points: Vec::new(),
         antigravity_points: Vec::new(),
     };
@@ -1101,6 +1157,7 @@ fn read_havok(native: &NativeDll, cache: CacheHandle, own: &[u8], at: usize) -> 
                     moving_friction_velocity_diff: rd_f32(e, FP_MOVING_FRICTION_VELOCITY_DIFF),
                     ebrake_friction: rd_f32(e, FP_EBRAKE_FRICTION),
                     ebrake_moving_friction: rd_f32(e, FP_EBRAKE_MOVING_FRICTION),
+                    ebrake_moving_friction_velocity_diff: rd_f32(e, FP_EBRAKE_MOVING_FRICTION_VEL_DIFF),
                     model_state_destroyed: {
                         let o = FP_MODEL_STATE_DESTROYED;
                         if o + 2 <= e.len() { i16::from_le_bytes([e[o], e[o + 1]]) } else { 0 }
@@ -1309,6 +1366,23 @@ impl TurnRate {
 
 /// What the driver is asking for this frame. All three are `-1..1` or a flag; nothing here is a
 /// speed, so a caller never has to know a vehicle's numbers.
+///
+/// # The contract of the engine's jeep (#jeep-law)
+///
+/// * `throttle` is the movement stick's FORWARD axis, `-1..1` (+ forward). The engine takes its
+///   sign (zero is zero) and the magnitude of the WHOLE stick, `min(|(forward, left)|, 1)`
+///   (`sub_140E61950`), so steering also feeds the throttle: a driver holding A and W is at full
+///   throttle, one holding A alone is at none.
+/// * `slide` is the movement stick's LEFT axis, `-1..1` (+ left). For a jeep it is the STEERING:
+///   the engine steers toward the unit's facing vector (`sub_140E62270`); a stick has none, so
+///   `stick * saturation angle` stands in (INFERRED) and the engine's own overdampen curve shapes
+///   it, giving a wheel angle of `max lock * stick^exponent` (Warthog: `60 deg * stick^1.5`). A
+///   digital key therefore means FULL LOCK instantly -- the engine slews the wheels at `turn rate`
+///   (9.4 rad/s, 0.11 s to lock) -- and at speed the Warthog / Mongoose spin out on it; ramp a key.
+/// * `brake` is the HAND BRAKE (control flag bit 15, `sub_140E69B30`). It locks the rear wheels
+///   (`attached to e-brake`) and loosens their grip; it does NOT cut the engine. The engine's own
+///   brake -- reverse against the direction of travel above 1 wu/s -- needs no input.
+/// * `want_yaw` is ignored by a jeep (the Ghost's look-to-steer uses it).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DriveInput {
     /// Forward / reverse, `-1..1`.
@@ -1380,6 +1454,21 @@ pub struct DriveState {
     /// clips are authored at 30 fps against the wall clock, so driving one off the frame counter
     /// plays it at half speed on a 30 Hz display and at double on a 120 Hz one.
     pub time: f32,
+    /// #jeep-law  The hull's full rotation, once a vehicle runs the engine's rigid-body law. `None`
+    /// until then; `yaw`/`pitch`/`roll` are kept in step with it either way, but a hull that has
+    /// rolled over cannot be held in three clamped Euler angles, so the rotation is the truth.
+    pub orient: Option<glam::Quat>,
+    /// #jeep-law  Angular velocity, world axes, rad/s (rigid-body law only).
+    pub ang_vel: glam::Vec3,
+    /// #jeep-law  Seconds until the engine's next 60 Hz tick (rigid-body law only). The engine's
+    /// forces, gear logic and counters run once per tick; the hull drifts between ticks.
+    pub tick_clock: f32,
+    /// #jeep-law  `sub_140E60D40`'s standstill counter (`jeep + 0xEC`), in ticks.
+    pub idle_ticks: u8,
+    /// #jeep-law  `sub_140E60B90`'s reverse-against-travel counter (`jeep + 0xED`), in ticks.
+    pub brake_ticks: u8,
+    /// #jeep-law  The stationary damper's strength used by the last tick, 0..1.
+    pub park: f32,
 }
 
 impl Default for DriveState {
@@ -1404,6 +1493,12 @@ impl Default for DriveState {
             grounded: false,
             odometer: 0.0,
             time: 0.0,
+            orient: None,
+            ang_vel: glam::Vec3::ZERO,
+            tick_clock: 0.0,
+            idle_ticks: 0,
+            brake_ticks: 0,
+            park: 0.0,
         }
     }
 }
@@ -1414,6 +1509,10 @@ impl DriveState {
     /// One function so that the renderer, the seat camera, the wheel solve and the gates cannot
     /// disagree about which way the hull is facing.
     pub fn basis(&self) -> glam::Quat {
+        self.orient.unwrap_or_else(|| self.euler_basis())
+    }
+    /// The basis the three Euler angles describe.
+    pub fn euler_basis(&self) -> glam::Quat {
         glam::Quat::from_rotation_z(self.yaw)
             * glam::Quat::from_rotation_y(-self.pitch)
             * glam::Quat::from_rotation_x(self.roll)
@@ -1588,6 +1687,11 @@ pub struct DriveModel {
     /// `havok ground friction`. The traction coefficient the hull's speed chases the wheels'
     /// surface speed at: Warthog 3.370, Mongoose 3.350, Scorpion 0.950. Authored.
     pub ground_friction: f32,
+    /// #jeep-law  The engine's own wheel law for a `human_jeep`, once a rigid body is attached
+    /// ([`DriveModel::with_rigid_body`]). When it is complete the vehicle is stepped as the free
+    /// rigid body the engine makes of it ([`DriveModel::step_rigid`]) and every field above that
+    /// only the kinematic path reads is dormant for it. `None` for every other family.
+    pub wheel_law: Option<drive::WheelLaw>,
 }
 
 impl DriveModel {
@@ -1773,7 +1877,72 @@ impl DriveModel {
             contacts,
             spring,
             ground_friction: hv.ground_friction,
+            wheel_law: Self::wheel_law_for(p),
         })
+    }
+
+    /// #jeep-law  The wheel law from a jeep's tags. `None` for any other family, and for a jeep
+    /// whose wheel markers did not all resolve (a short set would pair wheel 3's position with wheel
+    /// 2's radius).
+    fn wheel_law_for(p: &VehiclePhysics) -> Option<drive::WheelLaw> {
+        let Family::Jeep { steering, turning, .. } = &p.family else { return None };
+        let hv = &p.havok;
+        if hv.friction_points.len() < 3 || p.wheel_positions.len() != hv.friction_points.len() {
+            return None;
+        }
+        let wheels = hv
+            .friction_points
+            .iter()
+            .zip(p.wheel_positions.iter())
+            .map(|(f, &local)| drive::WheelDef {
+                local,
+                radius: f.radius,
+                share: f.fraction_of_total_mass,
+                powered: f.flags & drive::FP_POWERED != 0,
+                steer: drive::SteerRole::from_flags(f.flags),
+                ai_rear_turning: f.flags & drive::FP_AI_FORCE_REAR_TURNING != 0,
+                ebrake_wheel: f.flags & drive::FP_ATTACHED_TO_EBRAKE != 0,
+                moving_velocity_diff: f.moving_friction_velocity_diff,
+                ebrake_friction: f.ebrake_friction,
+                ebrake_moving_friction: f.ebrake_moving_friction,
+                ebrake_moving_velocity_diff: f.ebrake_moving_friction_velocity_diff,
+            })
+            .collect();
+        Some(drive::WheelLaw {
+            wheels,
+            ground: drive::WheelGround {
+                friction: hv.ground_friction,
+                depth: hv.ground_depth,
+                damp: hv.ground_damp_factor,
+                moving_friction: hv.ground_moving_friction,
+                slope_cos: hv.ground_max_slope_cos,
+                max_normal_force: hv.maximum_normal_force_effective(),
+            },
+            steer: drive::SteerLaw {
+                cusp: steering.overdampen_cusp_angle,
+                exponent: steering.overdampen_exponent,
+                max_left: turning.max_left,
+                max_right: turning.max_right,
+                turn_rate: turning.turn_rate,
+            },
+            body: None,
+            iterations: hv.iteration_count.max(1),
+        })
+    }
+
+    /// #jeep-law  Attach the vehicle's `phmo` rigid body ([`read_rigid_body`]). With it a jeep is
+    /// stepped by the engine's wheel law; without it (no `phmo`, or a tensor that does not invert) it
+    /// stays on the kinematic path and says so in [`DriveModel::describe`].
+    pub fn with_rigid_body(mut self, body: Option<&crate::physics_settle::PhysBody>) -> DriveModel {
+        if let (Some(law), Some(b)) = (self.wheel_law.as_mut(), body) {
+            law.body = drive::RigidBody::new(b.mass, b.com, b.inertia, b.lin_damping, b.ang_damping);
+        }
+        self
+    }
+
+    /// #jeep-law  Whether this vehicle is stepped by the engine's rigid-body wheel law.
+    pub fn rigid(&self) -> bool {
+        self.drivetrain.is_some() && self.wheel_law.as_ref().is_some_and(|w| w.body.is_some())
     }
 
     /// One step. `ground` answers "what is the ground height and normal under this point", which
@@ -1792,8 +1961,10 @@ impl DriveModel {
         dt: f32,
         ground: &dyn Fn(glam::Vec3) -> Option<(f32, glam::Vec3)>,
     ) -> DriveState {
-        use glam::Vec3;
         let dt = dt.clamp(0.0, 0.1);
+        if self.rigid() {
+            return self.step_rigid(st, input, dt, ground);
+        }
         // #vehicle-suspension  SUB-STEPPING. The engine does this itself: `sub_1406CF0F0` runs
         // its whole body `iteration count` times with `dt / n`. Every vehicle in `forge_halo`
         // authors 1, so the authored count alone would not sub-step at all — and a spring as
@@ -1809,6 +1980,195 @@ impl DriveModel {
             st = self.substep(st, input, h, ground);
         }
         st
+    }
+
+    /// #jeep-law  THE ENGINE'S JEEP: a free rigid body driven by wheel forces.
+    ///
+    /// The engine's per-tick work (`sub_140E47860` -> `sub_140E69D40`) runs at 60 Hz: it reads the
+    /// body's state, builds the wheel forces, kicks the velocities, and hands the body to Havok,
+    /// which drifts it under gravity until the next tick. This does the same: a tick when the
+    /// 60 Hz clock fires, and between ticks the body drifts in steps of at most
+    /// [`MAX_DRIFT_STEP`]. **Nothing here is a kinematic model**: the car turns because its steered
+    /// wheels' friction points sideways of its travel, and it slides when that force saturates.
+    fn step_rigid(&self, st: DriveState, input: DriveInput, dt: f32, ground: &dyn Fn(glam::Vec3) -> Option<(f32, glam::Vec3)>) -> DriveState {
+        let wl = self.wheel_law.as_ref().expect("rigid() checked");
+        let body = wl.body.as_ref().expect("rigid() checked");
+        let mut st = st;
+        if st.orient.is_none() {
+            st.orient = Some(st.euler_basis());
+        }
+        // #gravity  TWO places, deliberately different (they are in the engine): the wheel spring's
+        // `g` is the world constant times the BSP's gravity scale (`object_get_location`,
+        // `sub_1406CC8C0`) -- NOT the vehicle's `gravity scale`; Havok's gravity is that world
+        // constant times the body's gravity FACTOR, which carries the vehicle's `gravity scale`
+        // (`jeep_tick`, `reach_havok::vehicle_body_gravity_factor`). The jeep's `gravity adjust`
+        // (`sub_140E61E80`) is not applied: on any upward ground normal it returns unchanged.
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let mut remaining = dt;
+        while remaining > 1e-7 {
+            if st.tick_clock <= 1e-7 {
+                self.jeep_tick(wl, body, &mut st, input, g, ground);
+                st.tick_clock += TICK_DT;
+            }
+            let h = remaining.min(st.tick_clock).min(MAX_DRIFT_STEP);
+            self.drift(wl, body, &mut st, h, ground);
+            st.tick_clock -= h;
+            remaining -= h;
+        }
+        // Keep the Euler view in step with the rotation, for everything that still reads it.
+        let q = st.basis();
+        let r = glam::Mat3::from_quat(q);
+        st.yaw = r.x_axis.y.atan2(r.x_axis.x);
+        st.pitch = r.x_axis.z.clamp(-1.0, 1.0).asin();
+        st.roll = r.y_axis.z.atan2(r.z_axis.z);
+        st.pitch_rate = 0.0;
+        st.roll_rate = 0.0;
+        st.time += dt;
+        st
+    }
+
+    /// #jeep-law  One 60 Hz engine tick: `sub_140E69C30` (steering) then `sub_140E69D40` (the jeep
+    /// tick: throttle, brake, engine, wheels, integration), in the engine's order.
+    fn jeep_tick(
+        &self,
+        wl: &drive::WheelLaw,
+        body: &drive::RigidBody,
+        st: &mut DriveState,
+        input: DriveInput,
+        g: f32,
+        ground: &dyn Fn(glam::Vec3) -> Option<(f32, glam::Vec3)>,
+    ) {
+        let train = self.drivetrain.as_ref().expect("rigid() checked");
+        let q = st.basis();
+        let rot = glam::Mat3::from_quat(q);
+        let fwd = rot.x_axis;
+        let stick_left = input.slide.clamp(-1.0, 1.0);
+        let stick_fwd = input.throttle.clamp(-1.0, 1.0);
+
+        // --- STEERING: sub_140E69C30 -> sub_140E62270 + sub_141405EF0 --------------------------
+        // The engine steers toward the unit's FACING vector (`unit +0x1E4`, here `input.want_yaw`
+        // as a horizontal direction): the signed angle from the hull's forward to it, about the
+        // hull's up, is shaped by the overdampen curve and slewed into the wheel angle at `turn
+        // rate`, inside [max right, max left]. The lateral stick does NOT steer.
+        let facing_error = drive::facing_error(rot * glam::Vec3::Z, fwd, input.want_yaw);
+        st.steer_angle = wl.steer.slew(st.steer_angle, wl.steer.shape(facing_error), TICK_DT);
+
+        // --- THE THROTTLE: sub_140E61950 -------------------------------------------------------
+        // The sign of the forward axis times the magnitude of the WHOLE stick (capped at 1), times
+        // the unit's power scale (1: not disabled).
+        let mag = (stick_fwd * stick_fwd + stick_left * stick_left).sqrt().min(1.0);
+        let throttle = if stick_fwd > 0.0 { mag } else if stick_fwd < 0.0 { -mag } else { 0.0 };
+
+        // --- THE BRAKE: sub_140E60B90 / sub_140E60B00 ------------------------------------------
+        let speed_sq = st.vel.length_squared();
+        let speed = speed_sq.sqrt();
+        let fwd_dot_vel = if speed > 1e-6 { fwd.dot(st.vel / speed) } else { 0.0 };
+        st.brake_ticks = drive::brake_counter(st.brake_ticks, stick_fwd, speed, fwd_dot_vel, false);
+        let braking = drive::brake_active(st.brake_ticks, false);
+
+        // --- THE STATIONARY DAMPER: sub_140E60A00 ----------------------------------------------
+        let park = drive::park_factor(st.idle_ticks, speed_sq);
+        st.park = park;
+
+        // --- THE ENGINE: sub_140E5FE40 + sub_140E601B0 -----------------------------------------
+        let requested = train.requested_gear(&st.engine, throttle, braking, true);
+        train.update(&mut st.engine, throttle, requested, braking, TICK_DT);
+        let surface = if braking { 0.0 } else { train.wheel_surface_speed(&st.engine) };
+
+        // --- THE WHEELS AND THE INTEGRATION: sub_1406CF0F0 -------------------------------------
+        let cmd = drive::WheelCommand {
+            steer_angle: st.steer_angle,
+            surface_speed: surface,
+            brake_lock: braking,
+            handbrake: input.brake,
+            ai_driven: false,
+        };
+        let Some((vel, ang, wf)) = wl.integrate_tick(g, st.pos, q, st.vel, st.ang_vel, park, &cmd, TICK_DT, ground) else {
+            return;
+        };
+        // Havok's step (`reach_havok::HavokBody::step_psi`: gravity x factor, damping, velocity
+        // caps), once per tick and semi-implicit: the velocity changes, THEN the body moves with it.
+        // Only the velocities are taken from it; the drift between ticks spreads the motion over the
+        // frames.
+        // This is what puts a parked jeep at exactly `depth` of total compression: the tick-start
+        // velocity of a body at rest is zero.
+        let mut hb = crate::reach_havok::HavokBody::new(
+            crate::reach_havok::MotionType::Dynamic,
+            body.mass,
+            body.inv_inertia,
+            st.pos + q * body.com,
+            q,
+        )
+        .with_damping(body.lin_damping, body.ang_damping);
+        hb.set_gravity_factor(self.gravity_scale);
+        hb.set_velocity(vel, ang);
+        hb.step_psi(TICK_DT, crate::reach_havok::world_gravity());
+        st.vel = hb.v;
+        st.ang_vel = hb.w;
+        // The engine's load for the NEXT tick (`sub_140E60130`).
+        st.engine.ground_torque = wf.ground_torque;
+        st.idle_ticks = drive::idle_counter(
+            st.idle_ticks,
+            throttle.abs(),
+            braking,
+            wf.gripping.iter().take(wf.count).any(|&x| x),
+            speed_sq,
+        );
+        st.suspension = wf.compression;
+        st.touching = wf.touching;
+        st.contact_count = wf.count as u8;
+        st.ground_normal = wf.normal;
+        st.grounded = wf.touching.iter().take(wf.count).any(|&t| t);
+        // The wheels' rolling phase: `gear ratio * angular velocity` integrated (`sub_140E69D40`).
+        st.wheel_travel += surface * TICK_DT;
+    }
+
+    /// #jeep-law  Havok's half of a tick as the frames see it: the body drifts with the velocity the
+    /// tick set, and the ground backstop runs.
+    fn drift(
+        &self,
+        wl: &drive::WheelLaw,
+        body: &drive::RigidBody,
+        st: &mut DriveState,
+        h: f32,
+        ground: &dyn Fn(glam::Vec3) -> Option<(f32, glam::Vec3)>,
+    ) {
+        use glam::Vec3;
+        let q = st.basis();
+        let (prev, prev_q) = (st.pos, q);
+        let (pos, q) = drive::advance_pose(st.pos, q, body, st.vel, st.ang_vel, h);
+        st.pos = pos;
+        st.orient = Some(q);
+        // The backstop: no wheel hub may end up below the surface it stands on. The springs carry the
+        // hull and bottom out at the wheel radius, but the engine also has the hull's own Havok
+        // collision, which this does not model -- so a hub that has gone through is lifted back out
+        // at a bounded rate and its downward velocity removed, never teleported.
+        let rot = glam::Mat3::from_quat(q);
+        let prev_rot = glam::Mat3::from_quat(prev_q);
+        let mut lift = 0.0f32;
+        for w in &wl.wheels {
+            let hub = st.pos + rot * w.local;
+            // The ground is looked up from where the hub WAS if that was higher: a hub that has
+            // gone through a surface in one step would otherwise cast from inside the solid and
+            // find nothing, and the hull would fall out of the world.
+            let from = hub.z.max((prev + prev_rot * w.local).z);
+            if let Some((surface, _)) = ground(Vec3::new(hub.x, hub.y, from + w.radius)) {
+                lift = lift.max(surface - hub.z);
+            }
+        }
+        if lift > 0.0 {
+            // Bounded by construction: the query starts one wheel radius above the hub, so a surface
+            // it finds is at most `radius` above it. (The old rate limit existed for a ground query
+            // that could find the vehicle's OWN hull 1.25 wu up; that query is gone.)
+            st.pos.z += lift;
+            if st.vel.z < 0.0 {
+                st.vel.z = 0.0;
+            }
+        }
+        // The odometer: the motion that was resolved, along the hull's flat forward.
+        let fwd_flat = Vec3::new(rot.x_axis.x, rot.x_axis.y, 0.0).normalize_or_zero();
+        let moved = st.pos - prev;
+        st.odometer += Vec3::new(moved.x, moved.y, 0.0).dot(fwd_flat);
     }
 
     /// One sub-step of [`DriveModel::step`]. Everything below is per `h`, never per frame.
@@ -2171,6 +2531,40 @@ impl DriveModel {
                     .to_string(),
             ),
         }
+        if let Some(wl) = &self.wheel_law {
+            match &wl.body {
+                Some(b) => {
+                    out.push(format!(
+                        "  #jeep-law RIGID BODY (the engine's wheel law): mass {:.0}, centre of mass ({:+.3},{:+.3},{:+.3}), \
+                         {} wheel(s) of which {} driven; ground friction {:.2} / moving {:.2}, depth {:.3}, damp {:.3}; \
+                         lock {:.1}/{:.1} deg at {:.2} rad/s, overdampen cusp {:.4} rad ^{:.2}",
+                        b.mass,
+                        b.com.x,
+                        b.com.y,
+                        b.com.z,
+                        wl.wheels.len(),
+                        wl.wheels.iter().filter(|w| w.powered).count(),
+                        wl.ground.friction,
+                        wl.ground.moving_friction,
+                        wl.ground.depth,
+                        wl.ground.damp,
+                        wl.steer.max_left.to_degrees(),
+                        wl.steer.max_right.to_degrees(),
+                        wl.steer.turn_rate,
+                        wl.steer.cusp,
+                        wl.steer.exponent
+                    ));
+                    out.push(
+                        "  (the kinematic lines above are the FALLBACK path and are not what drives this vehicle)".to_string(),
+                    );
+                }
+                None => out.push(
+                    "  !! no `phmo` rigid body could be read for this jeep, so it is on the KINEMATIC fallback path, not the \
+                     engine's wheel law"
+                        .to_string(),
+                ),
+            }
+        }
         if let Some(n) = &self.law_note {
             out.push(format!("  !! {n}"));
         }
@@ -2189,6 +2583,14 @@ impl DriveModel {
         (d > 1e-3).then(|| wheelbase / d.tan())
     }
 }
+
+/// #jeep-law  One engine tick, seconds. The game runs at 60 Hz.
+pub const TICK_DT: f32 = 1.0 / drive::TICK_RATE;
+
+/// #jeep-law  The longest the rigid body drifts in one step between ticks, seconds. A numerical
+/// choice (the engine hands this half to Havok): the forces are fixed per tick, so a smaller step
+/// only samples the same trajectory more finely and the ground backstop more often.
+pub const MAX_DRIFT_STEP: f32 = 1.0 / 120.0;
 
 fn approach(cur: f32, target: f32, step: f32) -> f32 {
     if (target - cur).abs() <= step { target } else { cur + (target - cur).signum() * step }
@@ -2685,6 +3087,7 @@ mod gates {
             contacts: None,
             spring: no_spring(),
             ground_friction: 0.0,
+            wheel_law: None,
         };
         let flat = |_p: Vec3| Some((0.0f32, Vec3::Z));
         let at_rest = DriveState { pos: Vec3::new(0.0, 0.0, 0.25), yaw: 0.0, ..Default::default() };
@@ -2839,6 +3242,7 @@ mod gates {
             contacts: None,
             spring: no_spring(),
             ground_friction: 0.0,
+            wheel_law: None,
         };
         let flat = |_p: Vec3| Some((0.0f32, Vec3::Z));
         let rest = DriveState { pos: Vec3::new(0.0, 0.0, 0.375), yaw: 0.0, grounded: true, ..Default::default() };
@@ -2919,6 +3323,7 @@ mod gates {
             contacts: None,
             spring: no_spring(),
             ground_friction: 0.0,
+            wheel_law: None,
         };
         let flat = |_p: Vec3| Some((0.0f32, Vec3::Z));
         let none = |_p: Vec3| None;
@@ -3107,6 +3512,35 @@ mod gates {
             hover_without.len(),
             hover_without
         );
+    }
+
+    /// Print-only: the Warthog's and Mongoose's wheel flags, rigid body and the fields the jeep law reads.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_jeep_law_inputs() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        for t in native.tags_by_group(cache, "vehi") {
+            let path = native.tag_name(cache, t).unwrap_or_default();
+            if !(path.ends_with("warthog\\warthog") || path.ends_with("mongoose\\mongoose")) { continue }
+            let Some(p) = VehiclePhysics::read(native, cache, t) else { continue };
+            println!("== {path}");
+            println!("   update period ticks {:?}, iterations {}, suspension_count {}", p.havok.update_period_ticks, p.havok.iteration_count, p.havok.suspension_count);
+            for f in &p.havok.friction_points {
+                println!("   wheel {} '{}' flags {:#06x} mass {} r {} mvd {} ebrake mf {} f {} mvd {}", f.index, f.marker_name, f.flags, f.fraction_of_total_mass, f.radius, f.moving_friction_velocity_diff, f.ebrake_moving_friction, f.ebrake_friction, f.ebrake_moving_friction_velocity_diff);
+            }
+            if let Family::Jeep { steering, turning, engine, gravity_adjust, .. } = &p.family {
+                println!("   steering {steering:?} turning {turning:?} gravity_adjust {gravity_adjust}");
+                for g in &engine.gears {
+                    println!("   gear {} ratio {} loaded {:?} cruising {:?}", g.index, g.ratio, g.loaded_torque, g.cruising_torque);
+                }
+            }
+            match read_rigid_body(native, cache, t) {
+                Some(b) => println!("   body: {} mass {} com {:?} inertia diag {:?} lin_damp {} ang_damp {}", b.desc, b.mass, b.com, (b.inertia.x_axis.x, b.inertia.y_axis.y, b.inertia.z_axis.z), b.lin_damping, b.ang_damping),
+                None => println!("   NO rigid body"),
+            }
+            println!("   wheel positions {:?}", p.wheel_positions);
+        }
     }
 
     /// The derived ceiling is arithmetic over authored values, so it is testable with no map at

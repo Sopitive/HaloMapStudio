@@ -17,6 +17,9 @@ pub mod quality; // runtime render-quality knobs (Settings ▸ Graphics)
 mod flat; // the FLAT / white-mesh view (unlit clay + depth outline, no textures/post)
 pub mod lightbake_gpu;
 pub mod rtgi;
+#[cfg(test)]
+mod rtgi_gpu_tests; // the probe update run on a software (llvmpipe) adapter: no GPU, no window
+pub mod engine_gi; // the engine's lighting radiometry (sky list SH, dual-vMF fit, bounce source) as pure functions
 pub mod lensfx;
 pub use lensfx::{LensFlareDef, LensFlareInstance, LensFlareReflection};
 pub use bake::{BakeLayer, DetailBaker};
@@ -2357,6 +2360,21 @@ impl SceneRenderer {
         ([p.sun_dir[0], p.sun_dir[1], p.sun_dir[2]], [p.sun_color[0], p.sun_color[1], p.sun_color[2]])
     }
     pub fn rtgi_kick(&self) { self.rtgi.kick(); }
+    /// Every probe record plus the grid (origin, spacing, dims) — a blocking readback for measurement
+    /// (`HMS_RTGI_COMPARE`) and the lightmap baker's engine-record export; never called per frame.
+    pub fn rtgi_probes(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<rtgi::ProbeRecord>, [f32; 3], f32, [u32; 3]) {
+        let o = self.rtgi.params.origin;
+        (self.rtgi.read_probes(device, queue), [o[0], o[1], o[2]], self.rtgi.spacing, self.rtgi.dims)
+    }
+    /// The shading gain a freshly built scene starts at: 1.0 in engine mode (the probes carry the map's own
+    /// sky list), the fitted 1.3 of the legacy sky otherwise.
+    pub fn rtgi_default_gain(&self) -> f32 { self.rtgi.params.bias[3] }
+    /// Engine mode = the probes were lit from the sky render_model's light list (see `engine_gi`).
+    pub fn rtgi_engine_mode(&self) -> bool { self.rtgi.engine }
+    /// Replace the placed-piece occluders the probe tracer sees (`None` clears them). False = over capacity.
+    pub fn rtgi_set_dynamic(&mut self, queue: &wgpu::Queue, d: Option<&rtgi::RtGiDynamic>) -> bool { self.rtgi.set_dynamic(queue, d) }
+    /// An occluder changed inside `[min, max]`: re-estimate the probes it can reach. Returns how many.
+    pub fn rtgi_invalidate_region(&self, min: [f32; 3], max: [f32; 3]) -> usize { self.rtgi.invalidate_region(min, max) }
     /// Forget the tracer scene (new map) — the mode turns off until re-enabled.
     pub fn rtgi_clear_scene(&mut self, queue: &wgpu::Queue) { self.rtgi.clear_scene(queue); }
     pub fn rtgi_dump_at(&self, device: &wgpu::Device, queue: &wgpu::Queue, p: [f32; 3]) -> Vec<String> { self.rtgi.dump_at(device, queue, p) }

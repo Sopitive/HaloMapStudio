@@ -984,6 +984,9 @@ pub fn satisfied(block: &[Vec<StateCond>], known: &[i32]) -> bool {
 pub fn decidable_states(known: &[i32]) -> Vec<i32> {
     let mut v = known.to_vec();
     v.extend(KNOWN_FALSE_STATES);
+    // 24 `first person` and 25 `third person` are a PAIR the camera decides, so both are always
+    // decidable: whichever one `known` leaves out is false (a chase-camera seat asserts 25).
+    v.push(STATE_FIRST_PERSON);
     v
 }
 
@@ -992,8 +995,9 @@ pub fn decidable_states(known: &[i32]) -> Vec<i32> {
 ///
 /// Only an INVERTED clause can read these, and listing them is what lets the grenade block draw:
 /// its gate is `NOT 92 'grenades unusable'`, which needs HMS to be willing to say 92 is false.
-pub const KNOWN_FALSE_STATES: [i32; 16] = [
+pub const KNOWN_FALSE_STATES: [i32; 20] = [
     2, 3, 4, 5, // the other window layouts
+    18, // scripted training text -- test mode scripts none (STATE_TRAINING_TEXT is the live one)
     25,  // third person
     31,  // shielded critical
     33, 34, 35, // overshield 2/3/4
@@ -1004,6 +1008,9 @@ pub const KNOWN_FALSE_STATES: [i32; 16] = [
     92,  // grenades unusable
     98,  // weapon is left hand -- Reach has no dual wielding
     99,  // weapon is backpacked
+    114, // locking on available -- test mode tracks no target
+    115, // lock available
+    117, // locked on available
 ];
 
 /// The `chud_state_enum` values that are TRUE for a living, armed, unscoped player seen in first
@@ -1020,7 +1027,7 @@ pub const KNOWN_FALSE_STATES: [i32; 16] = [
 /// `98 'weapon is left hand'` is NOT in this set: Reach has no dual wielding, so the engine puts
 /// the one held weapon in the right hand, and a part gated on the left hand alone genuinely never
 /// draws. It still reaches the screen through the OR it shares with `97`.
-pub const RESTING_STATES: [i32; 9] = [
+pub const RESTING_STATES: [i32; 11] = [
     STATE_FULLSCREEN_WIDE,        // 1   the window layout HMS maps the virtual screen onto
     STATE_FIRST_PERSON,           // 24  this is the first-person HUD
     STATE_SHIELD_AVAILABLE,       // 32  a living Spartan has shields
@@ -1029,8 +1036,23 @@ pub const RESTING_STATES: [i32; 9] = [
     STATE_UNZOOMED,               // 84  the resting optic
     STATE_WEAPON_IS_RIGHT_HAND,   // 97  where Reach puts it
     STATE_CROSSHAIR_NORMAL,       // 100 nothing under the reticule
+    116,                          // lock unavailable: nothing is being locked, which is the rest state of a
+                                  //     lock-on reticle (the rocket pod's `crosshair` is gated on it)
+    118,                          // locked on unavailable: not locked on
     STATE_MULTI_FFA,              // 263 a saved film is a multiplayer game
 ];
+
+/// `chud_state_enum` 36: the player HUD's `player_training` collection and its `text_player_training`
+/// widget are gated on it (`collection: 36 OR 18`, `widget: 36 AND NOT 18`, measured on
+/// `ui\chud\spartan` and `ui\chud\elite`). INFERRED to be the "a message is on screen" state;
+/// the enum's value NAMES are not in the tool build.
+pub const STATE_TRAINING_TEXT: i32 = 36;
+/// The `input string` of `text_player_training`: a RUNTIME string the engine substitutes, as
+/// `chud_out_a` is a runtime number.
+pub const CHUD_TRAINING_TEXT: &str = "chud_training_text";
+/// The player HUD collection that carries it: anchored `4 center` at `(0, +164)` virtual units,
+/// scaled 1.2, with a dark strip behind the text.
+pub const TRAINING_COLLECTION: &str = "player_training";
 
 /// `chud_state_enum` 50 `binoculars disabled`. The Spartan HUD's whole `health_meter` collection
 /// is gated on it, so without it the health bar never draws at all.
@@ -1443,6 +1465,10 @@ pub struct HudValues {
     pub respawn: Field<f32>,
     /// Why the respawn countdown reads what it does, for the panel.
     pub respawn_note: String,
+    /// #seat-hud  The camera is a chase (third-person) one: a seat whose `third person camera`
+    /// flag is set. States 24 `first person` / 25 `third person` follow it, so a widget authored
+    /// for the first-person view alone (the player HUD's `unarmed_crosshair`) is not drawn there.
+    pub third_person: bool,
     /// #play-hud  The label of the key the viewer has bound to the action button, for a BUTTON
     /// PROMPT — a string that resolves to words with a private-use glyph embedded in them, like
     /// `"Hold \u{E446} to drive Warthog"`.
@@ -1453,13 +1479,19 @@ pub struct HudValues {
     /// button, so the glyph is replaced with the player's own bound key and the prompt is drawn —
     /// which is strictly better than the game's own line, because it names *their* key.
     pub button_label: Option<String>,
+    /// #use-hold  The message the player's action prompt is showing ("Hold E to drive Warthog"), the
+    /// words already resolved with the player's own key. `Some` raises `chud_state_enum` 36 and
+    /// is what the `chud_training_text` input of the player HUD's `player_training` collection
+    /// prints (see [`CHUD_TRAINING_TEXT`]). `None` in Theater, which has no action button.
+    pub training_text: Option<String>,
 }
 
 impl HudValues {
     /// The `chud_state_enum` values HMS is prepared to assert this frame. Everything else counts
     /// as FALSE, which keeps a widget HMS cannot evaluate off the screen.
     pub fn known_states(&self) -> Vec<i32> {
-        let mut v = vec![STATE_FULLSCREEN_WIDE, STATE_FIRST_PERSON, STATE_BINOCULARS_DISABLED];
+        let view = if self.third_person { STATE_THIRD_PERSON } else { STATE_FIRST_PERSON };
+        let mut v = vec![STATE_FULLSCREEN_WIDE, view, STATE_BINOCULARS_DISABLED];
         if self.weapon_tag.is_some() {
             v.push(STATE_SINGLE_WIELDING);
             v.push(STATE_WEAPON_IS_RIGHT_HAND);
@@ -1476,6 +1508,11 @@ impl HudValues {
             v.push(32); // shield available
         }
         v.push(STATE_CROSSHAIR_NORMAL);
+        v.push(116);
+        v.push(118);
+        if self.training_text.is_some() {
+            v.push(STATE_TRAINING_TEXT);
+        }
         v
     }
     /// One line per field for the panel, naming the provenance of each.
@@ -1627,10 +1664,68 @@ impl RespawnClock {
 // painting
 // ---------------------------------------------------------------------------------------------
 
+/// `chud_widget_bitmap_flags` bit 8, `auto permute external input1`: the sprite within the
+/// widget's sequence is chosen by a runtime input -- for the grenade block, the grenade type
+/// (the SEQUENCE advances; each grenade sequence holds one sprite).
+pub const BITMAP_AUTO_PERMUTE_INPUT1: u32 = 1 << 8;
+
 /// A sprite uploaded for one widget.
 pub struct WidgetTex {
     pub tex: egui::TextureHandle,
     pub uv: egui::Rect,
+    /// #hud-meter  Which way a METER widget's threshold ramp runs across the sprite.
+    pub ramp: Ramp,
+}
+
+/// #hud-meter  A chud bitmap's RGB is DATA, not colour. Measured over `forge_halo`: the shield
+/// meter carries a 0..255 ramp in R and B, the health meter a falling one, the AR's ammo meter a
+/// falling 40..0 one in B, and the vehicle / grenade sheets are `(0,0,0)` under their alpha. The
+/// widget is drawn in its resolved colour with the bitmap's ALPHA as the shape, and a meter shows
+/// the part of the shape whose ramp is at or below the fill -- a prefix of the sprite when the ramp
+/// rises left to right, a suffix when it falls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Ramp {
+    #[default]
+    None,
+    Rising,
+    Falling,
+}
+
+/// Direction of the strongest monotone ramp in the RGB of the opaque pixels of one sprite
+/// (`uv` is `[u0, u1, v0, v1]`); `Ramp::None` when no channel varies.
+pub fn detect_ramp(bgra: &[u8], w: usize, h: usize, uv: [f32; 4]) -> Ramp {
+    let (x0, x1) = ((uv[0] * w as f32) as usize, ((uv[1] * w as f32) as usize).min(w));
+    let (y0, y1) = ((uv[2] * h as f32) as usize, ((uv[3] * h as f32) as usize).min(h));
+    if x1 <= x0 + 8 || y1 <= y0 {
+        return Ramp::None;
+    }
+    const BANDS: usize = 8;
+    let mut sum = [[0f32; 3]; BANDS];
+    let mut cnt = [0usize; BANDS];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = &bgra[(y * w + x) * 4..][..4];
+            if p[3] > 128 {
+                let b = ((x - x0) * BANDS / (x1 - x0)).min(BANDS - 1);
+                sum[b][0] += p[2] as f32;
+                sum[b][1] += p[1] as f32;
+                sum[b][2] += p[0] as f32;
+                cnt[b] += 1;
+            }
+        }
+    }
+    let mut best = (0f32, Ramp::None);
+    for c in 0..3 {
+        let means: Vec<f32> = (0..BANDS).filter(|&b| cnt[b] > 0).map(|b| sum[b][c] / cnt[b] as f32).collect();
+        if means.len() < 4 {
+            continue;
+        }
+        let spread = means.iter().cloned().fold(f32::MIN, f32::max) - means.iter().cloned().fold(f32::MAX, f32::min);
+        if spread > best.0 + 1e-3 {
+            best = (spread, if means[means.len() - 1] >= means[0] { Ramp::Rising } else { Ramp::Falling });
+        }
+    }
+    if best.0 < 8.0 { Ramp::None } else { best.1 }
 }
 
 /// One `chdt` with every bitmap it draws uploaded, cached per (cache, tag).
@@ -1638,6 +1733,11 @@ pub struct HudArt {
     pub chud: HudChud,
     /// Parallel to `chud.collections[i].widgets[j]`, keyed `(i, j)`; a text widget has no entry.
     pub tex: std::collections::HashMap<(usize, usize), WidgetTex>,
+    /// #hud-permute  For a widget with `chud_widget_bitmap_flags` bit 8 `auto permute external
+    /// input1` (the grenade icons), the sprite of the sequence `sequence + element` (measured on the grenade sheet: sequence 0 is the frag
+    /// icon 37x50, sequence 1 the plasma 49x51) picked by the datasource element
+    /// index: `(collection, widget, element) -> sprite`. Element 0 is `tex` itself.
+    pub permute: std::collections::HashMap<(usize, usize, usize), (NavpointSprite, WidgetTex)>,
     /// #reach-strings  The cache's localized text, so an authored `string_id` can become the
     /// words the game prints. Loaded once per cache beside the art, because that is the lifetime
     /// it shares: one `tags_by_group("unic")` plus a name each.
@@ -1663,15 +1763,27 @@ pub fn hud_art(
         let made = (|| {
             let chud = read_chud(native, cache, tag)?;
             let mut tex = std::collections::HashMap::new();
+            let mut permute = std::collections::HashMap::new();
             for (ci, c) in chud.collections.iter().enumerate() {
                 for (wi, w) in c.widgets.iter().enumerate() {
-                    let WidgetArt::Bitmap { sprite, .. } = &w.art else { continue };
+                    let WidgetArt::Bitmap { sprite, flags, sequence, .. } = &w.art else { continue };
                     let Some(t) = upload_sprite(ctx, native, cache, sprite, &w.base) else { continue };
                     tex.insert((ci, wi), t);
+                    if flags & BITMAP_AUTO_PERMUTE_INPUT1 != 0 && *sequence >= 0 {
+                        for k in 1..4usize {
+                            let Some(sp) = crate::reach_chud::read_sprite(native, cache, sprite.bitmap_tag, *sequence as usize + k, 0)
+                            else {
+                                break;
+                            };
+                            if let Some(t) = upload_sprite(ctx, native, cache, &sp, &w.base) {
+                                permute.insert((ci, wi, k), (sp, t));
+                            }
+                        }
+                    }
                 }
             }
             let strings = crate::reach_strings::ReachStrings::load(native, cache);
-            Some(std::rc::Rc::new(HudArt { chud, tex, strings }))
+            Some(std::rc::Rc::new(HudArt { chud, tex, permute, strings }))
         })();
         m.borrow_mut().insert((cache.0, tag), made.clone());
         made
@@ -1691,17 +1803,23 @@ fn upload_sprite(
     if w == 0 || h == 0 || bgra.len() < (w as usize * h as usize * 4) {
         return None;
     }
+    let ramp = if shader_is_meter(base.shader_type) {
+        detect_ramp(&bgra, w as usize, h as usize, sp.uv)
+    } else {
+        Ramp::None
+    };
+    // RGB is data (see `Ramp`): keep the alpha as the shape and let the widget's colour tint it.
     let px: Vec<egui::Color32> = bgra
         .chunks_exact(4)
         .take(w as usize * h as usize)
-        .map(|c| egui::Color32::from_rgba_unmultiplied(c[2], c[1], c[0], c[3]))
+        .map(|c| egui::Color32::from_rgba_unmultiplied(255, 255, 255, c[3]))
         .collect();
     let img = egui::ColorImage { size: [w as usize, h as usize], pixels: px };
     let tex = ctx.load_texture(format!("reach-hud-{}-{}", sp.bitmap_tag, sp.bitmap_index), img, egui::TextureOptions::LINEAR);
     let s = base.placement().map(|p| p.scale).unwrap_or([1.0, 1.0]);
     let (u0, u1) = if s[0] < 0.0 { (sp.uv[1], sp.uv[0]) } else { (sp.uv[0], sp.uv[1]) };
     let (v0, v1) = if s[1] < 0.0 { (sp.uv[3], sp.uv[2]) } else { (sp.uv[2], sp.uv[3]) };
-    Some(WidgetTex { tex, uv: egui::Rect::from_min_max(egui::pos2(u0, v0), egui::pos2(u1, v1)) })
+    Some(WidgetTex { tex, uv: egui::Rect::from_min_max(egui::pos2(u0, v0), egui::pos2(u1, v1)), ramp })
 }
 
 /// The screen colour a widget's `color output A` resolves to.
@@ -1749,9 +1867,13 @@ pub fn widget_color(base: &WidgetBase, skin: Option<&ChudSkin>) -> egui::Color32
     // Unauthored, or an animation output: the first colour this widget does author.
     match base.custom.iter().find(|c| authored(**c)) {
         Some(c) => rgb(*c),
-        // Nothing authored anywhere. White is the neutral that leaves a sprite's own art alone,
-        // which is what a HUD bitmap is tinted against.
-        None => egui::Color32::WHITE,
+        // Nothing authored anywhere. A METER (ammo, health) draws in the skin's `highlight
+        // background`, the HUD's own blue -- INFERRED, the tags author no colour for these and the
+        // sheet's RGB is a ramp, not a colour. Anything else: white, which tints nothing.
+        None => match (skin, shader_is_meter(base.shader_type)) {
+            (Some(s), true) => rgb(s.colors[2]),
+            _ => egui::Color32::WHITE,
+        },
     }
 }
 
@@ -1856,11 +1978,20 @@ pub fn paint_bitmap(
         return None;
     }
     let full = egui::Rect::from_center_size(at, egui::vec2(w, h));
-    let rect = egui::Rect::from_min_size(full.min, egui::vec2(w * f, h));
-    let uv = egui::Rect::from_min_max(
-        tex.uv.min,
-        egui::pos2(tex.uv.min.x + (tex.uv.max.x - tex.uv.min.x) * f, tex.uv.max.y),
-    );
+    // A RISING ramp shows the left part of the sprite, a FALLING one the right part (see `Ramp`).
+    let (rect, uv) = if tex.ramp == Ramp::Falling {
+        let rect = egui::Rect::from_min_size(egui::pos2(full.max.x - w * f, full.min.y), egui::vec2(w * f, h));
+        let u = tex.uv.max.x - (tex.uv.max.x - tex.uv.min.x) * f;
+        (rect, egui::Rect::from_min_max(egui::pos2(u, tex.uv.min.y), tex.uv.max))
+    } else {
+        (
+            egui::Rect::from_min_size(full.min, egui::vec2(w * f, h)),
+            egui::Rect::from_min_max(
+                tex.uv.min,
+                egui::pos2(tex.uv.min.x + (tex.uv.max.x - tex.uv.min.x) * f, tex.uv.max.y),
+            ),
+        )
+    };
     let mut mesh = egui::Mesh::with_texture(tex.tex.id());
     mesh.add_rect_with_uv(rect, uv, color);
     painter.add(egui::Shape::mesh(mesh));
@@ -2282,7 +2413,7 @@ pub fn paint_collection(
         let col = widget_color(&w.base, skin);
         tr.color = Some(col);
         match &w.art {
-            WidgetArt::Bitmap { sprite, .. } => {
+            WidgetArt::Bitmap { sprite, flags, .. } => {
                 let m = cv.meter_for(&c.base.name, &w.base.name, Some(w.base.shader_type));
                 tr.meter = m;
                 let Some(tex) = art.tex.get(&(ci, wi)) else {
@@ -2301,7 +2432,57 @@ pub fn paint_collection(
                     Some(Some(f)) => f,
                     None => 1.0,
                 };
+                // #hud-origin  `widget origin` is the PIVOT: the point of the sprite (0..1 of its own
+                // size) that sits on the placement point. Evidence: `ar_reticule` / the shotgun and
+                // rocket reticles author ONE QUADRANT of their ring with `mirror horizontal` +
+                // `mirror vertical` and an origin of ~(1,1), which only closes into a ring when the
+                // corner of the quadrant is the pivot; and `ammo_area/meter` (origin 1.0, 0.5) is
+                // inside the safe frame only as a pivot.
+                // #hud-permute  Repeat k of a permuted widget draws sprite k of its sequence.
+                let (sprite, tex) = match art.permute.get(&(ci, wi, repeat)) {
+                    Some((s, t)) if *flags & BITMAP_AUTO_PERMUTE_INPUT1 != 0 => (s, t),
+                    _ => (sprite, tex),
+                };
+                tr.sprite = Some((sprite.bitmap_tag, sprite.bitmap_index, sprite.size));
+                let size = egui::vec2(
+                    (sprite.size[0] * scale[0]).abs() * vs.vpx,
+                    (sprite.size[1] * scale[1]).abs() * vs.vpx,
+                );
+                let point = at;
+                let at = egui::pos2(at.x + (0.5 - p.origin[0]) * size.x, at.y + (0.5 - p.origin[1]) * size.y);
                 let r = paint_bitmap(painter, at, scale, sprite, tex, col, vs.vpx, fill, w.base.blend_mode);
+                // #hud-mirror  `chud_widget_bitmap_flags` bit 0 `mirror horizontal`, bit 1 `mirror
+                // vertical`: the widget is ALSO drawn reflected about its placement point. The
+                // shield meter authors its RIGHT half with the pivot at the screen centre and the
+                // flag set, and the health meter its LEFT half the same way, so the pair reads as
+                // one symmetric bar; a meter's level is the same on both sides (its ramp is a
+                // distance from the pivot).
+                let (mh, mv) = (*flags & 1 != 0, *flags & 2 != 0);
+                if r.is_some() && (mh || mv) {
+                    let flip = |t: &WidgetTex, h: bool, v: bool| WidgetTex {
+                        tex: t.tex.clone(),
+                        uv: egui::Rect::from_min_max(
+                            egui::pos2(if h { t.uv.max.x } else { t.uv.min.x }, if v { t.uv.max.y } else { t.uv.min.y }),
+                            egui::pos2(if h { t.uv.min.x } else { t.uv.max.x }, if v { t.uv.min.y } else { t.uv.max.y }),
+                        ),
+                        ramp: match (t.ramp, h) {
+                            (Ramp::Rising, true) => Ramp::Falling,
+                            (Ramp::Falling, true) => Ramp::Rising,
+                            (r, _) => r,
+                        },
+                    };
+                    for (h, v) in [(mh, false), (false, mv), (mh, mv)] {
+                        if (!h && !v) || (h && !mh) || (v && !mv) {
+                            continue;
+                        }
+                        let ft = flip(tex, h, v);
+                        let c = egui::pos2(
+                            if h { 2.0 * point.x - at.x } else { at.x },
+                            if v { 2.0 * point.y - at.y } else { at.y },
+                        );
+                        paint_bitmap(painter, c, scale, sprite, &ft, col, vs.vpx, fill, w.base.blend_mode);
+                    }
+                }
                 tr.rect = r;
                 tr.outcome = if r.is_some() {
                     "drawn".into()
@@ -2324,6 +2505,17 @@ pub fn paint_collection(
                         None => {
                             skipped += 1;
                             tr.outcome = "NOT DRAWN: a runtime number HMS has no value for".into();
+                            log_widget(tr);
+                            continue;
+                        }
+                    }
+                } else if input == CHUD_TRAINING_TEXT {
+                    // #use-hold  A RUNTIME string: the action prompt the caller resolved.
+                    match &values.training_text {
+                        Some(t) => t.clone(),
+                        None => {
+                            skipped += 1;
+                            tr.outcome = "NOT DRAWN: no message is on screen".into();
                             log_widget(tr);
                             continue;
                         }
@@ -2600,24 +2792,6 @@ pub fn chud_by_path(native: &NativeDll, cache: CacheHandle, path: &str) -> Optio
         .tags_by_group(cache, "chdt")
         .into_iter()
         .find(|&t| native.tag_name(cache, t).is_some_and(|n| n.eq_ignore_ascii_case(path)))
-}
-
-/// A seated player's own HUD: the `vehi`'s `chud interface`.
-///
-/// `vehicle` tags carry the same `player interface` struct a weapon does, so a vehicle's HUD is
-/// found the same way — but at the VEHICLE's own base, not the weapon's. The offset is resolved
-/// by searching the tag for a `chdt` reference rather than hard-coding one, because the `vehi`
-/// chain's base differs from `weap`'s and the tool build's `vehi` definition does not expose the
-/// `player interface` struct at a single fixed offset the way `weap` does.
-pub fn vehicle_chud(native: &NativeDll, cache: CacheHandle, vehi_tag: u32) -> Option<u32> {
-    let meta = native.tag_meta(cache, vehi_tag, 0, 0x900)?;
-    let chdts: Vec<u32> = native.tags_by_group(cache, "chdt");
-    // A tag reference is 16 bytes with the tag datum at +0x0C; scan every aligned reference and
-    // take the first that names a `chdt`.
-    (0..meta.len().saturating_sub(16))
-        .step_by(4)
-        .filter_map(|o| tag_ref(&meta, o))
-        .find(|t| chdts.contains(t))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3921,7 +4095,10 @@ mod tests {
                 union = crate::reach_chud::paint_crosshair(p, vp, &art, &skin, vs.vpx);
             });
             assert!(!rects.is_empty(), "{weapon}'s reticule emitted no shape");
-            assert_eq!(rects.len(), art.crosshair.parts.len(), "{weapon}: one mesh per authored part");
+            // A part is drawn once plus once per reflection its `mirror horizontal` / `vertical` flags add:
+            // the assault rifle's ring is ONE quadrant authored with both set, i.e. four meshes.
+            let expect: usize = art.crosshair.parts.iter().map(|p| 1usize << p.mirror.iter().filter(|m| **m).count()).sum();
+            assert_eq!(rects.len(), expect, "{weapon}: one mesh per authored part and reflection");
             let off = (union.center() - vp.center()).length();
             eprintln!(
                 "  {weapon:<14} {} part(s), {:.0}x{:.0} pt, centre {off:.1} pt off the viewport centre",

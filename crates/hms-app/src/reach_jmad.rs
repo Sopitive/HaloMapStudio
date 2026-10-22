@@ -627,7 +627,12 @@ fn curve_rotation(blk: &[u8], h: &CodecHeader, ch: usize, frame: f32) -> Option<
     let (k, t) = curve_segment(&dur, frame)?;
     let keys = 0x08 + n;
     let (o0, o1) = (keys + 10 * k, keys + 10 * (k + 1));
-    if o1 + 10 > rec.len() { return None; }
+    // #walk-bob  The LAST key of a record is its position only (6 bytes): the lean nibbles that
+    // shape a segment are read from its START key (`curve_tangents(rec[o0 + 6 + i], ..)`), and the
+    // engine reads only the end key's three i16 [+0x218B80 reads `+0x21/+0x23/+0x25` of the
+    // next key, never its lean byte]. Demanding the full 10 bytes made the final segment of
+    // whichever record ends the block unreadable (see `curve_translation`).
+    if o1 + 6 > rec.len() { return None; }
     let a0 = curve_quat(rec, o0).to_array();
     let a1 = curve_quat(rec, o1).to_array();
     let mut out = [0.0f32; 4];
@@ -656,7 +661,16 @@ fn curve_translation(blk: &[u8], h: &CodecHeader, ch: usize, frame: f32) -> Opti
         let (k, t) = curve_segment(&dur, frame)?;
         let keys = 0x18 + n;
         let (o0, o1) = (keys + 9 * k, keys + 9 * (k + 1));
-        if o1 + 9 > rec.len() { return None; }
+        // #walk-bob  THE LAST KEY IS 6 BYTES, NOT 9 (position only; its lean byte is never read).
+        // Every record is `0x18 + n + 9n + 6` bytes, rounded up to 4 -- measured on the Spartan's
+        // pelvis channel of five clips (13 segments -> 160 B, 11 -> 140, 15 -> 180, 7 -> 100,
+        // 14 -> 172). With the translation table the LAST section of the block, the pelvis record
+        // is the block's final bytes, so asking for 9 failed the final segment: the sampler
+        // returned `None` for the last 1-2 frames of 322 of the 926 Spartan clips that carry a
+        // translation, the pose fell back to the bind-pose pelvis height (0.3798 against a
+        // 0.302-0.339 walk bob: 0.077 wu = 24 cm in ONE frame), and the body popped up and back
+        // down once per stride. The engine reads only the end key's three i16.
+        if o1 + 6 > rec.len() { return None; }
         let mut out = [0.0f32; 3];
         for i in 0..3 {
             let (p0, p1) = (q(o0, i), q(o1, i));
@@ -684,7 +698,7 @@ fn curve_scale(blk: &[u8], h: &CodecHeader, ch: usize, frame: f32) -> Option<f32
         let (k, t) = curve_segment(&dur, frame)?;
         let keys = 0x10 + n;
         let (o0, o1) = (keys + 3 * k, keys + 3 * (k + 1));
-        if o1 + 3 > rec.len() { return None; }
+        if o1 + 2 > rec.len() { return None; } // #walk-bob: the end key is its i16 alone
         let (p0, p1) = (rd_i16(rec, o0) as f32 * INV_32767, rd_i16(rec, o1) as f32 * INV_32767);
         let (m0, m1) = curve_tangents(rec[o0 + 2], p0, p1);
         hermite(t, p0, m0, p1, m1)

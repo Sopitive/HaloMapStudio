@@ -187,7 +187,16 @@ pub const CAM_FLAGS: usize = 0x000;
 pub const CAM_MARKER_NAME: usize = 0x004;
 pub const CAM_PITCH_AUTO_LEVEL: usize = 0x008;
 pub const CAM_PITCH_RANGE: usize = 0x00C;
+pub const CAM_TRACKS: usize = 0x014;
+pub const CAM_PITCH_MIN_SPRING: usize = 0x020;
+pub const CAM_PITCH_MAX_SPRING: usize = 0x024;
+pub const CAM_SPRING_VELOCITY: usize = 0x028;
+pub const CAM_LOOK_ACCELERATION: usize = 0x02C;
+pub const CAM_LOOK_DECELERATION: usize = 0x030;
 pub const CAM_OVERRIDE_FOV: usize = 0x038;
+/// `camera_obstruction_struct`, 24 bytes: cylinder fraction, test angle, max inward accel, max
+/// outward accel, max velocity, return delay.
+pub const CAM_OBSTRUCTION: usize = 0x03C;
 pub const CAM_SIZE: usize = 0x078;
 
 /// `unit_seat_flags`, in the tool build's own order (bit index == this index).
@@ -232,7 +241,20 @@ pub const FLAG_DRIVER: u32 = 1 << 2;
 pub const FLAG_GUNNER: u32 = 1 << 3;
 pub const FLAG_THIRD_PERSON_CAMERA: u32 = 1 << 4;
 pub const FLAG_ALLOWS_WEAPONS: u32 = 1 << 5;
+/// `third person on enter`: the camera is third person while the BOARDING animation plays even
+/// when the seat itself is a first-person one (`unit_should_be_third_person`, `sub_1401DA050`).
+pub const FLAG_THIRD_PERSON_ON_ENTER: u32 = 1 << 6;
+/// `local aiming`: the rider's aim carries the vehicle's own rotation. `player_control_get_
+/// controller_input` (`sub_1401E2530`, the `>> 0x1D & 1` test) adds the seat frame's yaw and
+/// pitch DELTA to the player's look every frame when it is set.
+pub const FLAG_LOCAL_AIMING: u32 = 1 << 29;
 pub const FLAG_NOT_VALID_WITHOUT_DRIVER: u32 = 1 << 8;
+/// `boarding seat` (bit 10): a seat that exists only to PLAY THE BOARDING ANIMATION of taking a
+/// vehicle over from an occupant (`boarding enters seat`, bit 12, then moves the unit on to the
+/// seat `boarding seat` names). Nobody walks up to one in an empty vehicle.
+pub const FLAG_BOARDING_SEAT: u32 = 1 << 10;
+/// `boarding need any passenger` (bit 13).
+pub const FLAG_BOARDING_NEEDS_PASSENGER: u32 = 1 << 13;
 pub const FLAG_INVALID_FOR_PLAYER: u32 = 1 << 14;
 pub const FLAG_GUNNER_PLAYER_ONLY: u32 = 1 << 17;
 pub const FLAG_DISALLOW_EXIT: u32 = 1 << 28;
@@ -278,15 +300,50 @@ pub struct Seat {
     pub camera_marker: String,
     /// The seat camera's `override fov`, as stored (0 = inherit).
     pub camera_override_fov: f32,
+    /// The rest of the seat's `unit_camera_struct`, which is what the following camera reads.
+    pub camera: SeatCamera,
     /// `pitch range`, the seat's own look limits, as stored.
     pub pitch_range: [f32; 2],
     /// `yaw minimum` / `yaw maximum`, as stored.
     pub yaw_range: [f32; 2],
-    /// `max speed reference` / `speed exponent`: how the yaw/pitch rate bounds interpolate.
+    /// `min speed reference` / `max speed reference` / `speed exponent`: how the yaw/pitch rate
+    /// bounds interpolate with the vehicle's speed.
+    pub min_speed_reference: f32,
     pub max_speed_reference: f32,
     pub speed_exponent: f32,
     pub yaw_rate_bounds: [f32; 2],
     pub pitch_rate_bounds: [f32; 2],
+}
+
+/// A seat's `unit_camera_struct` (120 bytes at `seat +0x70`), minus the stick-shaping blocks.
+///
+/// `flags` is `unit_camera_flags_definition`: bit 0 `pitch bounds absolute space`, bit 1 `only
+/// collides with environment`, bit 2 `hides player-unit from camera`, bit 3 `use aiming vector
+/// instead of marker forward` (strings read from the tool build's `.rdata`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SeatCamera {
+    pub flags: u16,
+    pub marker: String,
+    /// `pitch auto-level`, radians (0 = none).
+    pub pitch_auto_level: f32,
+    pub pitch_range: [f32; 2],
+    /// `camera tracks` (max 2), in block order: the `trak` tag, or `None` for an entry that names
+    /// none (the engine then falls back on the globals `default unit camera track`).
+    pub tracks: Vec<Option<u32>>,
+    pub pitch_min_spring: f32,
+    pub pitch_max_spring: f32,
+    pub spring_velocity: f32,
+    pub look_acceleration: f32,
+    pub look_deceleration: f32,
+    pub override_fov: f32,
+    /// `[cylinder fraction, test angle, max inward accel, max outward accel, max velocity,
+    /// return delay]`.
+    pub obstruction: [f32; 6],
+}
+
+impl SeatCamera {
+    pub const HIDES_PLAYER_UNIT: u16 = 1 << 2;
+    pub const USE_AIMING_VECTOR: u16 = 1 << 3;
 }
 
 impl Seat {
@@ -299,10 +356,34 @@ impl Seat {
     pub fn third_person(&self) -> bool {
         self.flags & FLAG_THIRD_PERSON_CAMERA != 0
     }
+    pub fn third_person_on_enter(&self) -> bool {
+        self.flags & FLAG_THIRD_PERSON_ON_ENTER != 0
+    }
+    pub fn local_aiming(&self) -> bool {
+        self.flags & FLAG_LOCAL_AIMING != 0
+    }
     /// Can a PLAYER take this seat at all? `invalid for player` and `locked` are the two the
     /// tag states outright.
     pub fn player_allowed(&self) -> bool {
         self.flags & (FLAG_INVALID_FOR_PLAYER | FLAG_LOCKED) == 0
+    }
+    /// Can a player walk up and sit in this seat of a vehicle NOBODY is in? (#ride-occupancy)
+    ///
+    /// Reported: the Mongoose's boarding seat could be entered with no one aboard. Two authored
+    /// flags forbid it: `boarding seat` (the seat is the hijack animation, only meaningful when
+    /// another unit holds the seat it leads to) and `not valid without driver` (the Mongoose
+    /// passenger needs the driver seat occupied first). `locked` and `invalid for player` are
+    /// [`Seat::player_allowed`]'s. Test mode has exactly one occupant, the player, so every seat
+    /// the player can enter starts from "nobody is aboard".
+    pub fn enterable_in_empty_vehicle(&self) -> bool {
+        self.player_allowed()
+            && self.flags & (FLAG_BOARDING_SEAT | FLAG_NOT_VALID_WITHOUT_DRIVER | FLAG_BOARDING_NEEDS_PASSENGER) == 0
+    }
+    /// `allows weapons` (bit 5): the rider may keep and use the biped's OWN weapon in this seat.
+    /// Clear = the weapon is not usable here (the engine suppresses the weapon-switch request,
+    /// `player_control_update_player`, and the seat's graph authors no weapon clips).
+    pub fn allows_weapons(&self) -> bool {
+        self.flags & FLAG_ALLOWS_WEAPONS != 0
     }
     /// The flag names set on this seat, for a diagnostic.
     pub fn flag_names(&self) -> Vec<&'static str> {
@@ -407,8 +488,34 @@ impl UnitSeats {
                 boarding_seat: rd_i16(e, S_BOARDING_SEAT),
                 camera_marker: sid(native, cache, rd_u32(e, cam + CAM_MARKER_NAME)),
                 camera_override_fov: rd_f32(e, cam + CAM_OVERRIDE_FOV),
+                camera: SeatCamera {
+                    flags: rd_u32(e, cam + CAM_FLAGS) as u16,
+                    marker: sid(native, cache, rd_u32(e, cam + CAM_MARKER_NAME)),
+                    pitch_auto_level: rd_f32(e, cam + CAM_PITCH_AUTO_LEVEL),
+                    pitch_range: [rd_f32(e, cam + CAM_PITCH_RANGE), rd_f32(e, cam + CAM_PITCH_RANGE + 4)],
+                    tracks: {
+                        let n = (rd_u32(e, cam + CAM_TRACKS) as usize).min(2);
+                        let p = rd_u32(e, cam + CAM_TRACKS + 4);
+                        native
+                            .tag_ptr_bytes(cache, p, (n * 32) as u32)
+                            .filter(|_| n > 0)
+                            .map(|t| (0..n).map(|i| {
+                                let d = rd_u32(&t, i * 32 + 0x0C);
+                                (d != u32::MAX && d != 0).then_some(d & 0xFFFF)
+                            }).collect())
+                            .unwrap_or_default()
+                    },
+                    pitch_min_spring: rd_f32(e, cam + CAM_PITCH_MIN_SPRING),
+                    pitch_max_spring: rd_f32(e, cam + CAM_PITCH_MAX_SPRING),
+                    spring_velocity: rd_f32(e, cam + CAM_SPRING_VELOCITY),
+                    look_acceleration: rd_f32(e, cam + CAM_LOOK_ACCELERATION),
+                    look_deceleration: rd_f32(e, cam + CAM_LOOK_DECELERATION),
+                    override_fov: rd_f32(e, cam + CAM_OVERRIDE_FOV),
+                    obstruction: std::array::from_fn(|k| rd_f32(e, cam + CAM_OBSTRUCTION + 4 * k)),
+                },
                 pitch_range: [rd_f32(e, cam + CAM_PITCH_RANGE), rd_f32(e, cam + CAM_PITCH_RANGE + 4)],
                 yaw_range: [rd_f32(e, S_YAW_MINIMUM), rd_f32(e, S_YAW_MAXIMUM)],
+                min_speed_reference: rd_f32(e, S_MIN_SPEED_REFERENCE),
                 max_speed_reference: rd_f32(e, S_MAX_SPEED_REFERENCE),
                 speed_exponent: rd_f32(e, S_SPEED_EXPONENT),
                 yaw_rate_bounds: [rd_f32(e, S_YAW_RATE_BOUNDS), rd_f32(e, S_YAW_RATE_BOUNDS + 4)],
@@ -428,7 +535,7 @@ impl UnitSeats {
         cands
             .iter()
             .copied()
-            .filter(|&i| self.seats.get(i).is_some_and(|s| s.player_allowed()))
+            .filter(|&i| self.seats.get(i).is_some_and(|s| s.enterable_in_empty_vehicle()))
             .min_by_key(|&i| {
                 let s = &self.seats[i];
                 let rank = if s.is_driver() { 0 } else if s.is_gunner() { 1 } else { 2 };
@@ -1392,5 +1499,187 @@ pub(crate) mod gates {
                 );
             }
         }
+    }
+
+    /// #seat-camera  **THE CAMERA MUST RESPOND.**
+    ///
+    /// Reported: *"the camera is WRONG for the warthog, it won't let me move it really AT ALL!"*
+    /// **A frozen camera passes every gate that only checks the camera is somewhere sensible**,
+    /// and every gate here did, so this one asserts responsiveness directly: a change in the look
+    /// input must change the returned `forward`, for every player seat, by an amount comparable to
+    /// what was asked for.
+    ///
+    /// Run as a closure battery rather than with a source sabotage, which is now house style: each
+    /// assertion is factored over the function under test, and each saboteur is a deliberately
+    /// broken stand-in that only its own assertion can catch. The meta-assertion at the end is the
+    /// part that matters — it fails if any saboteur is caught by nothing, which is how a vacuous
+    /// assertion is found without a rebuild.
+    #[test]
+    fn the_seat_camera_must_respond_to_the_look() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        // The Warthog driver's own authored ranges, measured: a full circle of yaw and +-45 of
+        // pitch. A seat this free is the strongest case for "it would not let me move it".
+        let hog = Seat {
+            yaw_range: [-std::f32::consts::PI, std::f32::consts::PI],
+            pitch_range: [-0.7854, 0.7854],
+            ..Default::default()
+        };
+        // And a genuinely limited one, so "responds" cannot be satisfied by ignoring the clamp.
+        let turret = Seat { yaw_range: [-2.0944, 2.0944], pitch_range: [-0.7854, 0.6109], ..Default::default() };
+
+        /// The function under test, as the production path composes it: clamp the look to the
+        /// seat, then solve the view.
+        type View = fn(&Seat, f32, f32, f32) -> SeatView;
+        let real: View = |seat, vehicle_yaw, yaw, pitch| {
+            let (y, p) = clamp_seat_look(seat, vehicle_yaw, yaw, pitch);
+            seat_view(seat, None, Mat4::IDENTITY, y, p, 1.0)
+        };
+        // SABOTEURS. Each is a plausible way this has already broken or could break.
+        //   A: the look is re-based to the vehicle's heading every frame -- THE BUG that was
+        //      reported, reproduced here as a stand-in (`set_pose_from_vehicle` overwrote
+        //      `st.yaw`, which `App` integrates the mouse from, so the look never accumulated).
+        let rebased: View = |seat, vehicle_yaw, _yaw, pitch| {
+            let (y, p) = clamp_seat_look(seat, vehicle_yaw, vehicle_yaw, pitch);
+            seat_view(seat, None, Mat4::IDENTITY, y, p, 1.0)
+        };
+        //   B: a zero yaw range read as "pinned" rather than "no limit".
+        let pinned: View = |seat, vehicle_yaw, _yaw, pitch| {
+            let (_, p) = clamp_seat_look(seat, vehicle_yaw, vehicle_yaw, pitch);
+            seat_view(seat, None, Mat4::IDENTITY, vehicle_yaw, p, 1.0)
+        };
+        //   C: the pitch range read as DEGREES, which turns +-45 into +-0.0137 rad.
+        let degrees: View = |seat, vehicle_yaw, yaw, pitch| {
+            let s = Seat { pitch_range: seat.pitch_range.map(|v| v.to_radians()), ..seat.clone() };
+            let (y, p) = clamp_seat_look(&s, vehicle_yaw, yaw, pitch);
+            seat_view(&s, None, Mat4::IDENTITY, y, p, 1.0)
+        };
+        //   D: the clamp applied as a HALF range, so the rider gets half the authored sweep.
+        let halved: View = |seat, vehicle_yaw, yaw, pitch| {
+            let s = Seat { yaw_range: seat.yaw_range.map(|v| v * 0.5), pitch_range: seat.pitch_range.map(|v| v * 0.5), ..seat.clone() };
+            let (y, p) = clamp_seat_look(&s, vehicle_yaw, yaw, pitch);
+            seat_view(&s, None, Mat4::IDENTITY, y, p, 1.0)
+        };
+
+        // The assertions, each over a `View`. Named so a failure says which property went.
+        let assertions: Vec<(&str, fn(View) -> ())> = vec![
+            // 1. A FREE seat must give the whole circle: 90 degrees asked for is 90 delivered.
+            ("a free seat follows the yaw it is given", |f: View| {
+                for deg in [15.0f32, 90.0, 170.0, -120.0] {
+                    let a = f(&free_seat(), 0.0, 0.0, 0.0).forward;
+                    let b = f(&free_seat(), 0.0, deg.to_radians(), 0.0).forward;
+                    let got = (a.y.atan2(a.x) - b.y.atan2(b.x)).abs().to_degrees();
+                    let want = deg.abs();
+                    assert!(
+                        (got - want).abs() < 1.0,
+                        "asked for {want:.0} deg of yaw and the camera turned {got:.1}"
+                    );
+                }
+            }),
+            // 2. ...and the whole authored pitch, which is where a units error shows.
+            ("a free seat follows the pitch it is given", |f: View| {
+                let a = f(&free_seat(), 0.0, 0.0, -0.7854).forward;
+                let b = f(&free_seat(), 0.0, 0.0, 0.7854).forward;
+                let got = (b.z.asin() - a.z.asin()).to_degrees();
+                assert!((got - 90.0).abs() < 1.0, "the authored +-45 deg of pitch delivered {got:.1} deg");
+            }),
+            // 3. A LIMITED seat must still respond INSIDE its range -- a clamp is not a freeze.
+            ("a limited seat still responds inside its range", |f: View| {
+                let s = Seat { yaw_range: [-2.0944, 2.0944], pitch_range: [-0.7854, 0.6109], ..Default::default() };
+                let a = f(&s, 0.0, -1.0, 0.0).forward;
+                let b = f(&s, 0.0, 1.0, 0.0).forward;
+                let got = (b.y.atan2(b.x) - a.y.atan2(a.x)).to_degrees();
+                assert!((got - 114.6).abs() < 1.0, "2 rad inside a +-2.09 rad range gave {got:.1} deg");
+            }),
+            // 4. ...and must be CLAMPED outside it, so "responds" is not satisfied by ignoring the
+            //    authored limit.
+            ("a limited seat is clamped outside its range", |f: View| {
+                let s = Seat { yaw_range: [-2.0944, 2.0944], pitch_range: [-0.7854, 0.6109], ..Default::default() };
+                let b = f(&s, 0.0, 3.0, 0.0).forward;
+                let got = b.y.atan2(b.x);
+                assert!((got - 2.0944).abs() < 1e-3, "3 rad against a +-2.0944 limit gave {got:.4}");
+            }),
+            // 5. The look must be RELATIVE to the hull: the same input on a turned vehicle gives
+            //    the same look, which is what makes the yaw range a limit on the rider and not on
+            //    the world.
+            ("the yaw limit is measured from the hull", |f: View| {
+                let s = Seat { yaw_range: [-0.5, 0.5], ..Default::default() };
+                for hull in [0.0f32, 1.3, -2.7] {
+                    let v = f(&s, hull, hull + 2.0, 0.0).forward;
+                    let rel = crate::reach_vehicle::wrap_angle(v.y.atan2(v.x) - hull);
+                    assert!((rel - 0.5).abs() < 1e-3, "at hull yaw {hull} the clamp gave {rel:.4} not 0.5");
+                }
+            }),
+        ];
+
+        let saboteurs: Vec<(&str, View)> =
+            vec![("re-based to the hull", rebased), ("pinned on a zero range", pinned), ("pitch range as degrees", degrees), ("a halved range", halved)];
+
+        // THE REAL THING MUST PASS EVERY ASSERTION.
+        for (name, a) in &assertions {
+            a(real);
+            println!("ok  {name}");
+        }
+        // AND EVERY SABOTEUR MUST BE CAUGHT BY AT LEAST ONE, which is the part that proves the
+        // assertions are not vacuous.
+        let mut caught: Vec<(&str, Vec<&str>)> = Vec::new();
+        for (sname, s) in &saboteurs {
+            let mut by = Vec::new();
+            for (aname, a) in &assertions {
+                let f = *a;
+                let v = *s;
+                if catch_unwind(AssertUnwindSafe(|| f(v))).is_err() {
+                    by.push(*aname);
+                }
+            }
+            println!("saboteur '{sname}' caught by {by:?}");
+            caught.push((*sname, by));
+        }
+        for (sname, by) in &caught {
+            assert!(!by.is_empty(), "saboteur '{sname}' was caught by NOTHING -- the assertions do not cover it");
+        }
+        // ...and no assertion may be dead weight: each must catch something no other does, or it
+        // is not earning its place.
+        for (aname, _) in &assertions {
+            let catches: Vec<&str> = caught.iter().filter(|(_, by)| by.contains(aname)).map(|(s, _)| *s).collect();
+            println!("assertion '{aname}' catches {catches:?}");
+        }
+        let uncovered: Vec<&str> = caught.iter().filter(|(_, by)| by.is_empty()).map(|(s, _)| *s).collect();
+        assert!(uncovered.is_empty(), "uncaught saboteurs: {uncovered:?}");
+    }
+
+    /// A seat with no authored look limit at all — zero in both range fields, which is the
+    /// commonest authoring and means NO LIMIT rather than pinned (measured: 30 of the 44 player
+    /// seats in `forge_halo` author `yaw_range [0,0]` and every one of them is a seat a player
+    /// really can look around in).
+    fn free_seat() -> Seat {
+        Seat { yaw_range: [0.0, 0.0], pitch_range: [-0.7854, 0.7854], ..Default::default() }
+    }
+
+    /// #seat-camera  The REGRESSION gate: `drive_and_seat` must give the look back after it places
+    /// the body.
+    ///
+    /// `set_pose_from_vehicle` writes the vehicle's heading into BOTH `st.facing` (right — a
+    /// seated body faces the way the vehicle does) and `st.yaw` (fatal — `st.yaw` is the look
+    /// accumulator `App` integrates the mouse from). A source gate, because the behaviour needs a
+    /// live scene and a cache to exercise and the line it depends on is one line.
+    #[test]
+    fn the_ride_restores_the_look_after_placing_the_body() {
+        let src = std::fs::read_to_string(format!("{}/src/play_mode.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("play_mode.rs");
+        let body = src.split("fn drive_and_seat(").nth(1).expect("drive_and_seat");
+        let place = body.find("set_pose_from_vehicle").expect("the placement call");
+        let after = &body[place..];
+        let restore = after.find("self.st.yaw = r.yaw;").expect(
+            "`drive_and_seat` must restore the LOOK into `st.yaw` after `set_pose_from_vehicle` \
+             overwrites it with the vehicle's heading -- without it the mouse is re-based to the \
+             hull every frame and the camera cannot be moved",
+        );
+        // It has to come AFTER the placement, or it is overwritten again.
+        assert!(restore > 0, "the restore must follow the placement call");
+        assert!(
+            after[..restore].find("rider_pose").is_none(),
+            "the restore must be in the same block as the placement it undoes"
+        );
     }
 }

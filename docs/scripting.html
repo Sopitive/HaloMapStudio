@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.4.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.6.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -409,7 +409,7 @@ camera lookat 40 -260 101.5
 screenshot forge_ground.png 1280x720</code></pre>
 
 <h2 id="mcp">MCP server (hms-mcp)</h2>
-<p><code>hms-mcp</code> is a small <a href="https://modelcontextprotocol.io">Model Context Protocol</a> server (JSON-RPC over stdio) that lets an LLM agent such as Claude drive the running editor. It is a thin bridge: every tool call is turned into a script and sent to the GUI's TCP command server, and the editor's log comes back as the tool result. It is built from the same repository (<code>cargo build --release -p hms-mcp</code>); a prebuilt binary is not part of the v1.4.0 archives, so treat it as a power-user feature.</p>
+<p><code>hms-mcp</code> is a small <a href="https://modelcontextprotocol.io">Model Context Protocol</a> server (JSON-RPC over stdio) that lets an LLM agent such as Claude drive the running editor. It is a thin bridge: every tool call is turned into a script and sent to the GUI's TCP command server, and the editor's log comes back as the tool result. It is built from the same repository (<code>cargo build --release -p hms-mcp</code>); a prebuilt binary is not part of the v1.5.0 archives, so treat it as a power-user feature.</p>
 <ol>
   <li>Start the editor (<code>hms-app</code>). The command server listens on <code>127.0.0.1:47800</code> (or <code>HMS_CMD_PORT</code>).</li>
   <li>Register <code>hms-mcp</code> with your MCP client. Example <code>mcpServers</code> entry for Claude Desktop / Claude Code:</li>
@@ -434,7 +434,7 @@ screenshot forge_ground.png 1280x720</code></pre>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.4.0 source (2026-10-12). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.6.0 source (2026-10-21). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

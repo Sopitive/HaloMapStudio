@@ -730,6 +730,9 @@ pub struct EntityState {
     pub facing_yaw_q: Option<u16>,
     /// Which gated field latched the base walk (ending the base block), if one did.
     pub latched_at: Option<u32>,
+    /// #film-riders  Where the reader stood right after the FIRST gate that read 0 -- the point
+    /// the walk used to stop at. `bits_after_base` is pinned to it when set.
+    pub bits_at_latch: Option<usize>,
     /// Bit offset into the payload at which the base-class walk stopped. The derived class's own
     /// dirty block starts here, so this is the anchor any search for a biped field needs.
     pub bits_after_base: usize,
@@ -797,15 +800,32 @@ fn base_dirty_walk(r: &mut BitReader, p: &DecodeParams, st: &mut EntityState) ->
     // `0x180A49258`). Before the presence bit of a gated field the stream carries one extra gate
     // bit, and a 0 there LATCHES the iterator: every later field is skipped with no bits read at
     // all. That is how the writer truncates the tail of the block.
+    //
+    // #film-riders  THE LATCH IS PER GROUP, NOT FOR THE REST OF THE BLOCK. `sub_1803B05C8` (the
+    // iterator's "is this field present") reads the gate flag when the field is the next gate in
+    // the list and stores `latch = (flag == 0)` -- an ASSIGNMENT, so the next gate's flag clears
+    // it again. A 0 at gate 2 therefore skips fields 2..7 only, and gate 8 is still read; fields
+    // 8..19 -- including the attachment at 12 -- can follow. This walk used to stop at the first 0
+    // gate, which hid field 12 on 764 of the 1,641 biped messages that carry it (and with it most
+    // of the corpus's seat links).
+    //
+    // What the early stop used to LEAVE BEHIND is kept exactly: `latched_at` is the first gate that
+    // read 0, and `bits_after_base` stays where the walk stood right after that gate flag (see
+    // `bits_at_latch`), because the biped-facing offset below was measured from there.
     let gate_list = [2u32, 8];
     let mut next_gate = 0usize;
+    let mut latched = false;
     for field in 0u32..20 {
         if next_gate < gate_list.len() && field == gate_list[next_gate] {
             next_gate += 1;
-            if !r.flag()? {
+            latched = !r.flag()?;
+            if latched && st.latched_at.is_none() {
                 st.latched_at = Some(field);
-                return Ok(()); // latched: the rest of the walk is absent
+                st.bits_at_latch = Some(r.pos());
             }
+        }
+        if latched {
+            continue; // this group is absent: no presence bit is read for it
         }
         let present = r.flag()?;
         st.fields_walked = field + 1;
@@ -1009,8 +1029,13 @@ pub fn decode_entity_payload(e: &EntityMessage, p: &DecodeParams) -> Option<Enti
         if !matches!(e.entity_type, 11 | 12 | 13 | 15 | 16 | 17 | 18) {
             return Some(st);
         }
-        base_dirty_walk(&mut r, p, &mut st).ok()?;
-        st.bits_after_base = r.pos();
+        let walk = base_dirty_walk(&mut r, p, &mut st);
+        // Past a latch the walk is only reaching for fields the old early stop never read, so a
+        // failure there must not cost the position and orientation already in hand.
+        if walk.is_err() && st.latched_at.is_none() {
+            return None;
+        }
+        st.bits_after_base = st.bits_at_latch.unwrap_or_else(|| r.pos());
         // A biped does not use base field 2 for its facing: the base walk's gate bit before that
         // field is almost always clear for a unit, which latches the walk and ends the base block
         // right after the position. The facing is the first field of the DERIVED (unit) block
@@ -5396,8 +5421,8 @@ mod tests {
             let f = |o: Option<usize>| o.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
             eprintln!(
                 "  {:<44} {:<16} {:>4} {:>6} | {:>6} {:>7} {:>5} | {:.3}",
-                &a.film[..a.film.len().min(44)],
-                &a.tag[..a.tag.len().min(16)],
+                a.film.chars().take(44).collect::<String>(),
+                a.tag.chars().take(16).collect::<String>(), // char-safe: gamertags can hold multi-byte emoji
                 a.slot,
                 a.owner,
                 f(a.rank_header),
@@ -6464,15 +6489,18 @@ mod tests {
             let mut seen = [false; 16];
             for &o in &owners {
                 let Some(sl) = idx.owner_to_slot(o) else { continue };
+                // #film-riders  FIVE bits, not four: `sub_1803B2590` reads `state[0x3F] =
+                // ReadBits(5) - 1` (the 2026-10-13 fix in `creation_biped`), so wire 16 is slot 15
+                // and the largest index the field carries is 30. This gate still asserted the
+                // superseded four-bit ceiling and failed on the 16-player clip for it.
                 assert!(
-                    sl <= 14,
-                    "{name}: stamp {o} named slot {sl}; the four-bit field cannot carry an index \
-                     above 14, because the engine writes index + 1"
+                    sl <= 15,
+                    "{name}: stamp {o} named slot {sl}; the header has sixteen slots"
                 );
                 assert_eq!(
                     sl,
                     o - 1,
-                    "{name}: stamp {o} must map to slot {} by the engine's own `read_bits(4) - 1`",
+                    "{name}: stamp {o} must map to slot {} by the engine's own `read_bits(5) - 1`",
                     o - 1
                 );
                 assert!(
@@ -6492,10 +6520,10 @@ mod tests {
             }
         }
         eprintln!(
-            "film_decode: the owner stamp follows `read_bits(4) - 1` on {checked} film(s); \
+            "film_decode: the owner stamp follows `read_bits(5) - 1` on {checked} film(s); \
              {with_zero} carry a stamp-0 body ({zero_bodies} bod(ies) the field attributes to \
-             nobody); {sixteen} film(s) occupy all sixteen header slots, which a four-bit field \
-             cannot cover -- so at least one player there is unnameable from the stamp alone"
+             nobody); {sixteen} film(s) occupy all sixteen header slots, all of which a \
+             five-bit field covers"
         );
     }
 

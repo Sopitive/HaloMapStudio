@@ -282,7 +282,7 @@ impl Distances {
 
     /// Do these distances describe a usable curve?
     ///
-    /// A gestalt row that is all zeroes (or has the knots out of order) is
+    /// A gestalt row that is all zeroes (or has the knots that ARE set out of order) is
     /// not a curve, and silently treating it as one is how a fabricated
     /// falloff gets in by the back door. A caller that gets `false` must play
     /// the sound unattenuated or not at all, by its own rule.
@@ -301,7 +301,13 @@ impl Distances {
         if self.maximum <= 0.0 {
             return false;
         }
-        k.windows(2).all(|w| w[1] >= w[0])
+        // A knot at distance 0 is not a knot (see `curve`: `push` skips it), so a row that leaves
+        // `sustain begin` / `sustain end` at zero is still the curve `(minimum, 1) -> (maximum, 0)`
+        // and must not be called unusable for it: it is the SHAPE OF EVERY VEHICLE ENGINE LOOP
+        // (`minimum 7, maximum 40`), which therefore played at full volume from any distance.
+        // Only the knots that exist have to be in order.
+        let set: Vec<f32> = k.into_iter().filter(|v| *v > 0.0).collect();
+        set.windows(2).all(|w| w[1] >= w[0])
     }
 }
 
@@ -442,6 +448,7 @@ pub const UGH_PITCH_RANGES: usize = 0x4C;
 pub const UGH_PERMUTATIONS: usize = 0x58;
 
 pub const SCALE_SIZE: usize = 20;
+pub const PITCH_PARAMS_SIZE: usize = 16;
 pub const PITCH_RANGE_SIZE: usize = 12;
 pub const PERMUTATION_SIZE: usize = 24;
 pub const IMPORT_NAME_SIZE: usize = 4;
@@ -489,6 +496,16 @@ pub struct PitchRange {
     pub permutation_count: usize,
 }
 
+/// `sound_gestalt_pitch_range_parameters_block`, 16 bytes (all cents). Debug: natural pitch
+/// `sub_1809B4B40` reads `+0x00`; the bend bounds `sub_1809B4DA0` are `+0x04/+0x06`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PitchParams {
+    pub natural_pitch: i16,
+    pub bend_bounds: (i16, i16),
+    pub max_gain_bounds: (i16, i16),
+    pub playback_bounds: (i16, i16),
+}
+
 /// A whole cache's `ugh!`, read once.
 #[derive(Clone, Debug, Default)]
 pub struct Gestalt {
@@ -497,6 +514,12 @@ pub struct Gestalt {
     /// `sound_gestalt_scale_block`: gain modifier dB (lower, upper), pitch
     /// modifier cents, skip fraction modifier.
     pub scale_gain_db: Vec<(f32, f32)>,
+    /// `sound_gestalt_scale_block +0x08 pitch modifier [cents]` (lower, upper): the span a
+    /// looping sound's SCALE (0..1) sweeps. Debug `0x1806538B0`:
+    /// `lerp(lower, upper, scale) + pitch_offset`.
+    pub scale_pitch_cents: Vec<(i16, i16)>,
+    /// `ugh!.pitch range parameters` (16 B), indexed by `PitchRange::parameters_index`.
+    pub pitch_params: Vec<PitchParams>,
     pub pitch_ranges: Vec<PitchRange>,
     pub permutations: Vec<Permutation>,
     /// `ugh!.import names`: one string id per entry.
@@ -519,6 +542,7 @@ impl Gestalt {
         let pb = tag_block(native, cache, tag, UGH_PLAYBACKS, PLAYBACK_SIZE, MAX_BLOCK);
         let sc = tag_block(native, cache, tag, UGH_SCALES, SCALE_SIZE, MAX_BLOCK);
         let nm = tag_block(native, cache, tag, UGH_IMPORT_NAMES, IMPORT_NAME_SIZE, MAX_BLOCK);
+        let pp = tag_block(native, cache, tag, UGH_PITCH_RANGE_PARAMETERS, PITCH_PARAMS_SIZE, MAX_BLOCK);
         let pr = tag_block(native, cache, tag, UGH_PITCH_RANGES, PITCH_RANGE_SIZE, MAX_BLOCK);
         let pm = tag_block(native, cache, tag, UGH_PERMUTATIONS, PERMUTATION_SIZE, MAX_BLOCK);
         if pm.is_empty() || pr.is_empty() {
@@ -534,6 +558,22 @@ impl Gestalt {
             .map(|c| {
                 let f = |o: usize| f32::from_le_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]);
                 (f(0x00), f(0x04))
+            })
+            .collect();
+        let scale_pitch_cents: Vec<(i16, i16)> = sc
+            .chunks_exact(SCALE_SIZE)
+            .map(|c| (i16::from_le_bytes([c[0x08], c[0x09]]), i16::from_le_bytes([c[0x0A], c[0x0B]])))
+            .collect();
+        let pitch_params: Vec<PitchParams> = pp
+            .chunks_exact(PITCH_PARAMS_SIZE)
+            .map(|c| {
+                let h = |o: usize| i16::from_le_bytes([c[o], c[o + 1]]);
+                PitchParams {
+                    natural_pitch: h(0x00),
+                    bend_bounds: (h(0x04), h(0x06)),
+                    max_gain_bounds: (h(0x08), h(0x0A)),
+                    playback_bounds: (h(0x0C), h(0x0E)),
+                }
             })
             .collect();
         let import_names: Vec<u32> = nm
@@ -596,6 +636,8 @@ impl Gestalt {
             tag,
             playbacks,
             scale_gain_db,
+            scale_pitch_cents,
+            pitch_params,
             pitch_ranges,
             permutations,
             import_names,
@@ -621,6 +663,16 @@ impl Gestalt {
     /// The gain law row for a `$#!+`, if it has one.
     pub fn playback_of(&self, snd: &CacheSound) -> Option<&Playback> {
         self.playbacks.get(snd.playback_index as usize)
+    }
+
+    /// `ugh!.scales[i]`'s authored pitch modifier, in cents (lower, upper).
+    pub fn scale_pitch_of(&self, snd: &CacheSound) -> (i16, i16) {
+        self.scale_pitch_cents.get(snd.scale_index as usize).copied().unwrap_or((0, 0))
+    }
+
+    /// The pitch parameters of one pitch range.
+    pub fn params_of(&self, pr: &PitchRange) -> Option<&PitchParams> {
+        self.pitch_params.get(pr.parameters_index as usize)
     }
 
     /// `ugh!.scales[i]`'s authored gain modifier, in dB (lower, upper).
@@ -1126,6 +1178,28 @@ impl GainLaw {
         distance_gain: Option<f32>,
         random01: f32,
     ) -> f32 {
+        self.voice_gain_db_extra(snd, playback, scale_gain_db, permutation_gain_db, distance_gain, random01, 0.0)
+    }
+
+    /// [`GainLaw::voice_gain_db`] with the SOURCE's own gain term, which the engine sums INSIDE
+    /// the clamp (`sub_180653820`: `source.gain_db + class ducking + interp_db(...)`).
+    ///
+    /// A looping sound's track gives it one: `looping_sound_manager.cpp` writes
+    /// `track.gain_db + layer fade + pitch-range crossfade` into `source + 0xCC` every frame
+    /// (debug `0x1809BA830`), and `sub_180659D70` adds that to the gain it hands the mixer.
+    /// `random01` is the SCALE for a looping sound: `sub_180653820`'s last argument is
+    /// `source + 0x24`, the loop's scale, not a random draw.
+    #[allow(clippy::too_many_arguments)]
+    pub fn voice_gain_db_extra(
+        &self,
+        snd: &CacheSound,
+        playback: Option<&Playback>,
+        scale_gain_db: (f32, f32),
+        permutation_gain_db: i8,
+        distance_gain: Option<f32>,
+        random01: f32,
+        source_db: f32,
+    ) -> f32 {
         let dist_db = match distance_gain {
             Some(g) => linear_to_db(g),
             None => 0.0,
@@ -1133,7 +1207,7 @@ impl GainLaw {
         let (clo, chi) = self.class(snd.class).map(|c| c.gain_bounds_db).unwrap_or((0.0, 0.0));
         let draw = interp_db_power(clo + scale_gain_db.0, chi + scale_gain_db.1, random01);
         let base = playback.map(|p| p.gain_base_db).unwrap_or(0.0);
-        let total = dist_db + draw + base + permutation_gain_db as f32;
+        let total = dist_db + source_db + draw + base + permutation_gain_db as f32;
         let clamped = if total.is_finite() { total.clamp(MIN_GAIN_DB, MAX_GAIN_DB) } else { MIN_GAIN_DB };
         clamped + self.master_db
     }
@@ -1219,6 +1293,31 @@ pub fn interp_db_power(a_db: f32, b_db: f32, t: f32) -> f32 {
     linear_to_db(g)
 }
 
+/// `interp_db` with its mode (debug `0x180973110`, all five arms). `t` is clamped to `0..1` first
+/// (`0x180973410` does that for the callers that use it).
+///
+/// 0 `_linear`: lerp in dB. 1 `_power`: lerp in linear gain. 2 `_inverse_power`: linear gain
+/// again, with `t` reshaped by `sqrt` when the end is louder than the start (and by
+/// `1 - sqrt(1 - t)` when it is quieter). 3 is mode 2 with the two shapes swapped. 4
+/// `_ease_in_out`: `3t^2 - 2t^3` as the weight, in linear gain.
+///
+/// The looping-sound manager crossfades overlapping pitch ranges with mode 2 from -64 dB to 0 dB
+/// (`looping_sound_manager.cpp`, debug `0x1809BA830`).
+pub fn interp_db(mode: u8, a_db: f32, b_db: f32, t: f32) -> f32 {
+    let t = if t.is_finite() { t.clamp(0.0, 1.0) } else { 0.0 };
+    if mode == 0 {
+        return a_db + (b_db - a_db) * t;
+    }
+    let (ga, gb) = (db_to_linear(a_db), db_to_linear(b_db));
+    let w = match mode {
+        2 => if gb > ga { t.sqrt() } else { 1.0 - (1.0 - t).sqrt() },
+        3 => if gb > ga { 1.0 - (1.0 - t).sqrt() } else { t.sqrt() },
+        4 => (t * t * 3.0 - 2.0 * t * t * t).clamp(0.0, 1.0),
+        _ => t,
+    };
+    linear_to_db(ga + (gb - ga) * w)
+}
+
 // ---------------------------------------------------------------------------------------------
 // `lsnd` — sound_looping: the ambience and music beds
 // ---------------------------------------------------------------------------------------------
@@ -1241,7 +1340,13 @@ pub const TRACK_IN: usize = 0x0C;
 pub const TRACK_LOOP: usize = 0x1C;
 pub const TRACK_OUT: usize = 0x2C;
 pub const TRACK_ALT_LOOP: usize = 0x3C;
+pub const TRACK_ALT_OUT: usize = 0x4C;
 pub const TRACK_FADE_IN_SECONDS: usize = 0x7C;
+pub const TRACK_FADE_IN_MODE: usize = 0x80;
+pub const TRACK_FADE_OUT_SECONDS: usize = 0x84;
+pub const TRACK_FADE_OUT_MODE: usize = 0x88;
+pub const TRACK_ALT_CROSSFADE_SECONDS: usize = 0x8C;
+pub const TRACK_ALT_CROSSFADE_MODE: usize = 0x90;
 
 /// `looping_sound_flags` bit 1: "not a loop — this is a collection of
 /// permutations strung together that should play once then stop".
@@ -1257,7 +1362,18 @@ pub struct LoopTrack {
     /// The `snd!` that loops. **This is the ambience bed.**
     pub loop_snd: Option<u32>,
     pub outro: Option<u32>,
+    /// The `snd!` that loops while the owner is LOADED (`sound_looping_set_alternate` true).
+    /// The vehicle engine flips it from its `load and cruise sound` block: cruise = `loop`,
+    /// loaded = `alt loop`.
+    pub alt_loop: Option<u32>,
+    pub alt_out: Option<u32>,
     pub fade_in_seconds: f32,
+    pub fade_out_seconds: f32,
+    pub alt_crossfade_seconds: f32,
+    /// `looping_sound_fade_modes`, which are `interp_db`'s modes (see [`interp_db`]).
+    pub fade_in_mode: u8,
+    pub fade_out_mode: u8,
+    pub alt_crossfade_mode: u8,
 }
 
 /// An `lsnd`, flattened.
@@ -1289,7 +1405,14 @@ impl LoopingSound {
                     intro: tag_ref_at(c, TRACK_IN),
                     loop_snd: tag_ref_at(c, TRACK_LOOP),
                     outro: tag_ref_at(c, TRACK_OUT),
+                    alt_loop: tag_ref_at(c, TRACK_ALT_LOOP),
+                    alt_out: tag_ref_at(c, TRACK_ALT_OUT),
                     fade_in_seconds: f(TRACK_FADE_IN_SECONDS),
+                    fade_out_seconds: f(TRACK_FADE_OUT_SECONDS),
+                    alt_crossfade_seconds: f(TRACK_ALT_CROSSFADE_SECONDS),
+                    fade_in_mode: c[TRACK_FADE_IN_MODE],
+                    fade_out_mode: c[TRACK_FADE_OUT_MODE],
+                    alt_crossfade_mode: c[TRACK_ALT_CROSSFADE_MODE],
                 }
             })
             .collect();
@@ -2502,6 +2625,20 @@ mod tests {
         assert!(d.usable());
         d.maximum = f32::NAN;
         assert!(!d.usable());
+    }
+
+    /// Every vehicle engine loop authors `minimum 7 / maximum 40` and nothing else, which is the
+    /// two-knot curve `(7, 1) -> (40, 0)`: unset knots are not knots (`curve` skips them), so such
+    /// a row is usable and must attenuate. It used to be refused, and those sounds played at full
+    /// volume from any distance.
+    #[test]
+    fn a_row_that_leaves_the_sustain_knots_unset_is_still_a_curve() {
+        let d = Distances { minimum: 7.0, maximum: 40.0, ..Default::default() };
+        assert!(d.usable());
+        assert_eq!(d.curve().count, 2);
+        assert_eq!(d.gain_at(3.0), 1.0, "flat inside the minimum distance");
+        assert!(d.gain_at(20.0) < 0.5 && d.gain_at(20.0) > 0.0, "falling between");
+        assert_eq!(d.gain_at(45.0), 0.0, "silent past the maximum");
     }
 
     #[test]

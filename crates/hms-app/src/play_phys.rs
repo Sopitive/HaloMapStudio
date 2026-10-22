@@ -50,10 +50,10 @@
 //!
 //! # What is deliberately absent
 //!
-//! There is **no step-up height**, because Reach does not author one: the character proxy is a
-//! Havok capsule and stepping over a small ledge is emergent from its bottom hemisphere (whose
-//! radius IS authored, above) plus the slope-limit rejection. See `crate::play_ctl`, which is
-//! why that module has no step constant either.
+//! There is **no step-up height**, because Reach does not author one: the engine's own character
+//! controller (`character_physics_mode_ground.cpp`) judges every contact on its NORMAL, so a low
+//! ledge is climbed or refused by the capsule's authored radius and the authored slope limit
+//! alone. See `crate::play_ctl`, which is why that module has no step constant either.
 
 use hms_native::{CacheHandle, NativeDll};
 
@@ -124,6 +124,17 @@ pub const BIPD_RUNTIME_CAMERA_HEIGHT_VELOCITY: usize = 0x584;
 pub const BIPD_PHYSICS: usize = 0x5E8;
 /// `character_physics_struct` `ground physics` — `character_physics_ground_struct`, 68 bytes.
 pub const PHYSICS_GROUND: usize = 0x44;
+/// Within the ground struct: `maximum slope angle` +0x00, the four slope-speed angles
+/// (`downhill falloff` +0x04, `downhill cutoff` +0x08, `uphill falloff` +0x0C, `uphill cutoff`
+/// +0x10), the two velocity scales (`downhill` +0x14, `uphill` +0x18), `scale ground adhesion
+/// velocity` +0x38, `gravity scale` +0x3C, `airborne acceleration scale` +0x40. The engine
+/// derives five `runtime_*` values from these at tag post-process (+0x1C..+0x2C); they are
+/// recomputed in [`PlayerPhysics`] rather than read, and `play_ctl`'s
+/// `probe_the_authored_ground_physics` checks the two agree on a real cache (they do, exactly).
+pub const GROUND_SLOPE_ANGLES: usize = 0x04;
+pub const GROUND_DOWNHILL_SCALE: usize = 0x14;
+pub const GROUND_UPHILL_SCALE: usize = 0x18;
+pub const GROUND_ADHESION_SCALE: usize = 0x38;
 
 // ---------------------------------------------------------------------------------------------
 // the constants
@@ -183,8 +194,23 @@ pub struct PlayerPhysics {
     pub height_crouching: f32,
     pub radius: f32,
     pub mass: f32,
-    /// The steepest ground that can be stood on and walked up, RADIANS from horizontal.
+    /// The steepest CONTACT NORMAL that can be stood on, RADIANS from horizontal. (The engine
+    /// tests the SURFACE it belongs to against a separate global 35 degrees; see
+    /// `play_ctl::ground_plane`.)
     pub max_slope: f32,
+    /// The four slope-speed angles, RADIANS: `downhill falloff`, `downhill cutoff`,
+    /// `uphill falloff`, `uphill cutoff` (ground struct +0x04..+0x10). Authored as angles; the
+    /// engine turns them into the sines [`PlayerPhysics::slope_speed_scale`] compares against.
+    pub downhill_falloff: f32,
+    pub downhill_cutoff: f32,
+    pub uphill_falloff: f32,
+    pub uphill_cutoff: f32,
+    /// Walking speed scale at the steepest downhill / uphill (ground struct +0x14 / +0x18).
+    pub downhill_velocity_scale: f32,
+    pub uphill_velocity_scale: f32,
+    /// `scale ground adhesion velocity` (+0x38): multiplies the velocity the engine pushes the
+    /// body into its ground plane with, when positive.
+    pub ground_adhesion_scale: f32,
     /// Per-biped scale on gravity and on airborne acceleration.
     pub gravity_scale: f32,
     pub airborne_acceleration_scale: f32,
@@ -513,6 +539,13 @@ impl PlayerPhysics {
             radius: b.radius,
             mass: b.mass,
             max_slope: b.max_slope,
+            downhill_falloff: b.slope_angles[0],
+            downhill_cutoff: b.slope_angles[1],
+            uphill_falloff: b.slope_angles[2],
+            uphill_cutoff: b.slope_angles[3],
+            downhill_velocity_scale: b.downhill_velocity_scale,
+            uphill_velocity_scale: b.uphill_velocity_scale,
+            ground_adhesion_scale: b.ground_adhesion_scale,
             gravity_scale: b.gravity_scale,
             airborne_acceleration_scale: b.airborne_acceleration_scale,
             turning_speed: b.turning_speed,
@@ -563,6 +596,13 @@ impl PlayerPhysics {
     /// rather than quietly applied. Where it is 1.0 the question is moot; where it is not, the
     /// note says so out loud and the number used is `GRAVITY × scale` with the measurement's own
     /// (equally scaled) body as its reference.
+    ///
+    /// **And for a PLAYER the engine does not read the biped's scale at all** (found 2026-10-20):
+    /// `sub_140E18320` builds the physics input's gravity from `sub_140DC5C40` (this scale times
+    /// the jump's runtime scale) only when the unit has NO player index; with one, it multiplies
+    /// by the player-trait gravity table instead (1.0 unless a game variant changes it). So the
+    /// jump's `sub_140DCB3B0(unit, 0.5)` never reaches a player's gravity either. The scale reads
+    /// 0.0 (= unscaled) on both forge_halo species, which is why this has never mattered.
     pub fn gravity(&self) -> f32 {
         GRAVITY * self.gravity_scale_or_unity()
     }
@@ -606,13 +646,60 @@ impl PlayerPhysics {
         self.airborne_acceleration * if self.airborne_acceleration_scale > 0.0 { self.airborne_acceleration_scale } else { 1.0 }
     }
 
+    /// The velocity the stick COMMANDS, in the body's own frame: `(forward, right)` wu/s, before
+    /// the sprint multiplier. This is `sub_1404E97C0` (`character_physics.cpp`'s ground-input
+    /// builder), line for line:
+    ///
+    /// * the stick is clamped into the unit CIRCLE (not a square), then each axis is snapped to
+    ///   +-1 once it passes **0.92** -- so a gamepad that cannot quite reach the rim still runs
+    ///   at full speed;
+    /// * forward uses `run forward` for a positive axis and `run backward` for a negative one,
+    ///   sideways uses `run sideways`; each is blended toward its `sneak` twin by the crouch
+    ///   FRACTION (0 standing .. 1 crouched), not switched by a flag;
+    /// * the two components are scaled independently, so a diagonal is
+    ///   `(0.707 x forward cap, 0.707 x sideways cap)` -- NOT the ellipse the old controller
+    ///   composed (the two agree to 0.5% at the authored Spartan row, but only this one is the
+    ///   engine's).
+    ///
+    /// `walking` is HMS's own slow-walk key (Reach has none for a player): the single authored
+    /// `walking speed` for every axis.
+    pub fn commanded_velocity(&self, fwd: f32, right: f32, crouch: f32, walking: bool) -> (f32, f32) {
+        let (mut sx, mut sy) = (fwd, right);
+        let len2 = sx * sx + sy * sy;
+        if len2 > 1.0 {
+            let k = 1.0 / len2.sqrt();
+            sx *= k;
+            sy *= k;
+        }
+        // `fabsf(v) - 0.92 >= 0 -> sign(v)`: exactly 0.92 snaps.
+        let snap = |v: f32| if v.abs() >= 0.92 { v.signum() } else { v };
+        let (sx, sy) = (snap(sx), snap(sy));
+        if walking {
+            // One authored walk speed, no direction split.
+            return (sx * self.walk_speed, sy * self.walk_speed);
+        }
+        let c = crouch.clamp(0.0, 1.0);
+        let lerp = |run: f32, sneak: f32| run + (sneak - run) * c;
+        let cap_f = if sx <= 0.0 {
+            lerp(self.run_backward, self.sneak_backward)
+        } else {
+            lerp(self.run_forward, self.sneak_forward)
+        };
+        (sx * cap_f, sy * lerp(self.run_sideways, self.sneak_sideways))
+    }
+
+    /// Ground acceleration at a crouch fraction, wu/s^2: `run acceleration` blended toward
+    /// `sneak acceleration` exactly as the speeds are (`sub_1404E97C0`'s `+0x10`/`+0x20` pair).
+    pub fn ground_acceleration(&self, crouch: f32) -> f32 {
+        let c = crouch.clamp(0.0, 1.0);
+        self.run_acceleration + (self.sneak_acceleration - self.run_acceleration) * c
+    }
+
     /// Top speed for a stick direction in the body's own frame, wu/s: `fwd` +1 is straight
     /// ahead, `right` +1 is a strafe. Reach authors three different caps (forward, backward,
     /// sideways), so a backpedal is slower than a charge, and crouching swaps the whole set for
-    /// the `sneak` one.
-    ///
-    /// The directional caps are composed as an ELLIPSE, which is what makes a diagonal neither
-    /// faster than a straight run (the bug a plain max() gives) nor slower than a strafe.
+    /// the `sneak` one. The stick is taken at full deflection in the given direction; this is
+    /// the length of [`commanded_velocity`](Self::commanded_velocity) for it.
     pub fn top_speed(&self, fwd: f32, right: f32, crouched: bool, walking: bool) -> f32 {
         self.top_speed_with(fwd, right, crouched, walking, false)
     }
@@ -631,23 +718,59 @@ impl PlayerPhysics {
     }
 
     fn top_speed_base(&self, fwd: f32, right: f32, crouched: bool, walking: bool) -> f32 {
-        let (f_pos, f_neg, side) = if crouched {
-            (self.sneak_forward, self.sneak_backward, self.sneak_sideways)
-        } else if walking {
-            // One authored walk speed, no direction split.
-            (self.walk_speed, self.walk_speed, self.walk_speed)
-        } else {
-            (self.run_forward, self.run_backward, self.run_sideways)
-        };
         let len = (fwd * fwd + right * right).sqrt();
         if len < 1e-6 {
             return 0.0;
         }
-        let (uf, ur) = (fwd / len, right / len);
-        let cap_f = if uf >= 0.0 { f_pos } else { f_neg };
-        let (a, b) = (cap_f.max(1e-4), side.max(1e-4));
-        // 1 / sqrt((uf/a)^2 + (ur/b)^2) — the radius of the ellipse along the stick direction.
-        1.0 / ((uf / a).powi(2) + (ur / b).powi(2)).sqrt()
+        let (f, r) = self.commanded_velocity(fwd / len, right / len, if crouched { 1.0 } else { 0.0 }, walking);
+        (f * f + r * r).sqrt()
+    }
+
+    /// The speed multiplier the engine applies along the direction of travel for the SLOPE it
+    /// is on, from `z` = the vertical component of the unit travel direction (sine of the slope
+    /// angle, + uphill). `sub_1406C4A20`, line for line:
+    ///
+    /// ```text
+    ///   z <= sin(-downhill falloff)                      -> downhill velocity scale
+    ///   z >= sin(uphill cutoff)                          -> uphill velocity scale
+    ///   sin(uphill falloff) < z < sin(uphill cutoff)     -> linear 1 .. uphill scale
+    ///   otherwise                                        -> 1
+    /// ```
+    ///
+    /// The downhill side is a STEP at the falloff angle (the `downhill cutoff` angle is
+    /// authored and post-processed to a sine, but the code never reads it: the disassembly of
+    /// the function touches `+0x58 +0x5C +0x64 +0x6C +0x70` of the physics struct and no other).
+    pub fn slope_speed_scale(&self, z: f32) -> f32 {
+        let downhill_k0 = (-self.downhill_falloff).sin();
+        let uphill_k0 = self.uphill_falloff.sin();
+        let uphill_k1 = self.uphill_cutoff.sin();
+        if z <= downhill_k0 {
+            return self.downhill_velocity_scale;
+        }
+        if z >= uphill_k1 {
+            return self.uphill_velocity_scale;
+        }
+        if z > uphill_k0 {
+            return (z - uphill_k0) * (self.uphill_velocity_scale - 1.0) / (uphill_k1 - uphill_k0) + 1.0;
+        }
+        1.0
+    }
+
+    /// `cos(maximum slope angle)` -- the engine's `runtime_minimum_normal_k`: a contact whose
+    /// normal's z does not exceed it is not ground.
+    pub fn min_normal_k(&self) -> f32 {
+        self.max_slope.cos()
+    }
+
+    /// The sprint speed fraction after `t` seconds of sprinting, 0 .. 1 (`sub_1401A2F50`): the
+    /// biped does not start to gain speed until `seconds to start` has passed, then
+    /// `sqrt((t - start) / (full - 1 tick))` of the way (a tick is 1/60 s) to the authored multiplier -- the
+    /// engine's transition function type 1, whose 1024-entry table is `sqrt` to within one
+    /// 8-bit step (read from the exe and compared: error 0.0039 = 1/255).
+    pub fn sprint_fraction(&self, t: f32) -> f32 {
+        let tick = 1.0 / crate::physics_settle::TICK_HZ;
+        let span = (self.sprint_seconds_to_full - tick).max(tick);
+        ((t - self.sprint_seconds_to_start) / span).clamp(0.0, 1.0).sqrt()
     }
 
     /// #play-rate  **The AUTHORED natural speed of one locomotion state, wu/s** — the speed at
@@ -730,11 +853,6 @@ impl PlayerPhysics {
         }
     }
 
-    /// Ground acceleration, wu/s².
-    pub fn acceleration(&self, crouched: bool) -> f32 {
-        if crouched { self.sneak_acceleration } else { self.run_acceleration }
-    }
-
     /// Eye height for a stance, wu above the feet.
     pub fn eye_height(&self, crouched: bool, moving: bool) -> f32 {
         match (crouched, moving) {
@@ -764,6 +882,7 @@ impl PlayerPhysics {
              | per-weapon-class camera height rows = {} span {:.3}..{:.3} wu\n\
              bipd  physics: capsule {:.3} wu tall ({:.3} crouched), radius {:.3} wu, mass {:.1} \
              | max slope {:.1} deg | gravity scale {:.2} | airborne accel scale {:.2} | turn {:.0} deg/s (stationary threshold {:.0} deg)\n\
+             bipd  slope speed: downhill x{:.3} past {:.1} deg (cutoff {:.1}) | uphill x{:.3} from {:.1} to {:.1} deg | ground adhesion scale {:.3}\n\
              {}\n\
              jump apex from the jump velocity and that gravity alone: {:.3} wu",
             self.species_row,
@@ -782,6 +901,9 @@ impl PlayerPhysics {
             self.max_slope.to_degrees(), self.gravity_scale, self.airborne_acceleration_scale,
             self.turning_speed.to_degrees(),
             self.stationary_turn_threshold.to_degrees(),
+            self.downhill_velocity_scale, self.downhill_falloff.to_degrees(), self.downhill_cutoff.to_degrees(),
+            self.uphill_velocity_scale, self.uphill_falloff.to_degrees(), self.uphill_cutoff.to_degrees(),
+            self.ground_adhesion_scale,
             self.gravity_note(),
             self.jump_velocity * self.jump_velocity / (2.0 * self.gravity().max(1e-4)),
         )
@@ -961,6 +1083,15 @@ impl PlayerPhysics {
             radius: rd_f32(&m, BIPD_PHYSICS + 0x0C),
             mass: rd_f32(&m, BIPD_PHYSICS + 0x10),
             max_slope: rd_f32(&m, g),
+            slope_angles: [
+                rd_f32(&m, g + GROUND_SLOPE_ANGLES),
+                rd_f32(&m, g + GROUND_SLOPE_ANGLES + 4),
+                rd_f32(&m, g + GROUND_SLOPE_ANGLES + 8),
+                rd_f32(&m, g + GROUND_SLOPE_ANGLES + 12),
+            ],
+            downhill_velocity_scale: rd_f32(&m, g + GROUND_DOWNHILL_SCALE),
+            uphill_velocity_scale: rd_f32(&m, g + GROUND_UPHILL_SCALE),
+            ground_adhesion_scale: rd_f32(&m, g + GROUND_ADHESION_SCALE),
             gravity_scale: rd_f32(&m, g + 0x3C),
             airborne_acceleration_scale: rd_f32(&m, g + 0x40),
         })
@@ -986,6 +1117,10 @@ struct BipedFields {
     radius: f32,
     mass: f32,
     max_slope: f32,
+    slope_angles: [f32; 4],
+    downhill_velocity_scale: f32,
+    uphill_velocity_scale: f32,
+    ground_adhesion_scale: f32,
     gravity_scale: f32,
     airborne_acceleration_scale: f32,
 }
@@ -1038,6 +1173,13 @@ pub mod tests_support {
             radius: 0.21,
             mass: 90.0,
             max_slope: 45f32.to_radians(),
+            downhill_falloff: 0.0,
+            downhill_cutoff: 0.0,
+            uphill_falloff: 0.0,
+            uphill_cutoff: 0.0,
+            downhill_velocity_scale: 1.0,
+            uphill_velocity_scale: 1.0,
+            ground_adhesion_scale: 0.0,
             gravity_scale: 1.0,
             airborne_acceleration_scale: 1.0,
             turning_speed: 2.0,
@@ -1141,12 +1283,11 @@ mod tests {
         let p = spartan_row();
         // --- the authored speed per state, as literals off the row -------------------------
         //
-        // Compared with a tolerance rather than for equality: a SIDEWAYS cap comes back through
-        // `top_speed_base`'s directional ellipse, `1 / sqrt((uf/a)^2 + (ur/b)^2)`, which for a
-        // pure strafe is `b` only up to f32 rounding (1.9800001 against 1.98). That is the
-        // fixture's own arithmetic, not a defect -- the tolerance is 1e-5, four orders of
-        // magnitude tighter than the 0.57 wu/s gap between any two authored speeds in the row,
-        // so it cannot let a wrong field through.
+        // Compared with a tolerance rather than for equality: every answer is the length of
+        // `commanded_velocity`, i.e. `sqrt(forward^2 + right^2)`, which for a pure axis is the
+        // cap only up to f32 rounding. That is the fixture's own arithmetic, not a defect -- the
+        // tolerance is 1e-5, four orders of magnitude tighter than the 0.57 wu/s gap between any
+        // two authored speeds in the row, so it cannot let a wrong field through.
         let got = |st: Stance, g: Gait| p.gait_speed(st, g);
         let is = |st: Stance, g: Gait, want: f32| {
             let v = got(st, g).unwrap_or_else(|| panic!("{st:?}/{g:?} has no authored speed"));
@@ -1393,8 +1534,9 @@ mod tests {
         assert!((rp::jump_apex(2.0 * v, GRAVITY) - 4.0 * apex).abs() < 1e-4);
     }
 
-    /// The directional caps compose as an ellipse: a diagonal is between the two straight caps,
-    /// never past the faster one. A plain `max()` would let a diagonal run outrun a straight run.
+    /// The two directional caps compose the way the engine composes them (a clamped stick, each
+    /// axis scaled by its own cap): a diagonal is between the two straight caps, never past the
+    /// faster one. A plain `max()` would let a diagonal run outrun a straight run.
     #[test]
     fn a_diagonal_is_between_the_two_straight_caps() {
         let p = stand_in();
@@ -1458,5 +1600,73 @@ mod tests {
         // dividing. (A band on the VALUE is deliberately absent -- see the note above.)
         assert!(apex > 0.0 && apex.is_finite());
         assert_eq!(crate::reach_physics::jump_apex(p.jump_velocity, 0.0), f32::INFINITY);
+    }
+
+    /// #play-gate  THE STICK -> COMMANDED VELOCITY (`sub_1404E97C0`), worked by hand on the
+    /// forge_halo Spartan row: forward 2.200, backward 1.980, sideways 1.980, sneak
+    /// 0.900 / 0.810 / 0.810.
+    ///
+    /// * a diagonal clamps into the unit circle FIRST: (1,1) -> (0.7071, 0.7071), then each axis
+    ///   takes its own cap: (1.5556, 1.4001), length 2.0928 -- not an ellipse's 2.081;
+    /// * a stick axis past 0.92 snaps to full (0.95 forward -> the whole 2.200), one at 0.91 does
+    ///   not (0.91 x 2.2 = 2.002);
+    /// * crouching blends by the FRACTION: half crouched is the mean of the two caps;
+    /// * backward uses the backward cap, and walking the single walking speed.
+    ///
+    /// SABOTAGE: remove the circle clamp -> the diagonal reads (2.2, 1.98); remove the snap ->
+    /// the 0.95 row reads 2.09; switch crouch on a flag (`crouch > 0.5`) -> the half row reads
+    /// 2.2.
+    #[test]
+    fn the_stick_becomes_the_commanded_velocity_the_engine_builds() {
+        let p = PlayerPhysics {
+            walk_speed: 0.512,
+            run_forward: 2.200,
+            run_backward: 1.980,
+            run_sideways: 1.980,
+            sneak_forward: 0.900,
+            sneak_backward: 0.810,
+            sneak_sideways: 0.810,
+            ..stand_in()
+        };
+        let near = |got: (f32, f32), want: (f32, f32), what: &str| {
+            assert!((got.0 - want.0).abs() < 1e-4 && (got.1 - want.1).abs() < 1e-4, "{what}: got {got:?}, want {want:?}");
+        };
+        let r = std::f32::consts::FRAC_1_SQRT_2;
+        near(p.commanded_velocity(1.0, 0.0, 0.0, false), (2.2, 0.0), "forward");
+        near(p.commanded_velocity(-1.0, 0.0, 0.0, false), (-1.98, 0.0), "backward");
+        near(p.commanded_velocity(0.0, 1.0, 0.0, false), (0.0, 1.98), "strafe");
+        near(p.commanded_velocity(1.0, 1.0, 0.0, false), (r * 2.2, r * 1.98), "diagonal");
+        let d = p.commanded_velocity(1.0, 1.0, 0.0, false);
+        assert!((d.0.hypot(d.1) - 2.0928).abs() < 1e-3, "diagonal speed {:.4}, hand-worked 2.0928", d.0.hypot(d.1));
+        near(p.commanded_velocity(0.95, 0.0, 0.0, false), (2.2, 0.0), "a stick at 0.95 snaps to full");
+        near(p.commanded_velocity(0.91, 0.0, 0.0, false), (0.91 * 2.2, 0.0), "a stick at 0.91 does not");
+        near(p.commanded_velocity(0.5, 0.0, 0.0, false), (1.1, 0.0), "half a stick is half a speed");
+        near(p.commanded_velocity(1.0, 0.0, 1.0, false), (0.9, 0.0), "crouched forward");
+        near(p.commanded_velocity(1.0, 0.0, 0.5, false), (1.55, 0.0), "half crouched blends, it does not switch");
+        near(p.commanded_velocity(-1.0, 0.0, 1.0, false), (-0.81, 0.0), "crouched backward");
+        near(p.commanded_velocity(1.0, 0.0, 0.0, true), (0.512, 0.0), "walking");
+        near(p.commanded_velocity(0.0, 0.0, 0.0, false), (0.0, 0.0), "no stick, no velocity");
+        // acceleration blends the same way
+        let q = PlayerPhysics { run_acceleration: 8.5, sneak_acceleration: 6.1, ..p };
+        assert!((q.ground_acceleration(0.0) - 8.5).abs() < 1e-6 && (q.ground_acceleration(1.0) - 6.1).abs() < 1e-6);
+        assert!((q.ground_acceleration(0.5) - 7.3).abs() < 1e-5);
+    }
+
+    /// #play-gate  THE SPRINT FRACTION: nothing until `seconds to start`, then the engine's
+    /// type-1 transition (which is `sqrt`, read off its 1024-entry table in the exe to within
+    /// one 8-bit step) over `seconds to full - 1 tick`. Hand-worked with start 0.2 s and full
+    /// 1.0 s: the span is 1.0 - 1/60 = 0.98333 s (one TICK, at the engine's 60 Hz), so the fraction is 0
+    /// at 0.2 s, exactly 0.5 a quarter of the span in (t = 0.44583), and 1 from t = 1.18333 on.
+    ///
+    /// SABOTAGE: make it linear -> the quarter-span row reads 0.25; ignore the start -> the
+    /// 0.2 s row reads 0.45.
+    #[test]
+    fn the_sprint_fraction_waits_then_rises_as_a_square_root() {
+        let p = PlayerPhysics { sprint_seconds_to_start: 0.2, sprint_seconds_to_full: 1.0, ..stand_in() };
+        assert_eq!(p.sprint_fraction(0.0), 0.0);
+        assert_eq!(p.sprint_fraction(0.2), 0.0);
+        assert!((p.sprint_fraction(0.2 + 0.98333 / 4.0) - 0.5).abs() < 1e-3);
+        assert!((p.sprint_fraction(0.2 + 0.98333) - 1.0).abs() < 1e-5);
+        assert_eq!(p.sprint_fraction(5.0), 1.0);
     }
 }

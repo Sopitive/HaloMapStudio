@@ -32,6 +32,11 @@ const MARKER_HALF: f32 = 0.3;
 pub struct H3EditorAssets {
     pub cache: Arc<H3Cache>,
     pub variant: Option<(std::path::PathBuf, H3Variant)>,
+    /// With no variant open: the blank canvas to adopt (scenario.rs).
+    pub canvas: Option<(std::path::PathBuf, H3Variant)>,
+    /// The build left the base map's own variant slots out of the static scenery: the editor
+    /// must supply them.
+    pub scenario_owned: bool,
     pub collect: H3EditorCollect,
     pub world_bounds: (Vec3, Vec3),
 }
@@ -78,7 +83,7 @@ pub struct H3ObjectScene {
 
 impl H3ObjectScene {
     pub fn new(assets: H3EditorAssets, device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let H3EditorAssets { cache, variant, collect, world_bounds } = assets;
+        let H3EditorAssets { cache, variant, collect, world_bounds, canvas: _, scenario_owned: _ } = assets;
         let tex = collect.tex.unwrap_or_else(|| TexCtx::new(cache.clone(), device, queue));
         let mut models: HashMap<u32, Option<Arc<H3ModelGeom>>> = HashMap::new();
         models.insert(H3_MARKER_TAG, Some(Arc::new(marker_geom())));

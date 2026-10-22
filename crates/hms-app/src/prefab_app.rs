@@ -260,6 +260,10 @@ impl PrefabScene for crate::App {
         } else {
             self.mvar_unresolved.len()
         };
+        // Halo 3: the base map's own objects keep the first `num_scenario_objects` slots (editor
+        // objects tagged [map]; deleting one frees nothing), so what a prefab can use is the Forge
+        // capacity and what is used is the Forge objects (h3_slot_budget)
+        let h3_slots = if self.h3_active { self.h3_slot_budget() } else { None };
         let slots_max = if self.h3_active { crate::h3::mvar::H3_SLOTS } else { crate::h4::mvar::H4_SLOTS };
         let mut per_quota: HashMap<u32, u32> = HashMap::new();
         let mut spent = 0.0f64;
@@ -275,7 +279,8 @@ impl PrefabScene for crate::App {
         // can read; the Halo 3 variant budget is not carried on `variant_globals`).
         let priced = self.h4_active;
         let budget_max = self.variant_globals.as_ref().map(|g| g.budget_max as f64).unwrap_or(0.0);
-        Capacity { slots_used: self.mvar_objects.len() + self.local_objects.len() + unresolved, slots_max, budget_spent: spent, budget_max, budget_priced: priced, per_quota }
+        let (slots_used, slots_max) = h3_slots.unwrap_or((self.mvar_objects.len() + self.local_objects.len() + unresolved, slots_max));
+        Capacity { slots_used, slots_max, budget_spent: spent, budget_max, budget_priced: priced, per_quota }
     }
 
     fn pf_selection(&self) -> Vec<u32> {

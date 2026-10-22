@@ -36,6 +36,7 @@ mod film_variant; // #gamevariant  the GAME VARIANT a film was recorded under (l
 mod film_vehicle; // #vehicle-rot #vehicle-damage  a film's VEHICLES: recorded basis, damage state, the wreck
 mod film_objective; // #film-objects  a film's OBJECTIVE objects (the flag) + loose weapons + debris
 mod film_projectile; // #projectile  a film's PROJECTILES, weapon firing effects and explosions
+mod film_riders; // #film-riders  a film's RIDERS: seat membership from the recorded parent link
 mod extimport; // externally imported OBJ/GLB models + their user-driven transform (#4)
 mod decal_projector;
 mod forge_scale;
@@ -50,10 +51,14 @@ mod headless;
 mod keybinds; // Settings ▸ Controls & keyboard — the rebindable action table every input site reads
 mod lightbake;
 mod lightprobe;
+mod rtgi_compare; // print-only: agreement of the probe field with the map's shipped airprobes
+mod rtgi_dyn; // placed Forge pieces as occluders of the real-time probe GI (+ the probes an edit reaches)
 mod map_spawns; // View > Show map spawn points
 mod mapcat;
 mod mccimport; // #mcc-import  Settings ▸ Controls & keyboard ▸ Import from MCC (read-only)
 mod physics_outlines; // View > Show physics outlines (hidden-blocker hulls)
+mod collision_bsp;
+mod object_hulls; // #collision  placed-object static hulls with the Havok convex radius put back // #collision  the ENGINE's structure collision BSP (sbsp resource), read in Rust
 mod play_phys; // #play  the player movement constants, read out of the bipd + matg tags
 mod play_ctl; // #play  the character controller: one biped's capsule vs the BSP + Forge objects
 mod load_status; // #loadstatus  not-started / in-flight / done / failed, as four answers
@@ -62,6 +67,7 @@ mod play_mode; // #play  test mode: spawn as a Spartan / Elite and walk around t
 mod play_pickup; // #pickup  test mode: pick a weapon up off the map
 mod play_hud; // #play-hud  test mode's own HUD values: the weap magazines layout, player vitality, grenades
 mod play_vehicle; // #seat-entry  test mode's vehicles: the prompt, getting in, riding, driving
+mod play_sound; // #play-sound  test mode's sound: vehicle engines, own weapon, footsteps
 mod physics_settle; // "Simulate physics": the phmo rigid-body settle (#settle)
 mod phmo_shapes; // phmo rigid bodies -> settle shapes, both games (#settle)
 mod ragdoll; // the articulated phmo solver: Theater ragdolls + the editor settle (#ragdoll)
@@ -85,13 +91,29 @@ mod reach_actor; // Reach posed skinned bipeds + held weapons (#reach-skin)
 mod reach_font; // #reach-font  Reach's own fonts (font_package / .font), decoded + painted
 mod reach_widget; // #reach-widget  Reach's own UI widgets (cui_screen 'cusc'), decoded + painted
 mod reach_chud; // #reach-chud  Reach's HUD authoring (chud_globals 'chgd'): the navpoint palette + anchor
+mod reach_action_hold; // #use-hold  the action button's hold-to-use rule
 mod reach_hud; // #reach-hud  the first-person HUD from the chud tags: ammo/grenades/vitals, the name-tag mode, the respawn countdown
 mod reach_jmad; // Reach model_animation_graph decode: codecs + sampling (#reach-skin)
 mod reach_projectile; // #projectile  Reach `weap` BARRELS + `proj` tag fields (what a shot launches and plays)
+mod play_fire; // #weapon-fire  the engine's trigger / barrel / magazine state machines: held fire, recovery, bursts, heat, charge
+mod reach_weapon; // #weapon-fire  the Reach weap FIRING MODEL: trigger/barrel/magazine tags + the engine's per-tick fire state machine
 mod reach_damage; // #damage  Reach `jpt!` + an object model's vitality / damage sections / responses
 mod reach_physics; // #gravity  Reach's ONE gravity constant + the biped physics law
+mod reach_havok; // #havok  the Havok rigid body UNDER the vehicle code: integrator, gravity factor, damping, contact materials
+mod reach_havok_solver; // #havok-solver  the engine's Havok pipeline: contact solver, admission, TOI, sleep (research/havok/)
+#[cfg(test)]
+mod play_ledge_gates; // #ledge-gate  driving off edges through the real PlayMode::tick
+mod play_world; // #play-world  test mode's rigid-body world: every physics-enabled object is simulated
 mod reach_collision; // #collision  Reach's COLLISION GROUPS: which physics collides with which
+mod reach_grip; // #ride-grip  a rider's hands follow the vehicle's steering node (two-bone solve)
+mod reach_unit_camera; // #ride-camera  Reach unit camera: trak chase tracks + the observer's quintic blend
 mod reach_seats; // #seats  Reach `unit_seat_block`: a vehicle's seats + the authored ENTRY rule
+#[cfg(test)]
+mod rtgi_engine_gates; // map-backed gates of the engine-mode probe GI, run on a software (llvmpipe) adapter
+#[cfg(test)]
+mod hud_raster; // #hud-raster  TEST-ONLY CPU rasteriser of egui's draw list: HUD frames as PNGs
+mod play_hud_draw; // #play-hud  the whole test-mode HUD as one painter function (app + headless rasteriser)
+mod reach_unit_hud; // #seat-hud  which chud a unit in a seat sees: the seat's own HUD, the vehicle weapon's, the biped weapon's (engine slots)
 mod reach_strings; // #reach-strings  Reach localized text: the MCC `.bin` key for a `unic` string id
 mod reach_vehicle; // #vehicle-phys  Reach `vehi` vehicle physics blocks (engine/gears/velocity/differential)
 mod reach_vehicle_anim; // #vehicle-anim  a DRIVEN vehicle's own overlays: wheels (a wrapping phase) + steering (a saturating range)
@@ -600,8 +622,8 @@ fn main() -> eframe::Result<()> {
             std::process::exit(0);
         }
         // #play  The movement constants test mode reads, out of a real map: the `matg` player
-        // information rows and each species' own `bipd` fields, with the derived step-up and
-        // ground probe beside them. Print-only, and the one way to CHECK the values without the
+        // information rows and each species' own `bipd` fields, with the ground law
+        // those fields imply (`play_ctl::law_summary`) beside them. Print-only, and the one way to CHECK the values without the
         // window.
         if let Some(pos) = args.iter().position(|a| a == "--dump-play-phys") {
             let map = args.get(pos + 1).cloned().unwrap_or_default();
@@ -619,11 +641,7 @@ fn main() -> eframe::Result<()> {
                             match play_mode::player_physics_for(n, c, &bipeds, sp) {
                                 Ok((path, pp)) => {
                                     println!("{path}\n{}", pp.describe());
-                                    println!(
-                                        "step-up {:.4} wu (emergent; no authored step field) | ground probe {:.4} wu",
-                                        play_ctl::max_step_height(&pp),
-                                        play_ctl::ground_probe_depth(&pp)
-                                    );
+                                    println!("{}", play_ctl::law_summary(&pp));
                                 }
                                 Err(e) => println!("{e}"),
                             }
@@ -1767,6 +1785,43 @@ fn prettify_stringid(raw: &str) -> String {
         .join(" ")
 }
 
+/// What a typed size did to a selection (the status line reads this).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SelectionScale {
+    changed: usize,
+    refused_other_label: usize,
+    refused_table_full: usize,
+    clamped: usize,
+    worst_ratio_err: f32,
+}
+
+/// #scale-use  Apply the size `want` to every object in `datums`, each under ITS OWN team (an
+/// X330 RED object and a BLUE one need different spawn sequences for the same size). The label
+/// table grows at most once. An object that cannot take the size is skipped and counted, never
+/// half-written.
+fn set_selection_scale(
+    metas: &mut std::collections::HashMap<u32, ObjMeta>,
+    datums: &[u32],
+    want: f32,
+    conv: forge_scale::ScaleConvention,
+    labels: &mut Vec<String>,
+) -> SelectionScale {
+    let mut r = SelectionScale::default();
+    for d in datums {
+        let Some(m) = metas.get_mut(d) else { continue };
+        match m.set_scale(want, conv, labels) {
+            Ok(ss) => {
+                r.changed += 1;
+                r.clamped += ss.clamped as usize;
+                r.worst_ratio_err = r.worst_ratio_err.max(ss.ratio_err.abs());
+            }
+            Err(e) if e.contains("label table is full") => r.refused_table_full += 1,
+            Err(_) => r.refused_other_label += 1,
+        }
+    }
+    r
+}
+
 /// World-units → 11-bit boundary value (inverse of the v/2047×200 dequant).
 pub(crate) fn wu_to_bval(v: f32) -> u16 {
     (v / 200.0 * 2047.0).round().clamp(0.0, 2047.0) as u16
@@ -2155,6 +2210,9 @@ struct PoseEdit {
 enum XformKind {
     Grab,
     Rotate,
+    /// #scale-sel  Scale the selection about its centroid, keeping every piece's offset from
+    /// that centroid in proportion -- so a whole build grows or shrinks as one thing.
+    Scale,
 }
 
 /// What a cursor ray grabs on the gizmo — a move axis handle or a rotate ring.
@@ -2377,6 +2435,31 @@ impl ObjMeta {
         if after.flags.damage != before.flags.damage { self.flags.damage = after.flags.damage; }
         // the Halo 4 block diffs per field too (h4/edit.rs); a Reach object stays None
         if after.h4 != before.h4 { self.h4 = h4::edit::merge_h4_changed(self.h4.take(), before.h4.as_deref(), after.h4.as_deref()); }
+    }
+
+    /// #scale-use  Give this object the size `want` (a multiplier, 1.0 = normal) under `conv`.
+    ///
+    /// A size is only a size when the object carries the forge `scale` label (otherwise the
+    /// spawn sequence is a spawn ORDER), so this adds that label to the variant's table when it is
+    /// missing and puts it on the object. It REFUSES, touching nothing, when the object already
+    /// carries a DIFFERENT label (Reach allows one per object, and a label names the object's role:
+    /// silently replacing it would change how the map plays) or when the table is full. The team
+    /// matters (X330 reads RED as cosmic), so the encoding uses this object's own team.
+    fn set_scale(&mut self, want: f32, conv: forge_scale::ScaleConvention, labels: &mut Vec<String>) -> Result<forge_scale::ScaleSet, String> {
+        let ss = forge_scale::set_scale(want, conv, forge_scale::team_from_u8(self.team))
+            .ok_or_else(|| "a size must be a positive number".to_string())?;
+        let has_scale = forge_scale::is_scale_label(&self.label);
+        if !has_scale && self.label_idx != 0xFFFF && !self.label.trim().is_empty() {
+            return Err(format!("this object already has the label '{}', and a size needs the `scale` label: clear its label first", self.label));
+        }
+        if !has_scale {
+            let idx = forge_scale::ensure_scale_label(labels)
+                .ok_or_else(|| format!("the variant's label table is full ({} labels), so it cannot gain the `scale` label", forge_scale::MAX_LABELS))?;
+            self.label_idx = idx;
+            self.label = labels[idx as usize].clone();
+        }
+        self.spawn_seq = ss.seq as i32;
+        Ok(ss)
     }
 
     /// Effective SCALED state (override, else "has the scale label").
@@ -3013,6 +3096,9 @@ struct App {
     /// #reach-sound  The audio engine. Constructing it touches no hardware and
     /// reads no bank; the device and the banks come up on the first sound.
     sound: sound::SoundEngine,
+    /// #play-sound  Test mode's audio: the driven vehicle's engine, the player's own weapon, the
+    /// map's ambience. Drives `sound` from `update_play`, not from the Theater clock.
+    play_sound: play_sound::PlaySound,
     /// #model-import: WHAT the shared browser is picking. One window, one set of navigation
     /// state, but the extension filter, the quick-access sidebar, the recent lists, the seeded
     /// folder and the window TITLE (which keys egui's remembered size/position) are per purpose.
@@ -3098,6 +3184,8 @@ struct App {
     sc_convention: forge_scale::ScaleConvention,
     /// Tools ▸ Scale converter modal visibility.
     show_scale_converter: bool,
+    /// #scale-use  A size typed in the properties panel, applied to the rest of the selection after the grid.
+    prop_scale_edit: Option<f32>,
     /// #xgame File ▸ "Convert variant to another game…" modal visibility + its state.
     show_convert_variant: bool,
     xgame: xgame::gui::ConvertState,
@@ -3144,6 +3232,8 @@ struct App {
     show_rtgi: bool,
     rtgi_pending: bool,
     rtgi_gain: f32,
+    /// Placed-piece occluders the probe tracer currently holds (see `rtgi_dyn`).
+    rtgi_dyn: rtgi_dyn::DynCache,
     /// Draw the scene's lights in the viewport (off by default, like trigger volumes)
     show_lights: bool,
     /// Sun yaw/pitch in degrees and an intensity scale — real-time mode only. `sun_edited`
@@ -3843,6 +3933,7 @@ impl App {
             bg_drawn: 0,
             film_clock: None,
             sound: sound::SoundEngine::default(),
+            play_sound: play_sound::PlaySound::default(),
             recent: recent::RecentStore::load(),
             recent_missing: std::collections::HashSet::new(),
             recent_menu_pass: 0,
@@ -3883,8 +3974,9 @@ impl App {
             edit_color: 0,
             #[cfg(feature = "injection")]
             edit_scale: 1.0,
-            sc_convention: forge_scale::ScaleConvention::X330,
+            sc_convention: forge_scale::load_convention(), // #scale-use: the convention you build for, remembered
             show_scale_converter: false,
+            prop_scale_edit: None,
             show_convert_variant: false,
             xgame: xgame::gui::ConvertState::default(),
             bsp_warn_pending: None,
@@ -3903,6 +3995,7 @@ impl App {
             show_rtgi: false,
             rtgi_pending: false,
             rtgi_gain: 1.3,
+            rtgi_dyn: Default::default(),
             show_lights: false,
             sun_yaw: 0.0,
             sun_pitch: 45.0,
@@ -4111,6 +4204,7 @@ impl App {
         self.h4_edit.src.clear();
         self.h4_edit.unresolved.clear();
         self.h4_edit.save_pending = None;
+        self.h3_edit.save_pending = None;
         // Lighting Lab: re-seed the sliders from the new map's cfxs band on the next panel draw.
         self.ll_seeded = false;
         // `// #h4-expo-3` the Halo 4 adaptation belongs to the map that is going away.
@@ -4249,6 +4343,9 @@ impl App {
                     Some(sd) => {
                         self.renderer.set_rtgi_scene(&dev, &q, &sd);
                         self.sun_base = Some(self.renderer.rtgi_sun().1);
+                        // 1.0 in engine mode (the probes carry the map's own sky list), the fitted 1.3 of the legacy sky otherwise
+                        self.rtgi_gain = self.renderer.rtgi_default_gain();
+                        self.rtgi_dyn = Default::default(); // the new tracer scene holds no placed pieces yet
                         self.renderer.rtgi_set_gain(&q, self.rtgi_gain);
                         self.renderer.rtgi_warm_up(&dev, &q, 8);
                     }
@@ -5601,6 +5698,8 @@ impl App {
             }
         }
         self.tick_scene_per_frame(anim_time);
+        // Real-time probe GI: placed pieces occlude, and the probes an edit reaches are re-estimated.
+        self.rtgi_dyn_tick();
     }
 
     /// The part of `tick_scene` that genuinely has to run EVERY frame — the camera-relative
@@ -6791,6 +6890,21 @@ impl App {
                         Self::push_cylinder(&mut tris, pivot - a * big, pivot + a * big, shaft_r * 0.5, col);
                     }
                 }
+                // #scale-sel  Scaling → short solid stubs on all three axes, so the CENTRE the
+                // scale is happening about is unmistakable. A build grows away from this point,
+                // and if the user expected a different pivot the overlay is how they notice.
+                XformKind::Scale => {
+                    for i in 0..3 {
+                        let a = axes[i];
+                        Self::push_cylinder(
+                            &mut tris,
+                            pivot - a * (len * 0.5),
+                            pivot + a * (len * 0.5),
+                            shaft_r,
+                            bright[i],
+                        );
+                    }
+                }
                 XformKind::Rotate => {
                     // Rotating → solid rotate torus(es): the locked axis only when locked, else all.
                     let ring_r = len * 0.9;
@@ -7474,6 +7588,108 @@ impl App {
         glam::Quat::from_axis_angle(axis, -theta)
     }
 
+    /// #scale-sel  The scale factor this op is currently asking for.
+    ///
+    /// Pointer DISTANCE from the on-screen pivot, as a ratio against the distance the drag
+    /// started at -- the same convention Blender uses, and the only one that behaves sensibly
+    /// when the pointer crosses the pivot. A typed number overrides it exactly.
+    ///
+    /// Guards, each for a real degeneracy rather than defensively: a drag that starts ON the
+    /// pivot has no reference length (so the ratio would be infinite), and a factor of zero
+    /// would collapse the build to a point with no way back short of undo.
+    fn scale_factor(&self, op: &XformOp, rect: egui::Rect, ptr: (f32, f32)) -> f32 {
+        if let Some(v) = numfield::parse_signed(&op.num_buf).map(|v| v as f32) {
+            // A typed 0 or a negative factor is a mis-key, not a request to mirror: a negative
+            // uniform scale would turn the build inside out and is not representable as an
+            // object size at all, so it is refused rather than reinterpreted.
+            if v > 0.0 {
+                return v.clamp(Self::SCALE_MIN, Self::SCALE_MAX);
+            }
+            return 1.0;
+        }
+        let pivot_s = match self.world_to_screen(op.pivot, rect) {
+            Some(p) => p,
+            None => return 1.0,
+        };
+        let d0 = ((op.start_pointer.0 - pivot_s.0).hypot(op.start_pointer.1 - pivot_s.1)).max(8.0);
+        let d1 = (ptr.0 - pivot_s.0).hypot(ptr.1 - pivot_s.1);
+        (d1 / d0).clamp(Self::SCALE_MIN, Self::SCALE_MAX)
+    }
+
+    /// Smallest and largest factor one drag may ask for. Not the limit on an object's own SIZE
+    /// (that is the convention's, see `commit_scale_sizes`) -- this bounds the POSITION spread so
+    /// a slip of the mouse cannot fling a build to the other side of the world or collapse it.
+    const SCALE_MIN: f32 = 0.01;
+    const SCALE_MAX: f32 = 100.0;
+
+    /// #scale-sel  Write each scaled object's own SIZE, and report what could not be done.
+    ///
+    /// # Why this is not simply `size *= k`
+    ///
+    /// **Reach has no per-object scale field.** An object's size is a community-mod convention
+    /// that overloads its `spawnSequence` -- a SIGNED BYTE -- and only applies at all when the
+    /// object carries the forge `scale` label (the `SCALED` pseudo-flag, see `ObjMeta::scaled_on`).
+    /// So three things follow, and each is reported rather than hidden:
+    ///
+    /// * **Sizes are QUANTISED.** Only ~201 sizes per convention exist, spaced multiplicatively.
+    ///   The nearest is chosen in LOG space (a ratio, which is what "scale" means) and the worst
+    ///   relative error across the selection is reported.
+    /// * **An object with no scale label keeps its size.** Its `spawnSequence` is real spawn
+    ///   ORDERING, and silently overwriting it would change how the map plays. Those objects are
+    ///   still MOVED (their offsets scale), so a build spreads out but those pieces stay their
+    ///   own size -- which is visible, and better than quietly breaking spawn order.
+    /// * **The convention has a ceiling.** Past it the request is clamped, and the clamp counted.
+    ///
+    /// Returns a note for the status line -- empty when every object took the exact size asked.
+    fn commit_scale_sizes(&mut self, op: &XformOp, k: f32) -> String {
+        if !(k > 0.0) || (k - 1.0).abs() < 1e-6 {
+            return String::new();
+        }
+        if let Some(note) = h3::app::scale_unsupported_note(self.h3_active) { return note.to_string(); }
+        let conv = self.sc_convention;
+        let mut unlabelled = 0usize;
+        let mut clamped = 0usize;
+        let mut worst_err = 0.0f32;
+        let mut sized = 0usize;
+        for &(d, _, _, _) in &op.start {
+            let Some(m) = self.mvar_meta.get_mut(&d) else { continue };
+            // An object that cannot carry a size is moved but not resized, and counted.
+            if !m.flags.scaled_on(&m.label) {
+                unlabelled += 1;
+                continue;
+            }
+            let team = forge_scale::team_from_u8(m.team);
+            let before = m.scale(conv);
+            let want = before * k;
+            let ceiling = forge_scale::object_max_scale(m.team).max(conv.max_scale());
+            let target = want.clamp(0.01, ceiling);
+            if (target - want).abs() > 1e-4 {
+                clamped += 1;
+            }
+            let (seq, got) = forge_scale::scale_to_spawn_seq_for_team(target, conv, team);
+            m.spawn_seq = seq as i32;
+            sized += 1;
+            // Relative error, because the quantity is multiplicative: being 0.05 out at 10x is
+            // not the same mistake as being 0.05 out at 0.5x.
+            if target > 0.0 {
+                worst_err = worst_err.max((got / target - 1.0).abs());
+            }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if sized > 0 && worst_err > 0.005 {
+            parts.push(format!("sizes land within {:.1}% (only ~201 are representable)", worst_err * 100.0));
+        }
+        if clamped > 0 {
+            parts.push(format!("{clamped} hit this convention's size ceiling"));
+        }
+        if unlabelled > 0 {
+            parts.push(format!(
+                "{unlabelled} moved but not resized (no scale label -- their spawn order is real)"
+            ));
+        }
+        if parts.is_empty() { String::new() } else { format!(" -- {}", parts.join("; ")) }
+    }
+
     /// Apply the op's current transform to the REAL object poses (solid meshes move live).
     /// The texture cache makes the resulting rebuild cheap enough to do every frame.
     fn apply_xform_live(&mut self, op: &XformOp, rect: egui::Rect, ptr: (f32, f32), magnet: bool) {
@@ -7489,6 +7705,20 @@ impl App {
                 for &(d, p, f, u) in &op.start {
                     let np = op.pivot + q * (p - op.pivot);
                     self.set_movable_pose(d, np, q * f, q * u);
+                }
+            }
+            // #scale-sel  Positions only, and ORIENTATION IS UNTOUCHED: a uniform scale about a
+            // point does not turn anything, and re-deriving `f`/`u` from a scaled basis would
+            // drift them through the normalisation on every frame of a live drag.
+            //
+            // The object's own SIZE is deliberately NOT written here. It is quantised to a
+            // sequence byte (see `commit_scale_sizes`), so writing it every frame would make a
+            // drag jump between representable sizes and would leave the undo entry holding
+            // whichever step the pointer happened to be nearest when the user released.
+            XformKind::Scale => {
+                let k = self.scale_factor(op, rect, ptr);
+                for &(d, p, f, u) in &op.start {
+                    self.set_movable_pose(d, op.pivot + (p - op.pivot) * k, f, u);
                 }
             }
         }
@@ -7516,7 +7746,7 @@ impl App {
         // defaults are the Shift+D / G / R / E / X / Y / Z the app has always used. Escape is
         // deliberately NOT rebindable — it is the universal way out.
         let flying_now = self.fly_button_down(ctx);
-        let (shift_d, g, r, e, kx, ky, kz, esc, enter, magnet) = ctx.input(|i| {
+        let (shift_d, g, r, sc, e, kx, ky, kz, esc, enter, magnet) = ctx.input(|i| {
             use keybinds::Action as A;
             let ph = &self.phys;
             (
@@ -7527,6 +7757,7 @@ impl App {
                 // While the fly button is held, the rotate key may double as the fly-up key —
                 // suppress it starting object-rotation here (update_camera owns it then).
                 self.keys.pressed(A::ModalRotate, i, ph) && !flying_now,
+                self.keys.pressed(A::ModalScale, i, ph) && !flying_now,
                 self.keys.pressed(A::AxisSpace, i, ph),
                 self.keys.pressed(A::AxisX, i, ph),
                 self.keys.pressed(A::AxisY, i, ph),
@@ -7773,6 +8004,12 @@ impl App {
                 self.status = "Grab — X/Y/Z axis · E space · Ctrl magnet · Shift fine · click/Esc".into();
                 return true;
             }
+            if sc && !self.movable_datums().is_empty() {
+                self.begin_xform(XformKind::Scale, ptr, false);
+                self.status =
+                    "Scale — type a factor · pieces keep their relative offsets · click/Esc".into();
+                return true;
+            }
             if r && !self.movable_datums().is_empty() {
                 self.begin_xform(XformKind::Rotate, ptr, false);
                 self.status = "Rotate — X/Y/Z axis · E space · Shift fine · click/Esc".into();
@@ -7830,7 +8067,11 @@ impl App {
             }
         });
         if !op.num_buf.is_empty() {
-            let (kname, unit) = if op.kind == XformKind::Rotate { ("Rotate", "°") } else { ("Move", "u") };
+            let (kname, unit) = match op.kind {
+                XformKind::Rotate => ("Rotate", "°"),
+                XformKind::Scale => ("Scale", "×"),
+                XformKind::Grab => ("Move", "u"),
+            };
             let axname = op.axis.map(|a| ["X", "Y", "Z"][a]).unwrap_or(if op.kind == XformKind::Rotate { "Z" } else { "—" });
             // Echo what the buffer MEANS (a trailing '-' has already flipped the sign) next to
             // what was typed, so the flip is visible before Enter.
@@ -7901,7 +8142,21 @@ impl App {
                 }
                 self.prop_snapshotted_for = None;
             }
-            self.status = format!("Transform applied to {} object(s)", op.start.len());
+            // #scale-sel  A scale also changes each object's own SIZE, and that is written HERE,
+            // once, rather than during the drag: the size is quantised to a sequence byte, so a
+            // per-frame write would make the pieces jump between representable sizes mid-drag.
+            if op.kind == XformKind::Scale {
+                let k = self.scale_factor(&op, rect, ptr);
+                let note = self.commit_scale_sizes(&op, k);
+                self.status = format!(
+                    "Scaled {} object(s) by x{:.3} about their centre{}",
+                    op.start.len(),
+                    k,
+                    note
+                );
+            } else {
+                self.status = format!("Transform applied to {} object(s)", op.start.len());
+            }
             self.apply_selection_highlight();
             // Swallow the confirming press's trailing release-click so it doesn't pick a
             // background object next frame — but only when confirmed by a mouse press over the
@@ -12625,6 +12880,7 @@ impl App {
         // Hold the save while objects sit outside playable space (window decides).
         if self.bsp_warn_gate(BspWarnAction::Save) { return; }
         if self.h4_save_gate(BspWarnAction::Save) { return; }
+        if self.h3_save_gate(BspWarnAction::Save) { return; } // #h3-save-check
         self.spawn_status = match self.save_variant_to(&dst) {
             Ok((n, _)) => {
                 let extra = self.save_failure_note();
@@ -12662,6 +12918,7 @@ impl App {
         if self.bsp_warn_gate(BspWarnAction::SaveAs) { return; }
         // The Halo 4 gates (bounds / quota / budget / type) hold the save the same way.
         if self.h4_save_gate(BspWarnAction::SaveAs) { return; }
+        if self.h3_save_gate(BspWarnAction::SaveAs) { return; } // #h3-save-check
         self.open_variant_save_browser();
     }
 
@@ -14394,6 +14651,7 @@ impl App {
             m.spawn_seq = new_seq as i32; // SPAWN_SEQ_ONLY
         }
         self.sc_convention = ScaleConvention::X330;
+        forge_scale::save_convention(self.sc_convention);
         if converted > 0 {
             self.rebuild_overlays();
         }
@@ -14759,6 +15017,7 @@ impl App {
             });
         // A convention change re-renders SCALE objects under the new decoding (live preview).
         if self.sc_convention != before {
+            forge_scale::save_convention(self.sc_convention);
             self.rebuild_overlays();
         }
         if do_convert {
@@ -15736,6 +15995,17 @@ impl App {
                     ui.close_menu();
                 }
                 ui.separator();
+                ui.menu_button("Forge scale convention", |ui| {
+                    ui.small("The gametype you build for. Sizes you type, the S tool and the viewport all use it.");
+                    for &c in forge_scale::ScaleConvention::ALL {
+                        if ui.radio(self.sc_convention == c, c.label()).on_hover_text(c.hover()).clicked() && self.sc_convention != c {
+                            self.sc_convention = c;
+                            forge_scale::save_convention(c);
+                            self.status = format!("Scale convention: {}", c.label());
+                            self.rebuild_overlays();
+                        }
+                    }
+                });
                 if ui.button("Scale converter…")
                     .on_hover_text("Convert between a visual scale multiplier and the spawnSequence encoding, for a chosen Forge scale convention")
                     .clicked()
@@ -16708,7 +16978,13 @@ impl App {
     /// changes, the filtered index only when the fingerprint or the search text changes.
     fn objects_list_ui(&mut self, ui: &mut egui::Ui) {
         let n_total = self.mvar_objects.len() + self.local_objects.len();
+        // Halo 3: the base map's own objects are in this list too (tagged [map]); say how many
+        let (own, own_deleted) = if self.h3_active { self.h3_scenario_counts() } else { (0, 0) };
         ui.heading(format!("Objects ({n_total})"));
+        if own + own_deleted > 0 {
+            ui.small(format!("{own} are the map's own objects [map] (editable{}); {} placed.", if own_deleted > 0 { format!(", {own_deleted} deleted") } else { String::new() }, n_total - own))
+                .on_hover_text("A Halo 3 map variant starts with the base map's own vehicles, weapons, equipment, scenery and crates (spawn points are among them). Select, move or delete them like any other object: a delete is saved as the map's object being removed. They use the variant's first object slots, so deleting one does not free a Forge slot.");
+        }
         if n_total == 0 {
             ui.small(egui::RichText::new("Open a variant or drag palette items into the viewport.").weak());
             return;
@@ -16730,6 +17006,7 @@ impl App {
                         }
                         let slot = if m.slot != 0xFFFF { format!("#{}", m.slot) } else { "new".to_string() };
                         label.push_str(&format!("   {slot}"));
+                        if h3::scenario::is_scenario_datum(o.datum) { label.push_str(" [map]"); }
                         // Small markers for the effective pseudo-flags (searchable too).
                         let (fs, fc) = forge_scale::effective_flags(&self.obj_globals, &m.flags, m.team, &m.label);
                         let mut marks = String::new();
@@ -16738,7 +17015,7 @@ impl App {
                         if fs { marks.push_str(" [scaled]"); }
                         if fc { marks.push_str(" [shadow]"); }
                         label.push_str(&marks);
-                        let key = format!("{} {} {} {}{}", pretty, leaf, m.label, slot, marks).to_lowercase();
+                        let key = format!("{} {} {} {}{}{}", pretty, leaf, m.label, slot, marks, if h3::scenario::is_scenario_datum(o.datum) { " map scenario [map]" } else { "" }).to_lowercase();
                         (label, key)
                     }
                     None => ("(object)".to_string(), "object".to_string()),
@@ -17914,6 +18191,11 @@ impl App {
                 // Halo 4 shape values are 16-bit 1/256 wu (types 13-15 = teleporters)
                 let (bvals, btype) = if m.h4.is_some() {
                     (m.boundary.map(|v| wu_to_bval(v as f32 / 256.0)), if (13..=15).contains(&m.cached_type) { 13 } else { 0 })
+                } else if self.h3_active {
+                    // Halo 3 shape values are 16-bit over [0, 60] wu (types 9-11 = teleporters, drawn
+                    // cyan through the Reach teleporter id 13); read as Reach's 11-bit 0..200 wu
+                    // they drew a 15 wu zone at ~1600 wu
+                    (m.boundary.map(|q| wu_to_bval(h3::edit::boundary_wu(q))), if (9..=11).contains(&m.cached_type) { 13 } else { 0 })
                 } else {
                     (m.boundary, m.cached_type)
                 };
@@ -18832,6 +19114,7 @@ impl eframe::App for App {
         self.save_error_window_ui(ctx);
         self.prefab_panel_ui(ctx); // #prefab Tools > Prefabs
         self.h4_save_window_ui(ctx); // the Halo 4 save check (bounds / quota / budget)
+        self.h3_save_window_ui(ctx); // #h3-save-check the Halo 3 one (bounds / quota / budget / slots)
         self.drive_lightbake_scan(ctx);
         self.lightbake_map_ui(ctx);
         // Help → Hotkeys reference window (Help menu toggles `show_hotkeys`).
@@ -19737,6 +20020,8 @@ impl eframe::App for App {
                         // spawn order 0..255, spawn time) instead of the four Reach-only rows below.
                         if m.h4.is_some() {
                             self.h4_rows_type_spawn(ui, &mut m);
+                        } else if self.h3_active {
+                            self.h3_rows_type_spawn(ui, &mut m);
                         } else { // the SCALED / SHADOW flags row below is shared with Halo 4
                         // Cached (multiplayer object) type as a NAMED dropdown of the engine-
                         // anchored categories, with a raw DragValue alongside for the unlabeled values.
@@ -19761,11 +20046,47 @@ impl eframe::App for App {
                         ui.horizontal(|ui| {
                             ui.add(egui::DragValue::new(&mut m.spawn_seq).range(-100..=100));
                             if m.scaled_on() {
-                                let txt = format!("-> ×{:.3}", forge_scale::object_scale(m.spawn_seq, m.team));
+                                let txt = format!("-> ×{:.3} ({})", m.scale(self.sc_convention), self.sc_convention.short());
                                 if self.obj_globals.scaled { ui.small(txt); } else { ui.small(egui::RichText::new(txt).weak()).on_hover_text("Scaled objects is OFF in Settings — rendered at ×1"); }
                             }
                         });
                         ui.end_row();
+                        // #scale-use  Type a size instead of a spawn sequence.
+                        ui.label("scale").on_hover_text("The object's size as a multiplier under the active scale convention (Tools > Forge scale convention). Typing one writes the nearest representable spawn sequence, adds the `scale` label to the variant if it is missing, and applies to the whole selection.");
+                        let mut want: Option<f32> = None;
+                        ui.horizontal(|ui| {
+                            let conv = self.sc_convention;
+                            let team = forge_scale::team_from_u8(m.team);
+                            let cur = if m.scaled_on() { m.scale(conv) } else { 1.0 };
+                            let (lo, hi) = forge_scale::representable_range(conv, team);
+                            let mut v = cur;
+                            let r = ui.add(egui::DragValue::new(&mut v).speed((cur * 0.01).max(0.0005)).range(lo..=hi).prefix("×").max_decimals(3))
+                                .on_hover_text(format!("{}: ×{:.3} to ×{:.1} reachable for this object's team. About 200 sizes exist, the nearest is chosen by ratio.", conv.short(), lo, hi));
+                            if r.changed() && (v - cur).abs() > 1e-6 { want = Some(v); }
+                            if ui.small_button("÷2").clicked() { want = Some(cur * 0.5); }
+                            if ui.small_button("×2").clicked() { want = Some(cur * 2.0); }
+                            egui::ComboBox::from_id_salt("obj-scale-conv").selected_text(conv.short()).width(54.0).show_ui(ui, |ui| {
+                                for &c in forge_scale::ScaleConvention::ALL {
+                                    if ui.selectable_value(&mut self.sc_convention, c, c.label()).on_hover_text(c.hover()).clicked() {
+                                        forge_scale::save_convention(c);
+                                    }
+                                }
+                            });
+                            if !m.scaled_on() { ui.small(egui::RichText::new("no scale label yet").weak()); }
+                        });
+                        ui.end_row();
+                        if let Some(w) = want {
+                            let conv = self.sc_convention;
+                            let had = self.mvar_labels.len();
+                            match m.set_scale(w, conv, &mut self.mvar_labels) {
+                                Ok(ss) => {
+                                    self.prop_scale_edit = Some(w);
+                                    if self.mvar_labels.len() != had { self.variant_header_dirty = true; }
+                                    self.status = format!("Scale: ×{:.3} asked, ×{:.3} written as spawn sequence {} under {} ({:+.1}%{})", w, ss.got, ss.seq, conv.short(), ss.ratio_err * 100.0, if ss.clamped { ", at the end of this convention's range" } else if ss.ratio_err.abs() > 0.05 { ", the nearest this object's team can reach" } else { "" });
+                                }
+                                Err(why) => self.status = format!("Scale: {why}."),
+                            }
+                        }
                         } // end of the Reach-only type / spawn seq rows
 
                         // The two PSEUDO-flags (never saved into the .mvar; kept in the
@@ -19829,6 +20150,9 @@ impl eframe::App for App {
                         ui.end_row();
                         } // end of the Reach-only rows
 
+                        // Halo 3 has neither labels nor a parent picker (a record's parent is a 64-bit
+                        // object identifier, not a slot); its rows would edit fields no save writes.
+                        if !self.h3_active {
                         // label: pick by NAME from the variant's label table (falls back to a raw
                         // index when the table is empty / compressed). Shows the string id (index).
                         ui.label("label");
@@ -19911,11 +20235,15 @@ impl eframe::App for App {
                                 }
                             });
                         ui.end_row();
+                        } // end of the Reach / Halo 4 label + parent rows
 
                         // Placement flags — named per the engine's own labels (reach_tag_test
                         // `scenario_map_variant.cpp`): physics (bits6-7), symmetry (bits2-3, as the
                         // `asymmetric_placement`/`symmetric_placement` pair), placed-at-start (bit4
                         // `not_initially_placed`, INVERTED), hide-unless-required (bit0), unique (bit5).
+                        if self.h3_active {
+                            self.h3_row_symmetry(ui, &mut m);
+                        } else {
                         ui.label("placement");
                         ui.vertical(|ui| {
                             // Physics: Normal / Fixed / Phased.
@@ -19974,6 +20302,7 @@ impl eframe::App for App {
                                 "is_shortcut (bit1)");
                         });
                         ui.end_row();
+                        } // end of the Reach / Halo 4 placement row
                         // The two raw Halo 4 placement bits, then the Halo 4 shape /
                         // type extras / scale / raw rows replace the Reach boundary + extras rows.
                         if m.h4.is_some() {
@@ -19981,6 +20310,8 @@ impl eframe::App for App {
                             self.h4_rows_shape(ui, &mut m);
                             self.h4_rows_type_extras(ui, &mut m);
                             self.h4_rows_scale_raw(ui, &mut m);
+                        } else if self.h3_active {
+                            self.h3_rows_shape(ui, &mut m);
                         } else {
                         ui.label("boundary");
                         let shapes = ["none", "sphere", "cylinder", "box"];
@@ -20067,7 +20398,8 @@ impl eframe::App for App {
                         ui.end_row();
                     });
 
-                    if m != m0 {
+                    let mut scale_edit = self.prop_scale_edit.take();
+                    if m != m0 || scale_edit.is_some() {
                         // One snapshot per contiguous edit-session on this object.
                         if self.prop_snapshotted_for != Some(datum) {
                             self.push_edit_undo();
@@ -20099,9 +20431,19 @@ impl eframe::App for App {
                             || m.pos != m0.pos
                             || m.cached_type != m0.cached_type;
                         self.mvar_meta.insert(datum, m.clone());
+                        let scale_targets = others.clone();
+                        // A typed size reaches the others ONLY through `set_selection_scale`: the generic
+                        // per-field copy below would stamp the `scale` label over whatever label an
+                        // object already carries (and a raw spawn sequence that is wrong for its team).
+                        let mut m_others = m.clone();
+                        if scale_edit.is_some() {
+                            m_others.label = m0.label.clone();
+                            m_others.label_idx = m0.label_idx;
+                            m_others.spawn_seq = m0.spawn_seq;
+                        }
                         for d in others {
                             let Some(mut t) = self.mvar_meta.get(&d).cloned() else { continue };
-                            t.apply_changed_fields(&m0, &m);
+                            t.apply_changed_fields(&m0, &m_others);
                             if moved {
                                 t.pos = [t.pos[0] + dpos[0], t.pos[1] + dpos[1], t.pos[2] + dpos[2]];
                                 if let Some(o) = self.mvar_objects.iter_mut().find(|o| o.datum == d) {
@@ -20114,6 +20456,16 @@ impl eframe::App for App {
                         }
                         if moved {
                             self.highlight_dirty = true;
+                        }
+                        // #scale-use  a typed size goes to the rest of the selection with EACH object's own team
+                        if let Some(w) = scale_edit.take() {
+                            let had = self.mvar_labels.len();
+                            let rep = set_selection_scale(&mut self.mvar_meta, &scale_targets, w, self.sc_convention, &mut self.mvar_labels);
+                            if self.mvar_labels.len() != had { self.variant_header_dirty = true; }
+                            if rep.refused_other_label + rep.refused_table_full > 0 {
+                                self.status = format!("Scale: {} other object(s) resized, {} skipped (they carry another label) and {} skipped (label table full).", rep.changed, rep.refused_other_label, rep.refused_table_full);
+                            }
+                            self.rebuild_overlays();
                         }
                         if shape_changed {
                             self.rebuild_overlays();
@@ -20418,24 +20770,46 @@ impl eframe::App for App {
                 // Forge object budget counter (placed / max), right-aligned. A Reach map variant
                 // has 651 object SLOTS (the real ceiling, not the 650 the Forge menu shows), and a
                 // save can only place a new object in a free one.
-                const MAX_FORGE_OBJECTS: usize = 651;
+                // Halo 3 holds 640 slots and its scenario owns the first few hundred (h3_slot_budget)
+                let h3_budget = self.h3_slot_budget();
+                let max_forge_objects: usize = h3_budget.map_or(651, |(_, cap)| cap);
                 // Objects HMS could not resolve still occupy a slot in the variant, so they MUST
                 // be counted -- otherwise the budget reads low on a variant that is actually full
                 // and a save then reports objects it could not fit, with no visible reason.
-                let placed = self.mvar_objects.len() + self.local_objects.len() + self.mvar_unresolved.len();
+                let placed = match h3_budget {
+                    Some((used, _)) => used,
+                    None => self.mvar_objects.len() + self.local_objects.len() + self.mvar_unresolved.len(),
+                };
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let col = if placed >= MAX_FORGE_OBJECTS {
+                    let col = if placed >= max_forge_objects {
                         egui::Color32::from_rgb(230, 90, 90)
-                    } else if placed >= MAX_FORGE_OBJECTS * 9 / 10 {
+                    } else if placed >= max_forge_objects * 9 / 10 {
                         egui::Color32::from_rgb(230, 190, 80)
                     } else {
                         ui.visuals().text_color()
                     };
-                    let free = MAX_FORGE_OBJECTS.saturating_sub(placed);
-                    ui.colored_label(col, egui::RichText::new(format!("Objects: {placed} / {MAX_FORGE_OBJECTS}")).strong())
-                        .on_hover_text(format!(
-                            "{free} free slot(s). A map variant has {MAX_FORGE_OBJECTS} object slots; a save can only place a new object in a free one."
-                        ));
+                    let free = max_forge_objects.saturating_sub(placed);
+                    let why = if h3_budget.is_some() {
+                        format!("{free} free Forge slot(s). A Halo 3 variant has {} object slots; the base map's own {} objects keep the first {} of them (deleting one does not free its slot), which leaves {max_forge_objects} for the objects you place. Forge refuses a placement when none is free.",
+                            h3::mvar::H3_SLOTS, h3::mvar::H3_SLOTS - max_forge_objects, h3::mvar::H3_SLOTS - max_forge_objects)
+                    } else {
+                        format!("{free} free slot(s). A map variant has {max_forge_objects} object slots; a save can only place a new object in a free one.")
+                    };
+                    ui.colored_label(col, egui::RichText::new(format!("Objects: {placed} / {max_forge_objects}")).strong()).on_hover_text(why);
+                    // Halo 3: the base map's own objects are editor objects too (not counted above)
+                    let (own, own_deleted) = if self.h3_active { self.h3_scenario_counts() } else { (0, 0) };
+                    if own + own_deleted > 0 {
+                        ui.colored_label(ui.visuals().text_color(), format!("Map's own: {own}{}", if own_deleted > 0 { format!(" ({own_deleted} deleted)") } else { String::new() }))
+                            .on_hover_text("The base map's own vehicles, weapons, equipment, scenery and crates (spawn points among them) are in the editor as objects tagged [map]: select, move or delete them like any other. They are saved in the variant's first object slots and do not count against the Forge slots on the left.");
+                        ui.separator();
+                    }
+                    // Halo 3 also has a BUDGET: every Forge object has a price and the variant a maximum
+                    if let Some((spent, max)) = self.h3_live_budget().filter(|&(_, max)| max > 0.0) {
+                        let bcol = if spent > max { egui::Color32::from_rgb(230, 90, 90) } else if spent >= max * 0.9 { egui::Color32::from_rgb(230, 190, 80) } else { ui.visuals().text_color() };
+                        ui.colored_label(bcol, egui::RichText::new(format!("Budget: {spent:.0} / {max:.0}")).strong())
+                            .on_hover_text("The price of every Forge object against this variant's budget. Saving past it asks first.");
+                        ui.separator();
+                    }
                 });
             });
             if map_loading || waiting_variant || variant_decoding || preparing {
@@ -21021,6 +21395,9 @@ impl App {
             Ok(p) => p,
             Err(e) => return format!("test mode: {e}"),
         };
+        // #play-world  The Forge physics of every placed object (normal / fixed / phased) is the
+        // low byte of its placement flags; the rigid-body world reads it when it is first built.
+        pm.props.placement = self.mvar_meta.iter().map(|(d, m)| (*d, m.placement)).collect();
         // #fp  The arms rig, from `matg @player representation` + the WEAPON's own first-person
         // graph. Resolved here because only the scene can answer both questions.
         let rows = sc.first_person_models();
@@ -21050,6 +21427,7 @@ impl App {
             return "not in test mode".into();
         };
         pm.leave(&mut self.actor_scene);
+        self.play_sound.stop(&mut self.sound);
         // #play  THE CAMERA STAYS WHERE THE PLAYER WAS. `update_play` has already written the
         // play camera into `self.camera` this frame, so leaving it alone IS the fix -- the user
         // walks to a spot, leaves, and edits there.
@@ -21091,7 +21469,10 @@ impl App {
             )
         });
         let (jump, crouch, sprint, walk, melee) = buttons;
-        let (fire, switch_view) = ctx.input(|i| keybinds::play_actions(&self.keys, i, &self.phys));
+        let (_fire_edge, switch_view) = ctx.input(|i| keybinds::play_actions(&self.keys, i, &self.phys));
+        // #weapon-fire  The fire button as a LEVEL: an automatic keeps firing while it is held and a
+        // semi-automatic fires once per press, both decided by the weapon's own trigger behavior.
+        let fire_held = ctx.input(|i| keybinds::play_fire_held(&self.keys, i, &self.phys));
         // #play-hud  The deliberate reload. The engine reloads a dry magazine by itself, so
         // this only matters for topping up a partial one -- but pressing R is muscle memory,
         // and a bound key that does nothing is worse than no key at all.
@@ -21099,6 +21480,9 @@ impl App {
         // #seat-entry  The enter/exit-vehicle action, and the LABEL of whatever it is bound to —
         // the prompt prints the player's own key in place of the engine's button glyph.
         let use_vehicle = ctx.input(|i| keybinds::play_use_vehicle(&self.keys, i, &self.phys));
+        // #use-hold  ...and the same key as a LEVEL: a seat or a weapon on the ground acts on the
+        // button being HELD for `matg`'s `minimum action hold time`, never on the press.
+        let use_down = ctx.input(|i| keybinds::play_use_held(&self.keys, i, &self.phys));
         let use_label = self.keys.label(keybinds::Action::PlayUseVehicle);
         if switch_view {
             if let Some(p) = self.play.as_mut() {
@@ -21159,31 +21543,58 @@ impl App {
             let (biped, weapon, shots) = (pm.biped_tag, pm.weapon_tag, pm.shots);
             self.play_hud.bind(native, cache, biped);
             self.play_hud.set_weapon(native, cache, weapon, shots);
+            // #seat-hud  The seat's own HUDs, read once per boarding (the engine's slot 6 and 4).
+            self.play_hud.bind_seat(native, cache, pm.riding.as_ref().map(|r| (r.vehi_tag, r.seat)));
         }
-        // #play-hud  THE FIRE GATE, and it only ever REFUSES. It never spends a round — the
-        // magazine's single writer is the `PlayMode::shots` delta below, so a pull the rate
-        // limiter swallows cannot cost ammunition and a pull this refuses cannot either.
-        // Short-circuited on `fire` so an un-pressed trigger never counts as a dry pull.
-        let fire_allowed = !fire || self.play_hud.before_fire();
         // #play-hud  One writer for the reload clock: `start_reload` refuses a magazine that is
         // already full or already reloading, so holding the key cannot restart it.
         if reload && self.play.is_some() {
             self.play_hud.start_reload();
         }
         if let Some(pm) = self.play.as_mut() {
-            if melee {
+            // #ride-controls  A seated rider's trigger and melee are the VEHICLE's, not the
+            // biped's: swinging or firing the biped's own gun from inside a Warthog would draw a
+            // shot and spend ammunition the player never held. Vehicle weapons are not wired.
+            if melee && pm.weapon_usable() {
                 pm.melee(scene, dmg.as_deref_mut());
             }
-            if fire && fire_allowed {
-                pm.fire(scene, dmg.as_deref_mut());
+            // #weapon-fire  THE FIRE LOOP. The weapon's trigger / barrel / magazine machines run
+            // at the engine's 60 Hz tick (so a held second is the same number of shots at any
+            // frame rate) and say what happened; each round that left a barrel is one `fire`.
+            //
+            // #play-hud  THE FIRE GATE, and it only ever REFUSES: `before_fire()` never spends a
+            // round, the magazine's writer is `adopt_rounds` below (the machine spends exactly
+            // `rounds per shot`, which the old "one per pull" assumption could not). A refused
+            // shot still cost nothing, and a dry pull starts the reload the way the engine does.
+            let ammo = self.play_hud.ammo.as_ref().map(|a| (a.loaded, self.play_hud.reloading.is_some(), a.reserve.unwrap_or(0) > 0));
+            for ev in pm.advance_fire(dt, fire_held, ammo) {
+                match ev {
+                    play_fire::FireEvent::Shot { projectiles, .. } => {
+                        if self.play_hud.before_fire() {
+                            pm.fire(scene, dmg.as_deref_mut(), &projectiles);
+                        }
+                    }
+                    play_fire::FireEvent::EmptyClick { .. } => self.play_hud.note_dry_pull(),
+                    play_fire::FireEvent::NeedReload => {
+                        self.play_hud.start_reload();
+                    }
+                    play_fire::FireEvent::Overheated | play_fire::FireEvent::Cooled => {}
+                }
+            }
+            if let Some(wf) = pm.weapon_fire.as_ref() {
+                if let Some(m) = wf.def.barrels.first().and_then(|b| b.magazine) {
+                    self.play_hud.adopt_rounds(wf.loaded[m], pm.shots);
+                }
             }
             pm.action_key_label = use_label;
             pm.tick(&input, dt, native, cache, scene, &objects, &mut self.actor_scene);
             // #seat-entry  Entering and leaving a seat, AFTER the tick so the offer the key acts
             // on is this frame's. The vehicle's own prompt named this key, so pressing it when
             // nothing is offered is a no-op with a reason rather than a silent nothing.
-            if use_vehicle {
-                let msg = if pm.riding.is_some() {
+            // #use-hold  The hold counts in 60 Hz ticks. Seated, the key is the EDGE that leaves.
+            let decision = pm.use_decide(use_down, use_vehicle, dt);
+            if decision != play_mode::UseDecision::Idle {
+                let msg = if decision == play_mode::UseDecision::Exit {
                     pm.exit_vehicle(native, cache)
                 } else if pm.offer.is_some() {
                     match pm.enter_vehicle(native, cache, &objects) {
@@ -21228,6 +21639,25 @@ impl App {
         // #play-hud  ADVANCE THE HUD. One call, after the tick, so the magazine is spent by shots
         // that actually left the barrel (`PlayMode::shots` counts the pulls the mode accepted) and
         // the reload clock runs on the same `dt` the controller used.
+        // #play-sound  Audio, after the camera moved, so the listener is this frame's.
+        let ground_material = self.play.as_ref().and_then(|p| objscene::ObjectScene::ground_material_index(sc, p.st.pos + glam::Vec3::Z * 0.4, 1.4));
+        if let (Some(pm), Some(map)) = (self.play.as_mut(), sc.open_map_path()) {
+            let fwd = self.camera.forward();
+            let left = -self.camera.right();
+            let up = self.camera.right().cross(fwd).normalize_or_zero();
+            let host = play_sound::Host {
+                native,
+                cache,
+                map_path: map,
+                dt,
+                listener: (self.camera.pos.into(), fwd.into(), left.into(), up.into()),
+                reloading: self.play_hud.reloading.is_some(),
+                dry_pulls: self.play_hud.dry_pulls,
+                ground_material: ground_material,
+            };
+            pm.drive_sound(&mut self.play_sound, &mut self.sound, &host);
+            self.status = format!("{}\n{}", self.status, self.play_sound.caption(&self.sound));
+        }
         let shots = self.play.as_ref().map(|p| p.shots).unwrap_or(0);
         self.play_hud.tick(dt, shots);
         // #play  POSE AND BUILD THE BIPED. Without this line test mode draws no body at all --
@@ -21271,9 +21701,11 @@ impl App {
     /// * **A ridden vehicle's own shield and health meters.** See
     ///   [`play_hud::PlayHud::vehicle_values`]: HMS keeps no vehicle vitality, and a vehicle
     ///   `chud`'s `shield_meter` would otherwise be fed the DRIVER's shield.
-    /// * **The held weapon's ammo block while riding.** The engine stows your weapon in a driver
-    ///   or gunner seat, and HMS does not read the seat's own weapon flags, so rather than draw an
-    ///   ammo block for a gun that is not in your hands it draws none and says so here.
+    /// * **The held weapon's HUD in a seat that forbids weapons.** The seat's `allows weapons` flag
+    ///   decides it (`reach_unit_hud`: the engine adds none of the biped's weapon slots there), so
+    ///   a driver sees the seat's own HUD and the vehicle weapon's reticule and no ammo block.
+    /// * **A vehicle weapon's heat / ammunition.** Test mode fires no vehicle weapon, so the
+    ///   reticule is drawn at rest and its meters have no value to show.
     /// * **The respawn countdown.** Nothing damages the player yet (`play_damage` carries hits
     ///   outward only), so there is no death to count from.
     fn play_first_person_hud(&self, ui: &mut egui::Ui, viewport: egui::Rect) -> Vec<String> {
@@ -21283,8 +21715,8 @@ impl App {
         }
         // The HUD is a FIRST-PERSON display. Third person is the "see your whole body" view and
         // the engine draws no first-person HUD over it — the same split `film_first_person_hud`
-        // makes, for the same reason.
-        if !matches!(p.view, play_mode::PlayView::FirstPerson) {
+        // makes, for the same reason. A seat's own camera decides while riding.
+        if !matches!(p.view, play_mode::PlayView::FirstPerson) && p.riding.is_none() {
             return vec!["The HUD is a first-person display; this is the third-person view".into()];
         }
         let Some((native, cache)) =
@@ -21292,196 +21724,19 @@ impl App {
         else {
             return vec!["No map open, so no chud tags to draw from".into()];
         };
-        let skin = reach_chud::globals_for(native, cache).and_then(|g| g.default_skin().cloned());
-        let vs = match &skin {
-            Some(s) => reach_hud::VirtualScreen::from_skin(viewport, s),
-            None => reach_hud::VirtualScreen::fallback(viewport),
+        let frame = play_hud_draw::HudFrame {
+            elite: p.species.is_elite(),
+            weapon_tag: p.weapon_tag,
+            weapon_usable: p.weapon_usable(),
+            seat_huds: self.play_hud.seat_huds.as_ref().map(|(_, h)| h.clone()),
+            riding: p.riding.as_ref().map(|r| (r.seat, r.seat_caption())),
+            hud_on: self.play_hud_on,
+            crosshair_on: self.play_crosshair_on,
+            key_label: self.keys.label(keybinds::Action::PlayUseVehicle),
+            prompt: p.action_prompt(),
         };
         let painter = ui.painter_at(viewport);
-        let mut lines: Vec<String> = Vec::new();
-
-        // #vehicle-hud  The seat's own `vehi` is the tag to ask, NOT the placement's: 18 of the 36
-        // vehicles in Forge are turret-typed and four of those are a Warthog's gunner positions,
-        // which live on the child attachment (`warthog_chaingun`). The placement is the fallback.
-        let riding = p.riding.as_ref();
-        let vehicle = riding.and_then(|r| {
-            reach_hud::vehicle_chud(native, cache, r.vehi_tag)
-                .or_else(|| reach_hud::vehicle_chud(native, cache, r.placement_tag))
-                .and_then(|t| native.tag_name(cache, t))
-                .map(|n| (n, r.seat.min(255) as u8))
-        });
-        let key = self.keys.label(keybinds::Action::PlayUseVehicle);
-        let weapon = if riding.is_some() { 0 } else { p.weapon_tag };
-        let v = self.play_hud.values(weapon, vehicle.clone(), Some(key));
-        let (mut drawn, mut skipped) = (0usize, 0usize);
-
-        // ---- the held weapon's reticule ---------------------------------------------------
-        //
-        // #vehicle-hud  NOT while riding: a vehicle's own `chud` carries its own `crosshair`
-        // collection, and drawing the player's as well would put two reticules on the screen at
-        // once (and, with the weapon stowed, the one it drew would be the UNARMED reticule).
-        if self.play_crosshair_on && riding.is_none() {
-            let art = (weapon != 0)
-                .then(|| reach_chud::crosshair_for(ui.ctx(), native, cache, weapon))
-                .flatten();
-            match (&art, &skin) {
-                (Some(a), Some(sk)) => {
-                    reach_chud::paint_crosshair(&painter, viewport, a, sk, vs.vpx);
-                    lines.push(format!(
-                        "Crosshair: {} authored part(s) from {}",
-                        a.crosshair.parts.len(),
-                        native.tag_name(cache, a.crosshair.chud_tag).unwrap_or_default()
-                    ));
-                }
-                _ => {
-                    // The engine's own empty-handed reticule, out of the player HUD — the same
-                    // fallback Theater takes for a body whose weapon it does not know.
-                    let path = if p.species.is_elite() {
-                        reach_hud::PLAYER_CHUD_ELITE
-                    } else {
-                        reach_hud::PLAYER_CHUD_SPARTAN
-                    };
-                    let drew = reach_hud::chud_by_path(native, cache, path)
-                        .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
-                        .and_then(|a| {
-                            let i =
-                                a.chud.collections.iter().position(|c| c.base.name == "unarmed_crosshair")?;
-                            Some(reach_hud::paint_collection(
-                                ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, 0,
-                            ))
-                        });
-                    lines.push(match (weapon, drew) {
-                        (0, Some((d, _))) if d > 0 => {
-                            "Crosshair: empty hands, so the player HUD's own `unarmed_crosshair` is drawn".into()
-                        }
-                        (0, _) => "Crosshair: empty hands, and this HUD authors no unarmed reticule".into(),
-                        (_, _) => "Crosshair: this weapon authors no reticule that draws at rest".into(),
-                    });
-                }
-            }
-        }
-
-        if self.play_hud_on {
-            // ---- the player HUD: shields, health, grenades -------------------------------
-            let path = if p.species.is_elite() {
-                reach_hud::PLAYER_CHUD_ELITE
-            } else {
-                reach_hud::PLAYER_CHUD_SPARTAN
-            };
-            match reach_hud::chud_by_path(native, cache, path)
-                .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
-            {
-                Some(a) => {
-                    for want in reach_hud::PLAYER_COLLECTIONS {
-                        let Some(i) = a.chud.collections.iter().position(|c| c.base.name == want) else {
-                            continue;
-                        };
-                        // The grenade block is datasource-driven: one repeat per grenade TYPE.
-                        let reps =
-                            if a.chud.collections[i].datasource == Some(reach_hud::DATASOURCE_GRENADES) { 2 } else { 1 };
-                        for r in 0..reps {
-                            let (d, s) = reach_hud::paint_collection(
-                                ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, r,
-                            );
-                            drawn += d;
-                            skipped += s;
-                        }
-                    }
-                }
-                None => lines.push(format!("Player HUD: this cache carries no '{path}'")),
-            }
-
-            // ---- the held weapon's own ammo block ----------------------------------------
-            //
-            // Matched by PREFIX: the shipped weapons are not consistent (`ammo_area` on the
-            // assault rifle, `ammo_area_right` on the magnum, `backpack_ammo_area` for a stowed
-            // one), which is why `reach_hud::WEAPON_AMMO_PREFIX` exists.
-            if weapon != 0 {
-                match reach_chud::weapon_chud(native, cache, weapon)
-                    .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
-                {
-                    Some(a) => {
-                        let mut blocks = 0usize;
-                        for (i, c) in a.chud.collections.iter().enumerate() {
-                            if !c.base.name.starts_with(reach_hud::WEAPON_AMMO_PREFIX) {
-                                continue;
-                            }
-                            blocks += 1;
-                            let (d, s) = reach_hud::paint_collection(
-                                ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &v, 0,
-                            );
-                            drawn += d;
-                            skipped += s;
-                        }
-                        if blocks == 0 {
-                            lines.push("Ammo block: this weapon's chud authors no `ammo_area*` collection".into());
-                        }
-                    }
-                    None => lines.push("Ammo block: this weapon references no `chud interface`".into()),
-                }
-            } else if riding.is_some() {
-                lines.push(
-                    "Ammo block: not drawn while riding — the engine stows your weapon in a driver \
-                     or gunner seat and HMS does not read the seat's own weapon flags"
-                        .into(),
-                );
-            }
-
-            // ---- #vehicle-hud  the ridden vehicle's OWN chud ------------------------------
-            if let Some((vpath, seat)) = &vehicle {
-                match reach_hud::chud_by_path(native, cache, vpath)
-                    .and_then(|t| reach_hud::hud_art(ui.ctx(), native, cache, t))
-                {
-                    Some(a) => {
-                        // The vehicle's values, with the PLAYER's vitality and ammo cleared — see
-                        // `PlayHud::vehicle_values` for why that is not an omission.
-                        let vv = self.play_hud.vehicle_values(vehicle.clone(), Some(self.keys.label(keybinds::Action::PlayUseVehicle)));
-                        let (mut vd, mut vs_skip) = (0usize, 0usize);
-                        let mut names: Vec<String> = Vec::new();
-                        for i in 0..a.chud.collections.len() {
-                            let (d, s) =
-                                reach_hud::paint_collection(ui.ctx(), &painter, &vs, &a, i, skin.as_ref(), &vv, 0);
-                            if d > 0 {
-                                names.push(a.chud.collections[i].base.name.clone());
-                            }
-                            vd += d;
-                            vs_skip += s;
-                        }
-                        drawn += vd;
-                        skipped += vs_skip;
-                        lines.push(format!(
-                            "Vehicle HUD: {vpath} (seat {seat}) — {vd} widget(s) drawn from [{}], \
-                             {vs_skip} left out. The vehicle's own shield, health and ammunition \
-                             are NOT modelled, so its meters are not drawn.",
-                            names.join(", ")
-                        ));
-                    }
-                    None => lines.push(format!("Vehicle HUD: '{vpath}' did not decode")),
-                }
-                if let Some(r) = riding {
-                    lines.push(format!("Riding: {}", r.seat_caption()));
-                }
-            }
-            lines.push(format!("HUD: {drawn} authored widget(s) drawn, {skipped} left out for want of a value"));
-        }
-
-        // The motion tracker, named rather than silently missing.
-        lines.push(
-            "Motion tracker: NOT drawn. Test mode has one body on the map and no other players, so \
-             every blip would be invented; an empty radar frame would be a claim of its own."
-                .into(),
-        );
-        let unresolved = reach_hud::take_unresolved_strings();
-        if !unresolved.is_empty() {
-            lines.push(format!(
-                "Not drawn ({} authored string(s) HMS cannot resolve to a glyph): {}",
-                unresolved.len(),
-                unresolved.join(", ")
-            ));
-        }
-        lines.extend(self.play_hud.report());
-        lines.extend(v.report());
-        lines
+        play_hud_draw::paint_play_hud(ui.ctx(), &painter, viewport, native, cache, &self.play_hud, &frame)
     }
 
     /// #play  The only thing test mode draws over the viewport: the way out, and one line of
@@ -21531,7 +21786,14 @@ impl App {
         // "walk up to it and nothing happens" is indistinguishable from "it does not work".
         // Whichever offer the action key would act on is the one shown, in the same order the key
         // uses, so the prompt can never name something the key would not do.
-        let prompt = if p.riding.is_some() {
+        // #use-hold  The prompt is the HUD's to draw (`player_training`, lower centre) whenever the
+        // HUD is on screen; this line is the fallback for a view with no HUD (third person, HUD
+        // switched off) and for a prompt whose authored string did not resolve, where the caption
+        // says why there is nothing to show.
+        let hud_shows_prompt = (self.play_hud_on || self.play_crosshair_on)
+            && (matches!(p.view, play_mode::PlayView::FirstPerson) || p.riding.is_some())
+            && p.action_prompt().is_some();
+        let prompt = if p.riding.is_some() || hud_shows_prompt {
             None
         } else if let Some(o) = p.offer.as_ref() {
             Some(o.caption())
@@ -21780,7 +22042,7 @@ impl App {
                 let r = match self.play.as_mut() {
                     Some(p) => {
                         if allowed {
-                            p.fire(scene, dmg.as_deref_mut());
+                            p.fire(scene, dmg.as_deref_mut(), &[]);
                         }
                         Ok(p.last_hit.clone().unwrap_or_default())
                     }
@@ -21956,11 +22218,7 @@ impl App {
                     match play_mode::player_physics_for(native, cache, &bipeds, sp) {
                         Ok((path, p)) => {
                             out += &format!("{path}\n{}\n", p.describe());
-                            out += &format!(
-                                "step-up {:.4} wu (emergent, no authored step field) | ground probe {:.4} wu\n",
-                                play_ctl::max_step_height(&p),
-                                play_ctl::ground_probe_depth(&p)
-                            );
+                            out += &format!("{}\n", play_ctl::law_summary(&p));
                         }
                         Err(e) => out += &format!("{e}\n"),
                     }
@@ -23446,19 +23704,24 @@ mod play_hud_call_site_gates {
         );
         // The painter it must go through is the shared one, not a second HUD.
         let f = method("fn play_first_person_hud(&self, ui: &mut egui::Ui, viewport: egui::Rect) -> Vec<String> {");
+        assert!(
+            f.contains("play_hud_draw::paint_play_hud("),
+            "the viewport must draw through `play_hud_draw::paint_play_hud`, the one function the headless rasteriser also runs"
+        );
+        let d = include_str!("play_hud_draw.rs");
         for want in [
             "reach_hud::paint_collection(",
             "reach_hud::PLAYER_COLLECTIONS",
             "reach_hud::WEAPON_AMMO_PREFIX",
-            "reach_hud::vehicle_chud(",
+            "reach_unit_hud::paint_seat_huds(",
             "reach_chud::paint_crosshair(",
             "vehicle_values(",
         ] {
-            assert!(f.contains(want), "the draw site must go through `{want}` rather than reimplement it");
+            assert!(d.contains(want), "the draw must go through `{want}` rather than reimplement it");
         }
         assert!(
-            !f.contains("Field::derived") && !f.contains("Field::recorded"),
-            "the draw site must not mint provenance of its own — every value comes from \
+            !d.contains("Field::derived") && !d.contains("Field::recorded"),
+            "the draw must not mint provenance of its own — every value comes from \
              `play_hud::PlayHud::values`, which is where the discipline lives"
         );
     }
@@ -23507,10 +23770,27 @@ mod play_hud_call_site_gates {
             up.contains(concat!("self.play_hud.", "set_weapon(native, cache, weapon, shots);")),
             "the HUD is never bound to the held weapon, so there is no magazine"
         );
+        // #seat-hud  The seat's HUDs are read from the seat block when a ride starts; without
+        // this the ridden vehicle shows no reticule and no seat HUD at all.
         assert!(
-            up.contains(concat!("let fire_allowed = !fire || self.play_hud.", "before_fire();")),
-            "the fire gate must short-circuit on `fire`, or an un-pressed trigger counts a dry \
-             pull on every frame"
+            up.contains(concat!("self.play_hud.", "bind_seat(")),
+            "the HUD is never bound to the seat being ridden, so a vehicle shows no reticule"
+        );
+        // #weapon-fire  The fire loop is what reaches `PlayMode::fire` now: it asks the HUD's
+        // gate once per ROUND the weapon's machines say left a barrel (an un-pressed trigger
+        // produces no Shot event, so it can never count as a dry pull), counts an empty click
+        // through the HUD, and hands the machine's exact spend back to the magazine.
+        assert!(
+            up.contains(concat!("pm.advance_fire(dt, fire_", "held, ammo)")),
+            "the window frame must run the weapon's fire loop (`PlayMode::advance_fire`)"
+        );
+        assert!(
+            up.contains(concat!("self.play_hud.", "note_dry_pull()")),
+            "an empty click must be counted by the HUD, or the dry-fire sound never plays"
+        );
+        assert!(
+            up.contains(concat!("self.play_hud.", "adopt_rounds(")),
+            "the machine's spend must be handed back to the HUD magazine, or the ammo meter never moves"
         );
     }
 
@@ -23530,5 +23810,156 @@ mod play_hud_call_site_gates {
             "`dump_hud` must print the recovered magazine layout and the biped vitality, or the \
              map-backed half of the recovery has no route to run"
         );
+    }
+}
+
+// #weapon-fire  THE WIRING OF THE WEAPON LOOP. `play_fire` is gated on its own; these gates are on
+// the three places it is CALLED FROM, because every previous "the machine exists and nothing
+// drives it" in this project passed its own unit gates.
+#[cfg(test)]
+mod play_fire_wiring_gates {
+    /// This file with this module cut off the end (see `play_hud_call_site_gates::src`: the needles
+    /// below are literals of this module and would otherwise find themselves).
+    fn main_src() -> &'static str {
+        let whole = include_str!("main.rs");
+        let at = whole.find(concat!("mod ", "play_fire_wiring_gates {")).expect("this module must be findable");
+        &whole[..at]
+    }
+
+    fn body_of<'a>(src: &'a str, sig: &str, next: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("{sig} must exist; if it was renamed, update this gate"));
+        let rest = &src[start..];
+        let end = rest[1..].find(next).map(|i| i + 1).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// One call of `PlayMode::fire` is ONE fire event: it must not drop an event because the last
+    /// one's animation is still playing (the old 0.25 s rate limiter), and it must resolve every
+    /// projectile the event launched.
+    #[test]
+    fn a_fire_event_is_never_swallowed_and_resolves_every_projectile() {
+        let pm = include_str!("play_mode.rs");
+        let fire = body_of(pm, "    pub fn fire(", "\n    pub fn ");
+        assert!(!fire.contains("self.fired.is_some()"), "fire() must not drop an event while the arms are still animating");
+        assert_eq!(fire.matches("self.shots += 1;").count(), 1, "one shot counted per event, none per projectile");
+        assert!(fire.contains("spread_dir"), "every projectile of the event is resolved along its own direction");
+        assert!(fire.contains("scene.raycast_solid("), "and traced against the scene");
+    }
+
+    /// The machine is built for the weapon in hand every time the weapon changes -- on spawn and in
+    /// `give_weapon` (which the pickup and the `Give weapon` menu both go through).
+    #[test]
+    fn the_machine_is_armed_whenever_the_weapon_changes() {
+        let pm = include_str!("play_mode.rs");
+        let give = body_of(pm, "    pub fn give_weapon(", "\n    pub fn ");
+        assert!(give.contains("self.arm_weapon("), "give_weapon must arm the machine for the new weapon");
+        assert!(pm.contains("pm.arm_weapon(native, cache);"), "the weapon a session starts with must be armed too");
+        let adv = body_of(pm, "    pub fn advance_fire(", "\n    pub fn ");
+        assert!(adv.contains("held && usable"), "a weapon the seat does not allow must see a released trigger");
+        assert!(adv.contains("melee: meleeing"), "a swing in progress holds fire");
+    }
+
+    /// The window frame: every Shot goes through the HUD's refuse-only gate before it is fired, an
+    /// empty click and a reload request reach the HUD, and the machine's spend goes back to it.
+    #[test]
+    fn the_window_frame_drives_the_loop_and_hands_the_spend_back() {
+        let s = main_src();
+        let up = body_of(s, "    fn update_play(&mut self, ctx: &egui::Context, response: &egui::Response) {", "\n    fn ");
+        let shot = up.find(concat!("FireEvent::", "Shot {")).expect("the loop must handle Shot events");
+        let arm = &up[shot..(shot + 400).min(up.len())];
+        assert!(arm.contains("before_fire()") && arm.contains(".fire(scene, dmg.as_deref_mut(), &projectiles)"), "a Shot is gated, then fired: {arm}");
+        assert!(up.contains(concat!("FireEvent::", "NeedReload => {")), "the engine's auto-reload request must reach the HUD");
+        assert!(up.contains("start_reload();"));
+        let _ = shot;
+    }
+}
+
+#[cfg(test)]
+mod scale_use_selection_gates {
+    use super::*;
+    use forge_scale::ScaleConvention as C;
+
+    fn meta(team: u8, label: &str, labels: &[String]) -> ObjMeta {
+        let idx = labels.iter().position(|l| l == label).map(|i| i as u16).unwrap_or(0xFFFF);
+        ObjMeta { team, label: label.to_string(), label_idx: if label.is_empty() { 0xFFFF } else { idx }, ..Default::default() }
+    }
+
+    /// An unlabelled object gains the `scale` label (appended once, reused after) and the byte
+    /// the convention gives; the object's size then DECODES to what was asked, through the same
+    /// `scale()` the viewport renders with.
+    #[test]
+    fn typing_a_size_labels_the_object_and_the_viewport_decodes_it() {
+        for &c in C::ALL {
+            let mut labels: Vec<String> = vec!["red_spawn".into()];
+            let mut m = meta(8, "", &labels);
+            let ss = m.set_scale(2.0, c, &mut labels).unwrap();
+            assert!(forge_scale::is_scale_label(&m.label), "{c:?}: label {:?}", m.label);
+            assert_eq!(labels.iter().filter(|l| forge_scale::is_scale_label(l)).count(), 1);
+            assert!(m.scaled_on(), "{c:?}: the object must now count as scaled");
+            assert_eq!(m.spawn_seq, ss.seq as i32);
+            assert!((m.scale(c) - ss.got).abs() < 1e-4, "{c:?}: viewport {} vs written {}", m.scale(c), ss.got);
+            let mut m2 = meta(8, "", &labels);
+            m2.set_scale(3.0, c, &mut labels).unwrap();
+            assert_eq!(labels.iter().filter(|l| forge_scale::is_scale_label(l)).count(), 1, "{c:?}: the label must be reused, not duplicated");
+        }
+    }
+
+    /// An object that already carries another label is REFUSED, untouched: a label names its role.
+    #[test]
+    fn a_labelled_object_is_never_relabelled_and_a_full_table_refuses() {
+        let mut labels: Vec<String> = vec!["red_spawn".into()];
+        let mut m = meta(8, "red_spawn", &labels);
+        let before = m.clone();
+        let e = m.set_scale(2.0, C::X330, &mut labels).unwrap_err();
+        assert!(e.contains("red_spawn"), "{e}");
+        assert!(m == before, "a refusal must not touch the object");
+        assert_eq!(labels.len(), 1, "or the table");
+        let mut full: Vec<String> = (0..forge_scale::MAX_LABELS).map(|i| format!("l{i}")).collect();
+        let mut m = meta(8, "", &full);
+        let before = m.clone();
+        let e = m.set_scale(2.0, C::X330, &mut full).unwrap_err();
+        assert!(e.contains("label table is full"), "{e}");
+        assert!(m == before, "a full table must not touch the object");
+        assert!(m.set_scale(-3.0, C::X330, &mut labels).is_err() && m.set_scale(f32::NAN, C::X330, &mut labels).is_err());
+    }
+
+    /// A typed size reaches a MIXED selection with each object's own team (X330 RED is cosmic), skips
+    /// the ones it must not relabel, and the label table grows at most once.
+    #[test]
+    fn a_selection_is_resized_per_object_team_and_skips_what_it_must_not_relabel() {
+        let mut labels: Vec<String> = vec!["koth_hill".into()];
+        let mut metas: std::collections::HashMap<u32, ObjMeta> = std::collections::HashMap::new();
+        metas.insert(1, meta(0, "", &labels));          // RED: cosmic branch under X330
+        metas.insert(2, meta(1, "", &labels));          // BLUE
+        metas.insert(3, meta(8, "", &labels));          // neutral
+        metas.insert(4, meta(8, "koth_hill", &labels)); // another label: skipped
+        // 300: reachable by both branches (RED under X330 cannot express anything between x1 and x327 at all)
+        let rep = set_selection_scale(&mut metas, &[1, 2, 3, 4], 300.0, C::X330, &mut labels);
+        assert_eq!((rep.changed, rep.refused_other_label, rep.refused_table_full), (3, 1, 0), "{rep:?}");
+        assert_eq!(labels.len(), 2, "the table grew by exactly the one `scale` label");
+        let (red, blue) = (metas[&1].spawn_seq, metas[&2].spawn_seq);
+        assert_ne!(red, blue, "RED and BLUE need different X330 bytes for the same size");
+        // each decodes, with ITS OWN team, to (about) the size that was asked
+        for d in [1u32, 2, 3] {
+            let got = metas[&d].scale(C::X330);
+            assert!((got / 300.0 - 1.0).abs() < 0.15, "object {d}: asked 300, viewport shows {got}");
+        }
+        assert_eq!(metas[&4].label, "koth_hill");
+        assert_eq!(metas[&4].spawn_seq, 0, "the refused object is untouched");
+        assert!(rep.worst_ratio_err < 0.15, "{rep:?}");
+    }
+
+    /// Under X330 a RED object has NOTHING between x1 and about x327 (the cosmic branch starts at
+    /// 32732/100): asking it for x50 resolves to the far side, and the result must SAY it is far off
+    /// so the UI can warn instead of quietly writing a size five times what was asked.
+    #[test]
+    fn a_red_object_cannot_be_asked_for_a_size_in_its_gap_and_the_error_says_so() {
+        let mut labels: Vec<String> = Vec::new();
+        let mut red = meta(0, "", &labels);
+        let ss = red.set_scale(50.0, C::X330, &mut labels).unwrap();
+        assert!(ss.ratio_err.abs() > 1.0, "the miss must be reported as large: {ss:?}");
+        let mut blue = meta(1, "", &labels);
+        let ok = blue.set_scale(50.0, C::X330, &mut labels).unwrap();
+        assert!(ok.ratio_err.abs() < 0.15, "a non-RED object reaches x50: {ok:?}");
     }
 }

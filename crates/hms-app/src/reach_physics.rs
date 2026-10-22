@@ -213,7 +213,23 @@ pub const fn biped_fall_acceleration() -> f32 {
 /// #gravity  **The acceleration a RIGID BODY is integrated at** — a ragdoll, a dropped weapon, a
 /// vehicle in the air.
 ///
-/// Still [`MEASURED_FALL_ACCELERATION`], and **that is a holding position, not an endorsement**:
+/// **#havok 2026-10-20: THE ENGINE'S ANSWER IS NOW KNOWN, AND IT IS [`WORLD_GRAVITY`].** A Havok
+/// body is integrated by `sub_141106780` (see [`crate::reach_havok`]): once per tick,
+/// `v += gravityFactor * world_gravity * dt`, with `gravityFactor` an `hkHalf` that defaults to
+/// 1.0 (`sub_1410DDD30`) and is set per object by `sub_140D9D3D0` from the structure BSP's
+/// `custom gravity scale` (1.0 in all 31 rows measured) -- and `world_gravity` is
+/// `(0, 0, -*physics_constants)` = -4.1712594 (`sub_18009A06C`). So a ragdoll, a dropped weapon
+/// and a vehicle in the air ALL fall at `reach_havok::world_gravity() * gravity_factor`; this
+/// function should return [`WORLD_GRAVITY`] and the 10.4576 below is the clamp artefact the module
+/// note explains. **It has not been flipped here** because `film_play::CORPSE_GRAVITY` aliases it
+/// and three gates pin the old number or the old separation (`film_play`'s
+/// `a_body_left_hanging_above_the_floor_falls_onto_it`, `play_phys`'s
+/// `gravity_is_the_engines_authored_constant_and_the_ragdolls_did_not_move_with_it`, and this file's
+/// `the_biped_and_the_rigid_body_fall_under_separately_named_laws`), and a corpse in Theater
+/// would fall 2.5x slower. The change is one line plus those three gates; the owner of Theater
+/// should see it first.
+///
+/// Until then this is [`MEASURED_FALL_ACCELERATION`], and **that is a holding position, not an endorsement**:
 /// the fit behind it has a known clamp defect (see [`biped_fall_acceleration`]). It stays because
 /// nothing about corpse falls has ever been reported wrong, because the value these consumers
 /// have always used is this one, and because "what a Havok body falls at" is a separate question
@@ -241,6 +257,12 @@ pub const fn rigid_body_fall_acceleration() -> f32 {
 /// differs between the tool build and the game dll, the layout does not. So a vehicle's
 /// suspension, the per-object-type gravity scale and the slope limit all come out of the one
 /// 32-byte block whose first float is [`WORLD_GRAVITY`].
+///
+/// **#havok:** the vehicle code never applies gravity itself at all -- `havok_vehicle_physics.cpp`
+/// does not read the `"physics constants"` block for it; Havok adds `gravityFactor * g * dt` to the
+/// hull's velocity every tick and the wheels / hover pads hold the hull up against it
+/// ([`crate::reach_havok`] module note). The per-vehicle `gravity scale` (`vehi +0x5AC`) is that
+/// `gravityFactor`, at all times, not only in the air.
 ///
 /// There is therefore no second gravity for a vehicle to be on. [`MEASURED_FALL_ACCELERATION`]
 /// has no engine basis at all — its fit clamped away its own population (see
@@ -553,18 +575,55 @@ mod gates {
                 (jump_apex(2.0 * jump, WORLD_GRAVITY) - 4.0 * authored).abs() < 1e-3,
                 "{leaf}: doubling the jump velocity did not quadruple the apex"
             );
-            // The apex under the BIPED's law is the one the player will feel; print it and
-            // require only that it is a jump a body that size could make -- between a quarter of
-            // its height and its full height. That is a sanity band, not a referee.
+            // THE APEX THE PLAYER FEELS, EXACTLY. The game ticks at 60 Hz and a player's gravity
+            // is the proven `4.1712594` at full strength (see `biped_fall_acceleration`), so the
+            // body leaves the ground at `v` and each tick does `vz -= g/60; z += vz/60` (the
+            // controller's order: velocity first, then position). The discrete apex is worked out
+            // HERE by running that recurrence, independently of the closed form, and must sit
+            // within half a tick of rise of `v^2 / 2g` (`v/120`, the semi-implicit error) -- and
+            // not be the half-gravity apex a jump that kept its 0.5 scale would give.
             let used = jump_apex(jump, biped_fall_acceleration());
+            let dt = 1.0 / 60.0f32;
+            let (mut vz, mut z, mut top) = (jump, 0.0f32, 0.0f32);
+            while vz > 0.0 {
+                vz -= 4.1712594f32 * dt; // the proven literal, NOT the function under test
+                z += vz * dt;
+                top = top.max(z);
+            }
             assert!(
-                used > 0.25 * height && used <= 1.05 * height,
-                "{leaf}: the biped's own law gives an apex of {used:.3} wu against a {height:.3} wu \
-                 body ({:.0}%), which is not a height a body that size jumps",
-                100.0 * used / height
+                (top - used).abs() <= jump * dt * 0.5 + 1e-4,
+                "{leaf}: the 60 Hz recurrence peaks at {top:.4} wu, the closed form v^2/2g says {used:.4}"
             );
+            let half = jump_apex(jump, 0.5 * biped_fall_acceleration());
+            assert!((top - half).abs() > 0.1 * half, "{leaf}: the apex {top:.3} is the half-gravity one -- the jump's 0.5 scale has leaked into a player");
+            // (`height` is the capsule's STANDING HEIGHT -- bipd physics +0x04, 0.650 Spartan,
+            // 0.790 Elite -- a collision-shape size. The old gate bounded the apex by it at 105%
+            // because gravity was then a fitted guess and "a jump is not taller than its body"
+            // was the only referee; with the gravity proven there is no reason an authored
+            // 2.650 wu/s jump must stay under a 0.790 wu capsule, and it does not: 0.842.)
             let _ = measured;
         }
+        // Every OTHER biped the cache has that authors a jump: the same recurrence against the
+        // same closed form (a read at the wrong offset would not agree with itself).
+        let mut others = 0usize;
+        for &t in &native.tags_by_group(cache, "bipd") {
+            let Some((jump, _, _)) = biped_physics(native, cache, t) else { continue };
+            if !(0.5..10.0).contains(&jump) {
+                continue;
+            }
+            let dt = 1.0 / 60.0f32;
+            let (mut vz, mut z, mut top) = (jump, 0.0f32, 0.0f32);
+            while vz > 0.0 {
+                vz -= 4.1712594f32 * dt; // the proven literal, NOT the function under test
+                z += vz * dt;
+                top = top.max(z);
+            }
+            let name = native.tag_name(cache, t).unwrap_or_default();
+            assert!((top - jump_apex(jump, biped_fall_acceleration())).abs() <= jump * dt * 0.5 + 1e-4, "{name}: jump {jump}");
+            others += 1;
+        }
+        println!("{others} bipeds with an authored jump checked against the 60 Hz recurrence");
+        assert!(others >= 2, "only {others} bipeds authored a readable jump");
         assert_eq!(checked, 2, "both playable bipeds must be checked, found {checked}");
         // **THE READ IS PER BIPED.** Reach authors 2.300 for the Spartan and 2.650 for the Elite,
         // so a shared constant -- or a read at an offset that happens to return the same bytes for

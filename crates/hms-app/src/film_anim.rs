@@ -850,7 +850,9 @@ pub fn is_melee_clip(name: &str) -> bool {
 /// #wclass The class component of a `mode:class:action` clip name, or `None` for a two-part name.
 pub fn class_of_clip(name: &str) -> Option<&str> {
     let p: Vec<&str> = name.split(':').collect();
-    (p.len() == 3 && !p[1].is_empty()).then_some(p[1])
+    // lazy on purpose: `then_some(p[1])` evaluates the index BEFORE the length test and panics on a
+    // clip name with no ':' in it (a one-part name reached it from a real film)
+    (p.len() == 3 && !p[1].is_empty()).then(|| p[1])
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1256,7 +1258,20 @@ pub fn death_tick(t: &crate::film_decode::EntityTrack) -> Option<u32> {
         return None;
     }
     t.destroyed_tick?;
-    let last = t.positions.last()?.0;
+    let mut last = t.positions.last()?.0;
+    // #film-riders  A SEATED body stops reporting a position the tick it boards, so "the last
+    // reported position" is the boarding spot, however long the drive that followed -- and a
+    // driver killed a minute in was drawn dying where he stepped up, with the vehicle driving on.
+    // His seat link says better. If he is linked at that last position (or boards right after
+    // it), the end is the tick the
+    // link is CLEARED (the death un-seats), or -- a link still standing when his messages stop --
+    // his last message, the best end there is for a body that died in the seat.
+    let linked = t.attached_at(last).is_some()
+        || t.attachments.iter().find(|(c, _)| *c > last).is_some_and(|(_, link)| link.is_some());
+    if linked {
+        let cleared = t.attachments.iter().find(|(c, link)| *c > last && link.is_none()).map(|&(c, _)| c);
+        last = cleared.unwrap_or(t.last_tick).max(last);
+    }
     // Guard the pathological track whose destroy arrives BEFORE its last position (a recycled
     // net id, measured down to -18,610 ticks): the track is two lives spliced together and there
     // is no single moment to end. One second of slack for an out-of-order message.
@@ -2044,6 +2059,10 @@ pub struct Ride {
     pub vehicle_net_id: u32,
     pub from_tick: u32,
     pub to_tick: u32,
+    /// #film-riders  The 6-bit SEAT INDEX the recording states (base field 12), into the seat
+    /// vehicle's own `unit_seat` block. `None` for a ride the displacement detector found, which
+    /// knows nothing about seats.
+    pub seat: Option<u8>,
 }
 
 impl Ride {
@@ -2144,14 +2163,14 @@ pub fn find_rides(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
                     }
                     Some(false) => {
                         if let Some((s, e)) = run.take() {
-                            out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v.net_id, from_tick: s, to_tick: e });
+                            out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v.net_id, from_tick: s, to_tick: e, seat: None });
                         }
                     }
                     None => {
                         // stationary: hold, but not forever
                         if let Some((s, e)) = run {
                             if t > e + ride::HOLD_TICKS {
-                                out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v.net_id, from_tick: s, to_tick: e });
+                                out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v.net_id, from_tick: s, to_tick: e, seat: None });
                                 run = None;
                             }
                         }
@@ -2160,7 +2179,7 @@ pub fn find_rides(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
                 t += ride::STEP;
             }
             if let Some((s, e)) = run {
-                out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v.net_id, from_tick: s, to_tick: e });
+                out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v.net_id, from_tick: s, to_tick: e, seat: None });
             }
         }
     }
@@ -2207,6 +2226,17 @@ pub const MIN_RIDE_TRAVEL_WU: f32 = 2.0;
 /// uses; [`find_rides`] and [`merge_rides`] are the stages, exposed for measurement.
 pub fn accepted_rides(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
     let mut out = merge_rides(find_rides(idx));
+    // #film-riders  The recording's own statement wins. A body that has stated its parent link at
+    // all by the time a detected ride ends is described by that statement -- linked or, with an
+    // explicit "no parent", not -- so the detector only speaks for bodies the stream was silent
+    // about. (Measured: the detector overlapped NONE of the recorded rides, because a seated
+    // body stops replicating its own position and there is no displacement to match.)
+    out.retain(|r| {
+        idx.tracks
+            .iter()
+            .find(|t| t.net_id == r.biped_net_id)
+            .map_or(true, |t| !t.attachments.iter().any(|(k, _)| *k <= r.to_tick))
+    });
     out.retain(|r| {
         let Some(v) = idx.tracks.iter().find(|t| t.net_id == r.vehicle_net_id) else { return false };
         let mut flat = 0.0f32;
@@ -2219,6 +2249,47 @@ pub fn accepted_rides(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
         }
         flat >= MIN_RIDE_TRAVEL_WU
     });
+    out.extend(recorded_rides(idx));
+    out.sort_by_key(|r| (r.from_tick, r.biped_net_id));
+    out
+}
+
+/// #film-riders  Every seat membership the recording STATES: a biped whose base field 12 names a
+/// vehicle as its parent and a seat index.
+///
+/// This is the engine's own seat state, replicated. A seated unit stops sending a position of its
+/// own (its place in the world is its parent's), so the stream gives the body's seat as a parent
+/// link and nothing else -- which is why a detector looking for the body's displacement matching
+/// the vehicle's never saw these.
+///
+/// One ride per run of the same `(parent, seat)`: the engine restates the record when the local
+/// offset changes, and that must not cut a ride in two. A ride ends the tick BEFORE the
+/// statement that clears or replaces it (so back-to-back rides never overlap), or at the body's
+/// destroy / last report when nothing ever ended it.
+pub fn recorded_rides(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
+    let vehicle: std::collections::HashSet<u32> =
+        idx.tracks.iter().filter(|t| t.entity_type == VEHICLE_TYPE).map(|t| t.net_id).collect();
+    let mut out = Vec::new();
+    for b in idx.tracks.iter().filter(|t| t.entity_type == BIPED_TYPE && !t.attachments.is_empty()) {
+        let mut open: Option<(u32, u32, u8)> = None; // (from, vehicle, seat)
+        let mut close = |open: &mut Option<(u32, u32, u8)>, end: u32, out: &mut Vec<Ride>| {
+            if let Some((from, v, seat)) = open.take() {
+                out.push(Ride { biped_net_id: b.net_id, vehicle_net_id: v, from_tick: from, to_tick: end.max(from), seat: Some(seat) });
+            }
+        };
+        for &(tick, a) in &b.attachments {
+            let seated = a.filter(|a| vehicle.contains(&a.parent)).and_then(|a| a.seat.map(|s| (a.parent, s)));
+            match (open, seated) {
+                (Some((_, v, s)), Some((pv, ps))) if v == pv && s == ps => {}
+                (_, next) => {
+                    close(&mut open, tick.saturating_sub(1), &mut out);
+                    open = next.map(|(v, s)| (tick, v, s));
+                }
+            }
+        }
+        close(&mut open, b.destroyed_tick.unwrap_or(b.last_tick), &mut out);
+    }
+    out.sort_by_key(|r| (r.from_tick, r.biped_net_id));
     out
 }
 
@@ -2498,6 +2569,12 @@ impl VehicleTable {
             .rides
             .iter()
             .find(|r| r.biped_net_id == biped_net_id && r.covers(tick))?;
+        // #film-riders  A STATED seat needs no recognised family: the driver resolves its label
+        // from the vehicle's own seat block. Only the detector's guess depends on the table.
+        if r.seat.is_some() {
+            let name = self.vehicles.get(&r.vehicle_net_id).map(|v| v.name.clone()).unwrap_or_default();
+            return Some(Seat { vehicle_net_id: r.vehicle_net_id, mode: String::new(), vehicle: name });
+        }
         let v = self.vehicles.get(&r.vehicle_net_id)?;
         if v.seat_family.is_empty() {
             return None;
@@ -3962,12 +4039,12 @@ mod tests {
     #[test]
     fn ride_fragments_separated_by_a_pause_are_merged() {
         let v = vec![
-            Ride { biped_net_id: 1, vehicle_net_id: 9, from_tick: 100, to_tick: 160 },
-            Ride { biped_net_id: 1, vehicle_net_id: 9, from_tick: 220, to_tick: 300 },
+            Ride { biped_net_id: 1, vehicle_net_id: 9, from_tick: 100, to_tick: 160, seat: None },
+            Ride { biped_net_id: 1, vehicle_net_id: 9, from_tick: 220, to_tick: 300, seat: None },
             // a gap of 10 s: a different ride
-            Ride { biped_net_id: 1, vehicle_net_id: 9, from_tick: 900, to_tick: 960 },
+            Ride { biped_net_id: 1, vehicle_net_id: 9, from_tick: 900, to_tick: 960, seat: None },
             // a different vehicle never merges
-            Ride { biped_net_id: 1, vehicle_net_id: 8, from_tick: 170, to_tick: 200 },
+            Ride { biped_net_id: 1, vehicle_net_id: 8, from_tick: 170, to_tick: 200, seat: None },
         ];
         let m = merge_rides(v);
         assert_eq!(m.len(), 3);
@@ -4024,6 +4101,11 @@ mod tests {
         assert_eq!(class_of_clip("combat:sword:idle"), Some("sword"));
         assert_eq!(class_of_clip("combat:landing_dead_back"), None);
         assert_eq!(class_of_clip("first_person:idle"), None);
+        // names with FEWER than two parts, and a blank middle, are "no class" -- never a panic
+        assert_eq!(class_of_clip("idle"), None);
+        assert_eq!(class_of_clip(""), None);
+        assert_eq!(class_of_clip("combat::idle"), None);
+        assert_eq!(class_of_clip("a:b:c:d"), None);
     }
 
     #[test]

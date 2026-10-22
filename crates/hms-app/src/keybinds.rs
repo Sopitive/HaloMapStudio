@@ -118,6 +118,8 @@ pub enum Action {
     // --- modal transform ---
     ModalMove,
     ModalRotate,
+    /// #scale-sel  Scale the selection about its own centre.
+    ModalScale,
     Duplicate,
     AxisX,
     AxisY,
@@ -179,7 +181,7 @@ pub struct Spec {
 }
 
 impl Action {
-    pub const ALL: [Action; 47] = [
+    pub const ALL: [Action; 48] = [
         Action::CamForward,
         Action::CamBack,
         Action::CamLeft,
@@ -191,6 +193,7 @@ impl Action {
         Action::FlyLook,
         Action::ModalMove,
         Action::ModalRotate,
+        Action::ModalScale,
         Action::Duplicate,
         Action::AxisX,
         Action::AxisY,
@@ -246,6 +249,7 @@ impl Action {
 
             A::ModalMove => ("modal_move", "Move the selection", "Starts a modal move: the selection follows the pointer until you click or confirm.", C::Transform, M::Any, false, false),
             A::ModalRotate => ("modal_rotate", "Rotate the selection", "Starts a modal rotate about the view axis (or the locked axis).", C::Transform, M::Any, false, false),
+            A::ModalScale => ("modal_scale", "Scale the selection", "Starts a modal scale about the selection's centre: the pieces keep their relative offsets, so a whole build grows or shrinks together. Type a number for an exact factor.", C::Transform, M::Any, false, false),
             A::Duplicate => ("duplicate", "Duplicate the selection", "Copies the selection and starts moving the copies.", C::Transform, M::Any, false, false),
             A::AxisX => ("axis_x", "Lock to X", "During a move / rotate: constrain to X (press again to unlock).", C::Transform, M::Any, false, false),
             A::AxisY => ("axis_y", "Lock to Y", "During a move / rotate: constrain to Y (press again to unlock).", C::Transform, M::Any, false, false),
@@ -283,7 +287,7 @@ impl Action {
             A::PlaySprint => ("play_sprint", "Sprint (hold)", "Test mode: hold to sprint.", C::Play, M::Any, true, false),
             A::PlayWalk => ("play_walk", "Walk slowly (hold)", "Test mode: hold to move at the authored walking speed instead of the run.", C::Play, M::Any, true, false),
             A::PlayMelee => ("play_melee", "Melee", "Test mode: swing. Plays the weapon class's own melee animation.", C::Play, M::NoCtrl, false, false),
-            A::PlayFire => ("play_fire", "Fire", "Test mode: fire the weapon in your hands along the crosshair.", C::Play, M::Any, false, true),
+            A::PlayFire => ("play_fire", "Fire", "Test mode: fire the weapon in your hands along the crosshair. Hold it to keep firing an automatic; a semi-automatic fires once per press.", C::Play, M::Any, false, true),
             A::PlayReload => ("play_reload", "Reload", "Test mode: reload the weapon in your hands. The magazine also reloads itself when it runs dry, which is what the engine does.", C::Play, M::NoCtrl, false, false),
             A::PlayView => ("play_view", "First / third person", "Test mode: switch between looking through the biped's own eyes and watching it from behind. Reach draws no legs in first person, so the full body is the third-person view.", C::Play, M::NoCtrl, false, false),
             A::PlayUseVehicle => ("play_use_vehicle", "Use: vehicle or weapon", "Test mode: get into the vehicle seat you are standing at, get out of the one you are in, or pick up the weapon you are standing next to. ONE action key for all three, which is the game's own arrangement; a vehicle wins when both are in range. The game's own prompt names this key.", C::Play, M::NoCtrl, false, false),
@@ -698,6 +702,7 @@ impl Keybinds {
             // Transform: by LETTER — G is "grab", R is "rotate", X/Y/Z are the axes.
             (A::ModalMove, Bind::one(Binding::key(K::G))),
             (A::ModalRotate, Bind::one(Binding::key(K::R))),
+            (A::ModalScale, Bind::one(Binding::key(K::S))),
             (A::Duplicate, Bind::one(Binding::key(K::D).with(Mods::SHIFT))),
             (A::AxisX, Bind::one(Binding::key(K::X))),
             (A::AxisY, Bind::one(Binding::key(K::Y))),
@@ -1145,6 +1150,19 @@ pub fn play_actions(keys: &Keybinds, i: &egui::InputState, ph: &PhysState) -> (b
     (fire, keys.pressed(Action::PlayView, i, ph))
 }
 
+/// #weapon-fire  The fire action as a LEVEL: true while the button is held, and also on a frame
+/// where it went down and came back up (a fast click on a slow frame must still reach the
+/// trigger for a tick, or a quick tap on a semi-auto would be lost). An automatic keeps firing
+/// for as long as this stays true -- the weapon's own trigger `behavior` decides what a held
+/// button means ([`crate::play_fire`]).
+pub fn play_fire_held(keys: &Keybinds, i: &egui::InputState, ph: &PhysState) -> bool {
+    let edge = match keys.bind(Action::PlayFire).primary.trigger {
+        Trigger::Mouse(_) => keys.mouse_pressed(Action::PlayFire, i),
+        _ => keys.pressed(Action::PlayFire, i, ph),
+    };
+    edge || keys.down(Action::PlayFire, i, ph)
+}
+
 /// #play-hud  The reload action, EDGE (true on the frame it went down).
 ///
 /// Its own function for the reason the two above give: adding a button here must not change a
@@ -1162,6 +1180,15 @@ pub fn play_use_vehicle(keys: &Keybinds, i: &egui::InputState, ph: &PhysState) -
         Trigger::Mouse(_) => keys.mouse_pressed(Action::PlayUseVehicle, i),
         _ => keys.pressed(Action::PlayUseVehicle, i, ph),
     }
+}
+
+/// #use-hold  The use action as a LEVEL: true while the key / button is held down. Vehicle seats and
+/// weapon pick-ups act on a HOLD of at least `matg`'s `minimum action hold time`, so the host has
+/// to be told how long the button has been down, not only that it went down
+/// ([`crate::reach_action_hold::HoldTimer`] counts it in 60 Hz ticks). Leaving a seat stays on
+/// [`play_use_vehicle`], the edge.
+pub fn play_use_held(keys: &Keybinds, i: &egui::InputState, ph: &PhysState) -> bool {
+    keys.down(Action::PlayUseVehicle, i, ph)
 }
 
 /// #play  Mouse-look for test mode: the yaw and pitch AFTER this frame's motion, radians.
@@ -2426,6 +2453,48 @@ mod play_reload_call_site_gates {
         assert!(
             !body.contains("keys.down("),
             "a held reload key must not re-trigger every frame"
+        );
+    }
+}
+
+// #weapon-fire  The fire button as a LEVEL. The gate on the reader and on the host, for the same
+// reason as the reload ones above: the weapon machines exist and are green, and if the window never
+// hands them the held button the assault rifle fires once per click again.
+#[cfg(test)]
+mod play_fire_held_gates {
+    #[test]
+    fn the_fire_reader_is_a_level_not_an_edge() {
+        let src = include_str!("keybinds.rs");
+        let f = src
+            .find("pub fn play_fire_held(")
+            .expect("play_fire_held must exist; if renamed, update this gate");
+        let body = &src[f..(f + 500).min(src.len())];
+        assert!(body.contains("keys.down("), "a held fire button must read as held");
+    }
+
+    #[test]
+    fn the_use_reader_is_a_level_and_reaches_the_hold_timer() {
+        let src = include_str!("keybinds.rs");
+        let f = src.find("pub fn play_use_held(").expect("play_use_held must exist; if renamed, update this gate");
+        assert!(src[f..(f + 300).min(src.len())].contains("keys.down("), "a held use button must read as held");
+        let host = include_str!("main.rs");
+        let read = host.find("keybinds::play_use_held(").expect("main.rs must read the held use button");
+        let next_fn = host[read..].find("\n    fn ").map(|i| read + i).unwrap_or(host.len());
+        assert!(
+            host[read..next_fn].contains(concat!("pm.use_", "decide(")),
+            "reading the held button must reach the hold timer in the same function"
+        );
+    }
+
+    #[test]
+    fn the_host_hands_the_held_button_to_the_weapon_loop() {
+        let src = include_str!("main.rs");
+        let read = src.find("keybinds::play_fire_held(").expect("main.rs must read the held fire button");
+        let next_fn = src[read..].find("\n    fn ").map(|i| read + i).unwrap_or(src.len());
+        let body = &src[read..next_fn];
+        assert!(
+            body.contains(concat!("pm.advance_fire(dt, fire_", "held")),
+            "reading the held button must reach the weapon's fire loop in the same function"
         );
     }
 }

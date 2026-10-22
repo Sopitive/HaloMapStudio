@@ -127,7 +127,7 @@ impl crate::App {
             let r = build_meshes(&loaded, &device, &queue, &mesh, &mut emit, &mut progress, Some(&worker_cancel), &mut log, Some(&mut collect));
             send(H3Msg::Done(r.map(|st| {
                 let (bmin, bmax) = st.frame_bounds();
-                let assets = H3EditorAssets { cache: loaded.cache.clone(), variant: variant.as_ref().zip(loaded.variant.clone()).map(|(p, v)| (p.clone(), v)), collect, world_bounds: (bmin, bmax) };
+                let assets = H3EditorAssets { cache: loaded.cache.clone(), variant: variant.as_ref().zip(loaded.variant.clone()).map(|(p, v)| (p.clone(), v)), canvas: loaded.canvas.clone(), scenario_owned: loaded.scenario_owned, collect, world_bounds: (bmin, bmax) };
                 (st, assets)
             }).map_err(|e| format!("{e:#}"))));
         }).expect("spawn h3 load thread");

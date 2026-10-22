@@ -4359,6 +4359,14 @@ pub struct SceneController {
     /// are clipped/conformed against this so they lie ON the receiving surface instead of
     /// floating as a flat quad.
     bsp_soup: crate::decal_projector::TriSoup,
+    /// #collision  What the PLAYER (and the vehicles' static gather) collides with: the engine's own
+    /// structure collision BSP surfaces (`collision_bsp.rs`), plus the render triangles of
+    /// INSTANCED geometry (whose per-definition collision BSPs are not decoded yet). `None`
+    /// until the BSP phase completes, and when no sbsp yields a collision resource -- then
+    /// `static_tris_in_aabb` falls back to the render soup, as before.
+    collision_soup: Option<crate::decal_projector::TriSoup>,
+    /// One line about how `collision_soup` was built, for the report.
+    collision_note: String,
     /// Retained per-mesh lightmap geometry (world verts + uv2 + atlas ids), captured
     /// during BSP load so the path-traced lightmapper can re-light the map without re-decoding.
     bsp_lm_geom: Vec<BspLmMesh>,
@@ -5697,6 +5705,8 @@ impl SceneController {
             // (serial) soup build, the dominant BSP-load cost. Only widens candidate sets per
             // query (conform/pick still do exact triangle tests), never affects precision.
             bsp_soup: crate::decal_projector::TriSoup::new(4.0),
+            collision_soup: None,
+            collision_note: String::new(),
             bsp_lm_geom: Vec::new(),
             emissive_tris: Vec::new(),
             bake_occluder_tri: Vec::new(),
@@ -5805,6 +5815,8 @@ impl SceneController {
         self.probe = LightProbeGrid::default();
         self.brightness = 1.0;
         self.bsp_brightness.clear();
+        self.collision_soup = None;
+        self.collision_note.clear();
         self.bsp_soup = crate::decal_projector::TriSoup::new(4.0); // Finer cell — faster conform (exact tests, byte-identical)
         self.bsp_lm_geom.clear(); // Fresh capture per map load
         self.emissive_tris.clear(); // Fresh emitter capture per map load
@@ -6251,6 +6263,7 @@ impl SceneController {
     fn shrink_load_arrays(&mut self) {
         self.bsp_soup.rebalance(8);
         self.bsp_soup.shrink();
+        self.build_collision_soup();
         self.obj_soup_owner.shrink_to_fit();
         self.bake_occluder_tri.shrink_to_fit();
         self.bake_occluder_mesh.shrink_to_fit();
@@ -6611,29 +6624,13 @@ impl SceneController {
     /// #settle The raw phmo blocks through the native DLL's tag reads (count i32 / pointer u32
     /// tag-block refs in the meta, elements via `tag_ptr_bytes`).
     fn phmo_blocks(&self, phmo: u32) -> Option<crate::phmo_shapes::PhmoBlocks> {
-        let cache = self.cache?;
-        let meta = self.native.tag_meta(cache, phmo, 0, 0x19C)?;
-        let rd = |o: usize| u32::from_le_bytes([meta[o], meta[o + 1], meta[o + 2], meta[o + 3]]);
-        Some(crate::phmo_shapes::PhmoBlocks::read(&crate::phmo_shapes::REACH, |off, elem| {
-            let n = rd(off) as i32;
-            let ptr = rd(off + 4);
-            if n <= 0 || n > 0x10000 || ptr == 0 || ptr == 0xFFFF_FFFF { return Vec::new(); }
-            self.native.tag_ptr_bytes(cache, ptr, (n as usize * elem) as u32).unwrap_or_default()
-        }))
+        crate::object_hulls::read_blocks(&self.native, self.cache?, phmo)
     }
 
     /// #settle The object's `mode` node -> model matrices (rigid bodies are in node space).
     fn mode_node_xforms(&self, obj_tag: u32) -> Vec<Mat4> {
-        let Some(cache) = self.cache else { return Vec::new() };
-        let mode = self.native.resolve_mode(cache, obj_tag);
-        if mode == 0 || mode == 0xFFFF_FFFF { return Vec::new(); }
-        let Some(h) = self.native.tag_meta(cache, mode, crate::phmo_shapes::OFF_MODE_NODES as u32, 12) else { return Vec::new() };
-        let n = i32::from_le_bytes([h[0], h[1], h[2], h[3]]);
-        let ptr = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
-        if n <= 0 || n > 1024 || ptr == 0 || ptr == 0xFFFF_FFFF { return Vec::new(); }
-        let elem = crate::phmo_shapes::REACH_MODE_NODE_ELEM;
-        match self.native.tag_ptr_bytes(cache, ptr, (n as usize * elem) as u32) {
-            Some(b) => crate::phmo_shapes::node_xforms(&b, elem),
+        match self.cache {
+            Some(c) => crate::object_hulls::mode_node_xforms(&self.native, c, obj_tag),
             None => Vec::new(),
         }
     }
@@ -6716,12 +6713,45 @@ impl SceneController {
         out
     }
 
+    /// #collision  The object's closed convex shells, posed and scaled (see
+    /// `ObjectScene::physics_world_shells`). The triangles stay wound outward unless the placement
+    /// mirrors, in which case they are re-wound.
+    pub fn physics_world_shells(&self, o: &ObjectInfo) -> Vec<Vec<[Vec3; 3]>> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let otag = Self::object_tag_of(o);
+        let phmo = self.native.resolve_phmo(cache, otag);
+        if phmo == 0 || phmo == 0xFFFF_FFFF {
+            return Vec::new();
+        }
+        let Some(shells) = self.phmo_blocks(phmo).and_then(|b| crate::object_hulls::hull_shells(&b, &self.mode_node_xforms(otag))) else { return Vec::new() };
+        let m = self.overlay_matrix(o);
+        let mirrored = m.determinant() < 0.0;
+        shells
+            .into_iter()
+            .map(|s| {
+                s.into_iter()
+                    .map(|t| {
+                        let p = t.map(|p| m.transform_point3(p));
+                        if mirrored { [p[0], p[2], p[1]] } else { p }
+                    })
+                    .filter(|t| t.iter().all(|p| p.is_finite()))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// #settle The object's physics hull (else collision hull) as posed, scaled world triangles -
     /// what another object settles against.
     pub fn physics_world_tris(&self, o: &ObjectInfo) -> Vec<[Vec3; 3]> {
         let Some(cache) = self.cache else { return Vec::new() };
         let otag = Self::object_tag_of(o);
         let phmo = self.native.resolve_phmo(cache, otag);
+        // #collision  boxes / polyhedra carry a Havok convex radius the native decode drops;
+        // `object_hulls::hull_tris` is the ONE place it is added back.
+        let shells = self.physics_world_shells(o);
+        if !shells.is_empty() {
+            return shells.into_iter().flatten().collect();
+        }
         let geo = if phmo != 0 && phmo != 0xFFFF_FFFF { self.native.phmo_geometry(cache, phmo) } else { None }
             .filter(|(v, i)| v.len() >= 9 && i.len() >= 3)
             .or_else(|| {
@@ -6742,9 +6772,66 @@ impl SceneController {
         out
     }
 
-    /// #settle Level triangles overlapping a world box (the BSP raycast soup).
+    /// #settle #collision  Level triangles overlapping a world box: the ENGINE'S structure
+    /// collision surfaces (plus instanced geometry), falling back to the render soup only when
+    /// the map yields no collision resource.
     pub fn static_tris_in_aabb(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
-        self.bsp_soup.tris_in_aabb(mn, mx, out);
+        match &self.collision_soup {
+            Some(c) => c.tris_in_aabb(mn, mx, out),
+            None => self.bsp_soup.tris_in_aabb(mn, mx, out),
+        }
+    }
+
+    /// #collision  One line: what the collision world is made of.
+    pub fn collision_note(&self) -> &str {
+        if self.collision_note.is_empty() { "collision: render triangles (no collision BSP resource)" } else { &self.collision_note }
+    }
+
+    /// #collision  Build `collision_soup` from every structure BSP's collision resource plus the
+    /// collision BSP of each instanced-geometry definition, placed at every instance's transform.
+    /// An instance whose definition has NO collision data keeps its render triangles (unless
+    /// transparent / glass) -- the engine walks through those, HMS used to be solid and still is.
+    fn build_collision_soup(&mut self) {
+        let Some(cache) = self.cache else { return };
+        let mut soup = crate::decal_projector::TriSoup::new(4.0);
+        let (mut bsps, mut surfaces, mut tris) = (0usize, 0usize, 0usize);
+        let (mut placed, mut placed_tris, mut fallback, mut fallback_tris) = (0usize, 0usize, 0usize, 0usize);
+        let mut seen = std::collections::HashSet::new();
+        for info in &self.structure_bsps {
+            if info.tag == 0xFFFF_FFFF || !seen.insert(info.tag) {
+                continue;
+            }
+            let Some(b) = crate::collision_bsp::CollisionBsp::for_sbsp(&self.native, cache, info.tag) else { continue };
+            bsps += 1;
+            surfaces += b.surface_count();
+            for (t, _) in b.solid_triangles() {
+                soup.add_tri_owned(t[0], t[1], t[2], (0, 0, -1), u32::MAX);
+                tris += 1;
+            }
+            let Some(inst) = crate::collision_bsp::instance_tris(&self.native, cache, info.tag) else { continue };
+            placed += inst.instances;
+            placed_tris += inst.placed.len();
+            fallback += inst.fallback_meshes;
+            fallback_tris += inst.fallback.len();
+            // #collision  ONLY the placed definition collision. An instance whose definition
+            // has no collision data has no collision in the engine (decoration: grass cards,
+            // rocks, detail meshes -- you walk and drive through them); its RENDER triangles
+            // used to be added here and they were the phantom walls on open ground (46,022 of
+            // them on forge_halo: straight drives on flat ground took 40..150 push-outs per
+            // 100 m, 0 without them -- `play_world::bisect_probe_instance_sources`).
+            for t in &inst.placed {
+                soup.add_tri_owned(t[0], t[1], t[2], (0, 0, -1), u32::MAX);
+            }
+        }
+        if bsps == 0 {
+            return;
+        }
+        soup.rebalance(8);
+        soup.shrink();
+        self.collision_note = format!(
+            "collision: {bsps} structure collision BSP(s), {surfaces} surfaces -> {tris} triangles; {placed} instances placed with their definition collision ({placed_tris} triangles); {fallback} instance meshes of definitions without collision are pass-through, as in the engine ({fallback_tris} render triangles left out)"
+        );
+        self.collision_soup = Some(soup);
     }
 
     /// always-on overlay geometry for HIDDEN forge blocks (render model present but
@@ -6818,6 +6905,16 @@ impl SceneController {
     /// TAG READS ONLY — none of the per-map state `open_cache` builds (BSP, palette, lightmaps)
     /// is set up, so this is for a gate that asks the tags a question, never for drawing.
     pub(crate) fn attach_cache(&mut self, cache: CacheHandle) { self.cache = Some(cache); }
+
+    /// Headless gates: build the collision world exactly as a load does (structure BSPs, then the
+    /// collision soup), without the GPU half of the load.
+    #[cfg(test)]
+    pub(crate) fn load_collision_for_test(&mut self) {
+        let Some(cache) = self.cache else { return };
+        self.scnr = self.native.find_scenario(cache).unwrap_or(0xFFFF_FFFF);
+        self.structure_bsps = self.decode_structure_bsps();
+        self.build_collision_soup();
+    }
 
     pub fn cache_handle(&self) -> Option<CacheHandle> { self.cache }
     pub fn native_dll(&self) -> &NativeDll { &self.native }
@@ -7132,6 +7229,15 @@ impl SceneController {
         if t.is_empty() { return None; }
         let pick = |i: u8| t.get(i as usize).copied();
         Some([pick(primary)?, pick(secondary)?])
+    }
+
+    /// #team-colour  The multiplayer globals' default TEAM colours; see
+    /// [`crate::film_variant::default_team_colors`].
+    pub fn team_colors(&self) -> Vec<[f32; 3]> {
+        match self.cache {
+            Some(cache) => crate::film_variant::default_team_colors(&self.native, cache),
+            None => Vec::new(),
+        }
     }
 
     pub fn build_actor_meshes(
@@ -12885,6 +12991,64 @@ impl SceneController {
         out
     }
 
+    /// The map's SHIPPED airprobes in engine units (position, dual-vMF lobes, bandwidth t, direction): what
+    /// the Tool's lightmapper wrote, for `rtgi_compare` to measure the probe field against.
+    pub fn shipped_airprobes(&self) -> Vec<crate::rtgi_compare::ShippedProbe> {
+        self.probe.points.iter().map(|p| crate::rtgi_compare::ShippedProbe { pos: p.pos, dom: p.dom_rgb, fill: p.fill_rgb, t: p.bandwidth, dir: p.dom_dir }).collect()
+    }
+
+    /// The sky render_model's `sun 1st bounce scaler` / `sky light 1st bounce scaler` (cache `mode`
+    /// +0x244 / +0x248; the HREK tag has them 12 bytes earlier, `research/new-maps/07` C8). They scale
+    /// every light's contribution to the lightmapper's BOUNCE source only (Forge World 0.30 / 1.00,
+    /// Sword Base 0.60 / 1.00, Ivory Tower 0.70 / 1.00, Panopticon 0.80 / 0.90), never to the direct
+    /// sky SH. None = the sky tag or the fields are unreadable (or outside 0..4: not a scaler).
+    pub fn sky_bounce_scalers(&self) -> Option<(f32, f32)> {
+        let c = self.cache?;
+        if self.scnr == 0xFFFF_FFFF { return None; }
+        let mode = self.native.sky_render_model(c, self.scnr, 0);
+        if mode == 0 || mode == 0xFFFF_FFFF { return None; }
+        let b = self.native.tag_meta(c, mode, 0x244, 8)?;
+        let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let (sun1, sky1) = (f(0), f(4));
+        if !(sun1.is_finite() && sky1.is_finite() && (0.0..=4.0).contains(&sun1) && (0.0..=4.0).contains(&sky1)) { return None; }
+        Some((sun1, sky1))
+    }
+
+    /// The sky render_model's `flags` word (cache `mode` +4; the HREK tag has it at the same place). Bit 3
+    /// (`& 8`) = no sun record: every record is sky (sky_icecave, sky_dusky_city). Read on forge_halo (0x10),
+    /// Ivory Tower (0x10) and ff60_icecave (0x18).
+    pub fn sky_flags(&self) -> Option<u16> {
+        let c = self.cache?;
+        if self.scnr == 0xFFFF_FFFF { return None; }
+        let mode = self.native.sky_render_model(c, self.scnr, 0);
+        if mode == 0 || mode == 0xFFFF_FFFF { return None; }
+        let b = self.native.tag_meta(c, mode, 4, 2)?;
+        Some(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    /// The sky light list split the way the Tool splits it (the LAST record is the sun unless `flags & 8`; in
+    /// practice always the brightest) plus the bounce scalers, for the engine-mode probe GI. None = no usable
+    /// list (fewer than 2 records) -> the legacy sky model.
+    pub fn engine_sky_lights(&self) -> Option<hms_render::engine_gi::SkyLights> {
+        use hms_render::engine_gi::{SkyLights, SkyRecord};
+        let lights = self.sky_lights();
+        if lights.len() < 2 { return None; }
+        let recs: Vec<SkyRecord> = lights.iter().map(|(d, c, sa)| SkyRecord { dir: *d, rgb: *c, omega: *sa }).collect();
+        let (sun_1st, sky_1st) = self.sky_bounce_scalers().unwrap_or((1.0, 1.0));
+        let has_sun = self.sky_flags().map_or(true, |f| f & 8 == 0);
+        let mut k = SkyLights::from_records(recs, has_sun, sun_1st, sky_1st);
+        if has_sun && !k.sun_is_brightest() {
+            // the authored order put something else last: take the brightest as the sun (as the legacy path does)
+            let mut all = k.sky;
+            all.extend(k.sun.take());
+            let p = |r: &SkyRecord| (r.rgb[0] + r.rgb[1] + r.rgb[2]) * r.omega;
+            let i = (0..all.len()).max_by(|a, b| p(&all[*a]).partial_cmp(&p(&all[*b])).unwrap_or(std::cmp::Ordering::Equal))?;
+            let sun = all.remove(i);
+            k = SkyLights { sky: all, sun: Some(sun), sun_1st, sky_1st };
+        }
+        Some(k)
+    }
+
     /// The tracer's (sun_dir, sun_irradiance, uniform_sky_radiance) DERIVED from the
     /// lightmapper's own sky light list. The brightest record is the sun (its L*solid_angle is exactly the
     /// irradiance the native sky_light read reports); every other record is sky, and their up-facing
@@ -13140,6 +13304,16 @@ impl SceneController {
                 sky_col = sl2;
             }
         }
+        // The engine's own sky list (HMS_RTGI_NO_SKYLIGHTS=1 forces the legacy sky model). A sunless sky
+        // (`mode.flags & 8`) has no sun to bounce: the legacy derivation above would have crowned its
+        // brightest sky record the sun.
+        let engine_sky = if ev("HMS_RTGI_NO_SKYLIGHTS").is_err() { self.engine_sky_lights() } else { None };
+        if let Some(k) = &engine_sky {
+            match k.sun {
+                Some(sn) => { sun_dir = Vec3::from(sn.dir).normalize_or_zero(); sun_col = k.sun_irradiance(); }
+                None => sun_col = [0.0; 3],
+            }
+        }
         if ev("HMS_DIAG").is_ok() || ev("HMS_RTGI_DIAG").is_ok() {
             let nsky = mats.chunks(3).filter(|m| m[0][3] > 1.5 && m[0][3] < 2.5).count();
             let nfol = mats.chunks(3).filter(|m| m[2][0] + m[2][1] + m[2][2] > 0.01).count();
@@ -13181,6 +13355,7 @@ impl SceneController {
             bounds_min: bmin.into(), bounds_max: bmax.into(),
             sun_dir: sun_dir.into(), sun_color: sun_col, sky_color: sky_col,
             fog_sigma, fog_top,
+            sky: engine_sky,
         })
     }
 
@@ -13538,6 +13713,13 @@ impl SceneController {
     /// forge objects, whichever is closer — capped at `max`. This is the primitive the camera
     /// stand-off uses: `raycast_scene` alone walks straight through Forge geometry, which is
     /// exactly the geometry a camera gets buried in.
+    /// #play-sound  The BSP render-material index of the level triangle straight below `origin`
+    /// (`bsp_soup` keeps `(diffuse tag, blend, material_index)` per triangle).
+    pub fn ground_material_index(&self, origin: Vec3, max: f32) -> Option<i32> {
+        let (_, _, tri) = self.bsp_soup.raycast_hit(origin, Vec3::NEG_Z, max)?;
+        self.bsp_soup.tri_material(tri).map(|m| m.2)
+    }
+
     pub fn raycast_solid(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
         self.raycast_solid_excluding(origin, dir, max, &[])
     }
@@ -13555,7 +13737,11 @@ impl SceneController {
         if d == Vec3::ZERO {
             return None;
         }
-        let mut best = self.bsp_soup.raycast(origin, d, max).map(|(t, _n)| t);
+        // #collision  The same world the hull and the character collide with: the engine's
+        // collision where this map has any, the render soup only for a map with no collision
+        // resource at all (a fallback of last resort).
+        let ground = self.collision_soup.as_ref().unwrap_or(&self.bsp_soup);
+        let mut best = ground.raycast(origin, d, max).map(|(t, _n)| t);
         if let Some(p) = self.raycast_objects_excluding(origin, d, exclude) {
             let t = (p - origin).length();
             if t <= max && best.map_or(true, |b| t < b) {
@@ -22054,6 +22240,7 @@ impl crate::objscene::ObjectScene for SceneController {
     fn physics_world_edges(&self, o: &ObjectInfo) -> Vec<([f32; 3], [f32; 3])> { SceneController::physics_world_edges(self, o) }
     fn physics_body(&self, o: &ObjectInfo) -> Option<crate::physics_settle::PhysBody> { SceneController::physics_body(self, o) }
     fn physics_world_tris(&self, o: &ObjectInfo) -> Vec<[Vec3; 3]> { SceneController::physics_world_tris(self, o) }
+    fn physics_world_shells(&self, o: &ObjectInfo) -> Vec<Vec<[Vec3; 3]>> { SceneController::physics_world_shells(self, o) }
     fn static_tris_in_aabb(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) { SceneController::static_tris_in_aabb(self, mn, mx, out) }
     fn pick_entry_counts(&self, datum: u32) -> (usize, usize) {
         let all: Vec<&PickEntry> = self.picks.iter().filter(|p| p.datum == datum).collect();
@@ -22064,6 +22251,7 @@ impl crate::objscene::ObjectScene for SceneController {
     fn spawn_camera(&self) -> Option<crate::spawn_camera::Pose> { SceneController::spawn_camera(self) }
     // The Reach primitive (BSP soup with the ray cap + object triangles).
     fn raycast_solid(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> { SceneController::raycast_solid(self, origin, dir, max) }
+    fn ground_material_index(&self, origin: Vec3, max: f32) -> Option<i32> { SceneController::ground_material_index(self, origin, max) }
     fn raycast_solid_excluding(&self, origin: Vec3, dir: Vec3, max: f32, exclude: &[u32]) -> Option<f32> { SceneController::raycast_solid_excluding(self, origin, dir, max, exclude) }
 }
 

@@ -46,6 +46,97 @@ struct Faults {
     message: std::sync::Mutex<String>,
     callbacks: AtomicU64,
     frames: AtomicU64,
+    /// Frames in the last callback's buffer.
+    last_buf: AtomicU64,
+    /// The longest time between two callback starts, and the longest the mixer took inside one.
+    max_gap_us: AtomicU64,
+    max_fill_us: AtomicU64,
+    /// Callbacks whose mix took longer than the audio it produced (the device ran dry), and
+    /// callbacks that arrived more than twice a buffer late (the device thread was starved).
+    underruns: AtomicU64,
+    late: AtomicU64,
+}
+
+/// What the output callback has been doing, for the owner to read without setting anything.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct OutDiag {
+    pub rate: u32,
+    pub callbacks: u64,
+    pub buffer_frames: u64,
+    pub max_gap_ms: f32,
+    pub max_fill_ms: f32,
+    pub underruns: u64,
+    pub late: u64,
+    /// Output frames that still exceeded full scale after the limiter, and frames the limiter was
+    /// working in (running totals since the device opened).
+    pub clipped: u64,
+    pub limited: u64,
+    /// Running totals for the output's RMS: `sumsq_nano` over `frames`.
+    pub sumsq_nano: u64,
+    pub mixed_frames: u64,
+    /// Per-category sums of squares (nano-units), see `MixStats::cat_sumsq`.
+    pub cat_sumsq_nano: [u64; crate::mix::CATEGORIES],
+}
+
+/// f32 -> i16 with SATURATION (and NaN to silence). A bare `as i16` of an out-of-range float
+/// saturates in Rust, but an intermediate integer multiply or a different backend's convert would
+/// wrap, and a wrapped sample is a full-scale click; the explicit clamp is the contract.
+pub fn to_i16(s: f32) -> i16 {
+    if s.is_nan() {
+        return 0;
+    }
+    (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+/// f32 -> u16 (offset binary), saturating.
+pub fn to_u16(s: f32) -> u16 {
+    if s.is_nan() {
+        return 32768;
+    }
+    ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0).round() as u16
+}
+
+impl Faults {
+    fn new() -> Faults {
+        Faults {
+            faulted: AtomicBool::new(false),
+            message: std::sync::Mutex::new(String::new()),
+            callbacks: AtomicU64::new(0),
+            frames: AtomicU64::new(0),
+            last_buf: AtomicU64::new(0),
+            max_gap_us: AtomicU64::new(0),
+            max_fill_us: AtomicU64::new(0),
+            underruns: AtomicU64::new(0),
+            late: AtomicU64::new(0),
+        }
+    }
+
+    /// Bookkeeping for one callback: `buf` frames at `rate`, `last` the previous start, and a
+    /// closure-free split into before/after so the mixer call itself is untouched. Lock-free.
+    fn begin(&self, last: &mut Option<std::time::Instant>, buf: usize, rate: u32) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        self.callbacks.fetch_add(1, Ordering::Relaxed);
+        self.frames.fetch_add(buf as u64, Ordering::Relaxed);
+        self.last_buf.store(buf as u64, Ordering::Relaxed);
+        if let Some(prev) = *last {
+            let gap = now.duration_since(prev).as_micros() as u64;
+            self.max_gap_us.fetch_max(gap, Ordering::Relaxed);
+            let buf_us = buf as u64 * 1_000_000 / u64::from(rate.max(1));
+            if gap > 2 * buf_us + 2_000 {
+                self.late.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        *last = Some(now);
+        now
+    }
+
+    fn end(&self, t0: std::time::Instant, buf: usize, rate: u32) {
+        let us = t0.elapsed().as_micros() as u64;
+        self.max_fill_us.fetch_max(us, Ordering::Relaxed);
+        if us > buf as u64 * 1_000_000 / u64::from(rate.max(1)) {
+            self.underruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// A handle on the output. Cheap to clone the control side; dropping the
@@ -91,12 +182,7 @@ impl Output {
             local: Some(mixer),
             retired: Some(retired),
             state: if why.is_empty() { State::Unopened } else { State::Off(why.to_string()) },
-            faults: Arc::new(Faults {
-                faulted: AtomicBool::new(false),
-                message: std::sync::Mutex::new(String::new()),
-                callbacks: AtomicU64::new(0),
-                frames: AtomicU64::new(0),
-            }),
+            faults: Arc::new(Faults::new()),
             rate: rate.max(1),
         }
     }
@@ -125,12 +211,7 @@ impl Output {
         if start_muted {
             handle.send(Cmd::Master(0.0));
         }
-        let faults = Arc::new(Faults {
-            faulted: AtomicBool::new(false),
-            message: std::sync::Mutex::new(String::new()),
-            callbacks: AtomicU64::new(0),
-            frames: AtomicU64::new(0),
-        });
+        let faults = Arc::new(Faults::new());
         let errf = faults.clone();
         let err = move |e: cpal::StreamError| {
             // NEVER panic here: this runs on the audio thread, and a panic
@@ -142,15 +223,17 @@ impl Output {
         };
         let statf = faults.clone();
         let nch = channels as usize;
+        let mut last: Option<std::time::Instant> = None;
         let stream: Box<dyn StreamKeepAlive> = match fmt {
             cpal::SampleFormat::F32 => {
                 let s = device
                     .build_output_stream(
                         &cfg.config(),
                         move |out: &mut [f32], _| {
-                            statf.callbacks.fetch_add(1, Ordering::Relaxed);
-                            statf.frames.fetch_add((out.len() / nch.max(1)) as u64, Ordering::Relaxed);
+                            let buf = out.len() / nch.max(1);
+                            let t0 = statf.begin(&mut last, buf, rate);
                             mixer.fill(out, nch);
+                            statf.end(t0, buf, rate);
                         },
                         err,
                         None,
@@ -165,13 +248,14 @@ impl Output {
                     .build_output_stream(
                         &cfg.config(),
                         move |out: &mut [i16], _| {
-                            statf.callbacks.fetch_add(1, Ordering::Relaxed);
-                            statf.frames.fetch_add((out.len() / nch.max(1)) as u64, Ordering::Relaxed);
+                            let buf = out.len() / nch.max(1);
+                            let t0 = statf.begin(&mut last, buf, rate);
                             scratch.resize(out.len(), 0.0);
                             mixer.fill(&mut scratch, nch);
                             for (o, s) in out.iter_mut().zip(scratch.iter()) {
-                                *o = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                                *o = to_i16(*s);
                             }
+                            statf.end(t0, buf, rate);
                         },
                         err,
                         None,
@@ -186,13 +270,14 @@ impl Output {
                     .build_output_stream(
                         &cfg.config(),
                         move |out: &mut [u16], _| {
-                            statf.callbacks.fetch_add(1, Ordering::Relaxed);
-                            statf.frames.fetch_add((out.len() / nch.max(1)) as u64, Ordering::Relaxed);
+                            let buf = out.len() / nch.max(1);
+                            let t0 = statf.begin(&mut last, buf, rate);
                             scratch.resize(out.len(), 0.0);
                             mixer.fill(&mut scratch, nch);
                             for (o, s) in out.iter_mut().zip(scratch.iter()) {
-                                *o = ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 65535.0) as u16;
+                                *o = to_u16(*s);
                             }
+                            statf.end(t0, buf, rate);
                         },
                         err,
                         None,
@@ -256,6 +341,25 @@ impl Output {
         )
     }
 
+    /// The callback's own numbers (all zero on a silent output).
+    pub fn diag(&self) -> OutDiag {
+        let f = &self.faults;
+        OutDiag {
+            rate: self.rate,
+            callbacks: f.callbacks.load(Ordering::Relaxed),
+            buffer_frames: f.last_buf.load(Ordering::Relaxed),
+            max_gap_ms: f.max_gap_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            max_fill_ms: f.max_fill_us.load(Ordering::Relaxed) as f32 / 1000.0,
+            underruns: f.underruns.load(Ordering::Relaxed),
+            late: f.late.load(Ordering::Relaxed),
+            clipped: self.handle.stats.clipped.load(Ordering::Relaxed),
+            limited: self.handle.stats.limited.load(Ordering::Relaxed),
+            sumsq_nano: self.handle.stats.sumsq_nano.load(Ordering::Relaxed),
+            mixed_frames: self.handle.stats.frames.load(Ordering::Relaxed),
+            cat_sumsq_nano: std::array::from_fn(|c| self.handle.stats.cat_sumsq[c].load(Ordering::Relaxed)),
+        }
+    }
+
     pub fn handle(&self) -> &MixerHandle {
         &self.handle
     }
@@ -280,8 +384,23 @@ impl Output {
         self.handle.start(pcm, gain, step, looping)
     }
 
+    /// Start a looping playlist of takes: a sound with several permutations does not repeat one
+    /// of them for ever. `pitch` as for [`Output::play`].
+    pub fn play_playlist(&self, pcms: Vec<Arc<Pcm>>, in_order: bool, gain: [f32; 2], pitch: f64) -> Option<VoiceId> {
+        let rate = pcms.first()?.sample_rate;
+        let step = (rate as f64 / self.rate as f64) * pitch;
+        self.handle.start_playlist(pcms, in_order, gain, step)
+    }
+
     pub fn set_gain(&self, id: VoiceId, gain: [f32; 2]) {
         self.handle.send(Cmd::SetGain { id, gain });
+    }
+
+    /// Re-pitch a playing voice: the same rate arithmetic as [`Output::play`], for a source that
+    /// is `source_rate` Hz. A looping engine is re-pitched every frame from its RPM.
+    pub fn set_pitch(&self, id: VoiceId, source_rate: u32, pitch: f64) {
+        let step = (source_rate as f64 / self.rate as f64) * pitch;
+        self.handle.send(Cmd::SetStep { id, step });
     }
 
     pub fn stop(&self, id: VoiceId) {
@@ -343,9 +462,12 @@ mod tests {
         assert!(o.play(pcm(100, 1.0), [1.0, 1.0], 1.0, false).is_some());
         // The mixer is real, so the sound is really there — it just has
         // nowhere to go.
-        let mut buf = vec![0.0f32; 64];
+        let mut buf = vec![0.0f32; 400];
         assert!(o.pump(&mut buf, 2));
-        assert!(buf[0] > 0.5, "{:?}", &buf[..4]);
+        // (past the limiter's look-ahead latency and the voice's 25-frame ramp-in: a 100-frame
+        // sample ramps over a quarter of itself)
+        let at = 2 * (crate::mix::LOOKAHEAD + 50);
+        assert!(buf[at] > 0.5, "{:?}", &buf[..4]);
     }
 
     #[test]
@@ -357,7 +479,7 @@ mod tests {
         let mut buf = vec![0.0f32; 400];
         o.pump(&mut buf, 1);
         let n = buf.iter().filter(|s| **s > 0.5).count();
-        assert!((195..=200).contains(&n), "{n} output frames from 100 source frames at 2x");
+        assert!((140..=200).contains(&n), "{n} output frames from 100 source frames at 2x");
     }
 
     #[test]
@@ -407,5 +529,20 @@ mod tests {
         eprintln!("{cbs} callbacks, {frames} frames, state {:?}", o.state());
         // And it is still healthy, not faulted.
         assert!(o.is_running(), "stream faulted: {:?}", o.state());
+    }
+
+    #[test]
+    fn the_device_conversions_saturate_instead_of_wrapping() {
+        assert_eq!(to_i16(0.0), 0);
+        assert_eq!(to_i16(1.0), 32767);
+        assert_eq!(to_i16(-1.0), -32767);
+        // Reach's streams are far above full scale: these must pin, not wrap to the other sign.
+        assert_eq!(to_i16(17.78), 32767);
+        assert_eq!(to_i16(-17.78), -32767);
+        assert_eq!(to_i16(f32::INFINITY), 32767);
+        assert_eq!(to_i16(f32::NAN), 0);
+        assert_eq!(to_u16(17.78), 65535);
+        assert_eq!(to_u16(-17.78), 0);
+        assert_eq!(to_u16(0.0), 32768);
     }
 }

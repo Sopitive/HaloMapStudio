@@ -160,7 +160,101 @@ pub fn decode_stream(stream: &RawStream<'_>) -> Result<Pcm> {
     })
 }
 
+/// The top of the band Reach's encoder actually codes. Measured on the real bank (every
+/// spectrogram of every class: shots, footsteps, foley, ambience, engine loops): a brick wall at
+/// ~16.5 kHz, and above it nothing but isolated rectangles of energy at 17-21 kHz, each one long
+/// block wide, 40-60 dB ABOVE the content just under the wall. In a played-back session that band
+/// carried more energy than the whole audible band of a footstep, and on an engine loop it swept
+/// with the pitch: a steady high-pitched squeal. Nothing the encoder meant to carry is above its
+/// own wall, so playback removes what is: a zero-phase FIR, flat below 16.3 kHz, 60 dB down by 17.3.
+pub const BAND_LIMIT_HZ: f32 = 16_800.0;
+const BAND_LIMIT_TAPS: usize = 255;
+
+fn band_limit_kernel(rate: u32) -> Vec<f32> {
+    let m = (BAND_LIMIT_TAPS - 1) / 2;
+    let fc = f64::from(BAND_LIMIT_HZ) / f64::from(rate.max(1));
+    let mut h: Vec<f64> = (0..BAND_LIMIT_TAPS)
+        .map(|k| {
+            let x = k as f64 - m as f64;
+            let sinc = if x == 0.0 { 2.0 * fc } else { (2.0 * std::f64::consts::PI * fc * x).sin() / (std::f64::consts::PI * x) };
+            let w = 0.42 - 0.5 * (2.0 * std::f64::consts::PI * k as f64 / (BAND_LIMIT_TAPS - 1) as f64).cos() + 0.08 * (4.0 * std::f64::consts::PI * k as f64 / (BAND_LIMIT_TAPS - 1) as f64).cos();
+            sinc * w
+        })
+        .collect();
+    let sum: f64 = h.iter().sum();
+    for v in &mut h {
+        *v /= sum;
+    }
+    h.into_iter().map(|v| v as f32).collect()
+}
+
+/// Remove everything above [`BAND_LIMIT_HZ`] from a decoded sample. The filter is applied
+/// PERIODICALLY (the sample wraps), so a looping sample's seam stays seamless; a one-shot's quiet
+/// tail wrapping into its head is negligible.
+pub fn band_limit(pcm: &mut Pcm) {
+    let ch = pcm.channels as usize;
+    let n = pcm.frames();
+    if ch == 0 || n < 2 || pcm.sample_rate <= 2 * BAND_LIMIT_HZ as u32 {
+        return;
+    }
+    let h = band_limit_kernel(pcm.sample_rate);
+    let m = (h.len() - 1) / 2;
+    // One channel at a time, padded by `m` frames of wrap-around each side so the inner loop has
+    // no index arithmetic; the kernel is symmetric, so each pair of taps shares one multiply.
+    let mut ext = vec![0.0f32; n + 2 * m];
+    for c in 0..ch {
+        for (k, e) in ext.iter_mut().enumerate() {
+            let j = (k + n * (m / n + 1) - m) % n;
+            *e = pcm.samples[j * ch + c];
+        }
+        for i in 0..n {
+            let centre = i + m;
+            let mut acc = h[m] * ext[centre];
+            for d in 1..=m {
+                acc += h[m + d] * (ext[centre - d] + ext[centre + d]);
+            }
+            pcm.samples[i * ch + c] = acc;
+        }
+    }
+}
+
+/// Frames of the crossfade that closes a loop (50 ms at 48 kHz).
+pub const LOOP_FADE_FRAMES: usize = 2400;
+
+/// A SEAMLESS version of a sample that will be looped on its own. A decoded Reach loop is not
+/// sample-exact: the step from its last frame to its first is as large as the loudest step inside
+/// it (measured on the Warthog's engine loops once the band limit took the noise out of the
+/// interior), which is a tick every loop. The last `F` frames are crossfaded (equal power) into
+/// the `F` frames that would follow them, i.e. the sample's own head, and dropped; the result is
+/// `F` frames shorter and the wrap is continuous.
+pub fn loop_crossfade(p: &Pcm) -> Pcm {
+    let ch = p.channels as usize;
+    let n = p.frames();
+    let f = LOOP_FADE_FRAMES.min(n / 6);
+    if ch == 0 || f < 8 || n < 4 * f {
+        return p.clone();
+    }
+    let keep = n - f;
+    let mut out = p.samples[..keep * ch].to_vec();
+    for i in 0..f {
+        let th = (i as f32 + 0.5) / f as f32 * std::f32::consts::FRAC_PI_2;
+        let (wh, wt) = (th.sin(), th.cos());
+        for c in 0..ch {
+            // Head frame `i` and the tail frame that sits `keep` frames after it.
+            out[i * ch + c] = p.samples[i * ch + c] * wh + p.samples[(keep + i) * ch + c] * wt;
+        }
+    }
+    Pcm { samples: out, channels: p.channels, sample_rate: p.sample_rate }
+}
+
 impl SoundBank {
+    /// [`SoundBank::decode_sample`], band-limited for playback (see [`BAND_LIMIT_HZ`]).
+    pub fn decode_sample_playback(&self, index: usize, setups: &SetupTable) -> Result<Pcm> {
+        let mut p = self.decode_sample(index, setups)?;
+        band_limit(&mut p);
+        Ok(p)
+    }
+
     /// Decode one bank sample to interleaved f32, trimmed to the bank's own
     /// declared frame count.
     pub fn decode_sample(&self, index: usize, setups: &SetupTable) -> Result<Pcm> {
@@ -174,6 +268,48 @@ impl SoundBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tone(f: f32, n: usize, rate: u32) -> Pcm {
+        Pcm { samples: (0..n).map(|i| (2.0 * std::f32::consts::PI * f * i as f32 / rate as f32).sin()).collect(), channels: 1, sample_rate: rate }
+    }
+
+    /// **THE BAND LIMIT** passes the coded band untouched, removes what is above the encoder's own
+    /// wall, and does not break a loop's seam.
+    #[test]
+    fn the_band_limit_keeps_the_coded_band_and_removes_what_is_above_it() {
+        let rms_mid = |p: &Pcm| {
+            let v = &p.samples[400..p.samples.len() - 400];
+            (v.iter().map(|x| x * x).sum::<f32>() / v.len() as f32).sqrt()
+        };
+        for (f, lo, hi) in [(1_000.0f32, 0.70, 0.72), (10_000.0, 0.70, 0.72), (15_500.0, 0.69, 0.72), (18_800.0, 0.0, 0.0007), (21_000.0, 0.0, 0.0007)] {
+            let mut p = tone(f, 8_192, 48_000);
+            band_limit(&mut p);
+            let r = rms_mid(&p);
+            assert!(r >= lo && r <= hi, "{f} Hz tone came out at rms {r} (want {lo}..{hi})");
+        }
+        // A looping 1 kHz tone (an exact number of periods) stays periodic across the seam.
+        let mut p = tone(1_000.0, 4_800, 48_000);
+        let before = p.samples.clone();
+        band_limit(&mut p);
+        let worst = p.samples.iter().zip(before.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 0.01, "the seam moved a 1 kHz loop by {worst}");
+    }
+
+    /// **THE LOOP SEAM.** A loop whose last frame does not meet its first (a tick every period)
+    /// has a continuous wrap after [`loop_crossfade`].
+    #[test]
+    fn a_crossfaded_loop_has_no_step_at_the_wrap() {
+        // A slow sine with a deliberate step at the seam: 3.37 periods.
+        let n = 20_000usize;
+        let p = Pcm { samples: (0..n).map(|i| (2.0 * std::f32::consts::PI * 3.37 * i as f32 / n as f32).sin() * 0.5).collect(), channels: 1, sample_rate: 48_000 };
+        let seam = (p.samples[0] - p.samples[n - 1]).abs();
+        let biggest = |x: &[f32]| x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0f32, f32::max);
+        assert!(seam > 3.0 * biggest(&p.samples), "the test loop must have a step at its seam: {seam}");
+        let q = loop_crossfade(&p);
+        assert_eq!(q.frames(), n - LOOP_FADE_FRAMES.min(n / 6));
+        let seam_q = (q.samples[0] - q.samples[q.frames() - 1]).abs();
+        assert!(seam_q <= 2.0 * biggest(&q.samples), "the wrap still steps by {seam_q} (interior {})", biggest(&q.samples));
+    }
 
     #[test]
     fn pcm_statistics_are_over_every_channel() {

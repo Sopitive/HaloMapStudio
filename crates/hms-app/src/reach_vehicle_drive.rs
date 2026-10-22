@@ -83,9 +83,17 @@
 
 use glam::Vec3;
 
-/// Reach's tick rate. `seconds_to_ticks` in the engine is `ceil(s * 30) * tick_multiplier`, and
-/// the multiplier is 1 at normal speed (`sub_1400BD130` / `sub_1400BD360`).
-pub const TICK_RATE: f32 = 30.0;
+/// The game's tick rate: **60 Hz** (`game_time_globals` +6 = 60, `seconds_per_tick` +8 = 1/60,
+/// read from `haloreach_debug.dll`; the MCC TOOL build `reach_tag_test.exe` the first version of
+/// this module was read from runs at 30, which is where its `30` came from). The whole simulation
+/// runs every tick and the vehicle update has no every-other-tick gate (`sub_1805FD970` ->
+/// `sub_18055D020` -> the jeep tick `sub_1805D58B0`), with `dt = seconds_per_tick`
+/// (`sub_180644B10`).
+pub const TICK_RATE: f32 = 60.0;
+
+/// `tick_rate / 30` (`sub_180644BD0`): the factor the engine's authored-in-30ths conversion is
+/// scaled by.
+pub const TICK_MULTIPLIER: u32 = 2;
 
 /// `k_maximum_friction_points_per_vehicle_physics_definition`, from the engine's own bound check
 /// `VALID_INDEX(friction_point_index, ...)` rejecting indices above 15
@@ -102,18 +110,26 @@ pub const GEAR_NEUTRAL: i8 = -1;
 /// Index 0 is REVERSE — the Warthog's gear 0 authors ratio `-0.50`.
 pub const GEAR_REVERSE: i8 = 0;
 
-/// `seconds_to_ticks`, exactly as `sub_1400BD130` computes it at normal game speed.
+/// `sub_1806449A0`, the conversion the gearbox and clutch use: `ceil(s * 30) * tick_multiplier`.
+/// Authored seconds are rounded UP to a 30 Hz grid and then scaled to the real tick, so 0.85 s is
+/// 26 * 2 = 52 ticks (0.867 s) at 60 Hz.
 pub fn seconds_to_ticks(s: f32) -> u32 {
     if !(s > 0.0) {
         return 0;
     }
-    (s * TICK_RATE).ceil() as u32
+    (s * 30.0).ceil() as u32 * TICK_MULTIPLIER
 }
 
-/// `clutch_shift_ticks` = `max(seconds_to_ticks(0.05), tick_multiplier)` = **2 ticks**, named by
-/// the engine's own assert `IN_RANGE_INCLUSIVE(engine->clutch_in_ticks, 0, clutch_shift_ticks-1)`
-/// (`vehicle_engine.cpp:335`).
-pub const CLUTCH_SHIFT_TICKS: u8 = 2;
+/// `sub_180644A60`, the conversion the standstill damper uses: `round(s * tick_rate)`.
+pub fn seconds_to_ticks_rounded(s: f32) -> u32 {
+    (s * TICK_RATE + 0.5) as u32
+}
+
+/// `clutch_shift_ticks` = `max(seconds_to_ticks(0.05), tick_multiplier)` = **4 ticks** at 60 Hz
+/// (1/15 s, the same time as 2 ticks at 30 Hz), named by the engine's own assert
+/// `IN_RANGE_INCLUSIVE(engine->clutch_in_ticks, 0, clutch_shift_ticks-1)` (`vehicle_engine.cpp:335`;
+/// the clutch compares against `max(sub_1806449A0(0.05), sub_180644BD0())`).
+pub const CLUTCH_SHIFT_TICKS: u8 = 4;
 
 /// The engine's idle floor and overspeed ceiling on the flywheel, as fractions of `engine max
 /// angular velocity` (`sub_140E601B0`: `min(1.3 * max, max(aav, 0.05 * max))`).
@@ -354,7 +370,7 @@ impl Drivetrain {
 
         // THE FLYWHEEL.
         if st.gear < 0 {
-            // Neutral: decay. The engine's 0.95 is per TICK, so it is raised to dt*30 here
+            // Neutral: decay. The engine's 0.95 is per TICK, so it is raised to dt*60 here
             // rather than applied once per frame -- otherwise a 120 Hz display spins the engine
             // down four times as fast as a 30 Hz one.
             st.angular_velocity *= NEUTRAL_DECAY_PER_TICK.powf(dt * TICK_RATE);
@@ -456,6 +472,12 @@ pub struct GroundSpring {
     pub damp: f32,
     /// `maximum normal force contribution` with its engine-confirmed default of 3 applied
     /// (`sub_1406D51E0`: `if (0.0 >= field) field = 3.0f`). A per-contact cap, wu/s^2.
+    ///
+    /// **CORRECTION (#jeep-law):** the engine does not cap the SPRING with this. `sub_1406CC8C0`
+    /// stores the spring's normal force uncapped and uses the cap only to clamp the load a
+    /// viscous-regime FRICTION force may draw (`+-cap * mass`) -- see [`WheelGround`]. The cap on
+    /// the spring below is kept because this path (a jeep with no `phmo` body, the tank, the
+    /// hover vehicles) is the kinematic fallback and the clamp is what keeps it from diverging.
     pub max_normal_force: f32,
     /// `ground maximum slope 0` / `1` as COSINES. A contact gives traction only when its normal's
     /// up component exceeds `[1]` (`sub_1406CC8C0`).
@@ -737,6 +759,611 @@ pub fn attitude_from_normal(normal: Vec3, yaw: f32) -> (f32, f32) {
     (pitch, roll)
 }
 
+// ---------------------------------------------------------------------------------------------
+// THE JEEP'S RIGID BODY: the engine's own wheel law, `havok_vehicle_physics.cpp`
+// ---------------------------------------------------------------------------------------------
+//
+// #jeep-law  Everything above this line models a wheeled vehicle as a point that is steered, with
+// a spring under it. **The engine does not.** A `human_jeep` is a free rigid body (mass, centre of
+// mass and inertia tensor from its `phmo`) and the ONLY things that act on it are, per 60 Hz tick:
+//
+// 1. the wheel forces of `sub_1406CC8C0` — one normal force and one friction force per `friction
+//    point`, applied at the wheel hub and turned into a torque about the centre of mass;
+// 2. `sub_1406CF0F0`'s integration of those into linear and angular velocity, with the
+//    stationary-vehicle damper;
+// 3. Havok, which integrates gravity and the velocity.
+//
+// Nothing in the Warthog's turn is a kinematic model: the car turns because the front wheels' friction
+// force points sideways of the hull's travel, and it slides out of a corner when that force
+// saturates. This section is that law, function by function, with the engine's own constants.
+//
+// ```text
+//   sub_140E69D40  jeep tick: builds the per-wheel orientation (steered wheels get the hull basis
+//                  rotated by the steering angle: quaternion (0,0,sin(d/2),cos(d/2)) = a rotation
+//                  of the FULL angle d), hands the wheels their surface speed, calls ...
+//   sub_1406CF0F0  ... the integrator: iteration_count x { wheel forces -> dv, dw }, then the
+//                  stationary damper `vel.xy *= (1-a)`, `w.z *= (1-a)`
+//   sub_1406CC8C0  the wheel forces (7331 bytes; the friction-point half is quoted below)
+//   sub_140E60130  the engine's load for the NEXT tick: the summed longitudinal friction force
+// ```
+//
+// PROVEN = read from the decompilation. INFERRED = said so at the site.
+
+/// The collision tolerance of the engine's Havok world (`sub_18009A06C`, see `reach-havok-world-config`):
+/// the wheel's closest-points query (`sub_14034F740`, an `hkpSimpleShapePhantom` with a sphere of the
+/// friction point's own `radius`) returns a contact while the sphere's surface is within it of the
+/// ground. **PROVEN value, INFERRED use** — the phantom's own tolerance is the world's by
+/// construction, but the field was not traced into the query.
+pub const WHEEL_CONTACT_TOLERANCE: f32 = 0.0328;
+
+/// #jeep-bounce  A multiplier on the spring's damper term. **INFERRED FROM THE RECORDINGS, and against the
+/// literal decompilation**: `sub_1406CC8C0` (tool and debug builds identically) computes
+/// `N = mass * (g * compression / depth - v_normal * ground_damp_factor)` with no scale, which with the
+/// tags' numbers is a damping ratio of 0.23 (Warthog) / 0.25 (Mongoose) and, on a landing, a rebound of
+/// 0.5-0.98 of the dip. The saved films show a median rebound/dip of 0.27 (Warthog, 10 landings), 0.20
+/// (Mongoose, 1) -- IQR 0.03..0.51 -- which the model reaches at about 1.5 (0.3) to 2 (0.17) and not at 1
+/// (0.8). 2 is the factor between the 30 Hz tick the tags were authored at and the 60 Hz tick the game now
+/// runs, which is the one natural explanation (a coefficient written per tick and not rescaled); no code was found
+/// that does it. **Set to 1.0 to get the literal law.** Gated against the recordings by
+/// `the_landing_rebound_matches_the_recordings` and against the law's own damping ratio by
+/// `a_small_drop_rings_down_at_the_damping_ratio_the_tags_imply`.
+pub const GROUND_DAMP_SCALE: f32 = 2.0;
+
+/// How far below a hub the ground may be before the wheel's contact plane is not even looked for, wu
+/// (beyond the wheel radius). See [`WheelLaw::contact`].
+pub const CONTACT_REACH: f32 = 1.0;
+
+/// The floor on a wheel's spring compression (`sub_1406CC8C0`: `fmaxf(radius - dist, 0.001)`).
+pub const MIN_WHEEL_COMPRESSION: f32 = 0.001;
+
+/// The literal `-0.0329999998` in `sub_1406CC8C0`'s friction expression (identical in the debug
+/// build). **A fixed gain, not a tick length**: it is applied to a FORCE and the integrator then
+/// multiplies by `dt`, so the friction acceleration per second does not depend on the tick rate.
+pub const FRICTION_TICK_GAIN: f32 = 0.033;
+
+/// The `0.899999976` inside `sqrt(mu * 0.9)` in both friction regimes.
+pub const FRICTION_MU_FACTOR: f32 = 0.9;
+
+/// `sub_140E60D40` / `sub_140E60A00`: the stationary damper starts after `ticks(0.45 s)` of standing
+/// still, and ramps to full over `0.8 s` after that.
+pub const PARK_DELAY_SECONDS: f32 = 0.45;
+pub const PARK_RAMP_SECONDS: f32 = 0.8;
+/// "Standing still": `|v|^2 <= 3.0625`, i.e. 1.75 wu/s (`sub_140E60D40`, `sub_140E60A00`).
+pub const PARK_SPEED_SQUARED: f32 = 3.0625;
+/// `sub_1406CF0F0` caps the damper's own acceleration: `sqrt(72900)` = 270 wu/s^2 on the
+/// horizontal velocity and `sqrt(324)` = 18 rad/s^2 on the yaw rate.
+pub const PARK_LINEAR_ACCEL_CAP: f32 = 270.0;
+pub const PARK_ANGULAR_ACCEL_CAP: f32 = 18.0;
+
+/// `sub_140E60B00`: a reverse command against the direction of travel brakes for this long
+/// (`game_ticks_to_seconds(counter) < 0.5`), and only above 1 wu/s (`sub_140E60B90`).
+pub const BRAKE_COMMAND_SECONDS: f32 = 0.5;
+pub const BRAKE_MIN_SPEED: f32 = 1.0;
+
+/// What a `friction_point_definition` flag word says (the tag's own `friction_point_definition_flags`
+/// enum: gets damage from region, powered, front turning, rear turning, AI force rear turning,
+/// attached to e-brake, can be destroyed).
+pub const FP_POWERED: u32 = 0x02;
+pub const FP_FRONT_TURNING: u32 = 0x04;
+pub const FP_REAR_TURNING: u32 = 0x08;
+pub const FP_AI_FORCE_REAR_TURNING: u32 = 0x10;
+pub const FP_ATTACHED_TO_EBRAKE: u32 = 0x20;
+
+/// One wheel as the engine reads it: the `friction_point_definition_block` plus its hub marker.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelDef {
+    /// The hub, model space.
+    pub local: Vec3,
+    pub radius: f32,
+    /// `fraction of total mass`, RAW. The engine multiplies the friction by it directly
+    /// (`sqrt(mu*0.9) * def[2]`) — it is a gain, not a fraction (Warthog 6.5).
+    pub share: f32,
+    /// Flag bit 1: this wheel is driven. A driven wheel's friction opposes its slip against the
+    /// engine's surface speed; a free wheel's opposes only its sideways slip.
+    pub powered: bool,
+    /// How the steering angle reaches this wheel.
+    pub steer: SteerRole,
+    /// Flag bit 4: steers inverted — but only when the vehicle is AI-driven
+    /// (`sub_140E69D40`: the bit is tested only `if (driver.actor_index != -1)`).
+    pub ai_rear_turning: bool,
+    /// Flag bit 5: this wheel locks with the hand brake and takes the `e-brake` friction values.
+    pub ebrake_wheel: bool,
+    /// `moving friction velocity diff`: the slip speed below which the wheel is in its viscous
+    /// regime and above which it is in its Coulomb regime.
+    pub moving_velocity_diff: f32,
+    /// The three `e-brake` values, used instead of the vehicle's and the above while the hand brake
+    /// holds this wheel.
+    pub ebrake_friction: f32,
+    pub ebrake_moving_friction: f32,
+    pub ebrake_moving_velocity_diff: f32,
+}
+
+/// `havok_vehicle_physics_struct`'s ground fields, the way `sub_1406CC8C0` reads them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelGround {
+    /// `ground friction` (`physics[1]`): the static-regime coefficient.
+    pub friction: f32,
+    /// `ground depth` (`physics[2]`): the spring's scale — a wheel compressed by this carries one
+    /// full gravity. PROVEN: the engine's `extension` is the wheel `radius` (`inst + 0x9C =
+    /// def[3]`, `sub_1406CE570`), so `ground_depth * extension / radius` is exactly `ground_depth`.
+    pub depth: f32,
+    /// `ground damp factor` (`physics[3]`).
+    pub damp: f32,
+    /// `ground moving friction` (`physics[4]`): the kinetic-regime coefficient.
+    pub moving_friction: f32,
+    /// `ground maximum slope 0/1` (`physics[5]`, `[6]`) as cosines: friction falls linearly from full
+    /// at `[0]` to none at `[1]` (`sub_1406CC8C0`: `(cos0 - n.z) / (cos0 - cos1)`).
+    pub slope_cos: [f32; 2],
+    /// `maximum normal force contribution` (`physics[7]`, default 3 applied): the cap on the load a
+    /// STATIC-regime friction force may use. **It does not cap the spring** — the old reading of this
+    /// field was wrong; `sub_1406CC8C0` stores the normal force uncapped and only clamps the
+    /// friction's load to `+-cap * mass`.
+    pub max_normal_force: f32,
+}
+
+/// The vehicle's rigid body: what `sub_1406CE570` fetches from Havok every tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RigidBody {
+    /// `inst + 0x74`, the Havok mass. Needed because the wheel forces are `mass * (...)` and the
+    /// engine's load is a FORCE.
+    pub mass: f32,
+    /// Centre of mass, model space.
+    pub com: Vec3,
+    /// The inverse inertia tensor in model axes (what `sub_140443EF0` hands the integrator).
+    pub inv_inertia: glam::Mat3,
+    /// `phmo` linear / angular damping, applied by `reach_havok::HavokBody::step_psi`
+    /// (`v *= max(0, 1 - dt * d)`).
+    pub lin_damping: f32,
+    pub ang_damping: f32,
+}
+
+impl RigidBody {
+    /// `None` when the tensor does not invert: a body with no inertia cannot be driven and the
+    /// caller must say so rather than substitute one.
+    pub fn new(mass: f32, com: Vec3, inertia: glam::Mat3, lin_damping: f32, ang_damping: f32) -> Option<RigidBody> {
+        if !(mass > 1e-3) || inertia.determinant().abs() < 1e-9 {
+            return None;
+        }
+        let inv_inertia = inertia.inverse();
+        if !inv_inertia.is_finite() {
+            return None;
+        }
+        Some(RigidBody { mass, com, inv_inertia, lin_damping, ang_damping })
+    }
+}
+
+/// What the jeep tick hands the wheels this tick.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelCommand {
+    /// The steering angle `a1+0xE8`, radians, left positive.
+    pub steer_angle: f32,
+    /// `gear_ratio * angular_velocity` (0 under the brake), wu/s — the powered wheels' surface speed.
+    pub surface_speed: f32,
+    /// `sub_140E60B00`: every wheel locked (the reverse-against-travel brake).
+    pub brake_lock: bool,
+    /// Control bit 15 (`sub_140E69B30`): the hand brake. Locks the `attached to e-brake` wheels.
+    pub handbrake: bool,
+    /// Whether a PLAYER drives. `AI force rear turning` applies only to an AI driver.
+    pub ai_driven: bool,
+}
+
+/// One tick's result of `sub_1406CC8C0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelForces {
+    /// Summed force on the body, world, in force units (mass * wu/s^2).
+    pub force: Vec3,
+    /// Summed torque about the centre of mass, world.
+    pub torque: Vec3,
+    /// `inst + 0x78`: the summed longitudinal friction force on the powered wheels, signed so that a
+    /// force RESISTING the wheel's spin is negative for the flywheel — see [`Drivetrain::update`].
+    pub ground_torque: f32,
+    /// The function's return value: more than half the wheels are in the static regime AND the hull
+    /// stands above `ground maximum slope 1`. Gates the stationary damper.
+    pub majority_static: bool,
+    /// Per wheel: spring compression (wu), whether it touched, and whether it GRIPS (touching and
+    /// not sliding — the engine's `physics_mask` bit is the negation).
+    pub compression: [f32; MAX_CONTACT_POINTS],
+    pub touching: [bool; MAX_CONTACT_POINTS],
+    pub gripping: [bool; MAX_CONTACT_POINTS],
+    pub count: usize,
+    /// The plane through the first three contacts (the tail of `sub_140E69D40`), else the hull's up.
+    pub normal: Vec3,
+}
+
+/// The contact plane under a wheel: from [`WheelLaw::contact`].
+#[derive(Clone, Copy, Debug)]
+struct WheelContact {
+    /// Signed distance from the hub to the plane, along the normal.
+    distance: f32,
+    normal: Vec3,
+    /// A point on the plane (for the contact-plane normal of the hull).
+    point: Vec3,
+}
+
+/// The steering law: `sub_140E62270` + `sub_141405EF0`, with the jeep block's own numbers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SteerLaw {
+    /// `overdampen cusp angle`, radians (the cache holds it already converted: 0.0305 on the
+    /// Warthog, which the tag editor shows as degrees).
+    pub cusp: f32,
+    pub exponent: f32,
+    /// `maximum left turn` (positive) and `maximum right turn` (negative), radians.
+    pub max_left: f32,
+    pub max_right: f32,
+    /// `turn rate`, rad/s: the slew of the wheel angle.
+    pub turn_rate: f32,
+}
+
+impl SteerLaw {
+    /// `sub_140E62270`'s shaping of the facing error: the angle is clamped to +-pi, replaced by
+    /// `cusp * (|angle| / cusp) ^ exponent` with its sign, and clamped to +-pi again.
+    ///
+    /// **Everything below `cusp` is damped and everything above it is amplified**: with the
+    /// Warthog's 0.0305 rad and exponent 1.5, 3 degrees of error asks for 4.5 degrees of lock and 10
+    /// degrees asks for 21.
+    pub fn shape(&self, angle: f32) -> f32 {
+        let pi = std::f32::consts::PI;
+        let a = angle.clamp(-pi, pi);
+        if !(self.cusp > 0.0) {
+            return a;
+        }
+        let sign = if a < 0.0 { -1.0 } else { 1.0 };
+        ((a / self.cusp).abs().powf(self.exponent) * (self.cusp * sign)).clamp(-pi, pi)
+    }
+
+    /// `sub_141405EF0` (non-wrapping): move `state` toward `target` by `rate * dt`, hold it inside
+    /// `[max_right, max_left]`, and snap to the target when the step would cross it.
+    pub fn slew(&self, state: f32, target: f32, dt: f32) -> f32 {
+        let diff = target - state;
+        if diff == 0.0 {
+            return state;
+        }
+        let dir = if diff <= 0.0 { -1.0 } else { 1.0 };
+        let mut s = dir * self.turn_rate * dt + state;
+        if s > self.max_left {
+            s = self.max_left;
+        } else if s < self.max_right {
+            s = self.max_right;
+        }
+        let after = target - s;
+        let after_dir = if after == 0.0 { 0.0 } else if after <= 0.0 { -1.0 } else { 1.0 };
+        if dir != after_dir {
+            return target;
+        }
+        s
+    }
+
+    /// The facing error (radians from the hull's forward) at which the shaped request just reaches
+    /// full lock — what a stick pushed all the way over has to ask for to give full lock, so that
+    /// the same law serves a stick and a look vector. **The mapping from a stick to a facing error
+    /// is the player-control layer's and was not decompiled** (INFERRED, see the module note); this
+    /// is the one choice that makes full stick = full lock without inventing an angle.
+    pub fn saturation_angle(&self) -> f32 {
+        if !(self.cusp > 0.0) || !(self.exponent > 0.0) {
+            return std::f32::consts::PI;
+        }
+        let lock = self.max_left.max(-self.max_right).max(1e-3);
+        (self.cusp * (lock / self.cusp).powf(1.0 / self.exponent)).min(std::f32::consts::PI)
+    }
+}
+
+/// The whole wheel law of one vehicle.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WheelLaw {
+    pub wheels: Vec<WheelDef>,
+    pub ground: WheelGround,
+    pub steer: SteerLaw,
+    /// `None` until a caller supplies the vehicle's `phmo` body; the law does not run without it.
+    pub body: Option<RigidBody>,
+    /// `iteration count`.
+    pub iterations: u32,
+}
+
+/// Where the ground under a point is: height and an advisory normal.
+pub type GroundFn<'a> = &'a dyn Fn(Vec3) -> Option<(f32, Vec3)>;
+
+impl WheelLaw {
+    /// The contact plane under a wheel hub, or `None` when the sphere is not within the
+    /// tolerance of any ground.
+    ///
+    /// The engine casts a sphere of the wheel's radius at the hub and takes the closest point's
+    /// plane (`sub_14034F740`). The ground callback answers "the surface under this point", so the
+    /// query starts at the TOP of the wheel sphere (`hub + radius`): nothing above that can touch
+    /// the sphere, and a hub that has sunk into the surface still finds it. The plane normal comes
+    /// from four neighbouring heights (central differences over half a radius) because the
+    /// callback's own normal only exists for the level BSP and a Forge ramp is not that; it falls
+    /// back to the callback's normal across a cliff or a missing sample.
+    fn contact(&self, w: &WheelDef, hub: Vec3, ground: GroundFn) -> Option<WheelContact> {
+        let top = hub + Vec3::Z * w.radius;
+        let (h, n0) = ground(top)?;
+        // Out of reach: the ground is more than a wheel and a metre below the hub, so no plane through
+        // it can touch the sphere (a face steep enough to is a wall, which the height query cannot
+        // describe anyway). Skipping the four neighbour samples here is what keeps an AIRBORNE jeep to
+        // one ground query per wheel per tick instead of five.
+        if hub.z - h > w.radius + CONTACT_REACH {
+            return None;
+        }
+        let e = (w.radius * 0.5).max(0.05);
+        let sample = |dx: f32, dy: f32| ground(top + Vec3::new(dx, dy, 0.0)).map(|(hh, _)| hh);
+        let normal = match (sample(e, 0.0), sample(-e, 0.0), sample(0.0, e), sample(0.0, -e)) {
+            (Some(px), Some(mx), Some(py), Some(my)) if (px - mx).abs() < 8.0 * e && (py - my).abs() < 8.0 * e => {
+                Vec3::new(-(px - mx) / (2.0 * e), -(py - my) / (2.0 * e), 1.0).normalize()
+            }
+            _ => {
+                let n = n0.normalize_or_zero();
+                if n.length_squared() < 0.5 { Vec3::Z } else if n.z < 0.0 { -n } else { n }
+            }
+        };
+        let point = Vec3::new(hub.x, hub.y, h);
+        let distance = (hub - point).dot(normal);
+        (distance - w.radius <= WHEEL_CONTACT_TOLERANCE).then_some(WheelContact { distance, normal, point })
+    }
+
+    /// `sub_1406CC8C0`, the friction-point half: the force and torque the wheels put on the body
+    /// this tick.
+    ///
+    /// `g` is the acceleration of gravity the vehicle is on (the spring's reference),
+    /// `pos`/`orient` the model origin and rotation, `vel`/`ang` the centre-of-mass velocity and the
+    /// angular velocity (world). Pure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forces(
+        &self,
+        g: f32,
+        pos: Vec3,
+        orient: glam::Quat,
+        vel: Vec3,
+        ang: Vec3,
+        cmd: &WheelCommand,
+        ground: GroundFn,
+        iteration_fraction: f32,
+    ) -> Option<WheelForces> {
+        let body = self.body.as_ref()?;
+        let rot = glam::Mat3::from_quat(orient);
+        let (hull_fwd, hull_left, hull_up) = (rot.x_axis, rot.y_axis, rot.z_axis);
+        let com = pos + rot * body.com;
+        let cap = self.ground.max_normal_force * body.mass;
+        let mut out = WheelForces {
+            force: Vec3::ZERO,
+            torque: Vec3::ZERO,
+            ground_torque: 0.0,
+            majority_static: false,
+            compression: [0.0; MAX_CONTACT_POINTS],
+            touching: [false; MAX_CONTACT_POINTS],
+            gripping: [false; MAX_CONTACT_POINTS],
+            count: self.wheels.len().min(MAX_CONTACT_POINTS),
+            normal: hull_up,
+        };
+        let mut considered = 0usize;
+        let mut statics = 0usize;
+        let mut contact_pts: Vec<Vec3> = Vec::new();
+        for (i, w) in self.wheels.iter().enumerate().take(MAX_CONTACT_POINTS) {
+            considered += 1;
+            let hub = pos + rot * w.local;
+            let r = hub - com;
+            let vp = vel + ang.cross(r);
+            let Some(c) = self.contact(w, hub, ground) else { continue };
+            out.touching[i] = true;
+            if contact_pts.len() < 3 {
+                contact_pts.push(c.point);
+            }
+            // The wheel's rolling axis: the hull's forward, rotated about the hull's up by the
+            // steering angle. A rotation of the FULL angle (quaternion half-angle built from d*0.5).
+            let yaw = match w.steer {
+                SteerRole::Steered => cmd.steer_angle,
+                SteerRole::Inverted => -cmd.steer_angle,
+                SteerRole::Fixed if w.ai_rear_turning && cmd.ai_driven => -cmd.steer_angle,
+                SteerRole::Fixed => 0.0,
+            };
+            let axis = hull_fwd * yaw.cos() + hull_left * yaw.sin();
+            let n = c.normal;
+            // --- the spring: N = mass * (g * compression / depth - v_normal * damp) -------------
+            let comp = (w.radius - c.distance).max(MIN_WHEEL_COMPRESSION).min(w.radius);
+            out.compression[i] = comp;
+            let n_force = if self.ground.depth > 1e-4 {
+                (g * comp / self.ground.depth - vp.dot(n) * self.ground.damp * GROUND_DAMP_SCALE) * body.mass
+            } else {
+                0.0
+            };
+            // A wheel on the far side of the hull (the hull is upside down against this plane)
+            // gives no support (`sub_1406CC8C0`: `if (n.up + 0.1 < 0) scale = 0`).
+            let support = if n.dot(hull_up) + 0.1 < 0.0 { 0.0 } else { 1.0 };
+            let mut f = n * (n_force * support);
+            // --- the friction -------------------------------------------------------------------
+            let proj = axis - n * axis.dot(n);
+            let plen = proj.length();
+            let mut friction = Vec3::ZERO;
+            let mut sliding = false;
+            if plen >= 1e-4 {
+                let lon = proj / plen;
+                let vt = vp - n * vp.dot(n);
+                let locked = cmd.brake_lock || (w.ebrake_wheel && cmd.handbrake);
+                // The slip: a driven wheel against its surface speed, a free one only sideways.
+                let slip = if w.powered { vt - lon * cmd.surface_speed } else { vt - lon * vt.dot(lon) };
+                let (slip_vec, slip_speed) = if locked { (vt, vt.length()) } else { (slip, slip.length()) };
+                let ebrake_now = w.ebrake_wheel && cmd.handbrake;
+                let mu_k = if ebrake_now { w.ebrake_moving_friction } else { self.ground.moving_friction };
+                let mu_s = if ebrake_now { w.ebrake_friction } else { self.ground.friction };
+                let vel_diff = if ebrake_now { w.ebrake_moving_velocity_diff } else { w.moving_velocity_diff };
+                let [c0, c1] = self.ground.slope_cos;
+                let slope = if (c0 - c1) > 1e-4 {
+                    1.0 - ((c0 - n.z) / (c0 - c1)).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                if slip_speed <= vel_diff {
+                    // VISCOUS: linear in the slip, loaded by the (capped) normal force.
+                    let load = n_force.max(-cap).min(cap);
+                    let k = (mu_s * FRICTION_MU_FACTOR).sqrt() * w.share;
+                    friction = slip_vec * (k * load * slope * -FRICTION_TICK_GAIN);
+                    statics += 1;
+                } else {
+                    // COULOMB: constant in the slip, loaded by the uncapped normal force.
+                    let k = (mu_k * FRICTION_MU_FACTOR).sqrt() * w.share;
+                    let dir = slip_vec.normalize_or_zero();
+                    friction = dir * (k * n_force * slope * -FRICTION_TICK_GAIN);
+                    sliding = true;
+                }
+                if w.powered {
+                    // The engine's load: the friction force projected on the wheel axis.
+                    let along = friction.dot(axis) * axis;
+                    let mag = along.length() * iteration_fraction;
+                    if friction.dot(axis) <= 0.0 {
+                        out.ground_torque += mag;
+                    } else {
+                        out.ground_torque -= mag;
+                    }
+                }
+            }
+            f += friction;
+            out.gripping[i] = !sliding;
+            out.force += f;
+            out.torque += r.cross(f);
+        }
+        out.majority_static = considered > 0 && statics > considered / 2 && hull_up.z > self.ground.slope_cos[1];
+        if contact_pts.len() == 3 {
+            let nrm = (contact_pts[2] - contact_pts[0]).cross(contact_pts[1] - contact_pts[0]);
+            if nrm.length() > 1e-4 {
+                let nrm = nrm.normalize();
+                out.normal = if nrm.z < 0.0 { -nrm } else { nrm };
+            }
+        }
+        Some(out)
+    }
+
+    /// `sub_1406CF0F0`: advance the body's velocities by the wheel forces over one tick, with the
+    /// stationary damper, `iteration_count` times.
+    ///
+    /// Returns the new `(vel, ang)` plus the last iteration's forces (for the animation and the
+    /// engine load). Positions are NOT advanced here — Havok does that — except between
+    /// iterations, where the engine moves its own copy of the pose so the next wheel solve sees it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn integrate_tick(
+        &self,
+        g: f32,
+        mut pos: Vec3,
+        mut orient: glam::Quat,
+        mut vel: Vec3,
+        mut ang: Vec3,
+        park: f32,
+        cmd: &WheelCommand,
+        tick_dt: f32,
+        ground: GroundFn,
+    ) -> Option<(Vec3, Vec3, WheelForces)> {
+        let body = self.body.as_ref()?;
+        let n = self.iterations.max(1);
+        let dt = tick_dt / n as f32;
+        let mut park = park;
+        let mut last = None;
+        let mut ground_torque = 0.0;
+        for it in 0..n {
+            let wf = self.forces(g, pos, orient, vel, ang, cmd, ground, 1.0 / n as f32)?;
+            ground_torque += wf.ground_torque;
+            if !wf.majority_static {
+                // `sub_1406CF0F0`: `if (CC8C0() == 0) { park = 0 }` -- and it stays zero.
+                park = 0.0;
+            }
+            let rot = glam::Mat3::from_quat(orient);
+            let inv_world = rot * body.inv_inertia * rot.transpose();
+            vel += wf.force / body.mass * dt;
+            ang += inv_world * wf.torque * dt;
+            if park > 0.0 {
+                let k = -(park / dt);
+                let mut a_lin = Vec3::new(vel.x * k, vel.y * k, 0.0);
+                if a_lin.length_squared() > PARK_LINEAR_ACCEL_CAP * PARK_LINEAR_ACCEL_CAP {
+                    a_lin *= PARK_LINEAR_ACCEL_CAP / a_lin.length();
+                }
+                let a_full = ang * k;
+                let mut a_yaw = a_full.z;
+                if a_full.length_squared() > PARK_ANGULAR_ACCEL_CAP * PARK_ANGULAR_ACCEL_CAP {
+                    a_yaw *= PARK_ANGULAR_ACCEL_CAP / a_full.length();
+                }
+                vel += a_lin * dt;
+                ang.z += a_yaw * dt;
+            }
+            if n > 1 && it + 1 < n {
+                let (p, q) = advance_pose(pos, orient, body, vel, ang, dt);
+                pos = p;
+                orient = q;
+            }
+            last = Some(wf);
+        }
+        let mut wf = last?;
+        wf.ground_torque = ground_torque;
+        Some((vel, ang, wf))
+    }
+}
+
+/// The signed angle from the hull's forward to the unit's facing, about the hull's up
+/// (`sub_140E62270`: `atan2((up x forward) . facing, forward . facing)`), left positive. `facing_yaw`
+/// is the facing vector's heading (world radians, horizontal). Zero when the facing is along the up
+/// axis or opposite-degenerate.
+pub fn facing_error(up: Vec3, forward: Vec3, facing_yaw: f32) -> f32 {
+    let a = Vec3::new(facing_yaw.cos(), facing_yaw.sin(), 0.0);
+    let c = up.cross(forward).dot(a);
+    let d = forward.dot(a);
+    if c == 0.0 && d == 0.0 { 0.0 } else { c.atan2(d) }
+}
+
+/// Move a rigid body over `dt`: the centre of mass by `vel`, the orientation by `ang` (world),
+/// keeping the model origin consistent with the centre of mass. Havok's drift step.
+pub fn advance_pose(pos: Vec3, orient: glam::Quat, body: &RigidBody, vel: Vec3, ang: Vec3, dt: f32) -> (Vec3, glam::Quat) {
+    let com = pos + orient * body.com + vel * dt;
+    let w = ang.length();
+    let q = if w * dt > 1e-9 {
+        (glam::Quat::from_axis_angle(ang / w, w * dt) * orient).normalize()
+    } else {
+        orient
+    };
+    (com - q * body.com, q)
+}
+
+/// The stationary damper's strength `a3` (`sub_140E60A00`): zero until the vehicle has stood still
+/// for more than `round(0.45 s * 60)` = 27 ticks, then a linear ramp over 0.8 s.
+pub fn park_factor(idle_ticks: u8, speed_squared: f32) -> f32 {
+    if u32::from(idle_ticks) <= seconds_to_ticks_rounded(PARK_DELAY_SECONDS) || speed_squared >= PARK_SPEED_SQUARED {
+        return 0.0;
+    }
+    ((f32::from(idle_ticks) / TICK_RATE - PARK_DELAY_SECONDS) / PARK_RAMP_SECONDS).clamp(0.0, 1.0)
+}
+
+/// `sub_140E60D40`: the standstill counter. It counts ticks of "no throttle (or braking), at least
+/// one wheel gripping, and slower than 1.75 wu/s" and resets on anything else.
+pub fn idle_counter(prev: u8, throttle_abs: f32, braking: bool, any_gripping: bool, speed_squared: f32) -> u8 {
+    if (throttle_abs <= 0.001 || braking) && any_gripping && speed_squared <= PARK_SPEED_SQUARED {
+        prev.saturating_add(1).min(0xFE)
+    } else {
+        0
+    }
+}
+
+/// `sub_140E60B90`: the reverse-against-travel brake counter. `stick_forward` is the movement
+/// stick's forward axis; `forward_dot_velocity` the cosine between the hull's forward and its
+/// velocity (the sign is what matters). Counts while the driver pushes against the direction of
+/// travel above [`BRAKE_MIN_SPEED`].
+pub fn brake_counter(prev: u8, stick_forward: f32, speed: f32, forward_dot_velocity: f32, hold_flag: bool) -> u8 {
+    if hold_flag {
+        return prev.saturating_add(1).min(0xFE);
+    }
+    if stick_forward == 0.0 || speed <= BRAKE_MIN_SPEED {
+        return 0;
+    }
+    let opposing = if stick_forward > 0.0 { forward_dot_velocity < 0.0 } else { forward_dot_velocity > 0.0 };
+    if opposing {
+        prev.saturating_add(1).min(0xFE)
+    } else {
+        0
+    }
+}
+
+/// `sub_140E60B00`: is the brake on. The first half second of an opposing command; after that only
+/// the persistent control flag.
+pub fn brake_active(counter: u8, hold_flag: bool) -> bool {
+    if counter == 0 {
+        return false;
+    }
+    f32::from(counter) / TICK_RATE < BRAKE_COMMAND_SECONDS || hold_flag
+}
+
 #[cfg(test)]
 mod gates {
     //! #vehicle-drivetrain #vehicle-suspension
@@ -779,7 +1406,7 @@ mod gates {
     }
 
     /// The Warthog's own authored engine and gearbox.
-    fn warthog_drivetrain() -> Drivetrain {
+    pub(super) fn warthog_drivetrain() -> Drivetrain {
         let g = |index: usize, ratio: f32, up: f32, up_s: f32, down: f32, down_s: f32| crate::reach_vehicle::Gear {
             index,
             ratio,
@@ -807,7 +1434,7 @@ mod gates {
 
     /// A Warthog-shaped [`DriveModel`]: the real contact geometry, the real spring, the real
     /// gearbox, and the turn law that was already gated.
-    fn warthog_model() -> DriveModel {
+    pub(super) fn warthog_model() -> DriveModel {
         DriveModel {
             kind: "human_jeep",
             max_forward_speed: 9.0,
@@ -832,6 +1459,7 @@ mod gates {
             contacts: Some(warthog_contacts()),
             spring: warthog_spring(),
             ground_friction: 3.37,
+            wheel_law: None,
         }
     }
 
@@ -1235,8 +1863,8 @@ mod gates {
     /// * gear 1 may upshift once the normalised flywheel speed has been above **0.90** for
     ///   **0.85 s** (26 ticks), and not before;
     /// * gear 3 may downshift once it has been below **0.60** for **0.25 s** (8 ticks);
-    /// * a shift takes `max(ceil(0.05*30), 1) = 2` ticks of clutch, during which the throttle the
-    ///   engine sees is zero.
+    /// * a shift takes `max(ceil(0.05*30) * 2, 2) = 4` ticks of clutch (1/15 s at 60 Hz), during
+    ///   which the throttle the engine sees is zero.
     #[test]
     fn the_gearbox_shifts_on_its_own_authored_thresholds_and_times() {
         let dt = warthog_drivetrain();
@@ -1278,30 +1906,35 @@ mod gates {
         let idling = EngineState { gear: 2, angular_velocity: m * 0.2, ..Default::default() };
         assert_eq!(dt.requested_gear(&idling, 0.0, false, true), GEAR_NEUTRAL, "below a quarter it drops to neutral");
 
-        // --- THE CLUTCH: two ticks, throttle cut ------------------------------------------
+        // --- THE CLUTCH: four 60 Hz ticks, throttle cut ------------------------------------
+        // `clutch_shift_ticks = max(ceil(0.05 * 30) * 2, 2) = 4` ticks of 1/60 s -- the same 1/15 s
+        // the 30 Hz tool build gets from 2 ticks. The shift is requested on tick 1; the clutch goes
+        // in over ticks 1..=4; the new gear is engaged on tick 5.
+        let h = 1.0 / 60.0;
         let mut st = EngineState { gear: 1, angular_velocity: m * 0.95, transition: 1.0, ..Default::default() };
-        let before = st.angular_velocity;
-        dt.update(&mut st, 1.0, 2, false, 1.0 / 30.0);
+        dt.update(&mut st, 1.0, 2, false, h);
         assert_eq!(st.gear, 1, "tick 1 of the shift: still in the old gear");
         assert_eq!(st.clutch_in_ticks, 1, "...with the clutch going in");
         assert_eq!(st.desired_gear, 2, "...and the desired gear recorded");
         // **The throttle cut lands on tick TWO, not tick one**, and that is the engine's own
         // ordering: `sub_140E601B0` reads `clutch_in_ticks` at the TOP of the function, before
         // the shift logic that sets it. So the first tick of a shift still sees the real throttle.
-        // The first version of this gate asserted the cut on tick one and went red for that
-        // reason -- an expectation error, and the clue was that the "wrong" value was exactly the
-        // fixture's own starting transition.
         assert_eq!(st.transition, 1.0, "tick 1 still sees the real throttle, so the blend holds");
-        dt.update(&mut st, 1.0, 2, false, 1.0 / 30.0);
-        assert_eq!(st.clutch_in_ticks, CLUTCH_SHIFT_TICKS, "tick 2: the clutch is fully in");
-        assert!(st.transition < 1.0, "...and NOW the throttle is cut, so the loaded blend falls");
-        dt.update(&mut st, 1.0, 2, false, 1.0 / 30.0);
-        assert_eq!(st.gear, 2, "tick 3: the shift completes");
+        for tick in 2..=4u8 {
+            dt.update(&mut st, 1.0, 2, false, h);
+            assert_eq!(st.clutch_in_ticks, tick, "tick {tick}: the clutch is still going in");
+            assert_eq!(st.gear, 1, "tick {tick}: not engaged yet");
+        }
+        assert_eq!(st.clutch_in_ticks, CLUTCH_SHIFT_TICKS, "tick 4: the clutch is fully in");
+        assert!(st.transition < 1.0, "...and the throttle has been cut, so the loaded blend falls");
+        dt.update(&mut st, 1.0, 2, false, h);
+        assert_eq!(st.gear, 2, "tick 5: the shift completes");
         assert_eq!(st.clutch_in_ticks, 0, "...and the clutch comes back out");
         assert_eq!(st.desired_gear, GEAR_NONE, "...with no shift pending");
         assert_eq!(st.upshift_ticks, 0, "...and both shift timers reset");
         assert_eq!(st.downshift_ticks, 0);
-        let _ = before;
+        // The same wall time as the 30 Hz build: 4 ticks of 1/60 = 2 ticks of 1/30 = 0.0667 s.
+        assert!((CLUTCH_SHIFT_TICKS as f32 * h - 2.0 / 30.0).abs() < 1e-6);
     }
 
     /// #vehicle-drivetrain  **The flywheel is integrated, clamped and frame-rate independent.**
@@ -1311,13 +1944,13 @@ mod gates {
     /// * it is floored at `0.05 * max` and ceilinged at `1.3 * max`;
     /// * in neutral it decays 0.95 per TICK, which must be the same after one second whatever the
     ///   frame rate — the trap `play_mode::clock` records, and the reason the decay is raised to
-    ///   `dt * 30` rather than applied once a frame.
+    ///   `dt * 30` rather than applied once a frame (`dt * 60`).
     #[test]
     fn the_flywheel_integrates_the_authored_torque_and_clamps_it() {
         let dt = warthog_drivetrain();
         let m = dt.max_angular_velocity;
         // ONE TICK of the integration, from a gear that is already engaged so no clutch runs.
-        let h = 1.0 / 30.0;
+        let h = 1.0 / 60.0;
         let mut st = EngineState { gear: 2, angular_velocity: m * 0.5, transition: 1.0, ..Default::default() };
         let start = st.angular_velocity;
         dt.update(&mut st, 1.0, 2, false, h);
@@ -1379,7 +2012,7 @@ mod gates {
             g.cruising_torque = Some(crate::scene::MapFn::Identity { lo: 4000.0, hi: -1000.0 });
         }
         let mut st = EngineState { gear: 2, angular_velocity: m * 0.1, transition: 1.0, ..Default::default() };
-        for _ in 0..900 {
+        for _ in 0..1800 {
             taper.update(&mut st, 1.0, 2, false, h);
         }
         let zero_at = 4000.0 / (4000.0 + 1000.0); // where Identity{4000,-1000} crosses zero
@@ -1402,10 +2035,10 @@ mod gates {
             st.angular_velocity
         };
         let (a, b, c) = (decayed(30.0), decayed(60.0), decayed(120.0));
-        // Independently: 0.95 per tick for 30 ticks.
-        let want = 9.0 * 0.95f32.powi(30);
-        println!("one second of neutral: 30 Hz {a:.5} | 60 Hz {b:.5} | 120 Hz {c:.5}, 0.95^30 says {want:.5}");
-        assert!((a - want).abs() < 1e-3, "one second in neutral must be 0.95^30, got {a:.5} against {want:.5}");
+        // Independently: 0.95 per tick (the literal is not scaled by the tick rate) for the 60 ticks of a second.
+        let want = 9.0 * 0.95f32.powi(60);
+        println!("one second of neutral: 30 Hz {a:.5} | 60 Hz {b:.5} | 120 Hz {c:.5}, 0.95^60 says {want:.5}");
+        assert!((a - want).abs() < 1e-3, "one second in neutral must be 0.95^60, got {a:.5} against {want:.5}");
         assert!((a - b).abs() < 1e-3 && (b - c).abs() < 1e-3, "the decay must not follow the frame rate");
     }
 
@@ -1984,12 +2617,1619 @@ mod gates {
     /// it. Both are quoted constants, so this gate exists to catch them being quietly changed.
     #[test]
     fn the_tick_conversion_is_the_engines_own_ceiling() {
+        // `sub_1806449A0` = ceil(s * 30) * (tick_rate / 30), tick_rate = 60.
         assert_eq!(seconds_to_ticks(0.0), 0);
-        assert_eq!(seconds_to_ticks(1.0 / 30.0), 1);
-        assert_eq!(seconds_to_ticks(0.05), 2, "ceil(1.5) = 2 -- and that is `clutch_shift_ticks`");
-        assert_eq!(seconds_to_ticks(0.85), 26, "ceil(25.5) = 26");
-        assert_eq!(seconds_to_ticks(0.25), 8, "ceil(7.5) = 8");
-        assert_eq!(seconds_to_ticks(0.45), 14, "ceil(13.5) = 14");
+        assert_eq!(seconds_to_ticks(1.0 / 30.0), 2, "one 30ths-step is two 60 Hz ticks");
+        assert_eq!(seconds_to_ticks(0.05), 4, "ceil(1.5) * 2 -- and that is `clutch_shift_ticks`");
+        assert_eq!(seconds_to_ticks(0.85), 52, "ceil(25.5) * 2 = 26 * 2");
+        assert_eq!(seconds_to_ticks(0.25), 16, "ceil(7.5) * 2");
+        assert_eq!(seconds_to_ticks(0.45), 28, "ceil(13.5) * 2: the engine's idle-reset time");
         assert_eq!(CLUTCH_SHIFT_TICKS as u32, seconds_to_ticks(0.05));
+        // `sub_180644A60` = round(s * 60): the standstill damper's delay is NOT on the 30ths grid.
+        assert_eq!(seconds_to_ticks_rounded(0.45), 27);
+        assert_eq!(seconds_to_ticks_rounded(0.5), 30);
+    }
+}
+
+#[cfg(test)]
+mod jeep_gates {
+    //! #jeep-law  Gates for the engine's rigid-body wheel law.
+    //!
+    //! Two kinds. The ones without `#[ignore]` run on a FIXTURE built from the real Warthog's
+    //! tag numbers (measured out of `forge_halo`, written down below) so they run in every suite;
+    //! the `#[ignore]`d ones read the real Warthog and Mongoose out of the cache — the tags, the
+    //! wheel markers, the real torque curves, the `phmo` body — and need the native library:
+    //! `cargo test -p hms-app --profile quick jeep_gates -- --ignored --nocapture --test-threads=1`
+    //!
+    //! **Every expectation is derived from the tag numbers by physics that is not the code under
+    //! test** (the static balance of a spring-borne body, the ballistic arc, the algebra of the
+    //! steering curve), or is a RELATIONSHIP (doubling this doubles that). None is a fitted output.
+
+    use super::*;
+    use crate::reach_vehicle::{DriveInput, DriveModel, DriveState};
+
+    // -----------------------------------------------------------------------------------------
+    // FIXTURE: the Warthog's own measured numbers
+    // -----------------------------------------------------------------------------------------
+
+    const FRONT_X: f32 = 0.6342681;
+    const REAR_X: f32 = -0.6657315;
+    const TRACK_Y: f32 = 0.39;
+    const HUB_Z: f32 = 0.19877;
+    const RADIUS: f32 = 0.25;
+
+    /// The Warthog's `friction_point` blocks (`forge_halo`): flags 0x46 front / 0x72 rear, share
+    /// 6.5 / 6.333, moving friction velocity diff 7.8 / 1.0, rear e-brake 1.55 / 8.25 / 3.0.
+    fn fixture_law() -> WheelLaw {
+        let wheel = |x: f32, y: f32, front: bool| WheelDef {
+            local: Vec3::new(x, y, HUB_Z),
+            radius: RADIUS,
+            share: if front { 6.5 } else { 6.333 },
+            powered: true,
+            steer: if front { SteerRole::Steered } else { SteerRole::Fixed },
+            ai_rear_turning: !front,
+            ebrake_wheel: !front,
+            moving_velocity_diff: if front { 7.8 } else { 1.0 },
+            ebrake_friction: if front { 0.0 } else { 1.55 },
+            ebrake_moving_friction: if front { 0.0 } else { 8.25 },
+            ebrake_moving_velocity_diff: if front { 0.0 } else { 3.0 },
+        };
+        WheelLaw {
+            wheels: vec![
+                wheel(FRONT_X, TRACK_Y, true),
+                wheel(FRONT_X, -TRACK_Y, true),
+                wheel(REAR_X, TRACK_Y, false),
+                wheel(REAR_X, -TRACK_Y, false),
+            ],
+            ground: WheelGround {
+                friction: 3.37,
+                depth: 0.125,
+                damp: 1.35,
+                moving_friction: 27.5,
+                slope_cos: [0.766, 0.643],
+                max_normal_force: 2.2,
+            },
+            steer: SteerLaw { cusp: 0.030543262, exponent: 1.5, max_left: 1.0471976, max_right: -1.0471976, turn_rate: 9.424778 },
+            body: RigidBody::new(
+                3300.0,
+                Vec3::new(0.041846935, 0.0, 0.32126704),
+                glam::Mat3::from_diagonal(Vec3::new(353.50116, 1291.3615, 1465.7584)),
+                0.0,
+                0.335,
+            ),
+            iterations: 1,
+        }
+    }
+
+    fn fixture() -> DriveModel {
+        let mut m = super::gates::warthog_model();
+        m.wheel_law = Some(fixture_law());
+        m.gravity_scale = 1.0;
+        m
+    }
+
+    fn flat(_p: Vec3) -> Option<(f32, Vec3)> {
+        Some((0.0, Vec3::Z))
+    }
+
+    /// A plane rising along +x at `deg` degrees, with its exact normal.
+    fn incline(deg: f32) -> impl Fn(Vec3) -> Option<(f32, Vec3)> {
+        let t = deg.to_radians().tan();
+        move |p: Vec3| Some((p.x * t, Vec3::new(-t, 0.0, 1.0).normalize()))
+    }
+
+    fn run(
+        d: &DriveModel,
+        mut st: DriveState,
+        input: DriveInput,
+        secs: f32,
+        fps: f32,
+        ground: &dyn Fn(Vec3) -> Option<(f32, Vec3)>,
+        mut each: impl FnMut(f32, &DriveState),
+    ) -> DriveState {
+        let n = (secs * fps).round() as usize;
+        for i in 0..n {
+            st = d.step(st, input, 1.0 / fps, ground);
+            each((i + 1) as f32 / fps, &st);
+        }
+        st
+    }
+
+    /// Where the model origin sits when the hubs rest `radius - depth/4` above the flat ground.
+    fn rest_z() -> f32 {
+        RADIUS - 0.125 / 4.0 - HUB_Z
+    }
+
+    fn at(z: f32) -> DriveState {
+        DriveState { pos: Vec3::new(0.0, 0.0, z), ..Default::default() }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // THE WEIGHT
+    // -----------------------------------------------------------------------------------------
+
+    /// **A parked jeep is carried by its four springs at the compression the tag implies.**
+    ///
+    /// Derived without the solver. The body is in equilibrium, so the four normal forces sum to its
+    /// weight (`g * compression / depth` per wheel, so the four compressions sum to `ground
+    /// depth`) and their moment about the centre of mass is zero (so the load splits front/rear by
+    /// where the centre of mass sits between the axles: `u_front = (x_com - x_rear) / (x_front -
+    /// x_rear)`). Both come from the tag's numbers and the wheel and centre-of-mass positions.
+    ///
+    /// Starts 0.18 wu above its rest so it must fall and land (liveness), and averages the last two
+    /// seconds.
+    #[test]
+    fn a_parked_jeep_is_carried_by_its_springs_at_the_compression_the_tag_implies() {
+        let d = fixture();
+        let law = d.wheel_law.as_ref().unwrap();
+        let body = law.body.as_ref().unwrap();
+        let (mut sum, mut front, mut n) = (0.0f32, 0.0f32, 0u32);
+        let start = rest_z() + 0.18;
+        let st = run(&d, at(start), DriveInput::default(), 6.0, 60.0, &flat, |t, s| {
+            if t > 4.0 {
+                sum += s.suspension[..4].iter().sum::<f32>();
+                front += s.suspension[0] + s.suspension[1];
+                n += 1;
+            }
+        });
+        let (sum, front) = (sum / n as f32, front / n as f32);
+        let u_front = (body.com.x - REAR_X) / (FRONT_X - REAR_X);
+        let want_sum = law.ground.depth;
+        let want_front = law.ground.depth * u_front;
+        println!("sum {sum:.5} (want {want_sum:.5}) front pair {front:.5} (want {want_front:.5}) z {:.4}", st.pos.z);
+        assert!(st.pos.z < start - 0.1, "the jeep must have FALLEN to its springs: z {:.4} from {start:.4}", st.pos.z);
+        assert!(st.touching[..4].iter().all(|&t| t), "all four wheels must be down");
+        assert!((sum / want_sum - 1.0).abs() < 0.02, "the springs carry the weight: sum of compressions {sum:.5}, the tag implies {want_sum:.5}");
+        assert!((front / want_front - 1.0).abs() < 0.03, "the load splits by the centre of mass: front {front:.5} vs {want_front:.5}");
+        assert!(st.roll.abs() < 1e-3, "a symmetric jeep parks level, roll {:+.5}", st.roll);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // GRAVITY AND THE JUMP
+    // -----------------------------------------------------------------------------------------
+
+    /// **A jump goes as high and stays up as long as the gravity in force says.**
+    ///
+    /// A ballistic arc has no free parameters: launched at `vz`, the apex is `vz^2 / 2g` above the
+    /// launch (a little less under Havok's 60 Hz semi-implicit step, which the expectation
+    /// reproduces). The expectation is that arc for the engine's `WORLD_GRAVITY` times the authored
+    /// `gravity scale` — and the RELATIONSHIP that doubling the scale halves the apex. Horizontal velocity
+    /// must not change in the air (nothing acts on a jeep with no wheel down), and neither may the
+    /// attitude.
+    #[test]
+    fn a_jump_follows_the_arc_the_gravity_in_force_gives() {
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let launch = |scale: f32| {
+            let mut d = fixture();
+            d.gravity_scale = scale;
+            let mut st = at(3.0);
+            st.vel = Vec3::new(5.0, 0.0, 3.0);
+            let (mut apex, mut touch) = (st.pos.z, None);
+            let mut vx_min = f32::MAX;
+            let mut vx_max = f32::MIN;
+            let mut tilt = 0.0f32;
+            run(&d, st, DriveInput::default(), 3.0, 60.0, &flat, |t, s| {
+                if touch.is_none() {
+                    apex = apex.max(s.pos.z);
+                    if s.touching[..4].iter().any(|&x| x) {
+                        touch = Some(t);
+                    } else {
+                        vx_min = vx_min.min(s.vel.x);
+                        vx_max = vx_max.max(s.vel.x);
+                        tilt = tilt.max(s.basis().angle_between(glam::Quat::IDENTITY));
+                    }
+                }
+            });
+            (apex - 3.0, touch, vx_min, vx_max, tilt)
+        };
+        let (rise, touch, vx_min, vx_max, tilt) = launch(1.0);
+        // The arc as Havok steps it: once per 60 Hz tick, semi-implicit (gravity changes the velocity,
+        // then the body moves with it). A tiny loop over the ARC, not over the code under test; the
+        // continuous formulas are checked against it as well.
+        let dt = 1.0 / 60.0;
+        let (mut v, mut z, mut apex) = (3.0f32, 0.0f32, 0.0f32);
+        for _ in 0..60 {
+            v -= g * dt;
+            z += v * dt;
+            apex = apex.max(z);
+        }
+        let want_rise = apex;
+        let cont_rise = 3.0f32 * 3.0 / (2.0 * g);
+        // A wheel is "down" at the first tick that starts with its sphere within the tolerance.
+        let thr = RADIUS + 0.0328_f32 - HUB_Z;
+        let (mut v, mut z, mut k) = (3.0f32, 3.0f32, 0u32);
+        while z > thr {
+            v -= g * dt;
+            z += v * dt;
+            k += 1;
+        }
+        let want_t = k as f32 * dt;
+        let t = touch.expect("it must come back down");
+        println!("apex {rise:.4} (discrete arc {want_rise:.4}, continuous {cont_rise:.4}), first wheel down at {t:.3} s (want {want_t:.3}), vx {vx_min:.4}..{vx_max:.4}, tilt {tilt:.5}");
+        assert!((rise / want_rise - 1.0).abs() < 0.01, "apex {rise:.4} against {want_rise:.4}: gravity in force is not {g}");
+        assert!((rise / cont_rise - 1.0).abs() < 0.06, "and it must be the same arc as the continuous one, {cont_rise:.4}");
+        assert!((t - want_t).abs() < 0.06, "airtime to first contact {t:.3} against {want_t:.3}");
+        assert!(vx_max - vx_min < 1e-3 && (vx_min - 5.0).abs() < 1e-3, "nothing may act on a jeep in the air: vx {vx_min}..{vx_max}");
+        assert!(tilt < 1e-3, "a jeep with no angular velocity must not tumble in the air: {tilt}");
+        // THE RELATIONSHIP: twice the gravity, half the height.
+        let (rise2, ..) = launch(2.0);
+        println!("gravity scale 2: apex {rise2:.4}");
+        assert!((rise2 / rise - 0.5).abs() < 0.03, "doubling `gravity scale` must halve the apex: {rise2:.4} vs {rise:.4}");
+    }
+
+    /// **The body's own damping bleeds a spin in the air.** Havok multiplies the angular velocity by
+    /// `max(0, 1 - dt * damping)` once per 60 Hz tick (`reach_havok`); the Warthog's `phmo` authors
+    /// 0.335 and no linear damping. After one second of free flight a 3 rad/s spin must read
+    /// `3 * (1 - 0.335/60)^60`, and the linear velocity must not have changed at all.
+    #[test]
+    fn a_spinning_jeep_in_the_air_loses_spin_to_the_bodys_own_damping() {
+        let d = fixture();
+        let mut st = at(200.0);
+        st.ang_vel = Vec3::new(0.0, 0.0, 3.0);
+        st.vel = Vec3::new(4.0, 0.0, 0.0);
+        let end = run(&d, st, DriveInput::default(), 1.0, 60.0, &flat, |_, _| {});
+        let want = 3.0 * (1.0f32 - 0.335 / 60.0).powi(60);
+        println!("spin after 1 s: {:.4} (want {want:.4}), vx {:.5}", end.ang_vel.z, end.vel.x);
+        assert!((end.ang_vel.z / want - 1.0).abs() < 0.005, "angular damping: {} vs {want}", end.ang_vel.z);
+        assert!((end.vel.x - 4.0).abs() < 1e-4, "no linear damping authored, none applied: {}", end.vel.x);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // THE STEERING
+    // -----------------------------------------------------------------------------------------
+
+    /// **The steering curve, evaluated by hand.** The goldens were computed outside the program
+    /// with the Warthog's `cusp` 0.0305433 rad and exponent 1.5: the shaped request is
+    /// `cusp * (|a|/cusp)^1.5` with the sign of `a`, clamped to pi; the wheel angle slews toward it
+    /// at `turn rate` * one tick and snaps when a step would cross.
+    #[test]
+    fn the_steering_curve_is_the_engines() {
+        let s = fixture_law().steer;
+        for (a, want) in [(0.01f32, 0.005721927), (0.030543262, 0.030543262), (0.1, 0.18094321), (0.2, 0.5117847), (-0.2, -0.5117847), (3.0, std::f32::consts::PI)] {
+            let got = s.shape(a);
+            assert!((got - want).abs() < 2e-5, "shape({a}) = {got}, the curve says {want}");
+        }
+        // Slew: 0.3141593 rad per tick; four ticks to full lock, and the last one snaps.
+        let mut w = 0.0f32;
+        let mut ticks = 0;
+        let mut seen = Vec::new();
+        while w < s.max_left && ticks < 20 {
+            w = s.slew(w, 5.0, 1.0 / 30.0);
+            seen.push(w);
+            ticks += 1;
+        }
+        println!("slew to an unreachable request: {seen:?}");
+        assert_eq!(ticks, 4, "9.4248 rad/s is 0.31416 rad per tick: full lock (1.0472) on the 4th");
+        assert!((seen[0] - 0.31415927).abs() < 1e-5 && (seen[2] - 0.9424778).abs() < 1e-5);
+        assert_eq!(seen[3], s.max_left, "held at the authored maximum, not past it");
+        // and a reachable request is hit exactly rather than overshot
+        assert_eq!(s.slew(0.0, 0.1, 1.0 / 30.0), 0.1);
+        assert_eq!(s.slew(0.5, -0.9, 1.0 / 30.0), 0.5 - 0.31415927);
+    }
+
+    /// **The jeep steers toward its FACING, by the curve: lock = max * (error / saturation)^exponent.**
+    /// The facing is `DriveInput::want_yaw` (the engine's `unit +0x1E4` facing vector); a facing
+    /// error of `s * saturation` (the error at which the shaped request just reaches full lock)
+    /// must give a wheel angle of `max * s^1.5` -- algebra on the tag's cusp and exponent, not a
+    /// fit. The lateral STICK (`slide`) must steer nothing, and a parked jeep never turns however
+    /// hard over the wheels are.
+    ///
+    /// The reported defect, as a property: *"I turn and the whole warthog pivots on a dime"*.
+    #[test]
+    fn a_jeep_steers_toward_its_facing_by_the_overdampen_curve_and_a_parked_jeep_never_turns() {
+        let d = fixture();
+        let law = d.wheel_law.as_ref().unwrap();
+        let st = run(&d, at(rest_z()), DriveInput::default(), 3.0, 60.0, &flat, |_, _| {});
+        let sat = law.steer.saturation_angle();
+        for s in [0.25f32, 0.5, 1.0] {
+            let end = run(&d, st, DriveInput { want_yaw: st.yaw + s * sat, ..Default::default() }, 1.0, 60.0, &flat, |_, _| {});
+            let want = law.steer.max_left * s.powf(law.steer.exponent);
+            println!("facing error {:.4} rad: lock {:+.4} rad, curve says {want:+.4}, yaw change {:+.6}", s * sat, end.steer_angle, end.yaw - st.yaw);
+            assert!((end.steer_angle - want).abs() < 2e-3, "facing error {s} x saturation: lock {} vs {want}", end.steer_angle);
+            assert!((end.yaw - st.yaw).abs() < 1e-4, "a parked jeep with the wheels hard over turned {:+.6} rad", end.yaw - st.yaw);
+            // the other side is the mirror image
+            let right = run(&d, st, DriveInput { want_yaw: st.yaw - s * sat, ..Default::default() }, 1.0, 60.0, &flat, |_, _| {});
+            assert!((right.steer_angle + want).abs() < 2e-3, "right lock {} vs {}", right.steer_angle, -want);
+        }
+        // THE LATERAL STICK DOES NOT STEER: A/D with the facing on the hull leave the wheels straight.
+        let keys = run(&d, st, DriveInput { slide: 1.0, want_yaw: st.yaw, ..Default::default() }, 1.0, 60.0, &flat, |_, _| {});
+        assert!(keys.steer_angle.abs() < 1e-6 && (keys.yaw - st.yaw).abs() < 1e-6, "the left stick steered a jeep: {}", keys.steer_angle);
+        // LIVENESS of "no turning": the same lock with the engine driving DOES turn it.
+        let moving = run(&d, st, DriveInput { throttle: 1.0, want_yaw: st.yaw + 1.5, ..Default::default() }, 2.0, 60.0, &flat, |_, _| {});
+        assert!((moving.yaw - st.yaw).abs() > 0.5, "driven at full lock it must turn, got {:+.4} rad", moving.yaw - st.yaw);
+        // The facing error is the signed angle about the hull's up, the short way round.
+        assert!((facing_error(Vec3::Z, Vec3::X, 3.0) - 3.0).abs() < 1e-5);
+        assert!((facing_error(Vec3::Z, Vec3::X, -3.0) + 3.0).abs() < 1e-5);
+        // Hull pointing -x, facing heading 3.0 rad = (-0.99, +0.14): left of -x is -y, so that is 0.1416 to the RIGHT.
+        assert!((facing_error(Vec3::Z, -Vec3::X, 3.0) + (std::f32::consts::PI - 3.0)).abs() < 1e-5);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // INDEPENDENCE OF THE FRAME RATE
+    // -----------------------------------------------------------------------------------------
+
+    /// **The result does not depend on the display.** The engine's logic runs on a 30 Hz clock;
+    /// the frame only decides how often the body is looked at. Driven for three seconds at 30,
+    /// 60 and 144 fps the jeep must be in the same place.
+    #[test]
+    fn the_jeep_is_in_the_same_place_at_any_frame_rate() {
+        let d = fixture();
+        let go = |fps: f32| {
+            let st = run(&d, at(rest_z()), DriveInput::default(), 1.0, fps, &flat, |_, _| {});
+            run(&d, st, DriveInput { throttle: 1.0, slide: 0.3, ..Default::default() }, 3.0, fps, &flat, |_, _| {})
+        };
+        let a = go(30.0);
+        let b = go(60.0);
+        let c = go(144.0);
+        println!("30 fps x {:.4} y {:.4} | 60 fps x {:.4} y {:.4} | 144 fps x {:.4} y {:.4}", a.pos.x, a.pos.y, b.pos.x, b.pos.y, c.pos.x, c.pos.y);
+        assert!(b.pos.x > 3.0, "it must have driven somewhere");
+        for (name, o) in [("30", &a), ("144", &c)] {
+            assert!((o.pos - b.pos).length() < 0.02 * b.pos.length(), "{name} fps ended {:?} but 60 fps {:?}", o.pos, b.pos);
+        }
+    }
+
+    /// **A wheel is down while its sphere is within the Havok world's collision tolerance of the
+    /// ground (0.0328 wu), and not beyond.** The hubs are lifted so the sphere's surface is 0.02
+    /// above the ground (down) and 0.05 above it (free), and the springs' compression there is the
+    /// floor of 0.001 -- the sphere is touching but not pressing.
+    #[test]
+    fn a_wheel_is_down_within_the_collision_tolerance_and_free_beyond_it() {
+        let law = fixture_law();
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let cmd = WheelCommand { steer_angle: 0.0, surface_speed: 0.0, brake_lock: false, handbrake: false, ai_driven: false };
+        let at_gap = |gap: f32| {
+            let pos = Vec3::new(0.0, 0.0, RADIUS + gap - HUB_Z);
+            law.forces(g, pos, glam::Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, &cmd, &flat, 1.0).unwrap()
+        };
+        let (near, far, pressed) = (at_gap(0.02), at_gap(0.05), at_gap(-0.03));
+        println!("gap 0.02: touching {:?} comp {:.4}; gap 0.05: touching {:?}; pressed 0.03: comp {:.4}", &near.touching[..4], near.compression[0], &far.touching[..4], pressed.compression[0]);
+        assert!(near.touching[..4].iter().all(|&t| t), "0.02 wu off the ground is inside the 0.0328 tolerance");
+        assert!((near.compression[0] - 0.001).abs() < 1e-6, "touching but not pressing: the compression floor, got {}", near.compression[0]);
+        assert!(far.touching[..4].iter().all(|&t| !t) && far.force == Vec3::ZERO, "0.05 wu off the ground is beyond it: no contact, no force");
+        assert!((pressed.compression[0] - 0.03).abs() < 1e-4, "pressed 0.03 into the ground: compression {}", pressed.compression[0]);
+    }
+
+    /// **No state is fatal.** Thrown at 25 wu/s with a violent tumble, from height, a jeep must stay
+    /// finite, must never put a wheel hub through the ground, and must come to rest -- the class of
+    /// report is *"the warthog just flew into the air and the map glitched out"*. Run at three
+    /// frame rates, because the failure mode that matters is numerical.
+    #[test]
+    fn a_thrown_and_tumbling_jeep_stays_finite_above_the_ground_and_comes_to_rest() {
+        let d = fixture();
+        let law = d.wheel_law.as_ref().unwrap();
+        for fps in [30.0f32, 60.0, 144.0] {
+            let mut st = at(4.0);
+            st.vel = Vec3::new(20.0, -10.0, 15.0);
+            st.ang_vel = Vec3::new(5.0, 3.0, 8.0);
+            let (mut lowest, mut finite, mut fastest) = (f32::MAX, true, 0.0f32);
+            let end = run(&d, st, DriveInput::default(), 40.0, fps, &flat, |_, s| {
+                let q = s.basis();
+                finite &= s.pos.is_finite() && s.vel.is_finite() && s.ang_vel.is_finite() && q.is_finite();
+                fastest = fastest.max(s.vel.length());
+                for w in &law.wheels {
+                    lowest = lowest.min((s.pos + q * w.local).z);
+                }
+            });
+            println!("{fps} fps: finite {finite}, lowest hub {lowest:+.4}, fastest {fastest:.1}, end speed {:.4} spin {:.4} at {:?}", end.vel.length(), end.ang_vel.length(), end.pos);
+            assert!(finite, "{fps} fps: a state went non-finite");
+            assert!(lowest > -0.02, "{fps} fps: a wheel hub went {lowest:+.4} through the ground");
+            assert!(fastest < 60.0, "{fps} fps: it gained energy: {fastest:.1} wu/s");
+            assert!(end.vel.length() < 0.5 && end.ang_vel.length() < 0.5, "{fps} fps: it must come to rest, not keep moving");
+        }
+    }
+
+    /// **A wheel that the hull is upside down against gives no support.** `sub_1406CC8C0` zeroes the
+    /// normal force when `contact normal . hull up + 0.1 < 0`. The same hubs, 0.02 above the
+    /// ground, with the hull upright and then rolled 180 degrees (hubs mirrored about the origin
+    /// plane): upright pushes up; inverted pushes nothing.
+    #[test]
+    fn a_wheel_the_hull_is_upside_down_against_gives_no_support() {
+        let law = fixture_law();
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let cmd = WheelCommand { steer_angle: 0.0, surface_speed: 0.0, brake_lock: false, handbrake: false, ai_driven: false };
+        let up = law.forces(g, Vec3::new(0.0, 0.0, RADIUS - HUB_Z - 0.03), glam::Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, &cmd, &flat, 1.0).unwrap();
+        // Rolled 180 about x the hub height (+0.1988) becomes -0.1988: lift the origin to match.
+        let flipped = law
+            .forces(g, Vec3::new(0.0, 0.0, RADIUS + HUB_Z - 0.03), glam::Quat::from_rotation_x(std::f32::consts::PI), Vec3::ZERO, Vec3::ZERO, &cmd, &flat, 1.0)
+            .unwrap();
+        println!("upright: all down {:?}, fz {:.1}; inverted: all down {:?}, fz {:.1}", up.touching[..4].iter().all(|&t| t), up.force.z, flipped.touching[..4].iter().all(|&t| t), flipped.force.z);
+        assert!(up.force.z > 1000.0, "an upright jeep on its springs is pushed up: {}", up.force.z);
+        assert!(flipped.touching[..4].iter().all(|&t| t), "the inverted hubs must be touching, or this proves nothing");
+        assert!(flipped.force.z.abs() < 1.0, "an inverted hull gets no support from its wheels: {}", flipped.force.z);
+    }
+
+    /// **The tick counters, evaluated by hand from the decompilation.** The stationary damper
+    /// (`sub_140E60A00`): nothing until the counter EXCEEDS `round(0.45 * 60)` = 27, then
+    /// `(counter / 60 - 0.45) / 0.8`, capped at 1, and never above 1.75 wu/s. The standstill counter
+    /// (`sub_140E60D40`): counts only with no throttle (or braking), a wheel gripping and under
+    /// 1.75 wu/s. The reverse-against-travel brake (`sub_140E60B90` / `sub_140E60B00`): counts above
+    /// 1 wu/s while the stick opposes the travel, brakes while `counter / 60 < 0.5` (29 ticks yes, 30
+    /// no) or while the hold flag is set.
+    #[test]
+    fn the_tick_counters_follow_the_decompilation() {
+        // (tick rate 60: the damper delay is round(0.45 * 60) = 27 ticks, the ramp is by seconds)
+        assert_eq!(park_factor(27, 0.0), 0.0, "27 ticks is not MORE than round(0.45 * 60)");
+        assert!((park_factor(28, 0.0) - 0.020833334).abs() < 1e-6, "(28/60 - 0.45) / 0.8");
+        assert!((park_factor(48, 0.0) - 0.4375).abs() < 1e-6, "(48/60 - 0.45) / 0.8");
+        assert_eq!(park_factor(120, 0.0), 1.0, "capped at 1");
+        assert_eq!(park_factor(120, 3.0625), 0.0, "and never while it is still moving at 1.75 wu/s");
+        assert!(park_factor(120, 3.0).abs() > 0.99);
+        // standstill counter
+        assert_eq!(idle_counter(5, 0.0, false, true, 1.0), 6, "no throttle, gripping, slow: counts");
+        assert_eq!(idle_counter(5, 0.5, false, true, 1.0), 0, "throttle resets it");
+        assert_eq!(idle_counter(5, 0.5, true, true, 1.0), 6, "braking counts even with the stick down");
+        assert_eq!(idle_counter(5, 0.0, false, false, 1.0), 0, "no wheel gripping resets it");
+        assert_eq!(idle_counter(5, 0.0, false, true, 4.0), 0, "too fast resets it");
+        assert_eq!(idle_counter(0xFE, 0.0, false, true, 0.0), 0xFE, "saturates");
+        // brake counter: brakes while counter / 60 < 0.5, i.e. 29 ticks yes, 30 no
+        let mut c = 0u8;
+        for _ in 0..29 {
+            c = brake_counter(c, -1.0, 8.0, 0.9, false);
+        }
+        assert_eq!(c, 29);
+        assert!(brake_active(c, false), "29 ticks = 0.483 s < 0.5 s: still braking");
+        assert!(!brake_active(brake_counter(c, -1.0, 8.0, 0.9, false), false), "30 ticks = 0.5 s: released");
+        assert!(brake_active(30, true), "the hold flag keeps it on");
+        assert_eq!(brake_counter(14, -1.0, 8.0, -0.9, false), 0, "reversing WITH the travel is not a brake");
+        assert_eq!(brake_counter(14, 1.0, 8.0, 0.9, false), 0, "driving forward is not a brake");
+        assert_eq!(brake_counter(14, -1.0, 0.9, 0.9, false), 0, "and not below 1 wu/s");
+        assert_eq!(brake_counter(14, 0.0, 8.0, 0.9, false), 0, "no stick, no brake");
+        assert!(!brake_active(0, true), "a zero counter is never braking");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // SLOPES
+    // -----------------------------------------------------------------------------------------
+
+    /// **A slope below the friction limit holds a jeep; one past it does not, and it slides at
+    /// `g sin(theta)`.**
+    ///
+    /// The tag authors the limits: friction is full above `ground maximum slope 0` (cos 0.766,
+    /// 40 deg) and zero below `ground maximum slope 1` (cos 0.643, 50 deg). At 30 deg a standing
+    /// jeep needs `g sin 30 = 2.09` of the 4.4 wu/s^2 the tyres can give and must stay put; at 55
+    /// deg the tyres give nothing, nothing but the spring acts along the slope, and the body
+    /// accelerates down it at exactly `g sin 55 = 3.42`. Both expectations are derived from the
+    /// tag's angles and gravity; neither is read back from the solver.
+    #[test]
+    fn a_slope_below_the_friction_limit_holds_and_one_past_it_slides_at_g_sin_theta() {
+        let d = fixture();
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        // 30 degrees: held.
+        let ground = incline(30.0);
+        let start = DriveState { pos: Vec3::new(0.0, 0.0, 0.6 + 0.8 * 30f32.to_radians().tan()), ..Default::default() };
+        let held = run(&d, start, DriveInput::default(), 3.0, 60.0, &ground, |_, _| {});
+        let mut drift = 0.0f32;
+        let end = run(&d, held, DriveInput::default(), 3.0, 60.0, &ground, |_, s| drift = drift.max((s.pos - held.pos).length()));
+        println!("30 deg: moved {drift:.4} wu in 3 s after settling, pitch {:+.3} rad", end.pitch);
+        assert!(end.touching[..4].iter().all(|&t| t), "all four wheels must be on the slope");
+        assert!((end.pitch - 30f32.to_radians()).abs() < 0.03, "it must be lying ON the slope, pitch {:+.3}", end.pitch);
+        // (Displacement, not tick-end speed: a body at rest reads +-g*dt/2 of kick-and-drift sawtooth.)
+        assert!(drift < 0.05, "30 degrees is inside the friction limit: it crept {drift:.3} wu");
+        // 55 degrees: past the second limit, sliding.
+        let ground = incline(55.0);
+        let start = DriveState { pos: Vec3::new(0.0, 0.0, 0.6 + 0.8 * 55f32.to_radians().tan()), ..Default::default() };
+        let (mut v1, mut v2) = (None, None);
+        run(&d, start, DriveInput::default(), 3.2, 60.0, &ground, |t, s| {
+            let along = s.vel.dot(Vec3::new(55f32.to_radians().cos(), 0.0, 55f32.to_radians().sin()));
+            if (t - 1.5).abs() < 0.009 {
+                v1 = Some(along);
+            }
+            if (t - 2.5).abs() < 0.009 {
+                v2 = Some(along);
+            }
+        });
+        let (v1, v2) = (v1.unwrap(), v2.unwrap());
+        let a = (v2 - v1) / 1.0;
+        let want = -g * 55f32.to_radians().sin();
+        println!("55 deg: along-slope speed {v1:.3} -> {v2:.3}, acceleration {a:+.3}, g sin(theta) {want:+.3}");
+        assert!((a / want - 1.0).abs() < 0.10, "past the friction limit it must slide at g sin(theta) = {want:.3}, got {a:.3}");
+    }
+    // -----------------------------------------------------------------------------------------
+    // THE REAL VEHICLES (need the cache)
+    // -----------------------------------------------------------------------------------------
+
+    use std::sync::OnceLock;
+
+    /// The real Warthog and Mongoose, built once exactly as a ride builds them.
+    fn real() -> Option<&'static (DriveModel, DriveModel)> {
+        static CELL: OnceLock<Option<(DriveModel, DriveModel)>> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let (_g, native, cache) = crate::reach_actor::tests::open_reach_for("forge_halo")?;
+            let build = |tail: &str| -> Option<DriveModel> {
+                let tag = native
+                    .tags_by_group(cache, "vehi")
+                    .into_iter()
+                    .find(|&t| native.tag_name(cache, t).is_some_and(|n| n.ends_with(tail)))?;
+                let mut index = crate::play_vehicle::VehicleIndex::default();
+                index.entry(&native, cache, tag)?.drive.clone().ok()
+            };
+            Some((build("warthog\\warthog")?, build("mongoose\\mongoose")?))
+        })
+        .as_ref()
+    }
+
+    fn settle_flat(d: &DriveModel) -> DriveState {
+        let r = d.wheel_law.as_ref().unwrap().wheels[0].radius;
+        run(d, DriveState { pos: Vec3::new(0.0, 0.0, r + 0.02), ..Default::default() }, DriveInput::default(), 3.0, 60.0, &flat, |_, _| {})
+    }
+
+    /// The best average acceleration over any half second of a standing start (straight, full
+    /// throttle, first three seconds).
+    fn best_launch_acceleration(d: &DriveModel) -> f32 {
+        let mut vx = vec![(0.0f32, 0.0f32)];
+        run(d, settle_flat(d), DriveInput { throttle: 1.0, ..Default::default() }, 3.0, 60.0, &flat, |t, s| vx.push((t, s.vel.x)));
+        vx.iter()
+            .filter(|(t, _)| *t >= 0.5)
+            .map(|&(t, v)| {
+                let (_, v0) = *vx.iter().min_by(|a, b| (a.0 - (t - 0.5)).abs().partial_cmp(&(b.0 - (t - 0.5)).abs()).unwrap()).unwrap();
+                (v - v0) / 0.5
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    /// **Full wheelspin gives exactly the Coulomb force of the tag.** All four wheels commanded to
+    /// a surface speed far past every `moving friction velocity diff`, the hull at rest at its
+    /// parking height: the summed forward force per unit mass is `0.033 * sqrt(0.9 * moving
+    /// friction) * sum(share) * g * compression / depth`, computed here from the tag's numbers and
+    /// the pose (every wheel is `radius - hub height` compressed). It is the engine's
+    /// `friction * normal force` with the constants quoted — and tripling the surface speed must
+    /// change nothing, because the Coulomb regime does not depend on the slip.
+    #[test]
+    fn full_wheelspin_gives_the_coulomb_force_of_the_tag_and_no_more() {
+        let law = fixture_law();
+        let body = law.body.unwrap();
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let pos = Vec3::new(0.0, 0.0, rest_z());
+        let go = |surface: f32| {
+            let cmd = WheelCommand { steer_angle: 0.0, surface_speed: surface, brake_lock: false, handbrake: false, ai_driven: false };
+            law.forces(g, pos, glam::Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, &cmd, &flat, 1.0).unwrap().force.x / body.mass
+        };
+        let compression = RADIUS - (pos.z + HUB_Z);
+        let share_sum: f32 = law.wheels.iter().map(|w| w.share).sum();
+        let want = 0.033_f32
+            * (0.9_f32 * law.ground.moving_friction).sqrt()
+            * share_sum
+            * g
+            * compression
+            / law.ground.depth;
+        let (a, b) = (go(30.0), go(90.0));
+        // THE ROOT: the same wheelspin on half the moving friction.
+        let mut slippery = law.clone();
+        slippery.ground.moving_friction *= 0.5;
+        let cmd = WheelCommand { steer_angle: 0.0, surface_speed: 30.0, brake_lock: false, handbrake: false, ai_driven: false };
+        let half = slippery.forces(g, pos, glam::Quat::IDENTITY, Vec3::ZERO, Vec3::ZERO, &cmd, &flat, 1.0).unwrap().force.x / body.mass;
+        println!("wheelspin: {a:.4} wu/s^2 (tag says {want:.4}), at triple the surface speed {b:.4}; on half the friction x{:.4}", half / a);
+        assert!((half / a - 0.5f32.sqrt()).abs() < 1e-3, "traction goes as the root of the friction: x{:.4}", half / a);
+        assert!((a / want - 1.0).abs() < 0.01, "full wheelspin accelerates at {a:.4}, the tag's friction gives {want:.4}");
+        assert!((b / a - 1.0).abs() < 1e-4, "the Coulomb regime must not depend on the slip: {a} vs {b}");
+
+        // THE ENGINE'S LOAD (`sub_140E60130`): the longitudinal tyre force on the driven wheels, in
+        // force units. Wheelspin from rest PULLS the flywheel down (the ground resists the driving
+        // wheels): minus the whole force. A hull coasting faster than the locked wheels PUSHES the
+        // flywheel up: plus the whole force. Same magnitude both ways, opposite sign.
+        let drive = |surface: f32, vx: f32| {
+            let cmd = WheelCommand { steer_angle: 0.0, surface_speed: surface, brake_lock: false, handbrake: false, ai_driven: false };
+            law.forces(g, pos, glam::Quat::IDENTITY, Vec3::new(vx, 0.0, 0.0), Vec3::ZERO, &cmd, &flat, 1.0).unwrap().ground_torque
+        };
+        let (spin, overrun) = (drive(30.0, 0.0), drive(0.0, 30.0));
+        println!("engine load: wheelspin {spin:.1}, overrun {overrun:.1} (mass * wheelspin accel = {:.1})", body.mass * want);
+        assert!((spin / (-body.mass * want) - 1.0).abs() < 0.01, "wheelspin must load the engine by the whole tyre force: {spin}");
+        assert!((overrun / (body.mass * want) - 1.0).abs() < 0.01, "overrun must drive the engine by the whole tyre force: {overrun}");
+    }
+
+    /// **A standing start is traction-limited.** Halving BOTH friction coefficients cuts every tyre
+    /// force by at most `sqrt(1/2)` at a given slip (the pure-function gate above shows the root
+    /// exactly), and a launch the engine could out-pull the tyres on would not notice at all. The
+    /// launch slows by between that factor (the slip can only grow to compensate, never shrink)
+    /// and 0.97 (an engine-limited launch would read 1.0).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_standing_start_is_traction_limited() {
+        let Some((wh, mg)) = real() else { return };
+        for (name, d) in [("Warthog", wh), ("Mongoose", mg)] {
+            let mut slippery = d.clone();
+            let law = slippery.wheel_law.as_mut().unwrap();
+            law.ground.friction *= 0.5;
+            law.ground.moving_friction *= 0.5;
+            let (a, b) = (best_launch_acceleration(d), best_launch_acceleration(&slippery));
+            println!("{name}: launch {a:.3} wu/s^2, on half the friction {b:.3} (x{:.4})", b / a);
+            assert!(a > 3.0, "{name} must actually launch: {a:.3}");
+            assert!(b / a > 0.5f32.sqrt() - 0.02 && b / a < 0.97, "{name}: halving the friction scaled the launch by {:.4}", b / a);
+        }
+    }
+
+    /// **The top speed is the drivetrain's ceiling** — `max angular velocity * the top gear's
+    /// ratio` from the tag (Warthog 9.5 * 1.2 = 11.40, Mongoose 8.0 * 1.1 = 8.80) — reached and
+    /// not passed, in top gear.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_top_speed_is_the_drivetrain_ceiling_and_it_is_reached() {
+        let Some((wh, mg)) = real() else { return };
+        for (name, d, want) in [("Warthog", wh, 11.4f32), ("Mongoose", mg, 8.8)] {
+            let ceiling = d.drivetrain.as_ref().unwrap().speed_ceiling();
+            assert!((ceiling - want).abs() < 1e-3, "the tag's ceiling for the {name} is {want}, the model says {ceiling}");
+            let mut top = 0.0f32;
+            let mut last_gear = 0;
+            let end = run(d, settle_flat(d), DriveInput { throttle: 1.0, ..Default::default() }, 30.0, 60.0, &flat, |_, s| {
+                top = top.max(s.vel.length());
+                last_gear = s.engine.gear;
+            });
+            println!("{name}: ceiling {ceiling:.3}, final {:.3}, max {top:.3}, gear {last_gear}", end.vel.length());
+            assert!((end.vel.length() / ceiling - 1.0).abs() < 0.005, "{name} ends at {:.3}, not at {ceiling:.3}", end.vel.length());
+            assert!(top <= ceiling * 1.02, "{name} passed its ceiling: {top:.3}");
+            assert_eq!(last_gear as usize, d.drivetrain.as_ref().unwrap().gears.len() - 1, "{name} must be in its top gear");
+        }
+    }
+
+    /// **Reverse against travel brakes, then reverses.** Cruising at the ceiling and pushing the
+    /// stick back: for the first half second every wheel is locked at the tyres' Coulomb limit
+    /// (`sub_140E60B00`), so the deceleration is the traction cap; afterwards the engine selects
+    /// reverse and the car backs away to `gear-0 ratio * max angular velocity` (-0.5 * 9.5).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn reverse_against_travel_brakes_at_the_tyre_limit_and_then_reverses() {
+        let Some((wh, _)) = real() else { return };
+        let d = wh;
+        let cruise = run(d, settle_flat(d), DriveInput { throttle: 1.0, ..Default::default() }, 12.0, 60.0, &flat, |_, _| {});
+        let law = d.wheel_law.as_ref().unwrap();
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        // Every wheel locked and sliding at far more than any velocity diff: the Coulomb force of the
+        // static load. Weight transfer in a stop moves it by a few per cent, hence the tolerance.
+        let cap = 0.033_f32 * (0.9_f32 * law.ground.moving_friction).sqrt() * law.wheels.iter().map(|w| w.share).sum::<f32>() * g / law.wheels.len() as f32;
+        let (mut v_a, mut v_b) = (0.0, 0.0);
+        let mut min_vx = 0.0f32;
+        let mut gear0_at = None;
+        let end = run(d, cruise, DriveInput { throttle: -1.0, ..Default::default() }, 9.0, 60.0, &flat, |t, s| {
+            if (t - 0.10).abs() < 0.009 {
+                v_a = s.vel.x;
+            }
+            if (t - 0.45).abs() < 0.009 {
+                v_b = s.vel.x;
+            }
+            min_vx = min_vx.min(s.vel.x);
+            if s.engine.gear == 0 && gear0_at.is_none() {
+                gear0_at = Some(t);
+            }
+        });
+        let decel = (v_a - v_b) / 0.35;
+        let reverse_top = -0.5 * 9.5;
+        println!("braking {decel:.3} wu/s^2 (tyre cap {cap:.3}), reverse engaged at {gear0_at:?}, backs away to {:.3} (want {reverse_top})", end.vel.x);
+        assert!(cruise.vel.x > 11.0, "it must be at speed to begin with: {}", cruise.vel.x);
+        assert!(decel <= cap * 1.12 && decel >= cap * 0.90, "braking {decel:.3} against the tyre limit {cap:.3}");
+        assert!(gear0_at.is_some_and(|t| t >= 0.5), "the engine must hold off reverse for the brake's half second: {gear0_at:?}");
+        assert!((end.vel.x / reverse_top - 1.0).abs() < 0.02, "backs away to {:.3}, not {reverse_top}", end.vel.x);
+        assert!(min_vx > reverse_top * 1.02, "it must not overshoot the reverse ceiling: {min_vx}");
+    }
+
+    /// **A hard landing is caught by the springs and the hull never goes through the ground.**
+    /// Dropped from 4 and 9 wu the springs bottom out (compression reaches the wheel radius, which
+    /// is what makes this a real landing and not a gentle one), no wheel hub ends up below the
+    /// surface, and the jeep comes to rest at the height it parks at.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_hard_landing_bottoms_the_springs_but_never_goes_through_the_ground() {
+        let Some((wh, _)) = real() else { return };
+        let d = wh;
+        let law = d.wheel_law.as_ref().unwrap();
+        let rest = settle_flat(d);
+        for drop in [4.0f32, 9.0] {
+            let mut lowest_hub = f32::MAX;
+            let mut peak = 0.0f32;
+            let end = run(d, DriveState { pos: Vec3::new(0.0, 0.0, rest.pos.z + drop), ..Default::default() }, DriveInput::default(), 8.0, 60.0, &flat, |_, s| {
+                let q = s.basis();
+                for w in &law.wheels {
+                    lowest_hub = lowest_hub.min((s.pos + q * w.local).z);
+                }
+                peak = peak.max(s.suspension[..4].iter().cloned().fold(0.0, f32::max));
+            });
+            println!("drop {drop}: lowest hub {lowest_hub:+.4}, peak compression {peak:.3}, rests at {:.4} (parks at {:.4})", end.pos.z, rest.pos.z);
+            assert!(peak >= law.wheels[0].radius * 0.99, "the {drop} wu drop must bottom the springs: peak {peak:.3}");
+            assert!(lowest_hub > -0.01, "a wheel hub went through the ground: {lowest_hub:+.4}");
+            assert!((end.pos.z - rest.pos.z).abs() < 3e-3, "it must settle back to {:.4}, got {:.4}", rest.pos.z, end.pos.z);
+            assert!(end.roll.abs() < 0.01 && end.pitch.abs() < 0.02, "and settle level");
+        }
+    }
+
+    /// **The Mongoose is a jeep too, and steers the right way.** A facing held 0.05 saturation
+    /// angles to the left of the hull (about a degree of lock) turns it left, to the right turns it
+    /// right, at top speed, and it stays upright. (Gentle: its centre of mass sits 72% of the way
+    /// to the front axle, so past ~4 degrees of lock at 8.8 wu/s the engine's own tyre law spins
+    /// it out.)
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_mongoose_drives_and_steers_the_right_way() {
+        let Some((_, mg)) = real() else { return };
+        assert!(mg.rigid(), "the Mongoose must be on the rigid-body law");
+        let sat = mg.wheel_law.as_ref().unwrap().steer.saturation_angle();
+        let cruise = run(mg, settle_flat(mg), DriveInput { throttle: 1.0, ..Default::default() }, 6.0, 60.0, &flat, |_, _| {});
+        for (err, sign) in [(0.05 * sat, 1.0f32), (-0.05 * sat, -1.0)] {
+            let (mut max_roll, mut turned, mut last) = (0.0f32, 0.0f32, cruise.yaw);
+            let mut st = cruise;
+            for _ in 0..180 {
+                st = mg.step(st, DriveInput { throttle: 1.0, want_yaw: st.yaw + err, ..Default::default() }, 1.0 / 60.0, &flat);
+                max_roll = max_roll.max(st.roll.abs());
+                turned += crate::reach_vehicle::wrap_angle(st.yaw - last);
+                last = st.yaw;
+            }
+            println!("Mongoose facing error {err:+.4}: yaw change {turned:+.3} rad, steer {:+.3}, max roll {max_roll:.3}", st.steer_angle);
+            assert!(turned * sign > 0.2, "a facing {err:+.3} off the hull must turn it that way: {turned:+.3}");
+            assert!(max_roll < 0.15, "and not roll it over: {max_roll:.3}");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // THE TYRE (pure: no map, no cache)
+    // -----------------------------------------------------------------------------------------
+
+    /// The rear axle only, every `moving friction velocity diff` set to 3, at the pose where the
+    /// hubs rest on flat ground. Returns the total sideways force when the hull slides sideways at
+    /// `v` with the wheels held still.
+    fn rear_axle_sideways_force(handbrake: bool, v: f32) -> f32 {
+        let mut law = fixture_law();
+        law.wheels.retain(|w| w.steer != SteerRole::Steered);
+        for w in &mut law.wheels {
+            w.moving_velocity_diff = 3.0;
+        }
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let cmd = WheelCommand { steer_angle: 0.0, surface_speed: 0.0, brake_lock: false, handbrake, ai_driven: false };
+        let wf = law
+            .forces(g, Vec3::new(0.0, 0.0, rest_z()), glam::Quat::IDENTITY, Vec3::new(0.0, v, 0.0), Vec3::ZERO, &cmd, &flat, 1.0)
+            .unwrap();
+        wf.force.y
+    }
+
+    /// **The tyre has two regimes and the tag draws the line between them.** Below `moving friction
+    /// velocity diff` the force is VISCOUS (linear in the slip: double the slip, double the force);
+    /// above it it is COULOMB (independent of the slip). And the hand brake swaps the rear wheels
+    /// onto their own `e-brake moving friction` (8.25 against 27.5), so their sideways grip falls by
+    /// `sqrt(8.25 / 27.5)`. Relationships on the production `forces`, with the load identical in
+    /// every call (the hull is not moving vertically).
+    #[test]
+    fn the_tyre_is_viscous_below_the_velocity_diff_coulomb_above_and_the_handbrake_loosens_the_rear() {
+        let (f1, f2) = (rear_axle_sideways_force(false, 1.0), rear_axle_sideways_force(false, 2.0));
+        let (f4, f8) = (rear_axle_sideways_force(false, 4.0), rear_axle_sideways_force(false, 8.0));
+        println!("viscous: {f1:.1} -> {f2:.1} (x{:.3}); Coulomb: {f4:.1} -> {f8:.1} (x{:.3})", f2 / f1, f8 / f4);
+        assert!(f1 < 0.0 && f4 < 0.0, "the friction must OPPOSE the slide");
+        assert!((f2 / f1 - 2.0).abs() < 1e-3, "below the velocity diff the force doubles with the slip: x{:.4}", f2 / f1);
+        assert!((f8 / f4 - 1.0).abs() < 1e-3, "above it the force does not change with the slip: x{:.4}", f8 / f4);
+        let hb = rear_axle_sideways_force(true, 8.0);
+        let want = (8.25f32 / 27.5).sqrt();
+        println!("hand brake: {hb:.1} against {f8:.1}: x{:.4} (sqrt(8.25/27.5) = {want:.4})", hb / f8);
+        assert!((hb / f8 - want).abs() < 1e-3, "the hand brake must loosen the rear by sqrt(mu_ebrake/mu): x{:.4} vs {want:.4}", hb / f8);
+    }
+    /// **A jeep that has rolled over stays rolled over; one that has only leant rights itself.**
+    /// The engine has no self-righting in the jeep tick (`sub_140E69D40` applies wheel forces and
+    /// nothing else), so tipped 60 degrees the springs (which push along the ground normal at the
+    /// hubs, below the centre of mass) bring it level, and tipped 170 degrees nothing turns it
+    /// back. The hull's own Havok collision is NOT modelled: a rolled jeep rests on its wheel hubs
+    /// (the ground backstop) rather than on its roof -- reported, not hidden.
+    ///
+    /// (The support cut-off is gated separately, below.)
+    #[test]
+    fn a_jeep_that_leans_rights_itself_and_one_that_rolls_over_stays_over() {
+        let d = fixture();
+        let rolled = |deg: f32| {
+            let mut st = at(1.0);
+            st.orient = Some(glam::Quat::from_rotation_x(deg.to_radians()));
+            let end = run(&d, st, DriveInput::default(), 8.0, 60.0, &flat, |_, _| {});
+            (end.basis() * Vec3::Z).z
+        };
+        let (leant, flipped) = (rolled(60.0), rolled(170.0));
+        println!("tipped 60 deg -> up.z {leant:+.3} after 8 s; tipped 170 deg -> up.z {flipped:+.3}");
+        assert!(leant > 0.99, "a jeep leant 60 degrees must come back level: up.z {leant}");
+        assert!(flipped < -0.9, "a rolled-over jeep has nothing to right it: up.z {flipped}");
+    }
+
+    /// Least-squares quadratic `y = c0 + c1 t + c2 t^2` over `(t, y)`; returns `(c0, c1, c2, rms)`.
+    fn quad_fit(pts: &[(f64, f64)]) -> Option<(f64, f64, f64, f64)> {
+        let n = pts.len() as f64;
+        if pts.len() < 4 { return None; }
+        let (mut s1, mut s2, mut s3, mut s4, mut y0, mut y1, mut y2) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(t, y) in pts {
+            let t2 = t * t;
+            s1 += t; s2 += t2; s3 += t2 * t; s4 += t2 * t2;
+            y0 += y; y1 += y * t; y2 += y * t2;
+        }
+        // normal equations 3x3 (Cramer)
+        let m = [[n, s1, s2], [s1, s2, s3], [s2, s3, s4]];
+        let det = |a: [[f64; 3]; 3]| a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+        let d = det(m);
+        if d.abs() < 1e-12 { return None; }
+        let rhs = [y0, y1, y2];
+        let mut c = [0.0; 3];
+        for k in 0..3 {
+            let mut mk = m;
+            for r in 0..3 { mk[r][k] = rhs[r]; }
+            c[k] = det(mk) / d;
+        }
+        let rms = (pts.iter().map(|&(t, y)| (y - (c[0] + c[1] * t + c[2] * t * t)).powi(2)).sum::<f64>() / n).sqrt();
+        Some((c[0], c[1], c[2], rms))
+    }
+
+    /// One free-flight arc found in a recording: `(film file name, net id, def_wire, a_z, a_horizontal, T, rms_z, vz at start)`.
+    #[derive(Clone, Debug)]
+    struct Arc {
+        film: String,
+        net: u32,
+        def: Option<u32>,
+        az: f64,
+        ah: f64,
+        t: f64,
+        rms: f64,
+        vz0: f64,
+        z: Vec<(f64, f64)>,
+    }
+
+    /// Find ballistic windows in vehicle position tracks. A window is a run of CONSECUTIVE recorded
+    /// samples (no gap over `max_gap` ticks) over which a quadratic fits z within `rms_z` AND x, y are
+    /// straight lines (speed change under `dh` wu/s over the window, residual under `rms_h`) AND the
+    /// vehicle is moving horizontally. **No rule looks at the fitted vertical acceleration.** `min_t`
+    /// is the window length; `min_dv` demands the fitted vz to change by at least that much over the
+    /// window so the curvature is measurable at all (a selection on how much the arc bends, not on
+    /// the value it bends to).
+    /// The arcs in ONE position track (`(tick, position)` samples), by the rules of [`film_arcs`].
+    /// Returns `(a_z, a_horizontal, T, rms_z, vz at start, samples)` per arc.
+    #[allow(clippy::type_complexity)]
+    fn track_arcs(pts: &[(u32, [f32; 3])], min_t: f64, rms_z: f64, dh: f64, rms_h: f64, min_dv: f64, min_h: f64) -> (usize, Vec<(f64, f64, f64, f64, f64, Vec<(f64, f64)>)>) {
+        let mut rejected = 0usize;
+        let mut arcs = vec![];
+        let mut i = 0usize;
+        while i + 8 < pts.len() {
+            let mut best: Option<(usize, f64, f64, f64, f64, f64)> = None;
+            let mut j = i + 7;
+            while j < pts.len() {
+                if pts[j].0 - pts[j - 1].0 > 6 { break; }
+                let t0 = pts[i].0 as f64 / 60.0;
+                let col = |c: usize| -> Vec<(f64, f64)> { pts[i..=j].iter().map(|&(k, q)| (k as f64 / 60.0 - t0, q[c] as f64)).collect() };
+                let (zs, xs, ys) = (col(2), col(0), col(1));
+                let (Some(fz), Some(fx), Some(fy)) = (quad_fit(&zs), quad_fit(&xs), quad_fit(&ys)) else { j += 1; continue };
+                let tt = zs.last().unwrap().0;
+                let hspeed = (fx.1.powi(2) + fy.1.powi(2)).sqrt();
+                let h_ok = hspeed >= min_h && (2.0 * fx.2 * tt).abs() < dh && (2.0 * fy.2 * tt).abs() < dh && fx.3 < rms_h && fy.3 < rms_h;
+                let ok = h_ok && fz.3 < rms_z;
+                if ok && tt >= min_t {
+                    let ah = (4.0 * (fx.2 * fx.2 + fy.2 * fy.2)).sqrt();
+                    best = Some((j, 2.0 * fz.2, ah, tt, fz.3, fz.1));
+                } else if !ok && tt >= min_t {
+                    break;
+                }
+                j += 1;
+            }
+            match best {
+                Some((end, az, ah, tt, rms, vz0)) if (az * tt).abs() >= min_dv => {
+                    let z: Vec<(f64, f64)> = pts[i..=end].iter().map(|&(k, q)| (k as f64 / 60.0 - pts[i].0 as f64 / 60.0, q[2] as f64)).collect();
+                    arcs.push((az, ah, tt, rms, vz0, z));
+                    i = end + 1;
+                }
+                Some((end, ..)) => { rejected += 1; i = end + 1; }
+                None => i += 3,
+            }
+        }
+        (rejected, arcs)
+    }
+
+    fn film_arcs(min_t: f64, rms_z: f64, dh: f64, rms_h: f64, min_dv: f64, min_h: f64) -> (usize, usize, Vec<Arc>) {
+        use crate::{film, film_decode};
+        let films = film::find_finished_films();
+        let (mut tracks, mut rejected) = (0usize, 0usize);
+        let mut out = vec![];
+        for p in &films {
+            let Ok(f) = film::open(p) else { continue };
+            let idx = film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            let name = p.file_name().map(|n| n.to_string_lossy().chars().take(20).collect::<String>()).unwrap_or_default();
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 15 && t.positions.len() > 30) {
+                tracks += 1;
+                let (rej, arcs) = track_arcs(&t.positions, min_t, rms_z, dh, rms_h, min_dv, min_h);
+                rejected += rej;
+                for (az, ah, tt, rms, vz0, z) in arcs {
+                    out.push(Arc { film: name.clone(), net: t.net_id, def: t.def_wire, az, ah, t: tt, rms, vz0, z });
+                }
+            }
+        }
+        (tracks, rejected, out)
+    }
+
+    /// Least-squares polynomial of `deg` over `(t, y)` (Gaussian elimination on the normal equations).
+    fn poly_fit(pts: &[(f64, f64)], deg: usize) -> Option<Vec<f64>> {
+        let m = deg + 1;
+        let mut a = vec![vec![0.0f64; m + 1]; m];
+        for &(t, y) in pts {
+            let mut pw = vec![1.0; 2 * m];
+            for k in 1..2 * m { pw[k] = pw[k - 1] * t; }
+            for r in 0..m {
+                for c in 0..m { a[r][c] += pw[r + c]; }
+                a[r][m] += y * pw[r];
+            }
+        }
+        for col in 0..m {
+            let piv = (col..m).max_by(|&x, &y| a[x][col].abs().partial_cmp(&a[y][col].abs()).unwrap())?;
+            if a[piv][col].abs() < 1e-12 { return None; }
+            a.swap(col, piv);
+            for r in 0..m {
+                if r != col {
+                    let f = a[r][col] / a[col][col];
+                    for c in col..=m { a[r][c] -= f * a[col][c]; }
+                }
+            }
+        }
+        Some((0..m).map(|r| a[r][m] / a[r][r]).collect())
+    }
+
+    fn summarize(label: &str, mut v: Vec<f64>) {
+        if v.is_empty() { println!("{label}: n 0"); return; }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = v.len();
+        let mean = v.iter().sum::<f64>() / n as f64;
+        let pos = v.iter().filter(|&&x| x > 0.0).count();
+        println!("{label}: n {n}, p10 {:.2} p25 {:.2} median {:.3} p75 {:.2} p90 {:.2}, mean {mean:.3}, a>0 (impossible in flight) {pos}", v[n / 10], v[n / 4], v[n / 2], v[n * 3 / 4], v[n * 9 / 10]);
+    }
+
+    #[test]
+    #[ignore = "print-only; reads the saved films on this machine"]
+    fn probe_film_free_flight_arcs() {
+        for (label, min_t, rms_z, dh, rms_h, min_dv, min_h) in [
+            ("strict", 0.6, 0.02, 0.4, 0.03, 1.5, 2.0),
+            ("long arcs only", 1.0, 0.03, 0.6, 0.04, 3.0, 2.0),
+            ("BIG jumps, any horizontal speed", 0.8, 0.04, 1.0, 0.06, 4.0, 0.0),
+            ("BIGGER jumps", 1.0, 0.05, 1.5, 0.08, 6.0, 0.0),
+        ] {
+            let (tracks, rejected, arcs) = film_arcs(min_t, rms_z, dh, rms_h, min_dv, min_h);
+            println!("-- {label}: {tracks} vehicle tracks, {} arcs, {rejected} too-flat windows skipped", arcs.len());
+            summarize("   all vehicles az", arcs.iter().map(|a| a.az).collect());
+            {
+                let mut v: Vec<&Arc> = arcs.iter().collect();
+                v.sort_by(|a, b| b.t.partial_cmp(&a.t).unwrap());
+                let wsum: f64 = v.iter().map(|a| a.t.powi(3)).sum();
+                let wmean = v.iter().map(|a| a.az * a.t.powi(3)).sum::<f64>() / wsum.max(1e-9);
+                println!("   T^3-weighted mean az {wmean:.3}; longest arcs (T, az, rms, def, film, net):");
+                for a in v.iter().take(8) { println!("      T {:.2} az {:.2} rms {:.3} vz0 {:.1} def {:?} {} {}", a.t, a.az, a.rms, a.vz0, a.def, a.film, a.net); }
+            }
+            println!("   vz at window start: {:?}", arcs.iter().map(|a| (a.vz0 * 10.0).round() / 10.0).collect::<Vec<_>>());
+            summarize("   horizontal accel", arcs.iter().map(|a| a.ah).collect());
+            let names = def_leafs(&arcs.iter().filter_map(|a| a.def).collect::<Vec<_>>());
+            let mut defs: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
+            for a in &arcs { defs.entry(a.def.and_then(|d| names.get(&d).cloned()).unwrap_or_else(|| format!("{:?}", a.def))).or_default().push(a.az); }
+            for (d, v) in defs { if v.len() >= 3 { summarize(&format!("   {d}"), v); } }
+            for a in arcs.iter().filter(|a| a.def.and_then(|d| names.get(&d)).is_some_and(|n| n == "warthog" || n == "mongoose")) {
+                println!("      {} T {:.2} az {:+.2} vz0 {:+.1} rms {:.3} {}", a.def.and_then(|d| names.get(&d).cloned()).unwrap_or_default(), a.t, a.az, a.vz0, a.rms, a.film);
+            }
+            // Is there a velocity-dependent term? Cubic fit per arc: a(t) = 2 c2 + 6 c3 t, vz(t) = c1 + 2 c2 t + 3 c3 t^2.
+            // Regress a_mid on vz_mid across arcs; linear drag a = -g - k vz gives slope -k.
+            let (mut xs, mut ys) = (vec![], vec![]);
+            for a in &arcs {
+                if let Some(c) = poly_fit(&a.z, 3) {
+                    let tm = a.t / 2.0;
+                    xs.push(c[1] + 2.0 * c[2] * tm + 3.0 * c[3] * tm * tm);
+                    ys.push(2.0 * c[2] + 6.0 * c[3] * tm);
+                }
+            }
+            if let Some(c) = poly_fit(&xs.iter().cloned().zip(ys.iter().cloned()).collect::<Vec<_>>(), 1) {
+                println!("   a_mid = {:.3} + {:.3} * vz_mid  over {} arcs (vz_mid range {:.1}..{:.1}); linear drag k would be {:.3}/s", c[0], c[1], xs.len(), xs.iter().cloned().fold(f64::MAX, f64::min), xs.iter().cloned().fold(f64::MIN, f64::max), -c[1]);
+            }
+        }
+    }
+
+    /// Landings in the recordings: the tick where a vehicle's vertical velocity goes from a fall (<= -4 wu/s)
+    /// to nearly level within 6 ticks, on a track that then stays continuous for 1.2 s with the
+    /// horizontal heading nearly straight. Returns `(film, net, fall speed, dz series every 0.05 s
+    /// from landing minus the mean level of the last 0.3 s)`.
+    /// Landings in one position track: see [`film_landings`]. `(index, fall speed, dz series)`.
+    fn track_landings(pts: &[(u32, [f32; 3])]) -> Vec<(u32, f64, Vec<f64>)> {
+        let mut out = vec![];
+        if pts.len() < 120 { return out; }
+        let v = |a: usize| ((pts[a + 1].1[2] - pts[a].1[2]) as f64) * 60.0 / (pts[a + 1].0 - pts[a].0).max(1) as f64;
+        let mut w = 12usize;
+        while w + 100 < pts.len() {
+            let cont = (0..72).all(|k| pts[w + k + 1].0 - pts[w + k].0 <= 2);
+            if cont && v(w - 4) < -4.0 && v(w + 4) > -1.5 {
+                let fall = -v(w - 4);
+                let at = |k: usize| pts.get(w + k).map(|q| q.1[2] as f64);
+                let level = (60..72).filter_map(at).sum::<f64>() / 12.0;
+                let series: Vec<f64> = (0..60).step_by(3).filter_map(|k| at(k).map(|z| z - level)).collect();
+                let h0 = (pts[w].1[1] - pts[w - 3].1[1]).atan2(pts[w].1[0] - pts[w - 3].1[0]);
+                let h1 = (pts[w + 60].1[1] - pts[w + 57].1[1]).atan2(pts[w + 60].1[0] - pts[w + 57].1[0]);
+                let hs = ((pts[w + 60].1[0] - pts[w].1[0]).powi(2) + (pts[w + 60].1[1] - pts[w].1[1]).powi(2)).sqrt();
+                if (h1 - h0).abs() < 0.8 && hs > 0.5 {
+                    out.push((pts[w].0, fall, series));
+                }
+                w += 90;
+            } else { w += 1; }
+        }
+        out
+    }
+
+    /// Landings in the recordings, per vehicle name. `(vehicle, film, net, fall speed, dz series every 0.05 s
+    /// from the landing minus the mean level of the last 0.3 s)`.
+    fn film_landings() -> Vec<(String, String, u32, f64, Vec<f64>)> {
+        use crate::{film, film_decode};
+        let mut out = vec![];
+        let mut found: Vec<(u32, String, u32, f64, Vec<f64>)> = vec![];
+        for p in &film::find_finished_films() {
+            let Ok(f) = film::open(p) else { continue };
+            let idx = film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            let name = p.file_name().map(|n| n.to_string_lossy().chars().take(14).collect::<String>()).unwrap_or_default();
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 15 && t.positions.len() > 200) {
+                for (_, fall, series) in track_landings(&t.positions) {
+                    found.push((t.def_wire.unwrap_or(0), name.clone(), t.net_id, fall, series));
+                }
+            }
+        }
+        let names = def_leafs(&found.iter().map(|f| f.0).collect::<Vec<_>>());
+        for (d, f, n, fall, s) in found {
+            out.push((names.get(&d).cloned().unwrap_or_else(|| format!("def{d}")), f, n, fall, s));
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "print-only; reads the saved films"]
+    fn probe_film_landings() {
+        let l = film_landings();
+        println!("{} clean landings", l.len());
+        for (v, f, n, fall, s) in l.iter().filter(|l| l.0 == "warthog" || l.0 == "mongoose" || l.0 == "pickup" || l.0 == "scorpion") {
+            println!("{v} film {f} net {n} fell {fall:.1}: {}", s.iter().map(|z| format!("{z:+.2}")).collect::<Vec<_>>().join(" "));
+        }
+    }
+
+    /// `def_wire` -> tag leaf name for the vehicles of the `forge_halo` cache, the way Theater resolves
+    /// a creation message's definition (`film_action::RefTable`).
+    fn def_leafs(wires: &[u32]) -> std::collections::HashMap<u32, String> {
+        let mut out = std::collections::HashMap::new();
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return out };
+        let Some(c) = crate::mapcat::enumerate().into_iter().find(|c| {
+            c.game == crate::mapcat::Game::Reach && c.path.file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case("forge_halo"))
+        }) else { return out };
+        let Ok(bytes) = std::fs::read(&c.path) else { return out };
+        let mut tags: Vec<(u32, String)> = Vec::new();
+        for g in crate::film_action::RefTable::CONCRETE_GROUPS {
+            for t in native.tags_by_group(cache, g) { tags.push((t, (*g).to_string())); }
+        }
+        let Some(table) = crate::film_action::RefTable::for_map(&bytes, &tags) else { return out };
+        for &w in wires {
+            if let Some(tag) = table.resolve(w) {
+                if let Some(n) = native.tag_name(cache, tag) { out.insert(w, n.rsplit('\\').next().unwrap_or(&n).to_string()); }
+            }
+        }
+        out
+    }
+
+    /// THE METHOD ON THE MODEL: the same arc finder, run on a simulated Warthog's own 60 Hz position track
+    /// over ramps of several sizes, whose true free-fall acceleration is exactly `-g`. What it recovers
+    /// is the finder's bias; the recordings must be read against that, not against `g`.
+    #[test]
+    #[ignore = "opens the native library"]
+    fn probe_arc_finder_on_the_model() {
+        let Some((wh, mg)) = real() else { return };
+        let g = crate::reach_physics::vehicle_fall_acceleration() as f64;
+        for (name, d) in [("Warthog", wh), ("Mongoose", mg)] {
+            let mut all = vec![];
+            for (deg, speed_frames) in [(8.0f32, 8.0f32), (12.0, 10.0), (15.0, 8.0), (20.0, 9.0), (25.0, 10.0), (10.0, 6.0)] {
+                let t = deg.to_radians().tan();
+                let ramp = move |p: Vec3| -> Option<(f32, Vec3)> { if p.x < 30.0 { Some((0.0, Vec3::Z)) } else if p.x < 34.0 { Some(((p.x - 30.0) * t, Vec3::new(-t, 0.0, 1.0).normalize())) } else { Some((0.0, Vec3::Z)) } };
+                let mut st = settle_flat(d);
+                st.pos.x = 0.0;
+                let mut pts: Vec<(u32, [f32; 3])> = vec![];
+                for k in 0..1500u32 {
+                    let thr = if st.vel.x > speed_frames { 0.0 } else { 1.0 };
+                    st = d.step(st, DriveInput { throttle: thr, ..Default::default() }, 1.0 / 60.0, &ramp);
+                    pts.push((k, [st.pos.x, st.pos.y, st.pos.z]));
+                }
+                let (_, arcs) = track_arcs(&pts, 0.6, 0.02, 0.4, 0.03, 1.5, 2.0);
+                for a in &arcs { all.push(a.0); }
+                println!("{name} ramp {deg} deg: {} arcs {:?}", arcs.len(), arcs.iter().map(|a| ((a.0 * 100.0).round() / 100.0, (a.2 * 100.0).round() / 100.0)).collect::<Vec<_>>());
+            }
+            summarize(&format!("{name} SIM (true -{g:.3})"), all);
+        }
+    }
+
+    #[test]
+    #[ignore = "print-only"]
+    fn probe_takeoff() {
+        let Some((wh0, mg0)) = real() else { return };
+        for (name, d0, kdamp) in [("warthog", wh0, 1.0f32), ("warthog", wh0, 2.0), ("warthog", wh0, 3.0), ("mongoose", mg0, 1.0), ("mongoose", mg0, 2.0)] {
+        let mut wh_owned = d0.clone();
+        wh_owned.wheel_law.as_mut().unwrap().ground.damp *= kdamp;
+        let wh = &wh_owned;
+        println!("-- {name} damper x{kdamp}");
+        for deg in [10.0f32, 15.0, 20.0, 30.0] {
+            let t = deg.to_radians().tan();
+            // a ramp that ends in a cliff (ground drops away): takeoff is clean
+            let ramp = move |p: Vec3| -> Option<(f32, Vec3)> { if p.x < 30.0 { Some((0.0, Vec3::Z)) } else if p.x < 34.0 { Some(((p.x - 30.0) * t, Vec3::new(-t, 0.0, 1.0).normalize())) } else { None } };
+            let mut st = settle_flat(wh);
+            st.pos.x = 0.0;
+            let mut last_touch: Option<(f32, DriveState)> = None;
+            let mut first_air: Option<(f32, DriveState)> = None;
+            let mut apex = f32::MIN;
+            for k in 0..1500u32 {
+                st = wh.step(st, DriveInput { throttle: 1.0, ..Default::default() }, 1.0 / 60.0, &ramp);
+                let touching = st.touching[..4].iter().any(|&b| b);
+                if touching { last_touch = Some((k as f32 / 60.0, st)); }
+                else if last_touch.is_some() && first_air.is_none() { first_air = Some((k as f32 / 60.0, st)); }
+                if first_air.is_some() { apex = apex.max(st.pos.z); }
+                if first_air.is_some() && st.pos.z < -20.0 { break; }
+            }
+            let (tl, l) = last_touch.unwrap();
+            let (ta, a) = first_air.unwrap();
+            let hs = a.vel.truncate().length();
+            let ballistic_vz = hs * deg.to_radians().tan();
+            println!("ramp {deg}: last wheel on ramp t {tl:.2} x {:.2} v ({:.2},{:.2}); first airborne t {ta:.2} v ({:.2},{:.2}) hspeed {hs:.2}, pitch {:+.1} deg; v*tan(ramp) = {ballistic_vz:.2}; apex above takeoff z {:.2}", l.pos.x, l.vel.x, l.vel.z, a.vel.x, a.vel.z, a.pitch.to_degrees(), apex - a.pos.z);
+        }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // END TO END: the real ride loop at real frame times
+    // -----------------------------------------------------------------------------------------
+
+    /// A real Warthog ridden through `PlayMode::tick` (the call the window makes) on the harness floor,
+    /// thrown into the air at `(z0, vel)`, stepped at `fps`. Returns `(t, pos, vel, any wheel down)` per frame.
+    fn ride_thrown(fps: f32, z0: f32, vel: Vec3, secs: f32) -> Option<Vec<(f32, Vec3, Vec3, bool)>> {
+        use crate::play_mode::ride_harness::Ride;
+        let (_g, native, cache) = crate::reach_actor::tests::open_reach_for("forge_halo")?;
+        let mut r = Ride::with_vehicle(native.clone(), cache, "warthog\\warthog")?;
+        let tag = r.objects[0].primary_tag;
+        r.force_seat(tag, 0).ok()?;
+        {
+            let rd = r.pm.riding.as_mut()?;
+            rd.drive.pos = Vec3::new(0.0, 0.0, z0);
+            rd.drive.vel = vel;
+        }
+        let input = r.input();
+        let mut out = vec![];
+        for i in 0..(secs * fps).round() as usize {
+            r.tick_dt(&input, 1.0 / fps);
+            let d = &r.pm.riding.as_ref()?.drive;
+            out.push(((i + 1) as f32 / fps, d.pos, d.vel, d.touching[..4].iter().any(|&b| b)));
+        }
+        Some(out)
+    }
+
+    /// Height and velocity of a body in free flight after `t` seconds under Havok's step as the engine runs
+    /// it: once per 1/60 s tick, gravity first, then the move (so the position at a time inside a tick
+    /// is the tick's start plus the fraction of that tick's displacement). Independent arithmetic.
+    fn free_flight(z0: f64, vz0: f64, g: f64, t: f64) -> (f64, f64) {
+        let dt = 1.0 / 60.0;
+        let n = (t / dt + 1e-9).floor();
+        let f = t / dt - n;
+        let (mut z, mut v) = (z0, vz0);
+        for _ in 0..n as usize {
+            v -= g * dt;
+            z += v * dt;
+        }
+        let v_next = v - g * dt;
+        (z + f * dt * v_next, v_next)
+    }
+
+    /// **THE END-TO-END FALL.** A real Warthog dropped from rest through the real ride loop at 30, 60 and 144
+    /// fps must be at the same height as the engine's own step puts it -- Havok once per 1/60 s tick,
+    /// gravity then move -- at 1 s and 2 s, and the three frame rates must agree. This measures what the
+    /// player sees, not `jeep_tick`: the tick accumulator, the drift spread across frames and the
+    /// production wrapper are all in it. A tick that ran at half rate, a gravity applied per frame, or a
+    /// drift with a different `dt` than the velocity change would each move it by tens of per cent.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_ridden_warthog_falls_at_the_engines_gravity_at_every_frame_rate() {
+        let g = crate::reach_physics::vehicle_fall_acceleration() as f64;
+        let mut at2: Vec<f32> = vec![];
+        for fps in [30.0f32, 60.0, 144.0] {
+            let Some(run) = ride_thrown(fps, 40.0, Vec3::ZERO, 2.0) else { return };
+            for t in [1.0f32, 2.0] {
+                let (_, pos, vel, down) = *run.iter().min_by(|a, b| (a.0 - t).abs().partial_cmp(&(b.0 - t).abs()).unwrap()).unwrap();
+                let (z, v) = free_flight(40.0, 0.0, g, t as f64);
+                println!("{fps} fps t {t}: z {:.4} (engine step {z:.4}, continuous {:.4}), vz {:.4} (engine {v:.4})", pos.z, 40.0 - 0.5 * g * (t as f64).powi(2), vel.z);
+                assert!(!down, "{fps} fps: a wheel is 'touching' 30 wu up -- the ground query is holding the Warthog in the air");
+                assert!((pos.z as f64 - z).abs() < 0.01, "{fps} fps t={t}: height {:.4} against the engine's step {z:.4}", pos.z);
+                // (the velocity is the one the LAST tick set, so it may be one tick ahead of or behind the
+                // continuous reading at an exact tick boundary: g * dt = 0.0695)
+                assert!((vel.z as f64 - v).abs() < g / 60.0 * 1.1, "{fps} fps t={t}: vz {:.4} against {v:.4}", vel.z);
+                if t == 2.0 { at2.push(pos.z); }
+            }
+        }
+        assert!(at2.iter().all(|z| (z - at2[1]).abs() < 0.01), "frame rates disagree: {at2:?}");
+    }
+
+    /// **THE END-TO-END LAUNCH.** Thrown up at 3 wu/s and forward at 5, through the real ride loop at three
+    /// frame rates: the apex is the engine step's apex, the horizontal speed does not change, and the
+    /// first wheel touches down when the engine's step says it reaches the contact tolerance.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_ridden_warthogs_jump_has_the_apex_and_airtime_the_gravity_gives() {
+        let g = crate::reach_physics::vehicle_fall_acceleration() as f64;
+        let dt = 1.0 / 60.0;
+        let (mut v, mut z, mut apex) = (3.0f64, 3.0f64, 3.0f64);
+        let rest_origin = 0.25f64 + 0.0328 - 0.19877; // origin height at which a wheel first reads as down
+        let (mut k, mut landed) = (0u32, None);
+        for _ in 0..600 {
+            v -= g * dt;
+            z += v * dt;
+            apex = apex.max(z);
+            k += 1;
+            if z <= rest_origin && landed.is_none() { landed = Some(k as f64 * dt); }
+        }
+        let want_t = landed.unwrap();
+        for fps in [30.0f32, 60.0, 144.0] {
+            let Some(run) = ride_thrown(fps, 3.0, Vec3::new(5.0, 0.0, 3.0), 3.0) else { return };
+            let mut max_z = f32::MIN;
+            let mut down_at = None;
+            for &(t, pos, vel, down) in &run {
+                if down_at.is_none() {
+                    max_z = max_z.max(pos.z);
+                    if down { down_at = Some(t); }
+                    else { assert!((vel.x - 5.0).abs() < 0.02, "{fps} fps: forward speed changed in the air: {}", vel.x); }
+                }
+            }
+            let t = down_at.expect("it must come down");
+            println!("{fps} fps: apex {:.4} (engine step {apex:.4}), first wheel down {t:.3} s (engine {want_t:.3})", max_z);
+            assert!((max_z as f64 - apex).abs() < 0.02, "{fps} fps: apex {max_z:.4} against {apex:.4}");
+            assert!((t as f64 - want_t).abs() < 0.07, "{fps} fps: airtime {t:.3} against {want_t:.3}");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // THE RECORDINGS
+    // -----------------------------------------------------------------------------------------
+
+    /// **THE RECORDED WARTHOGS FALL AS HMS DOES.** Free-flight arcs found in the saved films (vertical
+    /// quadratic, horizontal straight, window of 0.6 s or more; no rule looks at the fitted value) and the
+    /// SAME finder run on a simulated Warthog's own 60 Hz track over ramps whose true fall is `g`.
+    /// The finder reads low on both (springs and contact at the edges of its windows: it recovers about
+    /// -3.75 for a true -4.171 on the model), so the recording is compared with the model through the
+    /// finder, not with `g`. They must agree, and the count of arcs must be real.
+    #[test]
+    #[ignore = "opens the native library and reads the saved films on this machine"]
+    fn the_recorded_warthogs_fall_through_the_same_finder_as_the_model_does() {
+        let Some((wh, _)) = real() else { return };
+        if crate::film::find_finished_films().is_empty() {
+            eprintln!("SKIPPED: no saved films on this machine");
+            return;
+        }
+        let model_median = |d: &DriveModel| -> (usize, f64) {
+            let mut all = vec![];
+            for (deg, v) in [(8.0f32, 8.0f32), (12.0, 10.0), (15.0, 8.0), (20.0, 9.0), (25.0, 10.0), (10.0, 6.0)] {
+                let t = deg.to_radians().tan();
+                let ramp = move |p: Vec3| -> Option<(f32, Vec3)> {
+                    if p.x < 30.0 { Some((0.0, Vec3::Z)) } else if p.x < 34.0 { Some(((p.x - 30.0) * t, Vec3::new(-t, 0.0, 1.0).normalize())) } else { Some((0.0, Vec3::Z)) }
+                };
+                let mut st = settle_flat(d);
+                st.pos.x = 0.0;
+                let mut pts: Vec<(u32, [f32; 3])> = vec![];
+                for k in 0..1500u32 {
+                    let thr = if st.vel.x > v { 0.0 } else { 1.0 };
+                    st = d.step(st, DriveInput { throttle: thr, ..Default::default() }, 1.0 / 60.0, &ramp);
+                    pts.push((k, [st.pos.x, st.pos.y, st.pos.z]));
+                }
+                all.extend(track_arcs(&pts, 0.6, 0.02, 0.4, 0.03, 1.5, 2.0).1.into_iter().map(|a| a.0));
+            }
+            all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            (all.len(), all[all.len() / 2])
+        };
+        let (n_model, med_model) = model_median(wh);
+        let (_, _, arcs) = film_arcs(0.6, 0.02, 0.4, 0.03, 1.5, 2.0);
+        let names = def_leafs(&arcs.iter().filter_map(|a| a.def).collect::<Vec<_>>());
+        let mut hog: Vec<f64> = arcs.iter().filter(|a| a.def.and_then(|d| names.get(&d)).is_some_and(|n| n == "warthog")).map(|a| a.az).collect();
+        hog.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med_film = hog[hog.len() / 2];
+        let ghost: Vec<f64> = arcs.iter().filter(|a| a.def.and_then(|d| names.get(&d)).is_some_and(|n| n == "ghost")).map(|a| a.az).collect();
+        println!("Warthog: {} recorded arcs, median {med_film:.3} (p25 {:.2} p75 {:.2}); the model through the same finder: {n_model} arcs, median {med_model:.3}; true g -{:.3}; ghosts {} arcs",
+            hog.len(), hog[hog.len() / 4], hog[hog.len() * 3 / 4], crate::reach_physics::vehicle_fall_acceleration(), ghost.len());
+        assert!(hog.len() >= 8 && n_model >= 6, "too few arcs to say anything: {} recorded, {n_model} simulated", hog.len());
+        assert!((med_film - med_model).abs() < 0.45, "recorded Warthogs fall at {med_film:.3}, the model at {med_model:.3} through the same finder");
+    }
+
+    /// Power spectrum of the high-passed vertical motion of recorded vehicles that are driving (speed above
+    /// 3 wu/s, continuous 6 s segments), averaged over segments, in 0.25 Hz bins. Print-only: where does a
+    /// Warthog's body bounce on its springs?
+    #[test]
+    #[ignore = "print-only; reads the saved films"]
+    fn probe_film_vertical_spectrum() {
+        use crate::{film, film_decode};
+        let mut acc: std::collections::BTreeMap<String, (Vec<f64>, usize)> = Default::default();
+        let films = film::find_finished_films();
+        let mut all: Vec<(u32, String, Vec<(u32, [f32; 3])>)> = vec![];
+        for p in &films {
+            let Ok(f) = film::open(p) else { continue };
+            let idx = film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 15 && t.positions.len() > 400) {
+                all.push((t.def_wire.unwrap_or(0), String::new(), t.positions.clone()));
+            }
+        }
+        let names = def_leafs(&all.iter().map(|a| a.0).collect::<Vec<_>>());
+        let n = 360usize; // 6 s
+        for (def, _, pts) in &all {
+            let name = names.get(def).cloned().unwrap_or_default();
+            if !matches!(name.as_str(), "warthog" | "mongoose" | "ghost" | "pickup" | "scorpion") { continue; }
+            // segments of 6 s by TICK span, gaps of at most 3 ticks, resampled to every tick
+            let mut i = 0;
+            while i + 10 < pts.len() {
+                let t0 = pts[i].0;
+                let mut j = i;
+                while j + 1 < pts.len() && pts[j + 1].0 - pts[j].0 <= 3 && pts[j + 1].0 - t0 <= n as u32 { j += 1; }
+                if pts[j].0 - t0 >= n as u32 - 3 {
+                    let seg = &pts[i..=j];
+                    let sp = ((seg[seg.len() - 1].1[0] - seg[0].1[0]).powi(2) + (seg[seg.len() - 1].1[1] - seg[0].1[1]).powi(2)).sqrt() / 6.0;
+                    if sp > 3.0 {
+                        let mut z = vec![0.0f64; n];
+                        let mut q = 0usize;
+                        for (k, zk) in z.iter_mut().enumerate() {
+                            let tk = t0 + k as u32;
+                            while q + 1 < seg.len() - 1 && seg[q + 1].0 <= tk { q += 1; }
+                            let (a, b) = (&seg[q], &seg[(q + 1).min(seg.len() - 1)]);
+                            let f = if b.0 > a.0 { ((tk.saturating_sub(a.0)) as f64 / (b.0 - a.0) as f64).clamp(0.0, 1.0) } else { 0.0 };
+                            *zk = a.1[2] as f64 + (b.1[2] - a.1[2]) as f64 * f;
+                        }
+                        let w = 45usize;
+                        let hp: Vec<f64> = (w..n - w).map(|k| z[k] - z[k - w..=k + w].iter().sum::<f64>() / (2 * w + 1) as f64).collect();
+                        let m = hp.len();
+                        let e = acc.entry(name.clone()).or_insert((vec![0.0; 24], 0));
+                        for b in 0..24 {
+                            let fq = 0.25 * (b as f64 + 0.5);
+                            let (mut re, mut im) = (0.0, 0.0);
+                            for (k, v) in hp.iter().enumerate() {
+                                let ph = 2.0 * std::f64::consts::PI * fq * k as f64 / 60.0;
+                                re += v * ph.cos();
+                                im += v * ph.sin();
+                            }
+                            e.0[b] += (re * re + im * im) / (m * m) as f64;
+                        }
+                        e.1 += 1;
+                    }
+                    i = j + 1;
+                } else { i += 20; }
+            }
+        }
+        for (name, (p, cnt)) in acc {
+            let tot: f64 = p.iter().sum();
+            println!("{name}: {cnt} segments; spectrum (share per 0.25 Hz bin from 0.125 Hz): {}", p.iter().map(|v| format!("{:.0}", 100.0 * v / tot)).collect::<Vec<_>>().join(" "));
+        }
+    }
+
+    /// A landing's rebound, from a position track: after the landing instant `w` (vertical velocity from a fall
+    /// of at least `min_fall` wu/s to above -0.5 within 6 ticks) the lowest point `zt` of the next 0.42 s, the
+    /// settled level `zs` (mean of ticks 66..78) and the highest point `zp` of the 0.67 s after the trough.
+    /// `dip = zs - zt`, `rebound = zp - zs`. Returns `(fall speed, dip, rebound)` when the dip is measurable.
+    fn track_rebounds(pts: &[(u32, [f32; 3])], min_fall: f64) -> Vec<(f64, f64, f64)> {
+        let mut out = vec![];
+        if pts.len() < 130 { return out; }
+        let v = |a: usize| ((pts[a + 1].1[2] - pts[a].1[2]) as f64) * 60.0 / (pts[a + 1].0 - pts[a].0).max(1) as f64;
+        let mut w = 12usize;
+        while w + 110 < pts.len() {
+            let cont = (0..80).all(|k| pts[w + k + 1].0 - pts[w + k].0 <= 2);
+            if cont && v(w - 4) < -min_fall && v(w + 4) > -0.5 {
+                let z = |k: usize| pts[w + k].1[2] as f64;
+                let (ti, zt) = (0..25).map(|k| (k, z(k))).fold((0, f64::MAX), |a, b| if b.1 < a.1 { b } else { a });
+                let zs = (66..78).map(z).sum::<f64>() / 12.0;
+                let zp = (ti..(ti + 40).min(80)).map(z).fold(f64::MIN, f64::max);
+                let hs = ((pts[w + 60].1[0] - pts[w].1[0]).powi(2) + (pts[w + 60].1[1] - pts[w].1[1]).powi(2)).sqrt();
+                if zs - zt > 0.05 && hs > 0.5 {
+                    out.push((-v(w - 4), zs - zt, zp - zs));
+                }
+                w += 90;
+            } else { w += 1; }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "print-only; reads the saved films"]
+    fn probe_film_rebounds() {
+        use crate::{film, film_decode};
+        let mut found: Vec<(u32, String, (f64, f64, f64))> = vec![];
+        for p in &film::find_finished_films() {
+            let Ok(f) = film::open(p) else { continue };
+            let idx = film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 15 && t.positions.len() > 200) {
+                for r in track_rebounds(&t.positions, 1.5) { found.push((t.def_wire.unwrap_or(0), format!("{}", t.net_id), r)); }
+            }
+        }
+        let names = def_leafs(&found.iter().map(|f| f.0).collect::<Vec<_>>());
+        let mut by: std::collections::BTreeMap<String, Vec<(f64, f64, f64)>> = Default::default();
+        for (d, _, r) in found { by.entry(names.get(&d).cloned().unwrap_or_default()).or_default().push(r); }
+        for (n, v) in &by {
+            let mut ratios: Vec<f64> = v.iter().filter(|r| r.1 < 0.5).map(|r| r.2 / r.1).collect();
+            ratios.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            if !ratios.is_empty() { println!("{n}: dips<0.5 wu: {} landings, rebound/dip median {:.2} (p25 {:.2} p75 {:.2})", ratios.len(), ratios[ratios.len() / 2], ratios[ratios.len() / 4], ratios[ratios.len() * 3 / 4]); }
+            println!("{n}: {} landings; (fall, dip, rebound, rebound/dip): {}", v.len(), v.iter().map(|r| format!("({:.1},{:.2},{:+.2},{:.2})", r.0, r.1, r.2, r.2 / r.1)).collect::<Vec<_>>().join(" "));
+        }
+    }
+
+    #[test]
+    #[ignore = "print-only"]
+    fn probe_sim_rebounds() {
+        let Some((wh, mg)) = real() else { return };
+        for (name, d) in [("warthog", wh), ("mongoose", mg)] {
+            for fall in [2.5f32, 3.5, 5.0, 8.0, 14.0, 20.0] {
+                let h = fall * fall / (2.0 * 4.1712594);
+                let mut st = DriveState { pos: Vec3::new(0.0, 0.0, 0.0199 + h), ..Default::default() };
+                st.vel = Vec3::new(3.0, 0.0, 0.0);
+                let mut pts = vec![];
+                for k in 0..400u32 {
+                    st = d.step(st, DriveInput::default(), 1.0 / 60.0, &flat);
+                    pts.push((k, [st.pos.x, st.pos.y, st.pos.z]));
+                }
+                let r = track_rebounds(&pts, 2.0);
+                println!("{name} SIM fall {fall}: {:?}", r.iter().map(|r| format!("(fall {:.1} dip {:.2} rebound {:+.2} ratio {:.2})", r.0, r.1, r.2, r.2 / r.1)).collect::<Vec<_>>());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "print-only"]
+    fn probe_sim_rebound_vs_damper() {
+        let Some((wh, mg)) = real() else { return };
+        for (name, d0) in [("warthog", wh), ("mongoose", mg)] {
+            for k in [1.0f32, 1.25, 1.5, 1.75, 2.0, 3.0] {
+                let mut d = d0.clone();
+                d.wheel_law.as_mut().unwrap().ground.damp *= k;
+                let mut rows = vec![];
+                for fall in [2.0f32, 3.0, 4.0, 5.0, 6.0, 8.0] {
+                    let h = fall * fall / (2.0 * 4.1712594);
+                    let mut st = DriveState { pos: Vec3::new(0.0, 0.0, 0.0199 + h), ..Default::default() };
+                    st.vel = Vec3::new(3.0, 0.0, 0.0);
+                    let mut pts = vec![];
+                    for kk in 0..400u32 {
+                        st = d.step(st, DriveInput::default(), 1.0 / 60.0, &flat);
+                        pts.push((kk, [st.pos.x, st.pos.y, st.pos.z]));
+                    }
+                    for r in track_rebounds(&pts, 1.0) { rows.push(format!("({:.1}: dip {:.2} reb {:+.2} = {:.2})", r.0, r.1, r.2, r.2 / r.1)); }
+                }
+                println!("{name} damper x{k}: {}", rows.join(" "));
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // THE BOUNCE
+    // -----------------------------------------------------------------------------------------
+
+    /// The first undershoot, as a fraction of the starting offset, of a vehicle released `offset` wu above its
+    /// parked height and left to ring down (small enough that no spring bottoms or lets go).
+    fn ring_down_undershoot(d: &DriveModel, offset: f32) -> f32 {
+        let rest = settle_flat(d);
+        let mut st = rest;
+        st.pos.z += offset;
+        let mut lowest = f32::MAX;
+        for _ in 0..40 {
+            st = d.step(st, DriveInput::default(), 1.0 / 60.0, &flat);
+            lowest = lowest.min(st.pos.z - rest.pos.z);
+        }
+        -lowest / offset
+    }
+
+    /// **A small drop rings down at the damping ratio the tags imply.** Heave of a body on four equal springs
+    /// is a damped oscillator: `omega0^2 = sum(g / depth)`, `2 zeta omega0 = sum(damp) * scale`, and the first
+    /// undershoot after a release is `exp(-pi zeta / sqrt(1 - zeta^2))` of the offset. Computed here from the
+    /// TAG NUMBERS (depth, damp, wheel count) and the documented damper scale, not from the solver. The
+    /// release is 0.015 wu, inside the linear range (every wheel stays loaded).
+    #[test]
+    fn a_small_drop_rings_down_at_the_damping_ratio_the_tags_imply() {
+        let d = fixture();
+        let g = crate::reach_physics::vehicle_fall_acceleration();
+        let law = d.wheel_law.as_ref().unwrap();
+        let n = law.wheels.len() as f32;
+        let w0 = (n * g / law.ground.depth).sqrt();
+        let zeta = |scale: f32| n * law.ground.damp * scale / (2.0 * w0);
+        let overshoot = |z: f32| (-std::f32::consts::PI * z / (1.0 - z * z).sqrt()).exp();
+        let got = ring_down_undershoot(&d, 0.015);
+        let want = overshoot(zeta(2.0));
+        println!("zeta with the documented x2 damper: {:.3}, undershoot {got:.3} (law {want:.3}); the literal law would be zeta {:.3}, undershoot {:.3}", zeta(2.0), zeta(1.0), overshoot(zeta(1.0)));
+        assert!(got > 0.02, "it must actually ring (liveness): {got}");
+        assert!((got - want).abs() < 0.06, "undershoot {got:.3} against the damping ratio the tags imply, {want:.3}");
+    }
+
+    /// Rebound/dip ratios of simulated landings (falls of 2-8 wu/s onto flat ground), found with the SAME
+    /// detector the recordings go through ([`track_rebounds`]).
+    fn sim_rebound_ratios(d: &DriveModel) -> Vec<(f64, f64, f64)> {
+        let mut out = vec![];
+        for fall in [2.0f32, 3.0, 4.0, 5.0, 6.0, 8.0] {
+            let h = fall * fall / (2.0 * 4.1712594);
+            let mut st = DriveState { pos: Vec3::new(0.0, 0.0, 0.0199 + h), ..Default::default() };
+            st.vel = Vec3::new(3.0, 0.0, 0.0);
+            let mut pts = vec![];
+            for k in 0..400u32 {
+                st = d.step(st, DriveInput::default(), 1.0 / 60.0, &flat);
+                pts.push((k, [st.pos.x, st.pos.y, st.pos.z]));
+            }
+            out.extend(track_rebounds(&pts, 1.0));
+        }
+        out
+    }
+
+    /// **LANDINGS REBOUND AS LITTLE AS THE RECORDED ONES.** Landings found in the saved films (a fall of at
+    /// least 1.5 wu/s ending within 6 ticks, a dip under half a wu, the track continuous for 1.3 s after) give a
+    /// rebound/dip ratio; the SAME detector on simulated landings must give a median inside the recordings'
+    /// interquartile range, for the Warthog and the Mongoose. Liveness: enough recorded landings and enough
+    /// simulated ones to have a median at all. (The literal engine law gives a median of 0.8 and is red.)
+    #[test]
+    #[ignore = "opens the native library and reads the saved films on this machine"]
+    fn the_landing_rebound_matches_the_recordings() {
+        use crate::{film, film_decode};
+        let Some((wh, mg)) = real() else { return };
+        if film::find_finished_films().is_empty() {
+            eprintln!("SKIPPED: no saved films on this machine");
+            return;
+        }
+        let mut found: Vec<(u32, f64)> = vec![];
+        for p in &film::find_finished_films() {
+            let Ok(f) = film::open(p) else { continue };
+            let idx = film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 15 && t.positions.len() > 200) {
+                for r in track_rebounds(&t.positions, 1.5) {
+                    if r.1 < 0.5 { found.push((t.def_wire.unwrap_or(0), r.2 / r.1)); }
+                }
+            }
+        }
+        let names = def_leafs(&found.iter().map(|f| f.0).collect::<Vec<_>>());
+        let mut hog: Vec<f64> = found.iter().filter(|f| names.get(&f.0).is_some_and(|n| n == "warthog")).map(|f| f.1).collect();
+        hog.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let (q1, med, q3) = (hog[hog.len() / 4], hog[hog.len() / 2], hog[hog.len() * 3 / 4]);
+        println!("recorded Warthog landings: {} , rebound/dip median {med:.2} IQR {q1:.2}..{q3:.2}", hog.len());
+        assert!(hog.len() >= 8, "too few recorded landings: {}", hog.len());
+        for (name, d) in [("Warthog", wh), ("Mongoose", mg)] {
+            let mut r: Vec<f64> = sim_rebound_ratios(d).iter().map(|r| r.2 / r.1).collect();
+            r.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!("{name}: {} simulated landings, median {:.2}: {:?}", r.len(), r[r.len() / 2], r.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
+            assert!(r.len() >= 4, "{name}: too few simulated landings to say anything");
+            assert!(r[r.len() / 2] >= q1 && r[r.len() / 2] <= q3, "{name}: simulated rebound/dip {:.2} outside the recordings' {q1:.2}..{q3:.2}", r[r.len() / 2]);
+        }
+    }
+
+    /// **A drop settles.** Dropped from 1 wu the Warthog and the Mongoose are back within 2 cm of their parked
+    /// height 1.2 s after the first touch -- the interval in which the recorded landings are read as settled --
+    /// and are not moving.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_dropped_vehicle_is_settled_within_a_second_and_a_fifth() {
+        let Some((wh, mg)) = real() else { return };
+        for (name, d) in [("Warthog", wh), ("Mongoose", mg)] {
+            let rest = settle_flat(d);
+            let mut st = DriveState { pos: Vec3::new(0.0, 0.0, rest.pos.z + 1.0), ..Default::default() };
+            let mut touched = None;
+            let mut dev_at = None;
+            for k in 0..400u32 {
+                st = d.step(st, DriveInput::default(), 1.0 / 60.0, &flat);
+                let t = k as f32 / 60.0;
+                if touched.is_none() && st.touching[..4].iter().any(|&b| b) { touched = Some(t); }
+                if let Some(t0) = touched {
+                    if (t - t0 - 1.2).abs() < 0.009 { dev_at = Some(((st.pos.z - rest.pos.z).abs(), st.vel.z.abs())); }
+                }
+            }
+            let (dev, v) = dev_at.expect("it must land");
+            println!("{name}: 1.2 s after touching, {dev:.4} wu off its parked height, vz {v:.3}");
+            assert!(dev < 0.02 && v < 0.1, "{name} is still bouncing 1.2 s after landing: {dev:.3} wu, vz {v:.3}");
+        }
+    }
+
+    /// **A ramp launches no faster than its geometry.** Driving up a ramp the vertical speed at takeoff cannot
+    /// honestly exceed `horizontal speed * tan(ramp)` by much -- that is the velocity of a point following the
+    /// slope -- and a spring that rebounds adds to it (the literal law gave 1.23x and 1.27x on 20 and 30 degree
+    /// ramps). Between 0.6x (a hull that does not follow) and 1.1x. Both vehicles, 15-30 degrees.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_ramp_launches_no_faster_than_its_geometry() {
+        let Some((wh, mg)) = real() else { return };
+        for (name, d) in [("Warthog", wh), ("Mongoose", mg)] {
+            for deg in [15.0f32, 20.0, 30.0] {
+                let t = deg.to_radians().tan();
+                let ramp = move |p: Vec3| -> Option<(f32, Vec3)> {
+                    if p.x < 30.0 { Some((0.0, Vec3::Z)) } else if p.x < 34.0 { Some(((p.x - 30.0) * t, Vec3::new(-t, 0.0, 1.0).normalize())) } else { None }
+                };
+                let mut st = settle_flat(d);
+                st.pos.x = 0.0;
+                let mut took_off = None;
+                let mut was_down = false;
+                for _ in 0..1500 {
+                    st = d.step(st, DriveInput { throttle: 1.0, ..Default::default() }, 1.0 / 60.0, &ramp);
+                    let down = st.touching[..4].iter().any(|&b| b);
+                    if was_down && !down && took_off.is_none() { took_off = Some(st); }
+                    was_down |= down;
+                    if took_off.is_some() { break; }
+                }
+                let a = took_off.expect("it must leave the ramp");
+                let hs = a.vel.truncate().length();
+                let ratio = a.vel.z / (hs * t);
+                println!("{name} {deg} deg ramp: vz {:.2} at hspeed {hs:.2}, geometry {:.2}: x{ratio:.2}", a.vel.z, hs * t);
+                assert!(ratio > 0.6 && ratio < 1.1, "{name} {deg} deg: takeoff vz is x{ratio:.2} of v*tan(ramp)");
+            }
+        }
     }
 }

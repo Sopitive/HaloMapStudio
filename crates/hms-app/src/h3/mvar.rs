@@ -54,6 +54,7 @@
 //! shape's 16-bit sizes over [0, 60]: sphere radius; cylinder radius / top / bottom; box width /
 //! length / top / bottom].
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Result};
@@ -302,6 +303,16 @@ pub struct H3VariantObject {
     pub boundary: [f32; 4],
 }
 
+/// Boundary sizes (wu, clamped to [0, 60]) -> the 16-bit quanta a record stores.
+pub fn quantize_boundary(values: [f32; 4]) -> [u16; 4] {
+    let mut q = [0u16; 4];
+    for k in 0..4 {
+        let v = values[k].clamp(0.0, H3_BOUNDARY_MAX);
+        q[k] = quantize_real(v, 0.0, H3_BOUNDARY_MAX, 16, false, false).min(0xFFFF) as u16;
+    }
+    q
+}
+
 impl H3VariantObject {
     /// Re-quantise a new pose the way the engine writes it (sub_1801102E8 / sub_18004E758) and
     /// store what the file will decode back, so the editor shows the saved pose.
@@ -329,11 +340,8 @@ impl H3VariantObject {
     /// Set the boundary sizes (wu, clamped to [0, 60]) through the 16-bit quantiser.
     pub fn set_boundary(&mut self, shape: u8, values: [f32; 4]) {
         self.boundary_shape = shape;
-        for k in 0..4 {
-            let v = values[k].clamp(0.0, H3_BOUNDARY_MAX);
-            self.boundary_q[k] = quantize_real(v, 0.0, H3_BOUNDARY_MAX, 16, false, false).min(0xFFFF) as u16;
-            self.boundary[k] = dequantize_real(self.boundary_q[k] as u32, 0.0, H3_BOUNDARY_MAX, 16, false);
-        }
+        self.boundary_q = quantize_boundary(values);
+        for k in 0..4 { self.boundary[k] = dequantize_real(self.boundary_q[k] as u32, 0.0, H3_BOUNDARY_MAX, 16, false); }
     }
 
     /// World matrix: columns [fwd, up x fwd, up, pos] (local +X = forward, +Z = up), the same
@@ -390,6 +398,54 @@ impl H3Variant {
     pub fn quota_of(&self, o: &H3VariantObject) -> Option<&H3Quota> {
         usize::try_from(o.quota).ok().and_then(|q| self.quotas.get(q))
     }
+}
+
+/// Rewrite the quota bookkeeping a save is responsible for: each quota's `placed_on_map` and the
+/// variant's `spent_budget`. #h3-accounting
+///
+/// The engine's own bookkeeping is lossy and the shipped files do not agree with themselves
+/// (measured over all 333: `placed_on_map` equals the live slot count on 87.3% of the 42 598 quota
+/// rows, `spent_budget` equals the sum of the placed prices on 77 of 333 files, and no rule over the
+/// slot flags / engine flags / variant engine recovers the rest), so there is no exact formula to
+/// reproduce. What a save CAN do is keep the two honest about what it changed:
+///
+///   * `absolute = false` (an open variant being edited): the stored values move by the DIFFERENCE
+///     between the records before and after, per quota, so an untouched file stays byte-identical
+///     and an add / delete is reflected by exactly its own price / one count, quirks of the stored
+///     value included;
+///   * `absolute = true` (a blank canvas adopted from a template, whose Forge objects were dropped):
+///     the stored values describe objects that are no longer there, so they are recounted from the
+///     records being written.
+///
+/// A count is every present slot that names a quota (scenario-owned ones too: that rule fits the
+/// most rows) except a base-map object that was deleted (halo3.dll sub_1800BA3F0 does not count a
+/// scenario slot with `flags & 0x60`); the budget is the price of the slots that carry a Forge
+/// placement (the base map's own objects are free). Neither goes
+/// below zero, and a count saturates at the field's 255.
+pub fn account_for_save(out: &mut H3Variant, before: &[H3VariantObject], after: &[H3VariantObject], absolute: bool) {
+    let count = |objs: &[H3VariantObject]| -> HashMap<i32, u32> {
+        let mut m: HashMap<i32, u32> = HashMap::new();
+        for o in objs.iter().filter(|o| o.quota >= 0 && super::edit::counts_toward_quota(o)) { *m.entry(o.quota).or_default() += 1; }
+        m
+    };
+    let price_of = |q: &[H3Quota], o: &H3VariantObject| -> f32 {
+        // the base map's own objects are free, moved or not
+        if !o.placed || o.flags & super::scenario::SLOT_SCENARIO != 0 { return 0.0; }
+        usize::try_from(o.quota).ok().and_then(|i| q.get(i)).map_or(0.0, |q| q.price)
+    };
+    let (b, a) = (count(before), count(after));
+    for (i, q) in out.quotas.iter_mut().enumerate() {
+        let (nb, na) = (*b.get(&(i as i32)).unwrap_or(&0) as i64, *a.get(&(i as i32)).unwrap_or(&0) as i64);
+        q.placed_on_map = if absolute { na } else { q.placed_on_map as i64 + (na - nb) }.clamp(0, 255) as u8;
+    }
+    let spent_before: f32 = before.iter().map(|o| price_of(&out.quotas, o)).sum();
+    let spent_after: f32 = after.iter().map(|o| price_of(&out.quotas, o)).sum();
+    // the difference is formed first, so "nothing changed" is exactly 0.0 and the stored value
+    // is left bit-for-bit (a subtract-then-add could drift on a fractional price)
+    out.spent_budget = if absolute { spent_after } else { (out.spent_budget + (spent_after - spent_before)).max(0.0) };
+    // the stored figure saturates at the cap: 0 of the 333 shipped variants store more than their
+    // maximum, though 11 of them hold objects priced past it (their stored value is exactly the cap)
+    if out.maximum_budget > 0.0 { out.spent_budget = out.spent_budget.min(out.maximum_budget); }
 }
 
 /// The browser row's summary of a Halo 3 variant.
@@ -1166,5 +1222,396 @@ mod tests {
                 o.slot, o.quota, c.tag_name(q.tag_index()).rsplit('\\').next().unwrap_or(""), o.pos, o.fwd, o.up, o.object_type, o.team, o.flags, o.mp_flags, o.game_engine_flags, o.boundary_shape, &o.boundary[..]);
             let _ = i;
         }
+    }
+
+    /// Probe (print-only, #[ignore]): which header / body fields vary across the shipped variants.
+    /// Decides what a SAVE has to recompute instead of copying from its template.
+    #[test]
+    #[ignore]
+    fn writer_field_survey() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let files = shipped_variants();
+        eprintln!("SURVEY {} variants", files.len());
+        let mut cks: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+        let mut tstart: BTreeMap<u32, BTreeSet<Vec<i16>>> = BTreeMap::new();
+        let mut uid: HashMap<u64, usize> = HashMap::new();
+        let (mut size_eq, mut size_zero, mut size_other) = (0, 0, 0);
+        let (mut placed_ok, mut placed_bad, mut spent_ok, mut spent_bad) = (0, 0, 0, 0);
+        let mut ex_bad: Vec<String> = Vec::new();
+        let mut fl: BTreeMap<(u8, u8, u16, u8), usize> = BTreeMap::new();
+        let mut ss: BTreeMap<(u8, u8), BTreeMap<u8, usize>> = BTreeMap::new();
+        let mut sorted_by_type = (0, 0);
+        for f in &files {
+            let Ok(v) = parse_h3_variant(f) else { continue };
+            let raw = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+            cks.entry(v.map_id).or_default().insert(v.checksum);
+            tstart.entry(v.map_id).or_default().insert(v.type_start.to_vec());
+            *uid.entry(v.header.unique_id).or_default() += 1;
+            if v.header.size_bytes == raw { size_eq += 1 } else if v.header.size_bytes == 0 { size_zero += 1 } else { size_other += 1 }
+            // quota placed_on_map vs the live count of placed objects per quota
+            let mut cnt: HashMap<i32, u32> = HashMap::new();
+            let mut spent = 0.0f32;
+            for o in v.placed() {
+                *cnt.entry(o.quota).or_default() += 1;
+                if let Some(q) = v.quota_of(o) { spent += q.price; }
+                *fl.entry((o.object_type, o.mp_flags, o.game_engine_flags, o.boundary_shape)).or_default() += 1;
+                *ss.entry((o.object_type, o.mp_flags)).or_default().entry(o.shared_storage).or_default() += 1;
+            }
+            for (i, q) in v.quotas.iter().enumerate() {
+                if q.placed_on_map as u32 == *cnt.get(&(i as i32)).unwrap_or(&0) { placed_ok += 1 } else {
+                    placed_bad += 1;
+                    if ex_bad.len() < 6 { ex_bad.push(format!("{} quota {i}: file {} actual {}", f.file_name().unwrap().to_string_lossy(), q.placed_on_map, cnt.get(&(i as i32)).unwrap_or(&0))); }
+                }
+            }
+            if (v.spent_budget - spent).abs() < 0.01 { spent_ok += 1 } else { spent_bad += 1; if ex_bad.len() < 10 { ex_bad.push(format!("{} spent file {} actual {spent}", f.file_name().unwrap().to_string_lossy(), v.spent_budget)); } }
+            // are the Forge-placed slots (past the scenario block) grouped by object type?
+            let types: Vec<u8> = v.objects.iter().filter(|o| o.placed && o.slot >= v.num_scenario_objects as usize).map(|o| o.object_type).collect();
+            if types.windows(2).all(|w| w[0] <= w[1]) { sorted_by_type.0 += 1 } else { sorted_by_type.1 += 1 }
+        }
+        for (m, s) in &cks { eprintln!("map {m}: {} distinct checksum(s) {:?}", s.len(), s.iter().take(3).map(|c| format!("{c:#x}")).collect::<Vec<_>>()); }
+        let all_ck: BTreeSet<u32> = cks.values().flatten().copied().collect();
+        eprintln!("checksum values over everything: {}", all_ck.len());
+        for (m, s) in &tstart { eprintln!("map {m}: {} distinct type_start table(s)", s.len()); }
+        eprintln!("unique_id: {} distinct over {} files", uid.len(), files.len());
+        eprintln!("header size_bytes == file len {size_eq}, == 0 {size_zero}, other {size_other}");
+        eprintln!("quota placed_on_map: {placed_ok} agree / {placed_bad} disagree; spent_budget: {spent_ok} agree / {spent_bad} disagree");
+        for e in &ex_bad { eprintln!("  {e}"); }
+        eprintln!("forge slots sorted by object type: {} files yes / {} no", sorted_by_type.0, sorted_by_type.1);
+        eprintln!("(type, mp_flags, engine_flags, shape) -> count, top 25:");
+        let mut v: Vec<_> = fl.into_iter().collect(); v.sort_by(|a, b| b.1.cmp(&a.1));
+        for (k, n) in v.iter().take(25) { eprintln!("  type {:>2} mp {:#04x} eng {:#06x} shape {} : {n}", k.0, k.1, k.2, k.3); }
+        eprintln!("shared_storage by (type, mp_flags):");
+        for (k, m) in &ss { eprintln!("  type {:>2} mp {:#04x} : {:?}", k.0, k.1, m.iter().take(12).collect::<Vec<_>>()); }
+    }
+
+    /// Probe (print-only, #[ignore]): can quota `placed_on_map` / `spent_budget` be reproduced
+    /// exactly from the slots? Counts EVERY present slot with a quota (scenario-owned ones too).
+    #[test]
+    #[ignore]
+    fn budget_rule_survey() {
+        use std::collections::BTreeMap;
+        let (mut files, mut cnt_all_ok, mut cnt_placed_ok, mut spent_all_ok, mut spent_placed_ok) = (0, 0, 0, 0, 0);
+        let (mut rows, mut rows_all_ok, mut rows_placed_ok) = (0usize, 0usize, 0usize);
+        let (mut healthy, mut healthy_cnt_all, mut healthy_cnt_placed) = (0usize, 0usize, 0usize);
+        let mut ex: Vec<String> = Vec::new();
+        let mut max_budget: BTreeMap<u32, usize> = BTreeMap::new();
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            files += 1;
+            let mut all: BTreeMap<i32, u32> = BTreeMap::new();
+            let mut pl: BTreeMap<i32, u32> = BTreeMap::new();
+            let (mut sp_all, mut sp_pl) = (0.0f32, 0.0f32);
+            for o in &v.objects {
+                if o.quota < 0 { continue; }
+                let Some(q) = v.quota_of(o) else { continue };
+                *all.entry(o.quota).or_default() += 1;
+                sp_all += q.price;
+                if o.placed { *pl.entry(o.quota).or_default() += 1; sp_pl += q.price; }
+            }
+            let (mut a_ok, mut p_ok) = (true, true);
+            for (i, q) in v.quotas.iter().enumerate() {
+                rows += 1;
+                let ia = *all.get(&(i as i32)).unwrap_or(&0) == q.placed_on_map as u32;
+                let ip = *pl.get(&(i as i32)).unwrap_or(&0) == q.placed_on_map as u32;
+                rows_all_ok += ia as usize; rows_placed_ok += ip as usize;
+                a_ok &= ia; p_ok &= ip;
+            }
+            cnt_all_ok += a_ok as usize; cnt_placed_ok += p_ok as usize;
+            let sa = (v.spent_budget - sp_all).abs() < 0.01; let spp = (v.spent_budget - sp_pl).abs() < 0.01;
+            if spp { healthy += 1; healthy_cnt_all += a_ok as usize; healthy_cnt_placed += p_ok as usize; }
+            spent_all_ok += sa as usize; spent_placed_ok += spp as usize;
+            if !sa && ex.len() < 8 { ex.push(format!("{}: file {} all {sp_all} placed {sp_pl} (hopper={})", f.file_name().unwrap().to_string_lossy(), v.spent_budget, f.to_string_lossy().contains("hopper"))); }
+            *max_budget.entry(v.maximum_budget as u32).or_default() += 1;
+        }
+        eprintln!("BUDGET {files} files | every quota row's placed_on_map matches: all-slots {cnt_all_ok}, placed-only {cnt_placed_ok} | rows {rows}: all {rows_all_ok}, placed {rows_placed_ok}");
+        eprintln!("BUDGET spent_budget matches: all-slots {spent_all_ok}, placed-only {spent_placed_ok}");
+        eprintln!("BUDGET among the {healthy} files whose spent_budget == sum(price of placed): placed_on_map exact for all-slots {healthy_cnt_all}, placed-only {healthy_cnt_placed}");
+        for e in &ex { eprintln!("  {e}"); }
+        eprintln!("BUDGET maximum_budget values {max_budget:?}");
+    }
+
+    /// Probe (print-only, #[ignore]): the quota rows of the first budget-consistent file whose
+    /// placed_on_map disagrees with the slot counts.
+    #[test]
+    #[ignore]
+    fn quota_rows_probe() {
+        use std::collections::BTreeMap;
+        let mut shown = 0;
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            let sp_pl: f32 = v.placed().filter_map(|o| v.quota_of(o)).map(|q| q.price).sum();
+            if (v.spent_budget - sp_pl).abs() > 0.01 { continue; }
+            let mut all: BTreeMap<i32, u32> = BTreeMap::new();
+            let mut pl: BTreeMap<i32, u32> = BTreeMap::new();
+            let mut par: BTreeMap<i32, u32> = BTreeMap::new();
+            for o in &v.objects {
+                if o.quota < 0 { continue; }
+                *all.entry(o.quota).or_default() += 1;
+                if o.placed { *pl.entry(o.quota).or_default() += 1; }
+                if o.parent.is_some() { *par.entry(o.quota).or_default() += 1; }
+            }
+            let bad: Vec<usize> = (0..v.quotas.len()).filter(|&i| *all.get(&(i as i32)).unwrap_or(&0) != v.quotas[i].placed_on_map as u32).collect();
+            if bad.is_empty() { continue; }
+            eprintln!("QROWS {} budget {}/{} scen {} var {}", f.file_name().unwrap().to_string_lossy(), v.spent_budget, v.maximum_budget, v.num_scenario_objects, v.num_variant_objects);
+            for i in bad.iter().take(14) {
+                let q = &v.quotas[*i];
+                eprintln!("  quota {i} def {:#x} kind {} min {} max {} allowed {} price {}: file {} | all {} placed {} parented {}", q.definition, q.definition >> 16, q.minimum, q.maximum, q.maximum_allowed, q.price,
+                    q.placed_on_map, all.get(&(*i as i32)).unwrap_or(&0), pl.get(&(*i as i32)).unwrap_or(&0), par.get(&(*i as i32)).unwrap_or(&0));
+            }
+            shown += 1; if shown >= 3 { break; }
+        }
+    }
+
+    /// Probe (print-only, #[ignore]): does `placed_on_map` count only the objects whose
+    /// `game_engine_flags` include the variant's engine? Row agreement per candidate rule.
+    #[test]
+    #[ignore]
+    fn quota_engine_rule_probe() {
+        use std::collections::BTreeMap;
+        let mut agree: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut subtypes: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            *subtypes.entry((v.game_engine_subtype, v.header.game_engine_type)).or_default() += 1;
+            let rules: Vec<(String, Box<dyn Fn(&H3VariantObject) -> bool>)> = vec![
+                ("all".into(), Box::new(|_| true)),
+                ("placed".into(), Box::new(|o| o.placed)),
+                (format!("eng>>subtype"), { let s = v.game_engine_subtype; Box::new(move |o| (o.game_engine_flags >> s) & 1 == 1) }),
+                (format!("eng>>hdrtype"), { let s = v.header.game_engine_type; Box::new(move |o| (o.game_engine_flags >> s) & 1 == 1) }),
+                ("sym|asym".into(), Box::new(|o| o.mp_flags & 0x0C != 0)),
+                ("bit1".into(), Box::new(|o| o.mp_flags & 0x01 != 0)),
+                ("!bit7".into(), Box::new(|o| o.mp_flags & 0x80 == 0)),
+                ("!bit6".into(), Box::new(|o| o.mp_flags & 0x40 == 0)),
+                ("!bit1".into(), Box::new(|o| o.mp_flags & 0x02 == 0)),
+                ("placed&!bit7".into(), Box::new(|o| o.placed && o.mp_flags & 0x80 == 0)),
+                ("kind>=6 only if eng".into(), { let s = v.game_engine_subtype; Box::new(move |o| (o.game_engine_flags >> s) & 1 == 1 || o.game_engine_flags == 0x3FF) }),
+            ];
+            for (name, pred) in &rules {
+                let mut cnt: BTreeMap<i32, u32> = BTreeMap::new();
+                for o in v.objects.iter().filter(|o| o.quota >= 0 && pred(o)) { *cnt.entry(o.quota).or_default() += 1; }
+                let e = agree.entry(name.clone()).or_default();
+                for (i, q) in v.quotas.iter().enumerate() {
+                    e.1 += 1;
+                    if *cnt.get(&(i as i32)).unwrap_or(&0) == q.placed_on_map as u32 { e.0 += 1; }
+                }
+            }
+        }
+        for (n, (a, t)) in &agree { eprintln!("RULE {n:<22} {a}/{t} rows = {:.2}%", 100.0 * *a as f64 / *t as f64); }
+        eprintln!("RULE (subtype, header engine type) -> files {subtypes:?}");
+    }
+
+    /// Probe (print-only, #[ignore]): which tag names carry mp_flags 0x04-only / 0x08-only.
+    #[test]
+    #[ignore]
+    fn symmetry_bit_probe() {
+        use std::collections::BTreeMap;
+        let caches: Vec<crate::mapcat::MapCandidate> = crate::mapcat::enumerate().into_iter().filter(|c| c.game == crate::mapcat::Game::Halo3).collect();
+        let mut opened: HashMap<u32, H3Cache> = HashMap::new();
+        let mut tally: BTreeMap<(String, u8), usize> = BTreeMap::new();
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            let Some(cand) = caches.iter().find(|c| c.map_id == Some(v.map_id)) else { continue };
+            if !opened.contains_key(&v.map_id) { opened.insert(v.map_id, H3Cache::open(&cand.path).unwrap()); }
+            let c = &opened[&v.map_id];
+            for o in v.placed() {
+                if !matches!(o.mp_flags & 0x0C, 0x04 | 0x08) { continue; }
+                let Some(q) = v.quota_of(o) else { continue };
+                let Some(t) = quota_tag(c, q) else { continue };
+                let nm = c.tag_name(t).rsplit('\\').next().unwrap_or("").to_string();
+                *tally.entry((nm, o.mp_flags & 0x0C)).or_default() += 1;
+            }
+        }
+        let mut rows: Vec<_> = tally.into_iter().collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((n, b), c) in rows.iter().take(40) { eprintln!("SYM {n:<40} bit {:#04x}: {c}", b); }
+    }
+
+    /// Probe (print-only, #[ignore]): how often do shipped variants exceed a quota's limits?
+    #[test]
+    #[ignore]
+    fn quota_limit_probe() {
+        use std::collections::BTreeMap;
+        let (mut files_over_allowed, mut rows_over_allowed, mut rows_over_max, mut files_over_budget, mut files_over_640) = (0, 0, 0, 0, 0);
+        let mut by_kind: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+        let mut n = 0;
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            n += 1;
+            let mut cnt: BTreeMap<i32, u32> = BTreeMap::new();
+            for o in v.objects.iter().filter(|o| o.quota >= 0) { *cnt.entry(o.quota).or_default() += 1; }
+            let mut any = false;
+            for (i, q) in v.quotas.iter().enumerate() {
+                let c = *cnt.get(&(i as i32)).unwrap_or(&0);
+                let e = by_kind.entry(q.definition >> 16).or_default();
+                e.1 += 1;
+                if q.maximum_allowed > 0 && c > q.maximum_allowed as u32 { rows_over_allowed += 1; any = true; e.0 += 1; }
+                if q.maximum > 0 && c > q.maximum as u32 { rows_over_max += 1; }
+            }
+            files_over_allowed += any as usize;
+            if v.spent_budget > v.maximum_budget && v.maximum_budget > 0.0 { files_over_budget += 1; }
+            if v.objects.len() > 640 { files_over_640 += 1; }
+        }
+        eprintln!("QLIM {n} files: {files_over_allowed} exceed some maximum_allowed ({rows_over_allowed} rows), {rows_over_max} rows exceed `maximum`, {files_over_budget} spent>max budget, {files_over_640} >640");
+        eprintln!("QLIM by kind (rows over allowed, rows): {by_kind:?}");
+    }
+
+    // ---- #h3-accounting: account_for_save --------------------------------------------------
+
+    fn blank(slot: usize, quota: i32, placed: bool) -> H3VariantObject {
+        H3VariantObject { slot, flags: 0x83, quota, parent: None, placed, pos: [0.0; 3], fwd: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0],
+            pos_q: [0; 3], up_is_global: true, up_q: 0, angle_q: 0, boundary_q: [0; 4], object_type: 0, mp_flags: 0x0C,
+            game_engine_flags: 0x3FF, shared_storage: 0, spawn_time: 0, team: 8, boundary_shape: 0, boundary: [0.0; 4] }
+    }
+
+    /// A variant whose quota rows are (stored `placed_on_map`, price) and whose stored budget is `spent`.
+    fn variant_of(rows: &[(u8, f32)], spent: f32) -> H3Variant {
+        let mut v = H3Variant::default();
+        v.quotas = rows.iter().map(|&(p, price)| H3Quota { placed_on_map: p, price, ..Default::default() }).collect();
+        v.spent_budget = spent;
+        v
+    }
+
+    /// Nothing changed: the stored values come back bit-for-bit, STALE ones included (the shipped
+    /// files disagree with their own slots, and an untouched save must not "fix" them).
+    #[test]
+    fn accounting_leaves_an_untouched_save_exactly_as_read() {
+        let mut v = variant_of(&[(7, 10.0), (0, 25.5)], 123.25);
+        let objs = vec![blank(0, 0, true), blank(1, 0, true)];
+        account_for_save(&mut v, &objs, &objs, false);
+        assert_eq!(v.quotas[0].placed_on_map, 7, "a stale count survives a save that changed nothing");
+        assert_eq!(v.quotas[1].placed_on_map, 0);
+        assert_eq!(v.spent_budget.to_bits(), 123.25f32.to_bits());
+    }
+
+    /// An added object moves its own quota's count by one and the budget by exactly its price.
+    #[test]
+    fn accounting_charges_an_add_its_own_price_and_count() {
+        let mut v = variant_of(&[(7, 10.0), (0, 25.5)], 123.25);
+        let before = vec![blank(0, 0, true), blank(1, 0, true)];
+        let mut after = before.clone();
+        after.push(blank(2, 1, true));
+        account_for_save(&mut v, &before, &after, false);
+        assert_eq!(v.quotas[1].placed_on_map, 1);
+        assert_eq!(v.quotas[0].placed_on_map, 7, "the other quota is untouched");
+        assert_eq!(v.spent_budget, 123.25 + 25.5);
+    }
+
+    /// A delete refunds its price and count, and a stale value smaller than the refund stops at
+    /// zero instead of wrapping the u8 / going negative.
+    #[test]
+    fn accounting_refunds_a_delete_and_never_underflows() {
+        let mut v = variant_of(&[(0, 10.0)], 5.0);
+        let before = vec![blank(0, 0, true), blank(1, 0, true)];
+        account_for_save(&mut v, &before, &[], false);
+        assert_eq!(v.quotas[0].placed_on_map, 0, "0 stored, 2 removed: stops at 0 (a u8 would wrap to 254)");
+        assert_eq!(v.spent_budget, 0.0, "5 stored, 20 refunded: stops at 0");
+    }
+
+    /// A scenario-owned slot (no Forge placement) counts toward its quota but is free.
+    #[test]
+    fn accounting_counts_scenario_slots_but_charges_only_forge_placements() {
+        let mut v = variant_of(&[(0, 10.0)], 0.0);
+        let mut owned = blank(0, 0, false);
+        owned.placed = false;
+        account_for_save(&mut v, &[], &[owned], false);
+        assert_eq!(v.quotas[0].placed_on_map, 1, "counted");
+        assert_eq!(v.spent_budget, 0.0, "but free");
+    }
+
+    /// A blank canvas recounts: the template's stored numbers describe objects that were dropped.
+    #[test]
+    fn accounting_recounts_a_blank_canvas_instead_of_adjusting_it() {
+        let mut v = variant_of(&[(99, 10.0), (3, 5.0)], 9999.0);
+        let after = vec![blank(0, 1, true)];
+        account_for_save(&mut v, &[blank(5, 0, true)], &after, true);
+        assert_eq!(v.quotas[0].placed_on_map, 0);
+        assert_eq!(v.quotas[1].placed_on_map, 1);
+        assert_eq!(v.spent_budget, 5.0);
+    }
+
+    /// The stored budget never exceeds the cap (the engine saturates it), however much was placed.
+    #[test]
+    fn accounting_saturates_the_stored_budget_at_the_cap() {
+        let mut v = variant_of(&[(0, 100.0)], 0.0);
+        v.maximum_budget = 250.0;
+        let after: Vec<_> = (0..5).map(|i| blank(i, 0, true)).collect();
+        account_for_save(&mut v, &[], &after, false);
+        assert_eq!(v.spent_budget, 250.0, "500 of objects against a cap of 250");
+        // a variant with no cap (0) is left unclamped
+        let mut u = variant_of(&[(0, 100.0)], 0.0);
+        account_for_save(&mut u, &[], &after, false);
+        assert_eq!(u.spent_budget, 500.0);
+    }
+
+    /// The count field is a byte: 300 objects of one quota saturate at 255.
+    #[test]
+    fn accounting_saturates_a_count_at_the_field_width() {
+        let mut v = variant_of(&[(0, 0.0)], 0.0);
+        let after: Vec<_> = (0..300).map(|i| blank(i, 0, true)).collect();
+        account_for_save(&mut v, &[], &after, false);
+        assert_eq!(v.quotas[0].placed_on_map, 255);
+    }
+
+    /// Probe (print-only, #[ignore]): which objects does the engine NOT charge for? Candidate
+    /// exclusion rules scored by how many files' stored spent_budget they reproduce exactly.
+    #[test]
+    #[ignore]
+    fn price_rule_probe() {
+        let files: Vec<H3Variant> = shipped_variants().iter().filter_map(|f| parse_h3_variant(f).ok()).collect();
+        let rules: Vec<(&str, Box<dyn Fn(&H3VariantObject) -> bool>)> = vec![
+            ("charge all placed", Box::new(|_| false)),
+            ("exclude parented", Box::new(|o| o.parent.is_some())),
+            ("exclude slot flag 0x01", Box::new(|o| o.flags & 0x01 != 0)),
+            ("exclude slot flag 0x02", Box::new(|o| o.flags & 0x02 != 0)),
+            ("exclude slot flag 0x04", Box::new(|o| o.flags & 0x04 != 0)),
+            ("exclude slot flag 0x08", Box::new(|o| o.flags & 0x08 != 0)),
+            ("exclude slot flag 0x10", Box::new(|o| o.flags & 0x10 != 0)),
+            ("exclude slot flag 0x20", Box::new(|o| o.flags & 0x20 != 0)),
+            ("exclude slot flag 0x80", Box::new(|o| o.flags & 0x80 != 0)),
+            ("exclude slot flag 0x100", Box::new(|o| o.flags & 0x100 != 0)),
+            ("exclude mp 0x01", Box::new(|o| o.mp_flags & 0x01 != 0)),
+            ("exclude mp 0x02", Box::new(|o| o.mp_flags & 0x02 != 0)),
+            ("exclude mp 0x40", Box::new(|o| o.mp_flags & 0x40 != 0)),
+            ("exclude mp 0x80", Box::new(|o| o.mp_flags & 0x80 != 0)),
+            ("exclude type 12 (spawns)", Box::new(|o| o.object_type == 12)),
+            ("exclude type >= 12", Box::new(|o| o.object_type >= 12)),
+            ("exclude type 0 (ordinary)", Box::new(|o| o.object_type == 0)),
+        ];
+        for (name, excl) in &rules {
+            let (mut exact, mut within, mut n) = (0, 0, 0);
+            for v in &files {
+                n += 1;
+                let cost: f32 = v.objects.iter().filter(|o| o.placed && !excl(o)).filter_map(|o| v.quota_of(o)).map(|q| q.price).sum();
+                if (cost - v.spent_budget).abs() < 0.01 { exact += 1; }
+                if v.maximum_budget <= 0.0 || cost <= v.maximum_budget { within += 1; }
+            }
+            eprintln!("PRICE {name:<28} exact {exact:>3}/{n}  within-max {within:>3}/{n}");
+        }
+        // the budget-over files, in detail
+        for v in files.iter().filter(|v| v.maximum_budget > 0.0 && v.objects.iter().filter(|o| o.placed).filter_map(|o| v.quota_of(o)).map(|q| q.price).sum::<f32>() > v.maximum_budget).take(4) {
+            let mut by_flags: std::collections::BTreeMap<(u16, u8), (u32, f32)> = std::collections::BTreeMap::new();
+            for o in v.objects.iter().filter(|o| o.placed) {
+                let e = by_flags.entry((o.flags, o.mp_flags)).or_default();
+                e.0 += 1; e.1 += v.quota_of(o).map_or(0.0, |q| q.price);
+            }
+            eprintln!("PRICE over: stored {} max {} -> {:?}", v.spent_budget, v.maximum_budget, by_flags);
+        }
+    }
+
+    /// Probe (print-only, #[ignore]): the scenario-owned slot count per map, and how many of those
+    /// slots carry a quota (placed objects the scenario itself spawns) -- this is what a Forge
+    /// placement has to share the 640 slots with.
+    #[test]
+    #[ignore]
+    fn scenario_slots_per_map_probe() {
+        use std::collections::BTreeMap;
+        let mut by_map: BTreeMap<u32, (usize, usize, usize)> = BTreeMap::new();
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            let owned = v.objects.iter().filter(|o| !o.placed).count();
+            let e = by_map.entry(v.map_id).or_insert((v.num_scenario_objects as usize, owned, 0));
+            e.2 += 1;
+        }
+        for (m, (scen, owned, n)) in &by_map { eprintln!("SCEN map {m}: num_scenario_objects {scen} (present unplaced slots {owned}) -> forge capacity {} ({n} variants)", H3_SLOTS - scen); }
     }
 }

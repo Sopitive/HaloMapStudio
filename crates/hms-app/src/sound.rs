@@ -8,7 +8,9 @@
 //! * `reach_sound` owns the tag side — `snd!` / `ugh!` / `sncl` / `snmm` /
 //!   `lsnd` / the scenario's acoustics palette — and Reach's own gain,
 //!   distance and pan laws.
-//! * this module joins them to the Theater clock and the camera.
+//! * this module joins them to the Theater clock and the camera -- and, through
+//!   [`SoundEngine::begin_frame`] and the voice API, to test mode (`play_sound`), which has no
+//!   clock to be a pure function of and keeps voices alive across frames.
 //!
 //! # The rules this is built around
 //!
@@ -62,7 +64,10 @@ const SMOOTH_STEP_TICKS: f32 = TICK_HZ * 0.5;
 /// Decoded samples held at once. A Reach one-shot is a second or two of
 /// 48 kHz stereo, so a few hundred is tens of megabytes; this is a bound on
 /// that, not a performance tuning knob.
-const MAX_CACHED_SAMPLES: usize = 384;
+const MAX_CACHED_SAMPLES: usize = 8192;
+
+/// ...and the same bound in bytes (decoded `f32`): the loops a vehicle engine plays are long.
+const MAX_CACHED_BYTES: usize = 768 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------------------------
 // The worker: owns the banks, the setup table and the decode cache
@@ -71,15 +76,16 @@ const MAX_CACHED_SAMPLES: usize = 384;
 enum Job {
     /// Open the banks and read the Vorbis setup tables out of the module.
     Open { haloreach_dir: PathBuf },
-    /// Decode one sample of one bank.
-    Decode { bank: &'static str, sample: usize },
+    /// Decode one sample of one bank. `urgent`: a voice is waiting for it now, so it goes ahead of
+    /// the warm-up queue (a Warthog's 96 engine samples must not hold up a footstep).
+    Decode { bank: &'static str, sample: usize, urgent: bool },
     Stop,
 }
 
 enum Done {
     /// `Ok` carries the bank's sample count; `Err` the reason audio is off.
     Opened(Result<usize, String>),
-    Decoded { bank: &'static str, sample: usize, pcm: Option<Arc<Pcm>> },
+    Decoded { bank: &'static str, sample: usize, pcm: Option<Arc<Pcm>>, ms: f32 },
 }
 
 /// Everything the worker needs. Lives entirely on the worker thread.
@@ -91,7 +97,20 @@ struct Worker {
 impl Worker {
     fn run(rx: Receiver<Job>, tx: Sender<Done>) {
         let mut w = Worker { banks: HashMap::new(), setups: None };
-        while let Ok(job) = rx.recv() {
+        let mut pending: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+        loop {
+            if pending.is_empty() {
+                match rx.recv() {
+                    Ok(j) => pending.push_back(j),
+                    Err(_) => break,
+                }
+            }
+            while let Ok(j) = rx.try_recv() {
+                pending.push_back(j);
+            }
+            // Urgent decodes first, otherwise in the order asked.
+            let at = pending.iter().position(|j| matches!(j, Job::Decode { urgent: true, .. })).unwrap_or(0);
+            let Some(job) = pending.remove(at) else { continue };
             match job {
                 Job::Stop => break,
                 Job::Open { haloreach_dir } => {
@@ -100,9 +119,11 @@ impl Worker {
                         break;
                     }
                 }
-                Job::Decode { bank, sample } => {
+                Job::Decode { bank, sample, .. } => {
+                    let t0 = std::time::Instant::now();
                     let pcm = w.decode(bank, sample);
-                    if tx.send(Done::Decoded { bank, sample, pcm }).is_err() {
+                    let ms = t0.elapsed().as_secs_f32() * 1000.0;
+                    if tx.send(Done::Decoded { bank, sample, pcm, ms }).is_err() {
                         break;
                     }
                 }
@@ -133,7 +154,7 @@ impl Worker {
     fn decode(&self, bank: &'static str, sample: usize) -> Option<Arc<Pcm>> {
         let b = self.banks.get(bank)?;
         let s = self.setups.as_ref()?;
-        match b.decode_sample(sample, s) {
+        match b.decode_sample_playback(sample, s) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
                 log::warn!("hms-sound: sample {sample} of {bank}: {e:#}");
@@ -163,6 +184,8 @@ pub struct Clip {
     pub dist: Distances,
     /// Does this sound attenuate with distance at all?
     pub spatial: bool,
+    /// `snd!` flag "play permutations in order" (a looping bed steps through its takes).
+    pub in_order: bool,
 }
 
 impl Clip {
@@ -204,6 +227,7 @@ impl Clip {
             gain,
             dist,
             spatial: dist.usable(),
+            in_order: snd.flags & rs::SND_FLAG_PERMUTATIONS_IN_ORDER != 0,
         })
     }
 
@@ -248,6 +272,127 @@ impl Clip {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A LOOPING `snd!` — what a vehicle engine's `lsnd` track plays
+// ---------------------------------------------------------------------------------------------
+
+/// `sound_definition_flags` bit 13 as a cache holds it (`cache_file_sound +0x00 & 0x2000`): the
+/// looping-sound manager plays EVERY pitch range whose `bend bounds` contain the current pitch,
+/// at once, crossfading the edges (`looping_sound_manager.cpp`, debug `0x1809BA830`).
+pub const SND_FLAG_ALL_PITCH_RANGES: u16 = 0x2000;
+
+/// One pitch range of a looping `snd!`.
+#[derive(Clone, Debug)]
+pub struct LoopRange {
+    /// Bank sample per permutation, in order.
+    pub samples: Vec<usize>,
+    pub perm_gain_db: Vec<i8>,
+    /// `natural pitch`, cents: the pitch the samples sound at when played as recorded.
+    pub natural_pitch: f32,
+    /// `bend bounds`: the pitches this range is allowed to play at.
+    pub bend: (f32, f32),
+    /// `max gain pitch bounds`: the pitches it plays at full volume.
+    pub full: (f32, f32),
+}
+
+/// A `snd!` resolved for a LOOP: its pitch ranges, and the authored scale response.
+#[derive(Clone, Debug)]
+pub struct LoopSnd {
+    pub snd: u32,
+    pub cs: CacheSound,
+    pub ranges: Vec<LoopRange>,
+    /// `scale.gain modifier` (lower, upper), dB.
+    pub scale_gain_db: (f32, f32),
+    /// `scale.pitch modifier` (lower, upper), cents: the span the loop's 0..1 scale sweeps.
+    pub scale_pitch: (f32, f32),
+    pub playback: Option<PlaybackParams>,
+    pub dist: Distances,
+    pub spatial: bool,
+}
+
+impl LoopSnd {
+    pub fn all_ranges_at_once(&self) -> bool {
+        self.cs.flags & SND_FLAG_ALL_PITCH_RANGES != 0
+    }
+
+    /// The requested pitch in cents (`sub_1806538B0`): `lerp(lower, upper, scale) + offset`, where
+    /// the offset is the playback's `random pitch bounds` (the engine draws one per source at
+    /// start; its centre is used so the result is a pure function of the scale).
+    pub fn pitch_at(&self, scale: f32) -> f32 {
+        let offset = self
+            .playback
+            .map(|p| (p.random_pitch_cents.0 as f32 + p.random_pitch_cents.1 as f32) * 0.5)
+            .unwrap_or(0.0);
+        self.scale_pitch.0 + (self.scale_pitch.1 - self.scale_pitch.0) * scale + offset
+    }
+
+    /// The `(range, crossfade dB)` pairs playing at `pitch`.
+    ///
+    /// **All-ranges sounds** (`SND_FLAG_ALL_PITCH_RANGES`) play every range whose bend bounds
+    /// contain the pitch. Inside `max gain pitch bounds` that is 0 dB; outside it the gain is
+    /// `interp_db(mode 2, -64, 0, t)` with `t` running from 0 at the bend bound to 1 at the full
+    /// bound (`sub_1804D2700`), so a range fades in over the span between the two.
+    ///
+    /// **Other sounds** play one range: the one the engine's `sub_1809B0080` picks, which keeps
+    /// `current` while the pitch is still inside its bend bounds and otherwise takes the range
+    /// whose bounds contain the pitch, else the nearest.
+    pub fn ranges_at(&self, pitch: f32, current: Option<usize>) -> Vec<(usize, f32)> {
+        let usable = |r: &LoopRange| !r.samples.is_empty();
+        let inside = |r: &LoopRange| pitch >= r.bend.0 && pitch <= r.bend.1;
+        if self.all_ranges_at_once() {
+            return self
+                .ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| usable(r) && inside(r))
+                .map(|(i, r)| {
+                    let db = if pitch >= r.full.0 && pitch <= r.full.1 {
+                        0.0
+                    } else {
+                        let (edge, full, rising) = if pitch < r.full.0 {
+                            (r.bend.0, r.full.0, true)
+                        } else {
+                            (r.bend.1, r.full.1, false)
+                        };
+                        let span = full - edge;
+                        // `sub_1804D2700`: a degenerate span is 1 on the audible side, else 0.
+                        let t = if span.abs() < 1.0e-4 {
+                            if (edge > pitch) != rising { 1.0 } else { 0.0 }
+                        } else {
+                            ((pitch - edge) / span).clamp(0.0, 1.0)
+                        };
+                        rs::interp_db(2, rs::MIN_GAIN_DB, 0.0, t)
+                    };
+                    (i, db)
+                })
+                .collect();
+        }
+        // `sub_1809B0080` (decompiled): keep the CURRENT range while the pitch is inside its
+        // MAX-GAIN bounds (`+0x08`); else the first range whose max-gain bounds hold the pitch;
+        // else the range NEAREST by its BEND bounds (`+0x04`): the distance is `lo - pitch` while
+        // the pitch is at or below the bend's upper bound (so a pitch INSIDE a bend wins with a
+        // negative distance) and `pitch - hi` above it.
+        let in_full = |r: &LoopRange| pitch >= r.full.0 && pitch <= r.full.1;
+        if let Some(c) = current.filter(|c| self.ranges.get(*c).map_or(false, |r| usable(r) && in_full(r))) {
+            return vec![(c, 0.0)];
+        }
+        let hit = self.ranges.iter().position(|r| usable(r) && in_full(r));
+        let pick = hit.or_else(|| {
+            let d = |r: &LoopRange| if pitch <= r.bend.1 { r.bend.0 - pitch } else { pitch - r.bend.1 };
+            self.ranges
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| usable(r))
+                .fold(None::<(usize, f32)>, |best, (i, r)| match best {
+                    Some((_, bd)) if bd <= d(r) => best,
+                    _ => Some((i, d(r))),
+                })
+                .map(|(i, _)| i)
+        });
+        pick.map(|i| vec![(i, 0.0)]).unwrap_or_default()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------------------------
 
@@ -270,11 +415,24 @@ pub struct SoundStatus {
     pub melee_hits_started: u64,
     pub footsteps_started: u64,
     pub shots_skipped_not_decoded: u64,
+    /// Times a voice could not start because a take was still decoding.
+    pub decode_stalls: u64,
     /// Why a `action_weapon_fire` event did NOT become a sound, by reason.
     /// Counters rather than a log line, so the answer is always in hand and
     /// nothing has to be switched on to see it. Indices are
     /// [`FIRE_BAIL_NAMES`].
     pub fire_bail: [u64; 7],
+    /// Why a sound that SHOULD have played did not, by [`Refusal`] (index = `Refusal as usize`).
+    pub drops: [u64; REFUSAL_N],
+    /// Decodes a voice had to wait for, and the milliseconds spent waiting.
+    pub urgent_waits: u64,
+    pub urgent_wait_ms: f32,
+    /// Decodes finished, and the milliseconds they took (total and the slowest one).
+    pub decodes: u64,
+    pub decode_ms_total: f32,
+    pub decode_ms_max: f32,
+    /// Samples asked for and not yet decoded (the "sound loading" count).
+    pub loading: usize,
     /// Why audio is off, when it is. Shown once, not every frame.
     pub why: String,
 }
@@ -287,6 +445,30 @@ enum PlayResult {
     NotDecoded,
     NoSample,
 }
+
+/// Why a sound that should have played did not. Always counted (`SoundStatus::drops`), never
+/// gated, so the answer to "why was that silent" is on the status line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Refusal {
+    #[default]
+    None = 0,
+    /// The tag chain authors no sound for this event (silence by the tag).
+    NoClip = 1,
+    /// The sample was still decoding and did not arrive within the wait.
+    NotDecoded = 2,
+    /// Outside the sound's own distance window.
+    OutOfRange = 3,
+    /// Below the engine's -64 dB floor.
+    BelowFloor = 4,
+    /// No permutation / the mixer refused the voice (its cap).
+    NoVoice = 5,
+}
+pub const REFUSAL_N: usize = 6;
+pub const REFUSAL_NAMES: [&str; REFUSAL_N] = ["none", "no clip", "not decoded", "out of range", "below floor", "no voice"];
+
+/// How long a one-shot waits for its sample to decode before it is dropped, milliseconds. A
+/// footstep or a shot that arrives 30 ms late is heard; one that is skipped is not.
+pub const URGENT_WAIT_MS: u64 = 250;
 
 /// Which sound of a weapon. Each resolves through a different tag chain, so
 /// they are cached separately.
@@ -337,7 +519,19 @@ pub struct SoundEngine {
     opening: bool,
     /// Decoded samples, and the requests already in flight.
     pcm: HashMap<usize, Arc<Pcm>>,
+    /// Least-recently-used stamp per decoded sample, for eviction.
+    pcm_used: HashMap<usize, u64>,
+    use_clock: u64,
     inflight: HashSet<usize>,
+    /// Samples whose decode FAILED: never asked for again (a failing sample must not cost a wait
+    /// per frame).
+    failed: HashSet<usize>,
+    /// Seamless variants of single-sample loops (see `hms_sound::decode::loop_crossfade`).
+    loops: HashMap<usize, Arc<Pcm>>,
+    /// The reason the last refused sound was refused (see [`SoundEngine::last_drop`]).
+    last_drop: Refusal,
+    /// Reporting category the next voices started belong to (`hms_sound::mix::CATEGORIES`).
+    pub cat_hint: u8,
     /// Which map the tag-side tables belong to.
     map_key: Option<(u64, PathBuf)>,
     gestalt: Option<Gestalt>,
@@ -371,6 +565,7 @@ pub struct SoundEngine {
     /// The row currently playing, so a move between areas switches the bed.
     current_acoustics: Option<usize>,
     playing_ambience: Vec<AmbienceVoice>,
+    acoustics_read: bool,
     /// One-shot voices, so a seek can stop them.
     oneshots: Vec<VoiceId>,
     /// User volume, 0..=1. Persisted.
@@ -400,7 +595,13 @@ impl Default for SoundEngine {
             bank_samples: 0,
             opening: false,
             pcm: HashMap::new(),
+            pcm_used: HashMap::new(),
+            use_clock: 0,
             inflight: HashSet::new(),
+            failed: HashSet::new(),
+            loops: HashMap::new(),
+            last_drop: Refusal::None,
+            cat_hint: 0,
             map_key: None,
             gestalt: None,
             law: GainLaw::default(),
@@ -414,6 +615,7 @@ impl Default for SoundEngine {
             clusters: Vec::new(),
             current_acoustics: None,
             playing_ambience: Vec::new(),
+            acoustics_read: false,
             oneshots: Vec::new(),
             volume: load_volume_setting(),
             muted: false,
@@ -558,39 +760,117 @@ impl SoundEngine {
                     }
                     self.status.why = why;
                 }
-                Done::Decoded { bank: _, sample, pcm } => {
+                Done::Decoded { bank: _, sample, pcm, ms } => {
                     self.inflight.remove(&sample);
+                    if pcm.is_none() {
+                        self.failed.insert(sample);
+                    }
+                    self.status.decodes += 1;
+                    self.status.decode_ms_total += ms;
+                    self.status.decode_ms_max = self.status.decode_ms_max.max(ms);
                     if let Some(p) = pcm {
-                        if self.pcm.len() >= MAX_CACHED_SAMPLES {
-                            // Bounded, and it is a bound rather than a policy:
-                            // drop an arbitrary entry rather than grow without
-                            // limit. A dropped sample is simply decoded again.
-                            if let Some(k) = self.pcm.keys().next().copied() {
-                                self.pcm.remove(&k);
+                        self.use_clock += 1;
+                        self.pcm_used.insert(sample, self.use_clock);
+                        self.pcm.insert(sample, p);
+                        // Bounded by count and by decoded bytes (a vehicle's engine loops run to
+                        // several seconds of 48 kHz stereo each). The LEAST RECENTLY USED sample
+                        // goes: an arbitrary one used to, which could be the weapon sample that
+                        // had just arrived, so a shot was re-decoded and skipped again and again.
+                        while (self.pcm.len() > MAX_CACHED_SAMPLES || self.pcm.values().map(|p| p.samples.len() * 4).sum::<usize>() > MAX_CACHED_BYTES) && self.pcm.len() > 1 {
+                            let victim = self.pcm.keys().filter(|k| **k != sample).min_by_key(|k| self.pcm_used.get(*k).copied().unwrap_or(0)).copied();
+                            match victim {
+                                Some(k) => {
+                                    self.pcm.remove(&k);
+                                    self.pcm_used.remove(&k);
+                                }
+                                None => break,
                             }
                         }
-                        self.pcm.insert(sample, p);
                     }
                 }
             }
         }
         self.status.decoded = self.pcm.len();
+        self.status.loading = self.inflight.len();
     }
 
     /// Ask for a sample, and say whether it is ready now.
     fn want(&mut self, sample: usize) -> Option<Arc<Pcm>> {
         if let Some(p) = self.pcm.get(&sample) {
+            self.use_clock += 1;
+            self.pcm_used.insert(sample, self.use_clock);
             return Some(p.clone());
         }
-        if self.bank_samples == 0 || self.inflight.contains(&sample) {
+        if self.bank_samples == 0 || self.inflight.contains(&sample) || self.failed.contains(&sample) {
             return None;
         }
         if let Some((tx, _, _)) = &self.worker {
-            if tx.send(Job::Decode { bank: WORLD_BANK, sample }).is_ok() {
+            if tx.send(Job::Decode { bank: WORLD_BANK, sample, urgent: false }).is_ok() {
                 self.inflight.insert(sample);
             }
         }
         None
+    }
+
+    /// [`SoundEngine::want`] for a voice that is starting NOW: the decode jumps the warm-up queue
+    /// and the caller waits up to [`URGENT_WAIT_MS`] for it.
+    fn want_now(&mut self, sample: usize) -> Option<Arc<Pcm>> {
+        if let Some(p) = self.want(sample) {
+            return Some(p);
+        }
+        if self.bank_samples == 0 || self.failed.contains(&sample) {
+            return None;
+        }
+        // Re-ask as urgent (the warm-up request may be queued behind a hundred others).
+        if let Some((tx, _, _)) = &self.worker {
+            let _ = tx.send(Job::Decode { bank: WORLD_BANK, sample, urgent: true });
+            self.inflight.insert(sample);
+        }
+        let t0 = std::time::Instant::now();
+        let limit = std::time::Duration::from_millis(URGENT_WAIT_MS);
+        while t0.elapsed() < limit {
+            self.pump_worker();
+            if let Some(p) = self.pcm.get(&sample) {
+                let p = p.clone();
+                self.status.urgent_waits += 1;
+                self.status.urgent_wait_ms += t0.elapsed().as_secs_f32() * 1000.0;
+                return Some(p);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(500));
+        }
+        self.status.urgent_waits += 1;
+        self.status.urgent_wait_ms += t0.elapsed().as_secs_f32() * 1000.0;
+        None
+    }
+
+    /// Tag a started voice with a reporting category.
+    fn tag_voice(&self, id: VoiceId, cat: u8) {
+        if cat != 0 {
+            if let Some(o) = &self.out {
+                o.handle().set_cat(id, cat);
+            }
+        }
+    }
+
+    /// The seamless variant of a single-sample loop, built once per sample.
+    pub fn loop_variant(&mut self, sample: usize) -> Option<Arc<Pcm>> {
+        if let Some(p) = self.loops.get(&sample) {
+            return Some(p.clone());
+        }
+        let pcm = self.want_now(sample)?;
+        let v = Arc::new(hms_sound::decode::loop_crossfade(&pcm));
+        self.loops.insert(sample, v.clone());
+        Some(v)
+    }
+
+    /// Why the last sound this engine refused was refused ([`Refusal::None`] if it never refused).
+    pub fn last_drop(&self) -> Refusal {
+        self.last_drop
+    }
+
+    pub(crate) fn refuse(&mut self, why: Refusal) {
+        self.last_drop = why;
+        self.status.drops[why as usize] += 1;
     }
 
     /// Read the map's tag side once. Returns false when the map has no sound
@@ -607,6 +887,9 @@ impl SoundEngine {
         }
         self.stop_all();
         self.pcm.clear();
+        self.pcm_used.clear();
+        self.failed.clear();
+        self.loops.clear();
         self.inflight.clear();
         self.fire_of.clear();
         self.weapon_tracks.clear();
@@ -614,6 +897,7 @@ impl SoundEngine {
         self.footstep_of.clear();
         self.melee_victim_of.clear();
         self.acoustics.clear();
+        self.acoustics_read = false;
         self.clusters.clear();
         self.current_acoustics = None;
         self.subsound.clear();
@@ -676,6 +960,7 @@ impl SoundEngine {
             gain,
             dist,
             spatial: dist.usable(),
+            in_order: snd.flags & rs::SND_FLAG_PERMUTATIONS_IN_ORDER != 0,
         })
     }
 
@@ -741,7 +1026,10 @@ impl SoundEngine {
     /// yet, and picking the nearest-sounding entry by name would be a
     /// heuristic rather than the engine's rule.
     fn drive_ambience(&mut self, native: &NativeDll, cache: CacheHandle, listener: [f32; 3]) {
-        if self.acoustics.is_empty() {
+        if !self.acoustics_read {
+            // Once per map: a map with NO ambience used to repeat this whole scan (and grow
+            // `clusters`) on every frame.
+            self.acoustics_read = true;
             let Some(scnr) = native.find_scenario(cache) else { return };
             // A BSP carries its own acoustics palette AND the cluster table
             // that indexes it, so prefer the BSP's; the scenario's copy is the
@@ -815,13 +1103,21 @@ impl SoundEngine {
             {
                 continue;
             }
-            // Deterministic in the sound, not the clock: a bed does not need
-            // to vary, and varying it would make a re-scrub differ.
-            let perm = clip.permutation_for(0, clip.snd);
-            let Some(sample) = clip.samples.get(perm).copied() else { continue };
-            let Some(pcm) = self.want(sample) else { continue };
+            // ALL of the bed's takes, as a playlist: a bed is authored as several permutations
+            // (forge_halo's is six, 3.2 to 6.3 s each) and the engine moves on to another when
+            // one ends. Looping a single take is a 3-6 second loop repeating for ever -- a record
+            // skipping. Every take is requested; the bed starts once they are all decoded.
+            let perm = 0;
+            let wanted: Vec<Option<Arc<Pcm>>> = clip.samples.iter().take(16).map(|&s| self.want(s)).collect();
+            if wanted.is_empty() || wanted.iter().any(|p| p.is_none()) {
+                continue;
+            }
+            let pcms: Vec<Arc<Pcm>> = wanted.into_iter().flatten().collect();
             let g = clip.gain_unspatialized(perm);
-            let voice = self.out.as_ref().and_then(|o| o.play(pcm, g, 1.0, true));
+            let voice = self.out.as_ref().and_then(|o| o.play_playlist(pcms, clip.in_order, g, 1.0));
+            if let Some(v) = voice {
+                self.tag_voice(v, 1);
+            }
             self.playing_ambience.push(AmbienceVoice {
                 acoustics: idx,
                 snd: clip.snd,
@@ -1099,6 +1395,293 @@ impl SoundEngine {
         }
     }
 
+    // -----------------------------------------------------------------------------------------
+    // TEST MODE's side of the engine (`play_sound`): no Theater clock, voices that outlive a frame
+    // -----------------------------------------------------------------------------------------
+
+    /// Bring the device, the worker and this map's tag tables up, and say whether sounds can be
+    /// started this frame. Non-blocking: `false` while the banks are still opening, and the
+    /// caller simply tries again next frame.
+    pub fn begin_frame(&mut self, native: &NativeDll, cache: CacheHandle, map_path: &Path) -> bool {
+        self.ensure_open(map_path);
+        self.pump_worker();
+        if !self.ensure_map(native, cache, map_path) {
+            return false;
+        }
+        self.ensure_subsound_map(map_path);
+        if let Some(o) = &self.out {
+            o.reap();
+        }
+        self.bank_samples != 0 && !self.subsound.is_empty()
+    }
+
+    /// The map's ambience bed for a listener at `pos`, started and kept running (Theater drives
+    /// the same code from its clock; test mode drives it from its own frame).
+    pub fn ambience_frame(&mut self, native: &NativeDll, cache: CacheHandle, pos: [f32; 3]) {
+        self.drive_ambience(native, cache, pos);
+        self.status.ambience_playing = self.playing_ambience.len();
+    }
+
+    /// **The offline seam.** An engine whose output is the mixer with no device behind it: sounds
+    /// are accepted, mixed by the REAL [`hms_sound::mix::Mixer`], and handed back by
+    /// [`SoundEngine::render`] as samples. Nothing here can reach a speaker, which is what lets a
+    /// test hold a Warthog at idle, mid-rev and redline and measure what comes out.
+    #[cfg(test)]
+    pub fn offline(rate: u32) -> SoundEngine {
+        let mut e = SoundEngine::default();
+        e.out = Some(Output::silent(rate, "offline render"));
+        e.volume = 1.0;
+        e.push_master();
+        e
+    }
+
+    /// Mix `frames` stereo frames of whatever is playing, interleaved. Offline engines only.
+    #[cfg(test)]
+    pub fn render(&mut self, frames: usize) -> Vec<f32> {
+        let mut buf = vec![0.0f32; frames * 2];
+        if let Some(o) = self.out.as_mut() {
+            o.pump(&mut buf, 2);
+        }
+        buf
+    }
+
+    /// Start a decoded sample directly (gain, pitch ratio) on the offline mixer. Tests only.
+    #[cfg(test)]
+    pub fn play_pcm_for_test(&mut self, pcm: Arc<Pcm>, gain: [f32; 2], pitch: f64) -> bool {
+        self.out.as_ref().and_then(|o| o.play(pcm, gain, pitch, false)).is_some()
+    }
+
+    /// The weapon's fire clip as the engine resolves it. Tests only.
+    #[cfg(test)]
+    pub fn weapon_fire_clip_for_test(&mut self, native: &NativeDll, cache: CacheHandle, weap: u32) -> Option<Clip> {
+        self.weapon_clip(native, cache, weap, WeaponSound::Fire)
+    }
+
+    /// Has every permutation of the weapon's fire sound decoded? Tests only.
+    #[cfg(test)]
+    pub fn sample_ready_for_weapon(&mut self, native: &NativeDll, cache: CacheHandle, weap: u32) -> bool {
+        self.pump_worker();
+        match self.weapon_clip(native, cache, weap, WeaponSound::Fire) {
+            Some(c) => c.samples.iter().take(16).all(|s| self.pcm.contains_key(s)),
+            None => false,
+        }
+    }
+
+    /// The subsound id of a bank sample index (reverse of the join map). Tests only.
+    #[cfg(test)]
+    pub fn sample_subsound(&self, sample: usize) -> Option<u32> {
+        self.subsound.iter().find(|(_, v)| **v == sample).map(|(k, _)| *k)
+    }
+
+    /// The ambience beds currently chosen: `(permutation count, bank sample per permutation)`.
+    #[cfg(test)]
+    pub fn ambience_beds(&self) -> Vec<(usize, Vec<usize>)> {
+        self.playing_ambience.iter().map(|v| (v.clip.samples.len(), v.clip.samples.clone())).collect()
+    }
+
+    /// Voices the mixer is holding right now. Offline engines only.
+    #[cfg(test)]
+    pub fn mixer_voices(&self) -> usize {
+        self.out.as_ref().and_then(|o| o.voice_count()).unwrap_or(0)
+    }
+
+    /// Resolve a `snd!` for a loop (pitch ranges and the authored scale response).
+    pub fn resolve_loop(&self, native: &NativeDll, cache: CacheHandle, snd_tag: u32) -> Option<LoopSnd> {
+        let g = self.gestalt.as_ref()?;
+        let cs = CacheSound::read(native, cache, snd_tag)?;
+        let pb = g.playback_of(&cs).copied();
+        let first = cs.first_pitch_range as usize;
+        let mut ranges = Vec::new();
+        for pr in g.pitch_ranges.iter().skip(first).take(cs.pitch_range_count as usize) {
+            let (a, b) = (pr.first_permutation, pr.first_permutation + pr.permutation_count);
+            let mut samples = Vec::new();
+            let mut perm_gain_db = Vec::new();
+            for p in g.permutations.get(a..b).unwrap_or(&[]) {
+                if let Some(i) = self.subsound.get(&p.fmod_subsound_id).copied() {
+                    samples.push(i);
+                    perm_gain_db.push(p.gain_db);
+                }
+            }
+            let pp = g.params_of(pr).copied().unwrap_or_default();
+            ranges.push(LoopRange {
+                samples,
+                perm_gain_db,
+                natural_pitch: pp.natural_pitch as f32,
+                bend: (pp.bend_bounds.0 as f32, pp.bend_bounds.1 as f32),
+                full: (pp.max_gain_bounds.0 as f32, pp.max_gain_bounds.1 as f32),
+            });
+        }
+        if ranges.iter().all(|r| r.samples.is_empty()) {
+            return None;
+        }
+        let dist = self.law.distances_for(&cs, pb.as_ref());
+        let sp = g.scale_pitch_of(&cs);
+        Some(LoopSnd {
+            snd: snd_tag,
+            ranges,
+            scale_gain_db: g.scale_gain_of(&cs),
+            scale_pitch: (sp.0 as f32, sp.1 as f32),
+            playback: pb,
+            spatial: dist.usable(),
+            dist,
+            cs,
+        })
+    }
+
+    /// The engine's gain for one voice of a loop, dB, BEFORE distance and pan: the class and
+    /// scale gain bounds interpolated by the loop's SCALE, the playback `gain base`, the
+    /// permutation trim, the track's own gain and crossfades (`source_db`), clamped to
+    /// `[-64, 0]`, then the `snmm` master gain. See [`GainLaw::voice_gain_db_extra`].
+    pub fn loop_gain_db(&self, ls: &LoopSnd, scale: f32, perm_gain_db: i8, source_db: f32) -> f32 {
+        self.law.voice_gain_db_extra(&ls.cs, ls.playback.as_ref(), ls.scale_gain_db, perm_gain_db, None, scale, source_db)
+    }
+
+    /// A decoded sample, or `None` after asking for it (non-blocking).
+    pub fn sample(&mut self, index: usize) -> Option<Arc<Pcm>> {
+        self.pump_worker();
+        self.want(index)
+    }
+
+    /// Start a looping voice that will be re-aimed and re-pitched every frame, over one or
+    /// several takes (permutations): with several, it moves on to another each time one ends.
+    /// `None` while any take is still decoding (counted in `SoundStatus::decode_stalls`), or when
+    /// audio is off.
+    pub fn voice_start(&mut self, samples: &[usize], in_order: bool, gain: [f32; 2], pitch: f64) -> Option<(VoiceId, u32)> {
+        // A loop that is starting NOW (a driver sitting down, a vehicle coming into earshot) waits
+        // for its takes, once, for as long as a one-shot would: a loop that never starts is an
+        // engine that is silent (the audit's Warthog at redline).
+        // A single-sample loop plays its SEAMLESS variant (a decoded loop ticks at its wrap).
+        let single = samples.len() == 1;
+        let got: Vec<Option<Arc<Pcm>>> = samples.iter().take(16).map(|&s| if single { self.loop_variant(s) } else { self.want_now(s) }).collect();
+        if got.is_empty() || got.iter().any(|p| p.is_none()) {
+            self.status.decode_stalls += 1;
+            return None;
+        }
+        let pcms: Vec<Arc<Pcm>> = got.into_iter().flatten().collect();
+        let rate = pcms[0].sample_rate;
+        let id = self.out.as_ref()?.play_playlist(pcms, in_order, gain, pitch)?;
+        self.tag_voice(id, self.cat_hint);
+        Some((id, rate))
+    }
+
+    pub fn voice_set(&self, id: VoiceId, source_rate: u32, gain: [f32; 2], pitch: f64) {
+        if let Some(o) = &self.out {
+            o.set_gain(id, gain);
+            o.set_pitch(id, source_rate, pitch);
+        }
+    }
+
+    pub fn voice_stop(&self, id: VoiceId) {
+        if let Some(o) = &self.out {
+            o.stop(id);
+        }
+    }
+
+    /// Resolve one of a weapon's sounds and play it at a world position.
+    ///
+    /// The same chain Theater uses for another player's gun (`weap` -> `snd!`), so the player's
+    /// own shot, swing and reload cannot sound different from the ones in a film. Returns false
+    /// when the weapon authors no such sound, the sample is still decoding, or the listener is
+    /// outside the sound's own distance window.
+    #[allow(clippy::too_many_arguments)]
+    pub fn play_weapon_sound(
+        &mut self,
+        native: &NativeDll,
+        cache: CacheHandle,
+        weap: u32,
+        what: WeaponSound,
+        pos: [f32; 3],
+        listener: ([f32; 3], [f32; 3], [f32; 3], [f32; 3]),
+        seed: u32,
+    ) -> bool {
+        let Some(clip) = self.weapon_clip(native, cache, weap, what) else {
+            self.refuse(Refusal::NoClip);
+            return false;
+        };
+        let started = matches!(self.play_positioned(&clip, pos, listener, seed, weap), PlayResult::Started);
+        if started {
+            match what {
+                WeaponSound::Melee => self.status.melees_started += 1,
+                WeaponSound::Reload => self.status.reloads_started += 1,
+                WeaponSound::Clang | WeaponSound::Empty => {}
+                WeaponSound::Fire => self.status.shots_started += 1,
+            }
+        }
+        started
+    }
+
+    /// The output callback's own numbers, when there is a device.
+    pub fn out_diag(&self) -> Option<hms_sound::OutDiag> {
+        self.out.as_ref().map(|o| o.diag())
+    }
+
+    /// Ask the worker to decode a weapon's sounds ahead of the first shot, so the FIRST trigger
+    /// pull is heard instead of skipped (a sample that is not decoded yet is skipped, never
+    /// waited for).
+    pub fn warm_weapon(&mut self, native: &NativeDll, cache: CacheHandle, weap: u32) {
+        for what in [WeaponSound::Fire, WeaponSound::Melee, WeaponSound::Reload, WeaponSound::Empty] {
+            if let Some(clip) = self.weapon_clip(native, cache, weap, what) {
+                // EVERY permutation: a shot picks one by hash, and one that is not decoded yet is
+                // skipped, so warming only the first would leave most shots silent.
+                for &s in clip.samples.iter().take(16) {
+                    let _ = self.want(s);
+                }
+            }
+        }
+    }
+
+    /// Resolve a `snd!` to a one-shot [`Clip`] (cached by the caller).
+    pub fn resolve_one_shot(&self, native: &NativeDll, cache: CacheHandle, snd_tag: u32) -> Option<Clip> {
+        self.resolve_clip(native, cache, snd_tag)
+    }
+
+    /// Play a resolved one-shot at a world position (the single positioned path).
+    pub fn play_clip_at(
+        &mut self,
+        clip: &Clip,
+        pos: [f32; 3],
+        listener: ([f32; 3], [f32; 3], [f32; 3], [f32; 3]),
+        seed: u32,
+    ) -> bool {
+        matches!(self.play_positioned(clip, pos, listener, seed, 0), PlayResult::Started)
+    }
+
+    /// Play a resolved one-shot with no position: the clip's authored gain and nothing else.
+    /// The engine routes a sound on the PLAYER'S OWN unit or vehicle through its first-person
+    /// mix (`sub_1401F5BC0`) rather than a 3D position, so the driver's gear shift is heard
+    /// at the same level wherever the camera is.
+    pub fn play_clip_flat(&mut self, clip: &Clip, seed: u32) -> bool {
+        let perm = clip.permutation_for(seed, clip.snd);
+        let Some(&sample) = clip.samples.get(perm) else {
+            self.refuse(Refusal::NoClip);
+            return false;
+        };
+        let g = clip.gain_unspatialized(perm);
+        // Below the engine's -64 dB floor it would not be started at all.
+        if g[0].max(g[1]) <= rs::db_to_linear(rs::MIN_GAIN_DB) {
+            self.refuse(Refusal::BelowFloor);
+            return false;
+        }
+        let Some(pcm) = self.want_now(sample) else {
+            self.refuse(Refusal::NotDecoded);
+            return false;
+        };
+        match self.out.as_ref().and_then(|o| o.play(pcm, g, 1.0, false)) {
+            Some(v) => {
+                self.tag_voice(v, self.cat_hint);
+                self.oneshots.push(v);
+                if self.oneshots.len() > 128 {
+                    self.oneshots.remove(0);
+                }
+                true
+            }
+            None => {
+                self.refuse(Refusal::NoVoice);
+                false
+            }
+        }
+    }
+
     /// Play one FOOTSTEP: the sound `biped` makes on `material`, at `pos`.
     ///
     /// **This is the whole footstep feature's entry point and it is not keyed
@@ -1199,27 +1782,34 @@ impl SoundEngine {
         let distance = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
         // The engine refuses a sound outside its own distance window.
         if clip.spatial && (distance > clip.dist.maximum || distance < clip.dist.dont_play) {
+            self.refuse(Refusal::OutOfRange);
             return PlayResult::OutOfRange;
         }
         let perm = clip.permutation_for(tick, source);
         let g = clip.gains_at(dir, distance, perm);
         // Below the engine's own floor it would not be started at all.
         if g[0].max(g[1]) <= rs::db_to_linear(rs::MIN_GAIN_DB) {
+            self.refuse(Refusal::BelowFloor);
             return PlayResult::BelowFloor;
         }
-        let Some(sample) = clip.samples.get(perm).copied() else { return PlayResult::NoSample };
-        let Some(pcm) = self.want(sample) else {
-            // Not decoded yet. Skip rather than stall the frame; the next one
-            // from this weapon will be instant.
+        let Some(sample) = clip.samples.get(perm).copied() else {
+            self.refuse(Refusal::NoClip);
+            return PlayResult::NoSample;
+        };
+        let Some(pcm) = self.want_now(sample) else {
+            // Still not decoded after the urgent wait: counted, never silent about it.
+            self.refuse(Refusal::NotDecoded);
             return PlayResult::NotDecoded;
         };
         if let Some(v) = self.out.as_ref().and_then(|o| o.play(pcm, g, 1.0, false)) {
+            self.tag_voice(v, self.cat_hint);
             self.oneshots.push(v);
             if self.oneshots.len() > 128 {
                 self.oneshots.remove(0);
             }
             PlayResult::Started
         } else {
+            self.refuse(Refusal::NoVoice);
             PlayResult::NoSample
         }
     }
@@ -1332,6 +1922,7 @@ mod tests {
             gain,
             dist,
             spatial: dist.usable(),
+            in_order: false,
         }
     }
 

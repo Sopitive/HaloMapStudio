@@ -5,38 +5,62 @@
 //! biped from a [`crate::film_anim::BodyState`], choosing clips, drawing first-person arms,
 //! reading the collision triangles — already existed for Theater. Walking did not.
 //!
+//! # This is the ENGINE's controller, not an approximation of Havok's
+//!
+//! Reach does not use Havok's character proxy. `character_physics_mode_ground.cpp`
+//! (`reach_tag_test.exe`, the same code is in `haloreach.dll`) is the engine's own controller:
+//! it reads the contacts Havok's rigid body produced last tick, decides what it is standing on,
+//! computes a new LINEAR VELOCITY and hands it back; Havok only integrates and depenetrates.
+//! This module ports that decision, function for function (`sub_1406C2A50` ground plane,
+//! `sub_1406C3140` plane subsets, `sub_1406C4A20` velocity, `sub_1406C33B0` acceleration clamp,
+//! `sub_1404E97C0` stick -> commanded velocity), and keeps Havok's half as the honest
+//! approximation it has to be: a capsule of three spheres, pushed out of triangles along the
+//! contact normal, with the velocity into each contact removed.
+//!
+//! The consequences a player feels, each of them a fact of the engine and none a tuning choice:
+//!
+//! * **ONE contact test and ONE filter.** Every contact — face, edge or vertex — is judged on its
+//!   NORMAL, never on how high it sits on the capsule. A contact is ground-eligible while
+//!   `dot(normal, velocity) < 0.468` (the fastest the engine's own adhesion could pull the body
+//!   back), so "leaving the ground" is "moving away from it faster than adhesion can follow".
+//!   There is **no step-up height**: a ledge is climbed or refused by the contact normal its edge
+//!   makes with the bottom sphere, which is a consequence of the authored radius and slope limit.
+//! * **Two slope limits on two different normals.** The ground PLANE (the normalised sum of
+//!   whichever of the five flattest eligible contacts maximises its z — 31 subsets, tried
+//!   exhaustively) must have `z > cos(authored max slope)`; and every SURFACE the capsule touches
+//!   that is steeper than the global 35 degrees raises that bar to just above itself, so a steep
+//!   face can never be its own floor. 35 degrees is therefore the real walkable limit on a face;
+//!   the authored 50 governs cresting an edge.
+//! * **The body is never moved to keep it grounded.** On the ground the new velocity is the error
+//!   to the commanded velocity (acceleration-clamped, in 3-D, along the ground plane), minus an
+//!   ADHESION velocity of `clamp(speed / 2.2 * 0.234, 0.12, 0.234)` x 30/tick_rate wu/s into the plane; gravity
+//!   is added last and only while the clamp is still saturated. The contact pushes the body back
+//!   out. A position teleport to a probed height — this module's old way — has two writers for
+//!   one field and is what made ramps jitter.
+//! * **Air is a different mode**, not "ground with gravity": horizontal velocity chases the
+//!   commanded velocity at the authored `airborne acceleration` (1.05 wu/s^2 on the Spartan row —
+//!   far less than gravity along any steep face, so a steep slope slides you down however hard
+//!   you push), and gravity is Havok's.
+//!
 //! # Nothing in here is pure physics for its own sake
 //!
 //! Every constant it moves by comes from [`crate::play_phys::PlayerPhysics`], i.e. from the
 //! `bipd` and `matg` tags, and the module takes it as an argument rather than owning any
-//! numbers. The two quantities that are NOT authored anywhere are derived rather than chosen:
-//!
-//! * **There is no step-up height.** Halo's character proxy is a Havok capsule and Reach
-//!   authors no step field. Stepping over a low ledge is emergent: the capsule's bottom
-//!   hemisphere touches a ledge EDGE on a diagonal normal, and a contact whose normal is within
-//!   the biped's own `maximum slope angle` of vertical is pushed out along that full normal — so
-//!   the body rides up. A contact outside that angle is pushed out HORIZONTALLY, so a wall (and
-//!   a ramp too steep for this biped) stops it. The ledge height this climbs is therefore a
-//!   consequence of the authored radius and the authored slope limit, and
-//!   [`max_step_height`] states it in closed form so it can be measured rather than guessed.
-//! * **The ground probe depth**, which is what stops a body walking downhill from hopping off
-//!   the slope every frame. It is the vertical distance the fastest authored run can descend in
-//!   one engine tick on the steepest walkable slope — `run_forward × tan(max_slope) / TICK_HZ`.
-//!   That is the exact physical requirement, with no free parameter: any shallower and a legal
-//!   descent outruns the probe; any deeper and the body would cling to a ledge it has left.
+//! numbers. The handful of literals that are NOT authored are the engine's own code constants and
+//! are named and sourced where they are declared.
 //!
 //! # Shape
 //!
-//! [`PlayerState::step`] is pure over a [`StaticWorld`], so a floor, a ramp, a ledge and a wall
-//! can be built by hand in a test and the controller driven across them with no map, no window
-//! and no GPU — while the SAME function is what the live per-frame hook calls. The collision
-//! primitives are the project's own (`physics_settle::closest_point_on_triangle`, the same one
-//! the ragdoll solver and the object settle use), so a player lands on a Forge block for the
-//! same reason a corpse does.
+//! [`PlayerState::step`] is pure over a [`StaticWorld`], so a floor, a ramp, a staircase and a
+//! wall can be built by hand in a test and the controller driven across them with no map, no
+//! window and no GPU — while the SAME function is what the live per-frame hook calls. The
+//! collision primitives are the project's own (`physics_settle::closest_point_on_triangle`, the
+//! same one the ragdoll solver and the object settle use), so a player lands on a Forge block for
+//! the same reason a corpse does.
 
 use glam::Vec3;
 
-use crate::physics_settle::{closest_point_on_triangle, StaticWorld, TICK_HZ};
+use crate::physics_settle::{closest_point_on_triangle, Shell, StaticWorld, TICK_HZ};
 use crate::play_phys::PlayerPhysics;
 
 /// How many spheres stand in for the capsule. Three (bottom, middle, top) is what
@@ -44,56 +68,45 @@ use crate::play_phys::PlayerPhysics;
 /// same way every other capsule in this codebase is.
 pub const CAPSULE_SPHERES: usize = 3;
 
+/// Havok's `collisionTolerance` as the engine configures the world (`sub_18009A06C` in
+/// `haloreach.dll`): a body within this distance of a surface HAS a contact with it, touching or
+/// not. It is what lets a body that has just crested an edge still count as standing for the
+/// next tick, without the controller ever moving it to make that so.
+pub const CONTACT_TOLERANCE: f32 = 0.0328;
+
+/// `dot(contact normal, linear velocity) < 0.468` — the one filter on whether a contact may be
+/// ground (`sub_1406C2A50`, literal `0.467999995`; the shipped game's `sub_1801FC5CC` has the same
+/// literal). It is the 30 Hz-referenced adhesion ceiling (`ADHESION_MAX` x 2): a contact stops
+/// being ground when you leave it faster than the engine's adhesion could pull you back.
+pub const LEAVING_SPEED: f32 = 0.468;
+
+/// Contacts remembered between steps. Generous: a floor is deduplicated to one entry however many
+/// triangles it is made of, so only a very cluttered corner comes near it.
+const MAX_CONTACTS: usize = 24;
+/// The engine keeps the five flattest eligible contacts (`sub_1406C2A50` caps its list at 5).
+const GROUND_CANDIDATES: usize = 5;
 /// Depenetration passes per sub-step. More than one because pushing out of a floor can push
 /// into a wall (an inside corner needs both resolved).
-const SOLVER_PASSES: usize = 4;
-/// Extra passes run ONLY when the ordinary ones left the body inside something with nothing to
-/// stand on. See `resolve`.
-const ESCAPE_PASSES: usize = 2;
+const SOLVER_PASSES: usize = 6;
+/// The stuck fallback needs a penetration deeper than this fraction of the radius...
+const SQUEEZE_DEPTH: f32 = 0.5;
+/// ...on every tick for this long...
+const SQUEEZE_SECONDS: f32 = 0.5;
+/// ...with less horizontal progress than this, wu.
+const SQUEEZE_PROGRESS: f32 = 0.1;
 
-/// The depenetration accumulated over one solver pass.
-///
-/// **Contacts do not add up.** What each one asks for is `push · n >= depth` — a *constraint*, not
-/// a contribution — and summing them double-counts every surface the capsule touches more than
-/// once. A floor is TWO triangles sharing a diagonal, so a body that lands on that seam is
-/// reported twice with the same vertical normal and gets pushed out twice as far as it went in.
-/// MEASURED: dropped from 100 wu onto a seam it came to rest at z = +0.0793 with the floor at 0,
-/// floating 8 cm in the air, instead of standing on it.
-///
-/// So contacts whose normals agree are MERGED, keeping the deepest, and only genuinely different
-/// directions still add — which is what makes an inside corner push out of both walls. This is a
-/// deduplication, not a solver: it does not project onto the intersection of the contact planes,
-/// and in a corner the sum still over-shoots slightly. That is the known remaining
-/// approximation.
-#[derive(Default)]
-struct Depenetration {
-    dirs: Vec<(Vec3, f32)>,
-}
+/// The three literals of the adhesion velocity (`sub_1406C4A20`): it is
+/// `clamp(speed / ADHESION_REF_SPEED * ADHESION_MAX, ADHESION_MIN, ADHESION_MAX)` wu/s at a
+/// 30 Hz reference tick (see [`adhesion_speed`] for the 60 Hz scale).
+const ADHESION_REF_SPEED: f32 = 2.2;
+const ADHESION_MIN: f32 = 0.12;
+const ADHESION_MAX: f32 = 0.234;
 
-impl Depenetration {
-    /// cos of the angle within which two normals count as the same direction (~2.6 deg). The
-    /// seam case produces normals that agree to the last bit; the tolerance is only so that a
-    /// floor tessellated with a slight crease still merges.
-    const SAME_DIR: f32 = 0.999;
-
-    fn add(&mut self, n: Vec3, depth: f32) {
-        for (dir, d) in self.dirs.iter_mut() {
-            if dir.dot(n) > Self::SAME_DIR {
-                if depth > *d {
-                    *d = depth;
-                    *dir = n;
-                }
-                return;
-            }
-        }
-        self.dirs.push((n, depth));
-    }
-
-    fn total(&self) -> Vec3 {
-        self.dirs
-            .iter()
-            .fold(Vec3::ZERO, |acc, (n, d)| acc + *n * *d)
-    }
+/// The global walkable-SURFACE limit: `cos(35 degrees)`, the `+0x1C` of the engine's "physics
+/// constants" block (initialiser `sub_18014FC94`; see the `reach-engine-physics-gravity` note).
+/// `sub_14037A2F0` returns it. It is NOT authored per biped.
+fn surface_slope_cos() -> f32 {
+    35f32.to_radians().cos()
 }
 
 /// What the player is asking for this frame — a stick, a look direction and four buttons.
@@ -152,8 +165,12 @@ pub struct PlayerState {
     turning_in_place: bool,
     /// Standing on walkable ground this frame.
     pub grounded: bool,
-    /// The surface normal underfoot (`Vec3::Z` when airborne).
+    /// The ground PLANE underfoot (`Vec3::Z` when airborne) — [`ground_plane`]'s answer, which is
+    /// a normalised sum of contact normals and not necessarily any one surface's.
     pub ground_normal: Vec3,
+    /// The contacts the capsule ended the last step with; see [`PlayerState::contacts`].
+    contacts: [Contact; MAX_CONTACTS],
+    n_contacts: usize,
     /// Crouching — the ACTUAL state, which lags the button when a ceiling blocks standing up.
     pub crouched: bool,
     /// Eye interpolation, 0 = standing .. 1 = crouched. Driven at the authored transition rate.
@@ -171,6 +188,13 @@ pub struct PlayerState {
     /// globals author `seconds to full speed`, so a sprint accelerates into its top speed rather
     /// than snapping to it.
     pub sprint_time: f32,
+    /// The last position verified FREE (inside no shell, no surface deeper than a hair): where the
+    /// stuck fallback returns a body that cannot be pushed out.
+    last_free: Vec3,
+    /// Seconds the body has been squeezed (overlapping by more than the solver can undo).
+    squeeze_time: f32,
+    /// Where the current squeeze began, to tell a body going nowhere from one making progress.
+    squeeze_from: Vec3,
 }
 
 impl Default for PlayerState {
@@ -185,6 +209,8 @@ impl Default for PlayerState {
             turning_in_place: false,
             grounded: false,
             ground_normal: Vec3::Z,
+            contacts: [Contact::default(); MAX_CONTACTS],
+            n_contacts: 0,
             crouched: false,
             crouch_t: 0.0,
             air_time: 0.0,
@@ -192,6 +218,9 @@ impl Default for PlayerState {
             distance: 0.0,
             ground_speed: 0.0,
             sprint_time: 0.0,
+            last_free: Vec3::ZERO,
+            squeeze_time: 0.0,
+            squeeze_from: Vec3::ZERO,
         }
     }
 }
@@ -221,41 +250,183 @@ pub struct StepOut {
     /// thin geometry instead of into it. Reported rather than silent — a body that tunnels
     /// through a Forge platform must say so.
     pub substep_guard_tripped: bool,
+    /// Moves made to get the body out of the inside of a closed shell this step.
+    pub escaped: usize,
+    /// The body was squeezed for too long to be pushed out and has been moved to a free spot.
+    pub relocated: bool,
+    /// The deepest penetration the contact solver left at the end of the step, wu.
+    pub residual: f32,
 }
 
-/// The ledge height this capsule rides up, wu — the closed form of the emergent step-up.
-///
-/// The bottom sphere's centre sits `radius` above the feet. Touching the top EDGE of a ledge
-/// `s` high, the contact normal's vertical component is `(radius - s) / radius`, so the contact
-/// counts as walkable — and is therefore pushed out along the full normal, lifting the body —
-/// exactly while
-///
-/// ```text
-///   (radius - s) / radius >= cos(max_slope)      =>      s <= radius * (1 - cos(max_slope))
-/// ```
-///
-/// **Not a tuning knob**: both inputs are authored in `bipd`. This exists so the number can be
-/// printed and compared against what a test actually climbs.
-pub fn max_step_height(p: &PlayerPhysics) -> f32 {
-    p.radius * (1.0 - p.max_slope.cos())
+/// One contact of the capsule with the world, as Havok's manifold would hand it to the
+/// controller: the NORMAL of the contact (toward the capsule), and the normal of the SURFACE it
+/// was made against. They are the same for a face contact and different for an edge or vertex
+/// one, and the engine tests them against two different limits.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Contact {
+    /// `sub_140443770`: the contact normal (`contact + 0x30`).
+    pub normal: Vec3,
+    /// `sub_1404450B0`: the plane of the collision surface the contact belongs to, oriented
+    /// toward the capsule.
+    pub surface: Vec3,
 }
 
-/// The downward probe that keeps a body walking downhill in contact with the hill, wu.
+/// What the capsule is standing on: the engine's ground plane, or `None` when it is not
+/// standing (`sub_1406C2A50`, line for line).
 ///
-/// The requirement is exact: a body running at the fastest authored speed down the steepest
-/// walkable slope descends `run_forward * tan(max_slope)` wu per second, so in one engine tick
-/// it descends that over [`TICK_HZ`]. The probe has to reach at least that far or a legal
-/// descent leaves the ground; it must not reach much further or the body clings to a ledge it
-/// has walked off. No free parameter.
-pub fn ground_probe_depth(p: &PlayerPhysics) -> f32 {
-    (p.run_forward * p.max_slope.tan() / TICK_HZ).max(1e-4)
+/// 1. **Eligible contacts**: `normal.z > -1e-4` (nothing facing down) and
+///    `dot(normal, vel) < 0.468` ([`LEAVING_SPEED`]). The five FLATTEST are kept, sorted by z
+///    descending, a tie going behind the contact it ties with.
+/// 2. **The plane** is the normalised sum of whichever SUBSET of those maximises the sum's z —
+///    every non-empty subset is tried (31 of them for five), the best strictly-greater z wins.
+///    There is no order to be wrong about: two walls of a valley, each tilted 20 degrees, sum to
+///    a perfectly level plane that neither is alone.
+/// 3. **The bar**: `min_normal_k` (`cos(authored maximum slope)`), raised to `surface.z + 0.001`
+///    by every contact — eligible or not — whose SURFACE is steeper than the global 35 degrees.
+///    The plane's z must exceed it. That is how a 50-degree authored limit still cannot stand on
+///    a 40-degree face: the face's own normal is both the contact normal and the surface, and it
+///    is below the bar it sets.
+pub fn ground_plane(contacts: &[Contact], vel: Vec3, min_normal_k: f32) -> Option<Vec3> {
+    let global = surface_slope_cos();
+    let mut bar = min_normal_k;
+    for c in contacts {
+        if c.surface.z < global {
+            bar = bar.max(c.surface.z + 0.001);
+        }
+    }
+    let mut kept = [Vec3::ZERO; GROUND_CANDIDATES];
+    let mut n = 0usize;
+    for c in contacts {
+        let nz = c.normal.z;
+        if !(nz > -1e-4 && LEAVING_SPEED > c.normal.dot(vel)) {
+            continue;
+        }
+        // Insert behind every kept contact at least as flat, drop whatever falls off the end.
+        let mut at = 0;
+        while at < n && nz <= kept[at].z {
+            at += 1;
+        }
+        if at >= GROUND_CANDIDATES {
+            continue;
+        }
+        let last = n.min(GROUND_CANDIDATES - 1);
+        for i in (at..last).rev() {
+            kept[i + 1] = kept[i];
+        }
+        kept[at] = c.normal;
+        n = (n + 1).min(GROUND_CANDIDATES);
+    }
+    if n == 0 {
+        return None;
+    }
+    // `sub_1406C3140`: the engine seeds the answer with straight DOWN, so an all-cancelling
+    // subset can never win.
+    let mut best = Vec3::NEG_Z;
+    for mask in 1u32..(1u32 << n) {
+        let mut sum = Vec3::ZERO;
+        for (i, k) in kept.iter().enumerate().take(n) {
+            if mask & (1 << i) != 0 {
+                sum += *k;
+            }
+        }
+        let len = sum.length();
+        if len.abs() >= 1e-4 {
+            let unit = sum / len;
+            if unit.z > best.z {
+                best = unit;
+            }
+        }
+    }
+    (best.z > bar).then_some(best)
+}
+
+/// The velocity pushed INTO the ground plane every tick, wu/s (`sub_1406C4A20`): grows with how
+/// fast the body is already moving, between two literals, and is scaled by the biped's authored
+/// `scale ground adhesion velocity` when that is positive.
+pub fn adhesion_speed(vel: Vec3, p: &PlayerPhysics) -> f32 {
+    let a = (vel.length() / ADHESION_REF_SPEED * ADHESION_MAX).clamp(ADHESION_MIN, ADHESION_MAX);
+    let a = if p.ground_adhesion_scale > 0.0 { a * p.ground_adhesion_scale } else { a };
+    // The three literals are tuned for a 30 Hz tick and the engine divides the result by
+    // `tick_rate / 30` (`sub_1400BD360`; the same `1 / (int)(tick_rate/30)` is in the shipped
+    // game's `sub_1801FABE4`): 0.06 .. 0.117 wu/s at the real 60 Hz.
+    a * (30.0 / TICK_HZ)
+}
+
+/// Move `vel` toward `target` by at most `max_delta` — `sub_1406C33B0` with the melee-lunge
+/// braking boost left out (that bit is only ever set by the melee code). Returns the new delta
+/// and whether the clamp was SATURATED, which the ground branch needs for gravity.
+fn clamp_delta(err: Vec3, max_delta: f32) -> (Vec3, bool) {
+    let len = err.length();
+    if len <= max_delta {
+        (err, false)
+    } else {
+        (err / len * max_delta, true)
+    }
+}
+
+/// **The engine's velocity update**, one tick: `vel` is the body's velocity after last tick's
+/// contacts, `plane` the ground plane if [`ground_plane`] found one, `cmd` the commanded WORLD
+/// velocity (the stick through [`PlayerPhysics::commanded_velocity`], times any sprint boost),
+/// `crouch` the crouch fraction. Returns the new velocity. `dt` makes the engine's per-tick
+/// quantities per-second: the acceleration clamp is `accel * dt`, gravity is `g * dt`; the
+/// adhesion is a velocity and is not scaled.
+///
+/// **Grounded** (`sub_1406C4A20`, the `bit2 == 0` branch):
+/// 1. the commanded direction gets the slope-following z that lies in the plane,
+///    `z = -(x*nx + y*ny) / nz`, and is renormalised — a body walking up a ramp aims UP the ramp;
+/// 2. its speed is `|cmd|` times [`PlayerPhysics::slope_speed_scale`] of that direction's z;
+/// 3. the 3-D error to that target velocity is clamped to `accel * dt` (`accel` is the run
+///    acceleration blended toward the sneak one by the crouch fraction);
+/// 4. [`adhesion_speed`] is subtracted along the plane normal;
+/// 5. gravity is subtracted LAST, and only if step 3 saturated.
+///
+/// **Airborne** (`bit2` branch): the horizontal error to the commanded velocity is clamped to the
+/// authored `airborne acceleration * dt`; vertical velocity is Havok's, i.e. plain gravity.
+pub fn control_velocity(vel: Vec3, plane: Option<Vec3>, cmd: Vec3, p: &PlayerPhysics, crouch: f32, dt: f32) -> Vec3 {
+    match plane {
+        Some(n) if n.z > 1e-3 => {
+            let mag = cmd.length();
+            let mut dir = Vec3::new(cmd.x, cmd.y, -(cmd.x * n.x + cmd.y * n.y) / n.z);
+            let l = dir.length();
+            dir = if l > 0.0 { dir / l } else { Vec3::ZERO };
+            let target = dir * (mag * p.slope_speed_scale(dir.z));
+            let (mut delta, saturated) = clamp_delta(target - vel, p.ground_acceleration(crouch) * dt);
+            delta -= n * adhesion_speed(vel, p);
+            if saturated {
+                delta.z -= p.gravity() * dt;
+            }
+            vel + delta
+        }
+        _ => {
+            let err = Vec3::new(cmd.x - vel.x, cmd.y - vel.y, 0.0);
+            let (delta, _) = clamp_delta(err, p.air_acceleration() * dt);
+            Vec3::new(vel.x + delta.x, vel.y + delta.y, vel.z - p.gravity() * dt)
+        }
+    }
+}
+
+/// The ground law of this biped in one line, for the caption and the dump verb.
+pub fn law_summary(p: &PlayerPhysics) -> String {
+    format!(
+        "ground plane needs normal z > {:.4} (authored {:.1} deg, tested on the CONTACT normal) and any touched \
+         surface steeper than {:.1} deg (global) raises the bar above itself | the ledge a contact normal lets \
+         through is radius x (1 - cos slope) = {:.4} wu (emergent, no authored step height) | adhesion \
+         {:.3}..{:.3} wu/s into the plane, ground eligibility needs normal.vel < {LEAVING_SPEED} | \
+         contact tolerance {CONTACT_TOLERANCE} wu",
+        p.min_normal_k(),
+        p.max_slope.to_degrees(),
+        surface_slope_cos().acos().to_degrees(),
+        p.radius * (1.0 - p.min_normal_k()),
+        ADHESION_MIN * 30.0 / TICK_HZ,
+        ADHESION_MAX * 30.0 / TICK_HZ,
+    )
 }
 
 impl PlayerState {
     /// Stand a body at `feet`, facing `yaw`, at rest.
     pub fn standing_at(feet: Vec3, yaw: f32) -> PlayerState {
         // The body starts facing where it is looking; they only diverge once the mouse moves.
-        PlayerState { pos: feet, yaw, facing: yaw, ..Default::default() }
+        PlayerState { pos: feet, yaw, facing: yaw, last_free: feet, ..Default::default() }
     }
 
     /// How far the body's facing lags the aim, radians — **the quantity the aim overlay takes
@@ -285,6 +456,7 @@ impl PlayerState {
         // getting out cannot land in an airborne clip or a run cycle mid-stride.
         self.grounded = false;
         self.ground_normal = Vec3::Z;
+        self.n_contacts = 0;
         self.ground_speed = 0.0;
         self.air_time = 0.0;
         self.land_time = 0.0;
@@ -423,70 +595,43 @@ impl PlayerState {
         let (sy, cy) = self.yaw.sin_cos();
         let fwd = Vec3::new(cy, sy, 0.0);
         let right = Vec3::new(sy, -cy, 0.0);
-        let stick = Vec3::new(input.fwd, input.right, 0.0);
-        let stick_len = stick.length();
-        let wish_dir = if stick_len > 1e-4 { (fwd * input.fwd + right * input.right) / stick_len } else { Vec3::ZERO };
         // SPRINT is the globals' own `full speed multiplier`, not a number of this module's.
         // Claimed only for a straight-ahead run, because Reach cannot strafe or shoot sprinting.
         let sprinting = input.sprint && self.grounded && !self.crouched && !input.walk && input.fwd > 0.5 && input.right.abs() < 0.5;
-        // ...and it RAMPS IN over the authored `seconds to full speed` rather than snapping: the
-        // globals author both the multiplier and how long it takes to reach it.
+        // ...and it is EARNED over the authored `seconds to start` / `seconds to full speed`
+        // (`PlayerPhysics::sprint_fraction`) rather than snapping: the globals author the
+        // multiplier, the delay before it begins and how long it takes to arrive.
         self.sprint_time = if sprinting { self.sprint_time + dt } else { 0.0 };
-        let base_cap = p.top_speed(input.fwd, input.right, self.crouched, input.walk);
-        let full_cap = p.top_speed_with(input.fwd, input.right, self.crouched, input.walk, sprinting);
-        let ramp = if p.sprint_seconds_to_full > 1e-3 {
-            (self.sprint_time / p.sprint_seconds_to_full).clamp(0.0, 1.0)
+        let boost = if sprinting {
+            1.0 + (p.sprint_full_speed_multiplier.max(1.0) - 1.0) * p.sprint_fraction(self.sprint_time)
         } else {
             1.0
         };
-        let cap = (base_cap + (full_cap - base_cap) * ramp) * stick_len.min(1.0);
+        // The commanded velocity is built in the BODY's frame (forward cap, sideways cap, each
+        // blended toward its sneak twin by the crouch fraction) and turned into the world by the
+        // look yaw -- `sub_1404E97C0` then the rotation at the top of `sub_1406C4A20`.
+        let (cf, cr) = p.commanded_velocity(input.fwd, input.right, self.crouch_t, input.walk);
+        let cmd = (fwd * cf + right * cr) * boost;
 
-        // --- jump --------------------------------------------------------------------------
+        // --- jump ----------------------------------------------------------------------------
+        // `sub_140E45230`: the UP component of the velocity is raised to the authored jump
+        // velocity (`vel += up * (jump - dot(up, vel))` when that is positive). It is a velocity
+        // SET, not an impulse on top of whatever the body was doing, and horizontal velocity is
+        // left alone. The body is airborne from this tick: the floor it leaves is no longer
+        // eligible ground the moment it moves away from it faster than 0.468 wu/s.
+        let mut plane = self.grounded.then_some(self.ground_normal);
         if input.jump && self.grounded {
-            self.vel.z = p.jump_velocity;
+            if p.jump_velocity > self.vel.z {
+                self.vel.z = p.jump_velocity;
+            }
             self.grounded = false;
+            plane = None;
             self.air_time = 0.0;
             out.jumped = true;
         }
 
-        // --- accelerate ---------------------------------------------------------------------
-        let accel = if self.grounded { p.acceleration(self.crouched) } else { p.air_acceleration() };
-        let mut horiz = Vec3::new(self.vel.x, self.vel.y, 0.0);
-        let target_v = wish_dir * cap;
-        if self.grounded {
-            // On the ground the authored acceleration both speeds up and stops: a Spartan does
-            // not coast. The same rate pulls the velocity toward the target, which is zero when
-            // the stick is centred.
-            horiz = approach(horiz, target_v, accel * dt);
-        } else if stick_len > 1e-4 {
-            // Air control: the same pull toward the wish velocity but at the globals' own
-            // `airborne acceleration`, and it may never push the body past its ground cap — so a
-            // jump cannot be used to accelerate.
-            let before = horiz.length();
-            horiz = approach(horiz, target_v, accel * dt);
-            let after = horiz.length();
-            if after > before.max(cap) && after > 1e-6 {
-                horiz *= before.max(cap) / after;
-            }
-        }
-        self.vel.x = horiz.x;
-        self.vel.y = horiz.y;
-
-        // --- gravity, and the slope the body is standing on ---------------------------------
-        if self.grounded {
-            // Project the intended motion onto the ground plane, so running down a slope
-            // converts into motion ALONG the slope rather than a sequence of little falls. This
-            // is what makes a hill feel like a hill and not a staircase.
-            let n = self.ground_normal;
-            if n.z > 1e-3 {
-                let h = Vec3::new(self.vel.x, self.vel.y, 0.0);
-                self.vel.z = -(h.x * n.x + h.y * n.y) / n.z;
-            } else {
-                self.vel.z = 0.0;
-            }
-        } else {
-            self.vel.z -= p.gravity() * dt;
-        }
+        // --- the engine's velocity update ----------------------------------------------------
+        self.vel = control_velocity(self.vel, plane, cmd, p, self.crouch_t, dt);
 
         // --- integrate, sub-stepped, depenetrating as we go ---------------------------------
         // SUB-STEP UNTIL THE WHOLE DISPLACEMENT IS CONSUMED, never by more than half the
@@ -507,73 +652,40 @@ impl PlayerState {
         // The caller additionally splits a frame whose travel would outrun the gathered
         // collision neighbourhood, so this should never trip (see `PlayMode::tick`).
         const SUBSTEP_RUNAWAY_GUARD: usize = 256;
-        let step_cap = (p.radius * 0.5).max(1e-3);
+        let r = p.radius.max(1e-4);
+        let height = self.height(p);
+        let step_cap = (r * 0.5).max(1e-3);
         let travel = self.vel.length() * dt;
         let want = ((travel / step_cap).ceil() as usize).max(1);
         out.substep_guard_tripped = want > SUBSTEP_RUNAWAY_GUARD;
         let n_sub = want.min(SUBSTEP_RUNAWAY_GUARD);
         out.substeps = n_sub;
         let h = dt / n_sub as f32;
-        let mut grounded_any = false;
-        let mut normal_best = Vec3::Z;
-        let mut best_z = -2.0f32;
+        // The triangles are gathered ONCE for the whole step: the box covers where the body can
+        // be at any sub-step (its travel) plus everything a depenetration or the contact
+        // tolerance can reach.
+        let pad = Vec3::splat(2.0 * r + CONTACT_TOLERANCE + 0.05 + travel);
+        // A body that is INSIDE a closed shell (placed there, or a block dropped on it) has no
+        // face to push it out the right way; get it out first, the nearest way.
+        out.escaped = self.escape_shells(r, height, world);
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        world.gather(self.pos - pad, self.pos + Vec3::Z * height + pad, &mut tris);
+        out.tris = tris.len();
         for _ in 0..n_sub {
             self.pos += self.vel * h;
-            let r = self.resolve(p, world);
-            out.contacts += r.contacts;
-            out.steep_contacts += r.steep;
-            out.tris += r.tris;
-            if r.grounded && r.normal.z > best_z {
-                grounded_any = true;
-                best_z = r.normal.z;
-                normal_best = r.normal;
-            }
+            out.contacts += self.resolve(r, height, &tris);
         }
 
-        // --- ground state, with the derived probe for hysteresis ----------------------------
-        self.grounded = grounded_any;
-        self.ground_normal = if grounded_any { normal_best } else { Vec3::Z };
-        // IS THIS BODY LEAVING THE GROUND? The answer is about CAUSE, and that is the whole of
-        // the incline fix.
-        //
-        // A body leaves the ground if it JUMPED on this step, or if it was already off the ground
-        // coming into it. Nothing else does: rising because the floor under you slopes upward is
-        // not an ascent, it is the shape of the floor.
-        //
-        // **This used to compare the vertical SPEED against a tenth of the authored jump
-        // velocity, and that was the user's "it jitters and freaks out when I'm walking up any
-        // incline".** A body walking up a slope has an in-plane vertical velocity of
-        // `speed * tan(angle)` — entirely legitimate — so the old test fired whenever
-        //
-        //     speed * tan(angle) > jump_velocity * 0.1
-        //
-        // which for a Spartan running at the authored 2.200 wu/s with a 2.300 wu/s jump is
-        // **any incline past 5.97 degrees** (an Elite: 5.82). Past that angle the probe was
-        // skipped, the body was called airborne, gravity pulled it off the slope, the next
-        // frame's depenetration put it back, and it did that sixty times a second. It also
-        // flickered the ANIMATION between the run cycle and the jump arc, because the body state
-        // reads `grounded`.
-        //
-        // Two earlier versions of this test were both wrong in the same way — they asked "how
-        // fast is it going up?" when the question is "why is it going up?". `vel.z <= 0.0` failed
-        // on the solver's own push-out residue; the speed threshold failed on every real hill.
-        //
-        // THE PATTERN, because this is the third distinct fault in these few lines and they are
-        // all the same shape: each one was **a quantity that is only correct on FLAT GROUND, used
-        // on a slope** — `vel.z <= 0.0`, then a speed threshold, then (in `probe_ground`) a
-        // tangent point taken from the wrong place on the surface. Flat ground is the degenerate
-        // case where all three happen to be right, which is exactly why sixty-one passing gates
-        // never saw any of them. Anything added here that reasons about "the ground" should be
-        // checked on a slope before it is believed.
-        let leaving = out.jumped || !was_grounded;
-        if !self.grounded && !leaving {
-            // Not touching, but is there walkable ground within the distance a legal descent
-            // could have covered this tick? If so the body is still on the hill.
-            if let Some((z, n)) = self.probe_ground(p, world, ground_probe_depth(p)) {
-                self.pos.z = z;
-                self.grounded = true;
-                self.ground_normal = n;
-            }
+        // --- what the capsule is standing on now: the NEXT tick's input ---------------------
+        self.collect_contacts(r, height, &tris);
+        self.check_squeeze(r, height, p, world, &tris, out.escaped, dt, &mut out);
+        let plane = ground_plane(self.contacts(), self.vel, p.min_normal_k());
+        self.grounded = plane.is_some();
+        self.ground_normal = plane.unwrap_or(Vec3::Z);
+        // The slope limit "biting": contacts a body could lean on (nothing facing down) that did
+        // not make it ground.
+        if !self.grounded {
+            out.steep_contacts = self.contacts().iter().filter(|c| c.normal.z > -1e-4).count();
         }
         if self.grounded {
             if !was_grounded {
@@ -583,16 +695,6 @@ impl PlayerState {
                 self.land_time += dt;
             }
             self.air_time = 0.0;
-            // Only a LANDING kills the fall. A body that was already walking keeps whatever
-            // vertical velocity its own ground plane gives it — on a descent that is NEGATIVE and
-            // correct, and zeroing it every grounded frame made the body walk off the slope
-            // horizontally and drop back onto it, over and over, which is the same jitter from
-            // the other direction. Nothing accumulates: the ground-plane projection at the top of
-            // the next step is the only writer of `vel.z` while grounded, so it recomputes this
-            // from the horizontal velocity regardless.
-            if out.landed && self.vel.z < 0.0 {
-                self.vel.z = 0.0;
-            }
         } else {
             self.air_time += dt;
             self.land_time = 0.0;
@@ -605,212 +707,296 @@ impl PlayerState {
         out
     }
 
-    /// Push the capsule out of anything it is inside, cancel the velocity into each contact, and
-    /// report what it touched.
+    /// The points of the capsule's axis the inside test looks at: the sphere centres and enough
+    /// between them (never more than 4 cm apart) that no plate thinner than the gaps can pass
+    /// between two of them unseen.
+    fn axis_samples(feet: Vec3, height: f32, r: f32) -> Vec<Vec3> {
+        let lo = feet.z + r;
+        let hi = (feet.z + height - r).max(lo);
+        let n = (((hi - lo) / 0.04).ceil() as usize).max(2);
+        (0..=n).map(|i| Vec3::new(feet.x, feet.y, lo + (hi - lo) * i as f32 / n as f32)).collect()
+    }
+
+    /// **INSIDE A CLOSED SHELL.** The triangle contacts below all push a sphere toward the side of
+    /// a face it is on; a body whose axis is inside a block has a face on every side, so they
+    /// hold it where it is, and one that is past the middle of a thin wall pushes it on out the
+    /// FAR side. Havok pushes a penetrating character out along the penetration depth, i.e. the
+    /// NEAREST way out of the volume, and this does the same for every closed shell (`Shell`: the
+    /// Forge block hulls): it finds the SHORTEST straight translation (along an axis or a face
+    /// normal of the shells it is in) after which no point of the capsule's axis is inside any
+    /// shell -- the whole body, not the one sphere that happens to be nearest a face, since a
+    /// capsule impaled on a plate cannot leave by moving along its own length -- and moves
+    /// there; the contact solver then pushes the radius clear. The velocity going further in is
+    /// removed. Butted blocks can put the exit inside the next one, so the search repeats.
+    /// Returns the number of moves.
     ///
-    /// The slope limit lives here, and it is the whole of "a steep ramp is not climbable": a
-    /// contact whose normal is within the authored `maximum slope angle` of straight up is
-    /// walkable and is pushed out along its full normal (which is also what carries the body up
-    /// a low ledge); anything steeper is pushed out HORIZONTALLY, so it blocks without lifting.
-    fn resolve(&mut self, p: &PlayerPhysics, world: &dyn StaticWorld) -> Resolved {
-        let mut res = Resolved::default();
+    /// The ENGINE'S cap on how much is undone per tick (and its stuck fallback) is not decoded;
+    /// the whole distance is resolved at once.
+    fn escape_shells(&mut self, r: f32, height: f32, world: &dyn StaticWorld) -> usize {
+        const SCAN: f32 = 0.02;
+        const REACH: f32 = 3.0;
+        let mut shells: Vec<std::sync::Arc<Shell>> = Vec::new();
+        let pad = Vec3::splat(r + 0.05 + REACH);
+        world.solid_shells(self.pos - pad, self.pos + Vec3::Z * height + pad, &mut shells);
+        if shells.is_empty() {
+            return 0;
+        }
+        let inside = |pts: &[Vec3], at: Vec3| pts.iter().any(|p| shells.iter().any(|s| s.contains(*p + at)));
+        let mut moves = 0;
+        for _ in 0..6 {
+            let pts = Self::axis_samples(self.pos, height, r);
+            let here: Vec<&std::sync::Arc<Shell>> = shells.iter().filter(|s| pts.iter().any(|p| s.contains(*p))).collect();
+            if here.is_empty() {
+                break;
+            }
+            let mut dirs: Vec<Vec3> = vec![Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+            for s in &here {
+                for t in &s.tris {
+                    let n = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
+                    for d in [n, -n] {
+                        if d != Vec3::ZERO && dirs.len() < 40 && !dirs.iter().any(|k| k.dot(d) > 0.999) {
+                            dirs.push(d);
+                        }
+                    }
+                }
+            }
+            let mut best: Option<(f32, Vec3)> = None;
+            for d in dirs {
+                let limit = best.map_or(REACH, |(b, _)| b);
+                let mut t = SCAN;
+                while t <= limit {
+                    if !inside(&pts, d * t) {
+                        // the exit is somewhere in (t - SCAN, t]: bisect for the shortest free one
+                        let (mut lo, mut hi) = (t - SCAN, t);
+                        for _ in 0..8 {
+                            let m = 0.5 * (lo + hi);
+                            if inside(&pts, d * m) { lo = m } else { hi = m }
+                        }
+                        if best.map_or(true, |(b, _)| hi < b) {
+                            best = Some((hi, d));
+                        }
+                        break;
+                    }
+                    t += SCAN;
+                }
+            }
+            // No way out within reach: straight up, as far as it takes.
+            let (t, d) = best.unwrap_or_else(|| {
+                let mut t = REACH;
+                while inside(&pts, Vec3::Z * t) && t < 200.0 {
+                    t += 0.25;
+                }
+                (t, Vec3::Z)
+            });
+            // ...and a radius further: left at the surface itself a sphere centre is a hair
+            // outside, and which side of the face it is on is then rounding -- the solver could
+            // push it straight back in.
+            self.pos += d * (t + r + 1e-3);
+            let vn = self.vel.dot(d);
+            if vn < 0.0 {
+                self.vel -= d * vn;
+            }
+            moves += 1;
+        }
+        moves
+    }
+
+    /// **THE STUCK FALLBACK -- conservative by construction.** It fires only for a body that is
+    /// TRULY inside solid geometry and going nowhere: the contact solver leaves a penetration
+    /// deeper than [`SQUEEZE_DEPTH`] of the radius (or the shell escape has to act) on every tick
+    /// for [`SQUEEZE_SECONDS`], AND the body has moved less than [`SQUEEZE_PROGRESS`] wu over that
+    /// time. Pressing against a wall, a lip, a ledge or a seam is not that: the solver leaves such a
+    /// body touching (depth ~0), and a body that is making progress, however slowly, resets the
+    /// clock. Then it is moved to the nearest free spot at about its own height, else back to the
+    /// last position known to be free, else the nearest free spot at any height, with its velocity
+    /// cleared -- the engine's `teleport to a safe position` for a stuck unit. (The engine's
+    /// own trigger and search are not decoded; this is the behaviour, not its constants.)
+    #[allow(clippy::too_many_arguments)]
+    fn check_squeeze(&mut self, r: f32, height: f32, p: &PlayerPhysics, world: &dyn StaticWorld, tris: &[[Vec3; 3]], escaped: usize, dt: f32, out: &mut StepOut) {
+        let residual = Self::spheres_at(self.pos, height, r)
+            .iter()
+            .flat_map(|c| tris.iter().filter_map(move |t| sphere_tri_contact(*c, r, 0.0, t)).map(|h| h.depth))
+            .fold(0.0f32, f32::max);
+        out.residual = residual;
+        // (an escape that has to act tick after tick is a loop: the solver puts the body straight
+        // back where the escape took it from)
+        if residual > SQUEEZE_DEPTH * r || escaped >= 1 {
+            if self.squeeze_time == 0.0 {
+                self.squeeze_from = self.pos;
+            }
+            self.squeeze_time += dt;
+            if self.squeeze_time > SQUEEZE_SECONDS {
+                let moved = Vec3::new(self.pos.x - self.squeeze_from.x, self.pos.y - self.squeeze_from.y, 0.0).length();
+                self.squeeze_time = 0.0;
+                if moved < SQUEEZE_PROGRESS {
+                    self.pos = self
+                        .find_free(p, world, 3.0, &[0.0, 0.3, -0.3])
+                        .or_else(|| (self.last_free.distance(self.pos) < 20.0).then_some(self.last_free))
+                        .or_else(|| self.find_free(p, world, 6.0, &[0.8, 2.0, 4.0]))
+                        .unwrap_or(self.last_free);
+                    self.vel = Vec3::ZERO;
+                    self.grounded = false;
+                    out.relocated = true;
+                }
+            }
+        } else {
+            self.squeeze_time = 0.0;
+            if residual < 0.02 {
+                self.last_free = self.pos;
+            }
+        }
+    }
+
+    /// The nearest position to the body (rings out to `reach` wu, at the given height offsets)
+    /// where a standing capsule overlaps nothing.
+    pub fn find_free(&self, p: &PlayerPhysics, world: &dyn StaticWorld, reach: f32, dzs: &[f32]) -> Option<Vec3> {
+        let r = p.radius.max(1e-4);
+        let height = p.height_standing;
+        let pad = reach + 2.0 * r;
+        let top = dzs.iter().copied().fold(0.0f32, f32::max);
+        let low = dzs.iter().copied().fold(0.0f32, f32::min);
+        let (mn, mx) = (self.pos - Vec3::new(pad, pad, pad - low), self.pos + Vec3::new(pad, pad, height + top + pad));
+        let mut shells: Vec<std::sync::Arc<Shell>> = Vec::new();
+        world.solid_shells(mn, mx, &mut shells);
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        world.gather(mn, mx, &mut tris);
+        let free = |feet: Vec3| !Self::overlaps_with(feet, r, height, &shells, &tris, 0.02);
+        if dzs.contains(&0.0) && free(self.pos) {
+            return Some(self.pos);
+        }
+        let rings = (reach / 0.2).ceil() as usize;
+        for ring in 1..=rings {
+            let rad = ring as f32 * 0.2;
+            for k in 0..(8 + 2 * ring) {
+                let a = k as f32 / (8 + 2 * ring) as f32 * std::f32::consts::TAU;
+                for &dz in dzs {
+                    let feet = self.pos + Vec3::new(a.cos() * rad, a.sin() * rad, dz);
+                    if free(feet) {
+                        return Some(feet);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn overlaps_with(feet: Vec3, r: f32, height: f32, shells: &[std::sync::Arc<Shell>], tris: &[[Vec3; 3]], slack: f32) -> bool {
+        Self::axis_samples(feet, height, r).iter().any(|c| shells.iter().any(|s| s.contains(*c)))
+            || Self::spheres_at(feet, height, r).iter().any(|c| tris.iter().any(|t| sphere_tri_contact(*c, r, 0.0, t).is_some_and(|h| h.depth > slack)))
+    }
+
+    /// Put an already-placed body (a spawn, a respawn, a teleport, an exit from a vehicle) where
+    /// it does not overlap anything: out of every closed shell, then out of every surface, and if
+    /// that still leaves it wedged, to the nearest free spot. The same resolution the next
+    /// `step` would do, available to the placing code so the result is known before it is used.
+    /// Returns how far it moved the body.
+    pub fn settle_out(&mut self, p: &PlayerPhysics, world: &dyn StaticWorld) -> f32 {
+        let from = self.pos;
         let r = p.radius.max(1e-4);
         let height = self.height(p);
-        let min_normal_z = p.max_slope.cos();
-        let max_step = max_step_height(p);
+        self.escape_shells(r, height, world);
         let mut tris: Vec<[Vec3; 3]> = Vec::new();
-        let pad = Vec3::splat(r + 0.05);
-        let lo = Vec3::new(self.pos.x, self.pos.y, self.pos.z) - pad;
-        let hi = Vec3::new(self.pos.x, self.pos.y, self.pos.z + height) + pad;
-        world.gather(lo, hi, &mut tris);
-        res.tris = tris.len();
-        if tris.is_empty() {
-            return res;
-        }
-        // THE PASSES, and why the last ones are different.
-        //
-        // The ordinary passes answer "what is this body touching and what may it stand on". The
-        // ESCAPE passes answer a question that only arises when those have failed: the body is
-        // inside a surface, and the rules above have decided it is not something it could climb
-        // onto, so there is no push and no ground and it stays there for ever. They run LAST and
-        // only while nothing has been found to stand on — see `escaping` below for why that
-        // condition, and not the geometry, is what separates the two cases.
-        let mut pass = 0usize;
-        while pass < SOLVER_PASSES + ESCAPE_PASSES {
-            let escape = pass >= SOLVER_PASSES;
-            if escape && res.grounded {
-                break;
+        let pad = Vec3::splat(2.0 * r + CONTACT_TOLERANCE + 0.05);
+        world.gather(self.pos - pad, self.pos + Vec3::Z * height + pad, &mut tris);
+        self.resolve(r, height, &tris);
+        if Self::overlaps_at(self.pos, p, world, 0.05) {
+            if let Some(f) = self.find_free(p, world, 3.0, &[0.0, 0.3, -0.3]).or_else(|| self.find_free(p, world, 6.0, &[0.8, 2.0, 4.0])) {
+                self.pos = f;
             }
-            let mut push = Depenetration::default();
+        }
+        self.last_free = self.pos;
+        self.squeeze_time = 0.0;
+        self.pos.distance(from)
+    }
+
+    /// Would a standing capsule with its feet at `feet` overlap solid geometry? Inside a closed
+    /// shell, or into any surface by more than `slack` (resting on a floor is depth 0).
+    pub fn overlaps_at(feet: Vec3, p: &PlayerPhysics, world: &dyn StaticWorld, slack: f32) -> bool {
+        let r = p.radius.max(1e-4);
+        let height = p.height_standing;
+        let pad = Vec3::splat(2.0 * r + 0.05);
+        let (mn, mx) = (feet - pad, feet + Vec3::Z * height + pad);
+        let mut shells: Vec<std::sync::Arc<Shell>> = Vec::new();
+        world.solid_shells(mn, mx, &mut shells);
+        let mut tris: Vec<[Vec3; 3]> = Vec::new();
+        world.gather(mn, mx, &mut tris);
+        Self::overlaps_with(feet, r, height, &shells, &tris, slack)
+    }
+
+    /// The contacts the capsule had at the end of the last step — what the next tick's ground
+    /// plane is decided from.
+    pub fn contacts(&self) -> &[Contact] {
+        &self.contacts[..self.n_contacts]
+    }
+
+    /// Push the capsule out of everything it is inside and remove the velocity going INTO each
+    /// contact; returns how many contacts it found at the worst pass.
+    ///
+    /// This is the half of the engine's controller that belongs to Havok (depenetration and the
+    /// contact solver), and it is deliberately the plain one. **Every contact is pushed out along
+    /// its own normal and clipped along its own normal** — there is no classification by height,
+    /// no flattening of "steep" contacts and no step rule. What lets a body climb a low ledge
+    /// and what stops it at a steep face is the CONTROLLER above ([`ground_plane`]'s bar and the
+    /// air mode), exactly as in the engine; this function only keeps the capsule out of the
+    /// geometry.
+    ///
+    /// **Contacts are resolved ONE AT A TIME, each against the position the previous one left.**
+    /// The previous controller summed the push of every penetrating contact, merging only those
+    /// with the same direction: a body LANDING on a floor's diagonal, where the nearest point of
+    /// both triangles is the same edge point, was pushed out of it twice and came to rest 0.0793
+    /// wu in the air (its own measurement). Sequential projection cannot double-count: once the
+    /// first contact has pushed the body out, the second finds nothing left to resolve.
+    fn resolve(&mut self, r: f32, height: f32, tris: &[[Vec3; 3]]) -> usize {
+        let mut worst = 0usize;
+        for _ in 0..SOLVER_PASSES {
             let mut hits = 0usize;
-            let centres = Self::spheres_at(self.pos, height, r);
-            for (i, c) in centres.iter().enumerate() {
-                for t in &tris {
-                    let Some((n, depth, interior)) = sphere_tri_normal(*c, r, t) else { continue };
-                    hits += 1;
-                    // WHERE on the capsule the contact is, measured from the feet. This, not the
-                    // normal, is what classifies it — see the comment below.
-                    let (q, _) = closest_point_on_triangle(*c, t[0], t[1], t[2]);
-                    let contact_rise = q.z - self.pos.z;
-                    // THE SLOPE LIMIT, and with it the step-up. ONE rule, and it is a rule about
-                    // WHERE THE CONTACT IS rather than about the direction of the normal:
-                    //
-                    //   a contact on the bottom sphere is something this biped can stand on
-                    //   exactly while it is no higher above the feet than `max_step_height`.
-                    //
-                    // That is not a second law bolted beside the slope limit, it IS the slope
-                    // limit. A capsule resting on a plane of slope `theta` touches it at
-                    // `radius * (1 - cos theta)` above the feet, so "no higher than
-                    // `radius * (1 - cos(max_slope))`" is precisely "no steeper than
-                    // `max_slope`" for a plane — and it extends to a ledge EDGE, which has no
-                    // slope of its own, in the only way consistent with it.
-                    //
-                    // **Why not the normal.** Classifying by `n.z` is correct only at first
-                    // contact: once the body has penetrated, `n.z = (radius - rise) / d` with
-                    // `d < radius`, so the same ledge reads as a floor or a wall depending on how
-                    // deep the body happens to be — which depends on where the frames landed.
-                    // MEASURED: with the normal rule, ledges between 0.06 and 0.155 wu were
-                    // climbed or refused according to the approach, i.e. the same curb was
-                    // sometimes steppable and sometimes not. The height rule has no such freedom:
-                    // `q.z` is where the surface is.
-                    //
-                    // The three cases:
-                    //   * low enough on the bottom sphere -> FLOOR: pushed out along its full
-                    //     normal, which is also what lifts the body over a low ledge;
-                    //   * a normal that points DOWN or dead sideways -> a ceiling or a wall:
-                    //     pushed out along its full normal too, which cannot lift anything;
-                    //   * anything else -> FLATTENED: pushed out horizontally only, so a ramp
-                    //     past this biped's limit, and a ledge too tall to step onto, block
-                    //     without ever carrying the body upward.
-                    // A FACE contact is classified by its NORMAL; an EDGE or VERTEX contact by
-                    // the HEIGHT of the contact above the feet. That split is the whole of it,
-                    // and getting it wrong cost a body stuck inside the floor:
-                    //
-                    // The height rule exists to make the step-up deterministic, and an edge has no
-                    // normal of its own worth trusting (it depends on penetration depth). But
-                    // applied to a FACE it says something false. A body that lands hard penetrates
-                    // the floor by more than `max_step` — 0.0513 wu for this capsule — and the
-                    // height rule then reads the floor underneath it as "a ledge too tall to step
-                    // onto", flattens the push-out to horizontal, which for a normal of (0,0,1) is
-                    // ZERO, and never marks it grounded. **The body sits inside the floor for
-                    // ever, neither pushed out nor standing on it.** Measured: dropped 100 wu, it
-                    // came to rest at z = -0.08 and never grounded.
-                    //
-                    // A face's normal is exact, so for a face the question "can I stand on this"
-                    // is exactly "is the normal within the slope limit", which is also the
-                    // original rule and the one the slope gate was written against.
-                    // A DEEP PENETRATION IS AN ESCAPE, NOT A STEP-UP, and this is the case that
-                    // left a body stuck 8 cm inside a floor for 400 frames.
-                    //
-                    // The height rule asks "could I climb onto this?", which is the wrong question
-                    // when the body is already INSIDE the surface: `contact_rise` is measured from
-                    // the feet, and a penetration pushes the feet DOWN, so the rise inflates and
-                    // the floor underneath reads as a ledge too tall to climb. The push is then
-                    // flattened to horizontal — zero, for a normal of (0,0,1) — so there is no
-                    // push and no ground. MEASURED: dropped 100 wu onto a floor, came to rest at
-                    // z = -0.08 and never grounded.
-                    //
-                    // It is not only hard landings, and it is not only faces: the body lands on a
-                    // triangle SEAM as often as not (a floor is two triangles and their shared
-                    // diagonal is a real edge), so the edge branch sees it too — which is why
-                    // fixing face-versus-edge alone did not clear it.
-                    //
-                    // So getting OUT has to take precedence over deciding whether the surface
-                    // could have been climbed — but ONLY when there is nothing to stand on, and
-                    // that condition is doing the real work. A first attempt made deep
-                    // penetration of an upward-facing surface steppable unconditionally, on the
-                    // reasoning that a wall's normal would fail the test. It does, but a LEDGE's
-                    // rim does not: pressed against a curb 0.031 wu tall, the contact with its
-                    // rim has `n = (0,0,1)` and `depth = 0.031` once the body is directly under
-                    // it, which is geometrically indistinguishable from standing 0.031 wu inside
-                    // a floor. MEASURED: it climbed a ledge a 15 deg slope limit must refuse.
-                    //
-                    // The two cases are not told apart by the contact at all. They are told apart
-                    // by the rest of the body's situation: a body at a curb is ALREADY STANDING
-                    // on the floor the curb rises from, and a body stuck inside a floor is
-                    // standing on nothing. So the escape is a FALLBACK PASS -- it runs after the
-                    // ordinary passes and only while `res.grounded` is still false. The curb case
-                    // grounds on the floor in the first pass and never reaches it; the stuck case
-                    // never grounds and always does.
-                    let escaping = escape && i == 0 && depth > max_step && n.z >= min_normal_z;
-                    let steppable = i == 0
-                        && (escaping
-                            || if interior { n.z >= min_normal_z } else { contact_rise <= max_step + 1e-5 });
-                    let floor_like = steppable || (i > 0 && n.z >= min_normal_z);
-                    let too_steep_to_climb = !floor_like && n.z > 0.0;
-                    // The normal the POSITION and the VELOCITY are both resolved along. It is the
-                    // contact normal except on a surface too steep to climb, where it is that
-                    // normal flattened — see the measurement below.
-                    let mut eff_n = n;
-                    if floor_like {
-                        // Ground is only claimed from the BOTTOM sphere: a floor-shaped normal on
-                        // the head is an overhang the body is wedged under, not something it
-                        // stands on.
-                        if steppable {
-                            res.grounded = true;
-                            if n.z > res.normal.z || res.normal == Vec3::ZERO {
-                                res.normal = n;
-                            }
-                        }
-                        push.add(n, depth);
-                    } else if too_steep_to_climb {
-                        res.steep += 1;
-                        let flat = Vec3::new(n.x, n.y, 0.0);
-                        if flat.length_squared() > 1e-8 {
-                            let flat = flat.normalize();
-                            push.add(flat, depth);
-                            // THE VELOCITY MUST BE CLIPPED AGAINST THE SAME FLATTENED NORMAL the
-                            // position was pushed along, and this is not a detail.
-                            //
-                            // Clipping against the full normal instead removes the velocity going
-                            // into the surface and leaves the component ALONG it — which on an
-                            // upward-pointing normal points UP. MEASURED: a body running at 4.1
-                            // wu/s into the edge of a ledge 50% past its step height had 3.23
-                            // wu/s removed along a normal of (-0.79, 0, 0.62), which handed it
-                            // **+2.0 wu/s straight up** and launched it 0.18 wu into the air —
-                            // over the ledge it was supposed to be stopped by, landing on top and
-                            // walking on. The two halves of the solver have to agree about what
-                            // the surface is: a surface too steep to climb blocks horizontally,
-                            // so it takes horizontal velocity and gives nothing back.
-                            eff_n = flat;
-                        }
-                        // A normal with no horizontal part at all cannot be "too steep to
-                        // climb" (it is straight up or straight down), so there is no third case.
-                    } else {
-                        // Walls (n.z == 0) and ceilings / overhangs (n.z < 0): out along the
-                        // normal, which is horizontal for a wall and downward for a ceiling.
-                        push.add(n, depth);
+            let mut moved = false;
+            for i in 0..CAPSULE_SPHERES {
+                let (faces, nf) = face_contacts(Self::spheres_at(self.pos, height, r)[i], r, 0.0, tris);
+                for t in tris {
+                    // The sphere is re-placed for every triangle: an earlier push has moved it.
+                    let c = Self::spheres_at(self.pos, height, r)[i];
+                    let Some(hit) = sphere_tri_contact(c, r, 0.0, t) else { continue };
+                    if is_ghost(&hit, &faces[..nf], tris) {
+                        continue;
                     }
-                    // Remove the velocity going INTO the surface — along the SAME normal the
-                    // position was resolved with (see above).
-                    let vn = self.vel.dot(eff_n);
+                    hits += 1;
+                    self.pos += hit.normal * hit.depth;
+                    moved = true;
+                    let vn = self.vel.dot(hit.normal);
                     if vn < 0.0 {
-                        self.vel -= eff_n * vn;
+                        self.vel -= hit.normal * vn;
                     }
                 }
             }
-            res.contacts = res.contacts.max(hits);
-            let delta = push.total();
-            if hits == 0 {
+            worst = worst.max(hits);
+            if !moved {
                 break;
             }
-            if delta.length_squared() < 1e-12 {
-                if escape || res.grounded {
-                    break;
+        }
+        worst
+    }
+
+    /// Record every contact within [`CONTACT_TOLERANCE`] of the capsule at its final position,
+    /// merging those that agree on both normals (a floor is two triangles and one contact).
+    fn collect_contacts(&mut self, r: f32, height: f32, tris: &[[Vec3; 3]]) {
+        self.n_contacts = 0;
+        for c in Self::spheres_at(self.pos, height, r) {
+            let (faces, nf) = face_contacts(c, r, CONTACT_TOLERANCE, tris);
+            for t in tris {
+                let Some(hit) = sphere_tri_contact(c, r, CONTACT_TOLERANCE, t) else { continue };
+                if is_ghost(&hit, &faces[..nf], tris) {
+                    continue;
                 }
-                // Nothing ordinary left to resolve and nothing to stand on: this is the stuck
-                // case, so go straight to the escape rather than spending the remaining passes
-                // recomputing the same nil push.
-                pass = SOLVER_PASSES;
-                continue;
+                let known = self.contacts[..self.n_contacts]
+                    .iter()
+                    .any(|k| k.normal.dot(hit.normal) > 0.9999 && k.surface.dot(hit.surface) > 0.9999);
+                if !known && self.n_contacts < MAX_CONTACTS {
+                    self.contacts[self.n_contacts] = Contact { normal: hit.normal, surface: hit.surface };
+                    self.n_contacts += 1;
+                }
             }
-            self.pos += delta;
-            pass += 1;
         }
-        if res.grounded && res.normal == Vec3::ZERO {
-            res.normal = Vec3::Z;
-        }
-        res
     }
 
     /// Would the full standing capsule fit here? Asked before ending a crouch.
@@ -835,63 +1021,12 @@ impl PlayerState {
         let crouch_top = self.pos.z + p.height_crouching;
         for c in centres.iter().filter(|c| c.z + r > crouch_top - 1e-4) {
             for t in &tris {
-                if sphere_tri_normal(*c, r, t).is_some() {
+                if sphere_tri_contact(*c, r, 0.0, t).is_some() {
                     return false;
                 }
             }
         }
         true
-    }
-
-    /// Walkable ground within `depth` below the feet: its z and its normal.
-    fn probe_ground(&self, p: &PlayerPhysics, world: &dyn StaticWorld, depth: f32) -> Option<(f32, Vec3)> {
-        let r = p.radius.max(1e-4);
-        let min_normal_z = p.max_slope.cos();
-        let mut tris: Vec<[Vec3; 3]> = Vec::new();
-        let pad = Vec3::splat(r + 0.05);
-        world.gather(
-            Vec3::new(self.pos.x, self.pos.y, self.pos.z - depth) - pad,
-            Vec3::new(self.pos.x, self.pos.y, self.pos.z + r) + pad,
-            &mut tris,
-        );
-        // Sink the bottom sphere by `depth` and see what it would then be inside.
-        let c = Vec3::new(self.pos.x, self.pos.y, self.pos.z + r - depth);
-        let mut best: Option<(f32, Vec3)> = None;
-        for t in &tris {
-            let Some((n, _, interior)) = sphere_tri_normal(c, r, t) else { continue };
-            if n.z < min_normal_z {
-                continue;
-            }
-            let (q, _) = closest_point_on_triangle(c, t[0], t[1], t[2]);
-            // WHERE THE FEET REST ON THIS SURFACE, under the body's own axis.
-            //
-            // A FACE contact has a plane, so the height under the body is read off that plane and
-            // the feet sit `r*(sec - 1)` above it (see the long note in the jitter fix). An EDGE
-            // or VERTEX contact **has no plane**, and pretending it does is wrong in a way that
-            // matters at every crease: at the foot of a ramp the ramp's leading EDGE produced a
-            // fictional plane sloping up under the body, which placed the feet ABOVE where the
-            // body already was. For an edge, the exact answer is the tangent-sphere one — the
-            // centre is `q + n*r` and the feet are `r` below it.
-            let feet_z = if interior {
-                let plane_z = q.z - (n.x * (self.pos.x - q.x) + n.y * (self.pos.y - q.y)) / n.z;
-                plane_z + r * (1.0 / n.z - 1.0)
-            } else {
-                q.z + n.z * r - r
-            };
-            // ACCEPT, THEN COMPARE. Choosing the highest candidate first and filtering afterwards
-            // let ONE unacceptable candidate mask a perfectly good one: at the crease the ramp's
-            // edge scored higher than the floor directly underfoot, was then rejected for being
-            // above the body, and the floor never got a look in — so the body was called airborne
-            // while standing on it. MEASURED: exactly one frame in 180, at x = -0.063, which is
-            // the crease.
-            if feet_z > self.pos.z + 1e-4 || feet_z < self.pos.z - depth - 1e-4 {
-                continue;
-            }
-            if best.map(|(z, _)| feet_z > z).unwrap_or(true) {
-                best = Some((feet_z, n));
-            }
-        }
-        best
     }
 
     /// One line of state, for the caption and the live gate.
@@ -908,16 +1043,58 @@ impl PlayerState {
     }
 }
 
-#[derive(Default)]
-struct Resolved {
-    contacts: usize,
-    steep: usize,
-    tris: usize,
-    grounded: bool,
-    normal: Vec3,
+/// Does the triangle `t` pass through `q`, to float tolerance?
+fn passes_through(q: Vec3, t: &[Vec3; 3]) -> bool {
+    closest_point_on_triangle(q, t[0], t[1], t[2]).0.distance_squared(q) < 1e-8
 }
 
-/// The contact normal of a sphere against one triangle, and the penetration depth.
+/// The triangles the sphere at `c` touches through their INTERIOR, as indices into `tris`.
+/// (A sphere cannot touch more than a handful of faces at once; the cap only guards the array.)
+fn face_contacts(c: Vec3, r: f32, margin: f32, tris: &[[Vec3; 3]]) -> ([usize; 16], usize) {
+    let mut faces = [0usize; 16];
+    let mut n = 0;
+    for (k, t) in tris.iter().enumerate() {
+        if n < faces.len() {
+            if let Some(h) = sphere_tri_contact(c, r, margin, t) {
+                if h.interior {
+                    faces[n] = k;
+                    n += 1;
+                }
+            }
+        }
+    }
+    (faces, n)
+}
+
+/// **A GHOST CONTACT**: an edge or vertex contact whose point lies ON a triangle the sphere is
+/// already touching through its face (on its boundary where two triangles of one mesh meet, or
+/// inside it where one mesh's edge sits in another's face). That edge is not an obstacle -- the
+/// surface under the sphere is the face, and the edge point is on it and no closer to the sphere
+/// than the face's own foot -- but the edge contact's normal is tilted away from the face's, and
+/// pushing and clipping along it deflects the body: crossing the diagonal of a flat floor
+/// deflected a walking body UP by 0.5 wu/s and left it 5 mm in the air at every seam (measured).
+/// Havok's mesh shapes weld such edges (`snapToConvexEdge`, 30 degrees, in the world's cinfo);
+/// on a bare triangle soup the face contact simply dominates.
+fn is_ghost(hit: &Hit, faces: &[usize], tris: &[[Vec3; 3]]) -> bool {
+    !hit.interior && faces.iter().any(|&k| passes_through(hit.point, &tris[k]))
+}
+
+/// One sphere-against-triangle contact.
+struct Hit {
+    /// Contact normal, toward the sphere.
+    normal: Vec3,
+    /// The triangle's own plane normal, oriented toward the sphere.
+    surface: Vec3,
+    /// Penetration depth; negative inside the tolerance margin (not yet touching).
+    depth: f32,
+    /// The point of the triangle the contact is made at.
+    point: Vec3,
+    /// Is that point in the triangle's INTERIOR (a face contact) rather than on an edge or
+    /// vertex?
+    interior: bool,
+}
+
+/// The contact of a sphere against one triangle, if it is within `margin` of touching.
 ///
 /// **The normal comes from the triangle's own plane whenever the closest point is the triangle's
 /// INTERIOR**, and only from the centre-to-closest-point direction for an edge or a vertex
@@ -928,15 +1105,15 @@ struct Resolved {
 /// normals that were almost HORIZONTAL on a dead flat floor, which the slope rule then read as a
 /// wall. The symptom was a body that flickered airborne every few frames while walking across
 /// level ground, and flickered its animation with it.
-fn sphere_tri_normal(c: Vec3, r: f32, t: &[Vec3; 3]) -> Option<(Vec3, f32, bool)> {
+fn sphere_tri_contact(c: Vec3, r: f32, margin: f32, t: &[Vec3; 3]) -> Option<Hit> {
     let (q, interior) = closest_point_on_triangle(c, t[0], t[1], t[2]);
     let delta = c - q;
     let d = delta.length();
-    if d >= r {
+    if d >= r + margin {
         return None;
     }
     let face = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
-    let n = if interior && face != Vec3::ZERO {
+    let normal = if interior && face != Vec3::ZERO {
         // Oriented toward the sphere: a Halo collision soup is not reliably wound, and which
         // side of a triangle the body is on is a fact about the body, not about the winding.
         if face.dot(delta) < 0.0 {
@@ -951,18 +1128,15 @@ fn sphere_tri_normal(c: Vec3, r: f32, t: &[Vec3; 3]) -> Option<(Vec3, f32, bool)
     } else {
         return None;
     };
-    Some((n, r - d, interior))
-}
-
-/// Move `v` toward `target` by at most `max_delta`.
-fn approach(v: Vec3, target: Vec3, max_delta: f32) -> Vec3 {
-    let d = target - v;
-    let len = d.length();
-    if len <= max_delta || len < 1e-9 {
-        target
+    // The surface a contact belongs to, on the same side of it as the sphere.
+    let surface = if face == Vec3::ZERO {
+        normal
+    } else if face.dot(normal) < 0.0 {
+        -face
     } else {
-        v + d * (max_delta / len)
-    }
+        face
+    };
+    Some(Hit { normal, surface, depth: r - d, point: q, interior })
 }
 
 // =============================================================================================
@@ -1119,19 +1293,6 @@ mod tests {
         vec![[a, b, c], [a, c, d]]
     }
 
-    /// Walk a body at a ledge `h` high whose face is at x = 1, for `secs`. The floor and the
-    /// ledge both run far enough that a body which DOES climb cannot run off the end of the world
-    /// and land somewhere misleading — the first version of this harness did exactly that, and the
-    /// sweep read "blocked" for every ledge it had actually climbed.
-    fn ledge_run(p: &PlayerPhysics, h: f32, secs: f32) -> (PlayerState, Vec<StepOut>) {
-        let mut w = floor(0.0, 60.0);
-        w.extend(block(Vec3::new(1.0, -8.0, -1.0), Vec3::new(50.0, 8.0, h)));
-        let mut st = PlayerState::standing_at(Vec3::new(-0.5, 0.0, 0.2), 0.0);
-        settle(&mut st, p, &w);
-        let outs = run(&mut st, &MoveInput { fwd: 1.0, ..Default::default() }, p, &w, secs);
-        (st, outs)
-    }
-
     fn run(st: &mut PlayerState, input: &MoveInput, p: &PlayerPhysics, world: &Vec<[Vec3; 3]>, secs: f32) -> Vec<StepOut> {
         let dt = 1.0 / 60.0;
         let n = (secs / dt).round() as usize;
@@ -1153,109 +1314,18 @@ mod tests {
     // the gates a player would notice
     // -----------------------------------------------------------------------------------------
 
-    #[test]
-    #[ignore]
-    fn trace_one_ledge() {
-        let p = phys();
-        let h = max_step_height(&p) * 1.5;
-        let mut w = floor(0.0, 60.0);
-        w.extend(block(Vec3::new(1.0, -8.0, -1.0), Vec3::new(50.0, 8.0, h)));
-        let mut st = PlayerState::standing_at(Vec3::new(-0.5, 0.0, 0.2), 0.0);
-        settle(&mut st, &p, &w);
-        println!("ledge {h:.4}  max_step {:.4}  after settle z={:.6}", max_step_height(&p), st.pos.z);
-        for i in 0..90 {
-            let o = st.step(&MoveInput { fwd: 1.0, ..Default::default() }, &p, &w, 1.0 / 60.0);
-            if i % 2 == 0 || (st.pos.x > 0.6 && st.pos.x < 1.6) {
-                println!("f{i:02} x={:.4} z={:.5} g={} contacts={} steep={}", st.pos.x, st.pos.z, st.grounded, o.contacts, o.steep_contacts);
-            }
-        }
-    }
-
     // -----------------------------------------------------------------------------------------
     // #play-gate  THE INVERSE GATES: each one proves the gate above it BITES.
     //
     // A gate that has only ever been seen green proves nothing, so each behaviour is also
-    // exercised with the authored value CHANGED — and because every one of these behaviours is
-    // driven by `PlayerPhysics`, which the test constructs, the sabotage is in the DATA rather
-    // than in the code. That matters practically as well as philosophically: a code sabotage
-    // costs a full recompile of a very large crate each time, and on a tree shared by five
-    // agents that is an hour of a contended build lock; these cost nothing and they run in the
-    // same build as the gates they guard.
+    // exercised with the authored value CHANGED — and because most of these behaviours are
+    // driven by `PlayerPhysics`, which the test constructs, the sabotage can be in the DATA
+    // rather than in the code.
     //
-    // What they prove: that the gate's subject is genuinely driven by the authored value, and
-    // that the assertion responds when it changes. What they do NOT prove: that the code path
-    // could not be deleted outright — two of those were proven separately by editing the source
-    // and watching the matching gate go red (the crouch transition rate, and the eye's crouch
-    // interpolation).
-    //
-    // THE SOURCE-LEVEL SABOTAGES still owed, and the exact edit for each, so the next session can
-    // run them without re-deriving them. Each one must turn the named gate red:
-    //
-    //   1. ~~`resolve`: make the escape pass unconditional (`if escape { break }` instead of
-    //      `if escape && res.grounded`) ->
-    //      `a_falling_body_does_not_tunnel_a_thin_platform_on_a_hitched_frame`.~~
-    //      **RUN 2026-10-14: STAYED GREEN, and the prediction was wrong rather than the gate.**
-    //      That edit disables the escape passes entirely (the break happens before any of their
-    //      work), and the tunnelling fixture never needs them: a body landing on `floor()` gets a
-    //      FACE contact, which is steppable on its normal alone with no depth test, so it grounds
-    //      in the first ordinary pass. See
-    //      `a_body_that_lands_inside_an_edge_contact_is_pushed_back_out`, which went looking for a
-    //      fixture that does need the escape and establishes that **there isn't one**: the
-    //      sub-step cap bounds penetration to half a capsule radius and the solver resolves inside
-    //      the sub-step, so the deep-penetration state cannot be produced from outside. The escape
-    //      pass is uncovered belt-and-braces, and that is written down there as a known gap.
-    //   2. `Depenetration::add`: never merge (`if false && dir.dot(n) > SAME_DIR`) ->
-    //      `contacts_in_the_same_direction_merge_instead_of_adding` and the tunnelling gate.
-    //   3. `step`: turn instantly (`let step = residual.abs();`) ->
-    //      `the_body_turns_toward_the_aim_at_the_authored_rate`.
-    //   4. `step`: ignore the threshold (`let turn = true;`) ->
-    //      `a_standing_body_holds_its_feet_until_the_aim_passes_the_authored_threshold`.
-    //   5. `body_state`: measure travel against the aim (`st.yaw` for `st.facing`) ->
-    //      `the_travel_direction_is_measured_against_the_body_not_the_camera`.
-    //   6. `step`: drop the wrap (`self.yaw = input.yaw;`) ->
-    //      `the_look_yaw_stays_in_range_however_far_the_player_spins`.
-    //
-    // **SABOTAGES 2 TO 6 WERE RUN 2026-10-14 AND ALL FIVE TURNED THEIR NAMED GATE RED**, each one
-    // naming the actual defect, in a `rsync` snapshot with its own target directory so the shared
-    // tree was never sabotaged. Baseline 35 passed / 0 failed; each sabotage 0 passed / 1 failed.
-    // Only #1 above did not bite, for the reason recorded against it.
-    //
-    // **And one warning about the harness, which cost a whole pass.** A sabotage runner that
-    // reads `cargo test`'s failure list and treats an EMPTY list as green will report every
-    // sabotage as "stayed green" the moment a run stops producing a result line at all — a
-    // compile error, or a kill. It happened: the baseline printed "NO RESULT LINE, failed=[]"
-    // and the pass carried on. A missing result line has to be a hard error, not a quiet zero.
-    // (The kill was self-inflicted: the runner's `cargo test` command line was byte-identical to
-    // a stale run of mine, so killing the stale one by PID took the baseline with it.)
+    // The 2026-10-20 controller port carries its OWN source-level sabotage table, run against a
+    // snapshot copy of this file and `cmp`-checked afterwards; it is recorded on each gate that
+    // has one (search for "SABOTAGE:").
     // -----------------------------------------------------------------------------------------
-
-    /// #play-gate  INVERSE of the slope gate: a biped whose authored limit is nearly vertical
-    /// climbs the ramp the Spartan's 50 degrees refuses. If this passed with the slope rule
-    /// removed, the slope gate would be passing for the wrong reason.
-    #[test]
-    fn a_kinder_authored_slope_limit_makes_the_same_ramp_climbable() {
-        let p = phys();
-        let steep = p.max_slope.to_degrees() + 20.0;
-        let mut w = floor(0.0, 6.0);
-        w.extend(ramp(steep, 20.0, 6.0));
-        // As authored: refused.
-        let mut a = PlayerState::standing_at(Vec3::new(-1.0, 0.0, 0.2), 0.0);
-        settle(&mut a, &p, &w);
-        run(&mut a, &MoveInput { fwd: 1.0, ..Default::default() }, &p, &w, 3.0);
-        assert!(a.pos.z < 0.15, "the authored limit should refuse a {steep:.0} deg ramp, got z {:.3}", a.pos.z);
-        // With a kinder authored limit: climbed. Only the TAG VALUE differs.
-        let mut q = p;
-        q.max_slope = (steep + 10.0).to_radians();
-        let mut b = PlayerState::standing_at(Vec3::new(-1.0, 0.0, 0.2), 0.0);
-        settle(&mut b, &q, &w);
-        run(&mut b, &MoveInput { fwd: 1.0, ..Default::default() }, &q, &w, 3.0);
-        assert!(
-            b.pos.z > 0.5,
-            "a biped whose authored limit is {:.0} deg must climb a {steep:.0} deg ramp, got z {:.3}",
-            q.max_slope.to_degrees(),
-            b.pos.z
-        );
-    }
 
     /// #play-gate  THE PRECONDITION FOR BLENDING, at the one place test mode owns.
     ///
@@ -1570,58 +1640,73 @@ mod tests {
         assert!(!standing_turns(&tight, 1.5), "a threshold past the look must hold the feet");
     }
 
-    /// #play-gate  Contacts that point the same way are ONE constraint, not two.
+    /// #play-gate  A TRIANGLE SEAM IS NOT A BUMP. A floor is two triangles; the body standing on,
+    /// landing on and walking across the diagonal that joins them must rest at exactly the
+    /// surface height. The first resolver summed the push of every penetrating contact and
+    /// merged only identical directions, so at the seam -- where the edge contact's normal is a
+    /// hair off the face's -- the body was pushed out of the floor twice and floated 5 mm (and
+    /// 0.0793 wu when it landed there). Sequential projection cannot double-count.
     ///
-    /// This is the rule in the small, where the arithmetic is visible: a floor is two triangles,
-    /// a body landing on their seam is reported twice with the same normal, and if those add the
-    /// body is pushed out twice as far as it went in. Measured as a floating body at z = +0.0793;
-    /// here it is a single assertion.
+    /// SABOTAGE: sum the pushes of one pass instead of applying them one at a time -> the seam
+    /// rows read ~0.004 wu and go red.
     #[test]
-    fn contacts_in_the_same_direction_merge_instead_of_adding() {
-        let up = Vec3::Z;
-        let mut d = Depenetration::default();
-        d.add(up, 0.08);
-        d.add(up, 0.08);
-        assert!((d.total().z - 0.08).abs() < 1e-6, "a seam must push out once, got {:?}", d.total());
-        // The deepest of the merged set wins: the shallower report must not shorten the push.
-        let mut d = Depenetration::default();
-        d.add(up, 0.02);
-        d.add(up, 0.08);
-        d.add(up, 0.05);
-        assert!((d.total().z - 0.08).abs() < 1e-6, "the deepest must win, got {:?}", d.total());
-        // Genuinely different directions DO add -- that is what gets a body out of a corner.
-        let mut d = Depenetration::default();
-        d.add(Vec3::X, 0.03);
-        d.add(Vec3::Y, 0.04);
-        let t = d.total();
-        assert!((t.x - 0.03).abs() < 1e-6 && (t.y - 0.04).abs() < 1e-6, "a corner must push out of both walls, got {t:?}");
-    }
-
-    /// #play-gate  INVERSE of the step-up gate: a bigger authored RADIUS steps higher, and a
-    /// harsher authored slope limit steps lower. The step-up has no constant of its own, so this
-    /// is the whole of "it is the authored pair that decides".
-    #[test]
-    fn the_step_up_follows_the_authored_radius_and_slope_limit() {
-        let p = phys();
-        let climbs = |q: &PlayerPhysics, h: f32| {
-            let (st, _) = ledge_run(q, h, 2.0);
-            st.pos.z > h - 0.02 && st.pos.x > 1.2
-        };
-        let base = max_step_height(&p);
-        // Twice the radius: twice the step, and a ledge the ordinary capsule refuses is climbed.
-        let mut big = p;
-        big.radius = p.radius * 2.0;
-        assert!((max_step_height(&big) - base * 2.0).abs() < 1e-6);
-        let over = base * 1.5;
-        assert!(!climbs(&p, over), "the authored capsule must refuse a {over:.4} wu ledge");
-        assert!(climbs(&big, over), "a capsule of twice the authored radius must climb it");
-        // A harsher slope limit: a lower step, and a ledge the ordinary capsule climbs is refused.
-        let mut harsh = p;
-        harsh.max_slope = 15f32.to_radians();
-        assert!(max_step_height(&harsh) < base * 0.5);
-        let under = base * 0.5;
-        assert!(climbs(&p, under), "the authored capsule must climb a {under:.4} wu ledge");
-        assert!(!climbs(&harsh, under), "a 15 deg slope limit must refuse it");
+    fn a_triangle_seam_is_not_a_bump() {
+        let p = spartan();
+        let w = floor(0.0, 30.0); // diagonal y = x
+        // landing on the seam from a height, at several points along it
+        for k in [0.0f32, 1.0, -2.5, 7.25] {
+            let mut st = PlayerState::standing_at(Vec3::new(k, k, 1.0), 0.0);
+            // The landing itself, frame by frame: from the first frame the body is within 2 mm of
+            // the floor it must never be above 2 mm again -- a body pushed out twice springs up
+            // by its penetration (up to 3 cm at this fall speed) and then sinks back, and the
+            // settled state alone cannot see it.
+            let mut touched = false;
+            let mut sprang = 0.0f32;
+            for s in trace(&mut st, &MoveInput::default(), &p, &w, 90) {
+                if s.pos.z < 2e-3 {
+                    touched = true;
+                } else if touched {
+                    sprang = sprang.max(s.pos.z);
+                }
+            }
+            assert!(touched, "seam point {k}: never reached the floor");
+            assert!(sprang < 2e-3, "seam point {k}: touched down and then sprang {sprang:.4} wu back up (pushed out twice)");
+            assert!(st.grounded, "seam point {k}: never landed");
+            assert!(st.pos.z.abs() < 1e-6, "seam point {k}: rests at z {:e}, not on the surface", st.pos.z);
+        }
+        // walking straight across it at 40 different sub-frame phases: whether a frame happens
+        // to land with the sphere over the seam depends on the phase, and a ghost contact only
+        // shows on those frames
+        let mut worst = 0.0f32;
+        for k in 0..40 {
+            let mut st = PlayerState::standing_at(Vec3::new(-1.0 + k as f32 * 0.0017, 0.0, 0.2), 0.0);
+            settle(&mut st, &p, &w);
+            for s in trace(&mut st, &MoveInput { fwd: 1.0, ..Default::default() }, &p, &w, 90) {
+                worst = worst.max(s.pos.z.abs());
+            }
+            assert!(st.pos.x > 0.3, "phase {k}: did not cross the seam");
+        }
+        assert!(worst < 1e-6, "crossing the seam at some phase bumped z by {worst:e}");
+        // walking across it in several directions
+        for (fwd, right, yaw, from) in [
+            (1.0f32, 0.0f32, 0.0f32, Vec3::new(-2.0, 1.0, 0.2)),
+            (0.0, 1.0, 0.0, Vec3::new(-2.0, 1.0, 0.2)),
+            // heading 57 degrees: y - x GROWS, so start on the other side of the diagonal
+            (1.0, 0.0, 1.0, Vec3::new(1.0, -0.5, 0.2)),
+        ] {
+            let mut st = PlayerState::standing_at(from, yaw);
+            settle(&mut st, &p, &w);
+            let input = MoveInput { fwd, right, yaw, ..Default::default() };
+            let mut worst = 0.0f32;
+            let mut crossed = false;
+            let side0 = (st.pos.y - st.pos.x).signum();
+            for s in trace(&mut st, &input, &p, &w, 240) {
+                worst = worst.max(s.pos.z.abs());
+                crossed |= (s.pos.y - s.pos.x).signum() != side0;
+            }
+            assert!(crossed, "the walk ({fwd},{right}) never crossed the seam (ended at {:?}, started on side {side0}), so it proved nothing", st.pos);
+            assert!(worst < 1e-6, "walking ({fwd},{right}) across the seam bumped z by {worst:e}");
+        }
     }
 
     /// #play-gate  INVERSE of the jump gate: the apex follows the AUTHORED jump velocity, and a
@@ -1749,44 +1834,6 @@ mod tests {
         }
     }
 
-    /// #play  A MEASUREMENT, not a gate: sweep the ledge height and report the tallest one the
-    /// capsule actually walks onto, beside the closed form. Run with
-    /// `cargo test -p hms-app --profile quick -- play_ctl::tests::measure_step_up --ignored --nocapture`.
-    #[test]
-    #[ignore]
-    fn measure_step_up() {
-        let p = phys();
-        println!("radius {:.4}  max_slope {:.2} deg  closed form {:.4} wu", p.radius, p.max_slope.to_degrees(), max_step_height(&p));
-        let climbs = |h: f32| -> (bool, f32, f32) {
-            let (st, _) = ledge_run(&p, h, 2.0);
-            (st.pos.z > h - 0.02 && st.pos.x > 1.2, st.pos.x, st.pos.z)
-        };
-        let mut best = 0.0f32;
-        let mut h = 0.005f32;
-        while h < 0.30 {
-            let (ok, x, z) = climbs(h);
-            println!("ledge {h:.4} -> {} (ended x={x:.3} z={z:.4})", if ok { "CLIMBED" } else { "blocked" });
-            if ok { best = best.max(h); }
-            h += 0.005;
-        }
-        println!("MEASURED max step {best:.4} wu vs closed form {:.4} wu", max_step_height(&p));
-    }
-
-    /// #play  The contact normals at a ledge, printed — the evidence behind the closed form.
-    #[test]
-    #[ignore]
-    fn measure_ledge_normals() {
-        let p = phys();
-        let r = p.radius;
-        for s in [0.01f32, 0.03, 0.06, 0.1, 0.15, 0.2] {
-            // The bottom sphere's centre sits `r` above the feet; touching the ledge's top EDGE
-            // the normal's vertical part is (r - s) / d, and at first contact d == r.
-            let nz = ((r - s) / r).max(-1.0);
-            println!("ledge {s:.3}: n.z at first contact {nz:.4}  (limit cos {:.4}) -> {}",
-                p.max_slope.cos(), if nz >= p.max_slope.cos() { "walkable" } else { "WALL" });
-        }
-    }
-
     /// #play-gate  A BODY DROPPED ON A FLOOR LANDS ON IT, and its feet end up ON the surface —
     /// not sunk into it and not hovering above it.
     #[test]
@@ -1863,39 +1910,15 @@ mod tests {
     ///
     /// The platform is a single quad with NO thickness, deliberately: the guarantee is about the
     /// sphere's sweep overlapping, not about the geometry being thick enough to catch.
-    #[test]
     /// #play-gate  **AN EDGE-ONLY LANDING SETTLES ON THE SURFACE.** A single triangle, landed on
     /// beside its hypotenuse so the nearest point is the EDGE and no adjoining face can supply a
     /// contact — the fixture the floor pair cannot produce.
     ///
-    /// # What this gate is NOT, which is the point of writing it down
-    ///
-    /// It was written to cover the ESCAPE PASS (`escaping` in [`PlayerState::resolve`]), and **it
-    /// does not reach it.** The chain, measured rather than reasoned:
-    ///
-    /// 1. The note above predicted that disabling the escape passes (`if escape { break }`, which
-    ///    breaks before any of their work) would redden
-    ///    `a_falling_body_does_not_tunnel_a_thin_platform_on_a_hitched_frame`. Run, it **stayed
-    ///    green**: a body landing on `floor()` gets a FACE contact, and `steppable` for a face is
-    ///    `n.z >= min_normal_z` with no depth test at all, so it grounds on the first ordinary
-    ///    pass. Even the "on the triangle seam" cases ground through the two adjoining faces.
-    /// 2. So this fixture removed the second triangle to force an edge contact — where the height
-    ///    rule applies and a penetration deeper than `max_step_height` (0.0625 wu here) would
-    ///    read as "a ledge too tall to climb", flatten the push to zero, and strand the body.
-    /// 3. **It still never penetrates.** Dropped from 30, 100 and 300 wu on 100 ms frames the
-    ///    feet never go below z = 0.0000: the sub-step cap bounds a sub-step to half a capsule
-    ///    radius and the solver resolves within that sub-step, so a penetration deeper than
-    ///    `max_step` cannot be produced from outside at all.
-    ///
-    /// **Conclusion: the escape pass is unreachable through the public API as the solver now
-    /// stands, and it has no coverage.** The deep-penetration bug it was written for was
-    /// separately cured by the sub-step cap and by the face-versus-edge split, and the escape
-    /// remains as belt and braces. That is recorded as a KNOWN GAP rather than papered over with
-    /// a gate that passes for the wrong reason — and it is a real one: if the sub-step cap is ever
-    /// loosened, the escape becomes live code again with nothing watching it.
-    ///
-    /// What this gate does prove, which is worth having on its own: an edge-only landing comes to
-    /// rest ON the surface and claims ground, at three drop heights, on hitched frames.
+    /// The old controller classified edge contacts by their HEIGHT on the capsule and needed an
+    /// "escape pass" for a body that landed deep inside one; that classification is gone (every
+    /// contact is judged on its normal), and this stays as the proof that the plain solver still
+    /// brings an edge-only landing to rest ON the surface and claims ground, at three drop
+    /// heights, on hitched frames.
     #[test]
     fn a_body_that_lands_inside_an_edge_contact_is_pushed_back_out() {
         let p = phys();
@@ -1936,12 +1959,9 @@ mod tests {
             assert!(
                 landed,
                 "dropped {drop} wu onto an EDGE contact and never came to rest on the surface: \
-                 final z {:.4}, grounded {} (deepest {deepest:.4}) -- a body that penetrates an \
-                 upward-facing surface deeper than its {:.4} wu step height has no push and no \
-                 ground unless the ESCAPE pass runs",
+                 final z {:.4}, grounded {} (deepest {deepest:.4})",
                 st.pos.z,
                 st.grounded,
-                max_step_height(&p)
             );
         }
     }
@@ -2099,15 +2119,18 @@ mod tests {
     fn walking_down_an_incline_does_not_jitter() {
         let p = phys();
         for deg in [8.0f32, 20.0, 32.0] {
-            let w = downramp(deg, 30.0, 6.0, 8.0);
+            let w = downramp(deg, 60.0, 6.0, 8.0);
             let mut st = PlayerState::standing_at(Vec3::new(-3.0, 0.0, 0.3), 0.0);
             settle(&mut st, &p, &w);
             assert!(st.grounded, "{deg} deg: never settled");
             let input = MoveInput { fwd: 1.0, ..Default::default() };
             run(&mut st, &input, &p, &w, 1.5);
             assert!(st.pos.x > 0.5, "{deg} deg: did not reach the descent");
-            // Steady state, as uphill.
-            run(&mut st, &input, &p, &w, 0.5);
+            // Steady state, as uphill. A body running off the CREST leaves the ground -- the
+            // engine's contact normal rotates past the 0.468 leaving speed -- and lands on the
+            // slope further down; the window starts after that landing (the old controller hid
+            // the flight by teleporting the body onto the slope).
+            run(&mut st, &input, &p, &w, 4.0);
             let (mut lo, mut hi) = (f32::MAX, f32::MIN);
             let mut airborne = 0;
             for _ in 0..120 {
@@ -2140,8 +2163,9 @@ mod tests {
     #[test]
     fn an_uphill_velocity_is_never_mistaken_for_leaving_the_ground() {
         let p = phys();
-        let limit = p.max_slope.to_degrees();
-        for deg in [6.0f32, 10.0, 15.0, 25.0, 35.0, limit - 2.0] {
+        // The walkable limit on a FACE is the engine's global 35 degrees, not the authored 50.
+        let limit = 35.0f32;
+        for deg in [6.0f32, 10.0, 15.0, 25.0, 33.0, limit - 0.5] {
             let mut w = floor(0.0, 8.0);
             w.extend(ramp(deg, 40.0, 8.0));
             let mut st = PlayerState::standing_at(Vec3::new(-2.0, 0.0, 0.2), 0.0);
@@ -2353,43 +2377,6 @@ mod tests {
         assert!(st.pos.x < 3.0, "tunnelled through a thin wall to x {:.3}: {}", st.pos.x, st.describe(&p));
     }
 
-    /// #play-gate  A SLOPE PAST THE AUTHORED LIMIT IS NOT CLIMBABLE, and one inside it is. The
-    /// limit is `bipd` `maximum slope angle`, so this gate moves if the tag moves.
-    #[test]
-    fn a_slope_past_the_authored_limit_is_not_climbable() {
-        let p = phys();
-        let limit = p.max_slope.to_degrees();
-        // Inside the limit: the body climbs.
-        let gentle = limit - 15.0;
-        let mut w = floor(0.0, 6.0);
-        w.extend(ramp(gentle, 20.0, 6.0));
-        let mut st = PlayerState::standing_at(Vec3::new(-1.0, 0.0, 0.2), 0.0);
-        settle(&mut st, &p, &w);
-        run(&mut st, &MoveInput { fwd: 1.0, ..Default::default() }, &p, &w, 3.0);
-        assert!(
-            st.pos.z > 0.5,
-            "could not climb a {gentle:.0} deg ramp with a {limit:.0} deg limit: {}",
-            st.describe(&p)
-        );
-        // Past the limit: it cannot.
-        let steep = limit + 20.0;
-        let mut w2 = floor(0.0, 6.0);
-        w2.extend(ramp(steep, 20.0, 6.0));
-        let mut st2 = PlayerState::standing_at(Vec3::new(-1.0, 0.0, 0.2), 0.0);
-        settle(&mut st2, &p, &w2);
-        let outs = run(&mut st2, &MoveInput { fwd: 1.0, ..Default::default() }, &p, &w2, 3.0);
-        assert!(
-            st2.pos.z < 0.15,
-            "climbed a {steep:.0} deg ramp past a {limit:.0} deg limit to z {:.3}: {}",
-            st2.pos.z,
-            st2.describe(&p)
-        );
-        assert!(
-            outs.iter().any(|o| o.steep_contacts > 0),
-            "the slope limit never even fired, so this gate proves nothing"
-        );
-    }
-
     /// #play-gate  CROUCHING LOWERS THE EYE TO THE TAG'S OWN CROUCHING CAMERA HEIGHT, and takes
     /// the tag's own transition time to get there.
     #[test]
@@ -2442,66 +2429,12 @@ mod tests {
         assert!(!st2.crouched, "a body in the open could not stand up either");
     }
 
-    /// #play-gate  THE STEP-UP IS THE EMERGENT ONE, AND IT IS THE PREDICTED SIZE.
-    ///
-    /// No step constant exists to tune, so this measures what the capsule plus the slope limit
-    /// actually climbs and checks it against [`max_step_height`]'s closed form. A ledge inside
-    /// that height is walked onto; one well past it is not.
-    #[test]
-    fn the_step_up_is_the_capsules_own_and_matches_the_closed_form() {
-        let p = phys();
-        let predicted = max_step_height(&p);
-        assert!(predicted > 0.0 && predicted < p.radius, "closed form {predicted} is not between 0 and the radius");
-        let climbs = |h: f32| -> bool {
-            let (st, _) = ledge_run(&p, h, 2.0);
-            st.pos.z > h - 0.02 && st.pos.x > 1.2
-        };
-        // Inside the predicted height: walked onto. Checked at several heights up to the limit,
-        // because the point of the height rule is that this is DETERMINISTIC — under the normal
-        // rule it depended on where the frames landed.
-        for k in [0.1f32, 0.3, 0.5, 0.7, 0.9, 0.99] {
-            let low = predicted * k;
-            assert!(climbs(low), "could not step onto a {low:.4} wu ledge, under the predicted {predicted:.4}");
-        }
-        // Well past it: never walked onto.
-        for k in [1.5f32, 2.0, 3.0, 5.0] {
-            let high = predicted * k;
-            assert!(!climbs(high), "stepped onto a {high:.4} wu ledge, past the predicted {predicted:.4}");
-        }
-        // And the MEASURED limit, by bisection, against the closed form. This is the gate that
-        // matters, because it is the number rather than a side of it.
-        //
-        // The two do not agree exactly and the reason is physical rather than a fudge: the body
-        // rests a few thousandths of a world unit above the floor (the depenetration resolves to
-        // touching, not to interpenetrating), so the rise it measures to a ledge is that much
-        // smaller and it steps that much higher. 0.01 wu is 3 mm at Halo's scale.
-        let (mut lo, mut hi) = (0.0f32, predicted * 3.0);
-        for _ in 0..24 {
-            let mid = (lo + hi) * 0.5;
-            if climbs(mid) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        assert!(
-            (lo - predicted).abs() < 0.01,
-            "MEASURED step-up {lo:.4} wu vs the closed form {predicted:.4} wu — they must agree to within 0.01 wu"
-        );
-        // And the limit is the AUTHORED pair's, not a number of this module's: a biped with a
-        // bigger radius or a kinder slope limit steps higher, and nothing here can be tuned
-        // without changing one of those two.
-        let mut q = phys();
-        q.radius *= 2.0;
-        assert!((max_step_height(&q) - predicted * 2.0).abs() < 1e-6);
-    }
-
     /// #play-gate  WALKING DOWN A SLOPE STAYS ON THE SLOPE. Without the derived ground probe the
     /// body leaves the hill every frame and the animation flickers between running and airborne.
     #[test]
     fn running_downhill_never_leaves_the_hill() {
         let p = phys();
-        let deg = p.max_slope.to_degrees() - 10.0;
+        let deg = 30.0f32;
         let t = deg.to_radians().tan();
         // A ramp DESCENDING along +X from x=0.
         let a = Vec3::new(-4.0, -6.0, 0.0);
@@ -2614,4 +2547,1966 @@ mod tests {
             assert_eq!(b.gait, want, "stick ({}, {}) gave {:?}: {}", inp.fwd, inp.right, b.gait, s.describe(&p));
         }
     }
+
+    /// A world of bare triangles plus closed shells, for the inside-a-block tests.
+    struct ShellWorld {
+        tris: Vec<[Vec3; 3]>,
+        shells: Vec<std::sync::Arc<Shell>>,
+    }
+    impl StaticWorld for ShellWorld {
+        fn gather(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+            self.tris.as_slice().gather(mn, mx, out)
+        }
+        fn solid_shells(&self, mn: Vec3, mx: Vec3, out: &mut Vec<std::sync::Arc<Shell>>) {
+            out.extend(self.shells.iter().filter(|s| (0..3).all(|k| s.mn[k] <= mx[k] && s.mx[k] >= mn[k])).cloned());
+        }
+    }
+    fn shell_world(boxes: &[(Vec3, Vec3)]) -> ShellWorld {
+        let mut w = ShellWorld { tris: Vec::new(), shells: Vec::new() };
+        for (mn, mx) in boxes {
+            let c = (*mn + *mx) * 0.5;
+            let h = (*mx - *mn) * 0.5;
+            let planes = [(Vec3::X, h.x), (Vec3::NEG_X, h.x), (Vec3::Y, h.y), (Vec3::NEG_Y, h.y), (Vec3::Z, h.z), (Vec3::NEG_Z, h.z)];
+            let t: Vec<[Vec3; 3]> = crate::object_hulls::hull_triangles(&planes, 0.0).into_iter().map(|t| t.map(|p| p + c)).collect();
+            w.tris.extend(t.iter().copied());
+            w.shells.push(std::sync::Arc::new(Shell::new(t)));
+        }
+        w
+    }
+
+    /// #collision  **A BODY PLACED INSIDE A BLOCK COMES OUT THE NEAREST SIDE.** The triangle
+    /// contacts are two-sided toward the sphere, so a sphere whose centre is inside a closed
+    /// block is held between its faces (or, past the middle of a thin wall, pushed on out the
+    /// FAR side). A 0.2 thick wall with the body a hair either side of its middle must leave on
+    /// that side, a deep cube must be left by the nearest face, and nothing may end inside.
+    ///
+    /// SABOTAGE: make `escape_shells` return 0 (one-sided / face-only contacts) -> every
+    /// assertion about the final position goes red.
+    #[test]
+    fn a_body_placed_inside_a_closed_block_leaves_by_the_nearest_face() {
+        let p = phys();
+        let r = p.radius;
+        let wall = shell_world(&[(Vec3::new(-0.1, -1.0, 0.0), Vec3::new(0.1, 1.0, 2.0))]);
+        for (x, want_sign) in [(0.03f32, 1.0f32), (-0.03, -1.0), (0.09, 1.0), (-0.09, -1.0)] {
+            let mut st = PlayerState::standing_at(Vec3::new(x, 0.0, 0.5), 0.0);
+            let out = st.step(&MoveInput::default(), &p, &wall, 1.0 / 60.0);
+            assert!(out.escaped >= 1, "x {x}: the body was not recognised as inside the wall");
+            for _ in 0..60 {
+                st.step(&MoveInput::default(), &p, &wall, 1.0 / 60.0);
+            }
+            assert!(st.pos.x * want_sign >= 0.1 + r - 0.02, "x {x}: ended at {:.3}, not out the {want_sign} side", st.pos.x);
+            assert!(!PlayerState::overlaps_at(st.pos, &p, &wall, 0.02), "x {x}: still overlapping at {:?}", st.pos);
+        }
+        // a cube: nearest face by depth, not by the way the body was moving
+        let cube = shell_world(&[(Vec3::new(-1.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 2.0))]);
+        let mut st = PlayerState::standing_at(Vec3::new(0.8, 0.1, 0.3), 0.0);
+        st.vel = Vec3::new(-1.0, 0.0, 0.0);
+        let out = st.step(&MoveInput::default(), &p, &cube, 1.0 / 60.0);
+        assert!(out.escaped >= 1);
+        assert!(st.pos.x > 1.0 + r - 0.05, "left the far way: {:?}", st.pos);
+    }
+
+    /// #collision  Two butted blocks: the exit from the first is not left inside the second.
+    #[test]
+    fn a_body_inside_one_of_two_butted_blocks_does_not_end_in_the_other() {
+        let p = phys();
+        let w = shell_world(&[
+            (Vec3::new(-0.5, -0.5, 0.0), Vec3::new(0.5, 0.5, 1.0)),
+            (Vec3::new(0.5, -0.5, 0.0), Vec3::new(1.5, 0.5, 1.0)),
+        ]);
+        let mut st = PlayerState::standing_at(Vec3::new(0.4, 0.0, 0.2), 0.0);
+        for _ in 0..30 {
+            st.step(&MoveInput::default(), &p, &w, 1.0 / 60.0);
+        }
+        assert!(!PlayerState::overlaps_at(st.pos, &p, &w, 0.02), "ended overlapping at {:?}", st.pos);
+    }
+
+    /// A world that hides the shells: what the controller saw before `escape_shells`.
+    struct NoShells<'a>(&'a ShellWorld);
+    impl StaticWorld for NoShells<'_> {
+        fn gather(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+            self.0.gather(mn, mx, out)
+        }
+    }
+
+    /// #collision  **EVERY REAL FORGE BLOCK LETS A TRAPPED BODY OUT.** For each `objects\levels\
+    /// forge\ff_*` block whose physics is closed shells (the production hulls, radius included),
+    /// a Spartan is placed at a 5x5x5 grid of positions through the block's box, every one with a
+    /// sphere centre INSIDE the solid, and stepped for 1.5 s. After the first tick it must have
+    /// moved no further than the nearest way out (half the shell's thinnest side plus a radius,
+    /// plus 0.1 -- not through to the far side), and at the end it must overlap nothing. Also two
+    /// copies butted at the block's pitch, with the body straddling the seam.
+    ///
+    /// BEFORE (shells hidden, as the controller was): the same placements are counted as ending
+    /// inside the solid. SABOTAGE: `escape_shells` returning 0 -> red.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_every_real_forge_block_lets_a_trapped_body_out() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let (_, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, crate::play_mode::Species::Spartan).unwrap();
+        let r = p.radius;
+        let (mut blocks, mut trapped, mut stuck_before, mut stuck_after, mut too_far, mut seam_cases) = (0, 0, 0, 0, 0, 0);
+        let mut report: Vec<String> = Vec::new();
+        for &tag in native.tags_by_group(cache, "bloc").iter() {
+            let name = native.tag_name(cache, tag).unwrap_or_default();
+            if !name.contains("levels\\forge\\ff_") {
+                continue;
+            }
+            let ph = native.resolve_phmo(cache, tag);
+            if ph == 0 || ph == 0xFFFF_FFFF {
+                continue;
+            }
+            let Some(blk) = crate::object_hulls::read_blocks(native, cache, ph) else { continue };
+            let Some(shells) = crate::object_hulls::hull_shells(&blk, &crate::object_hulls::mode_node_xforms(native, cache, tag)) else { continue };
+            blocks += 1;
+            // the objects: one block, and a butted copy at the block's own x pitch
+            let one = ShellWorld { tris: shells.iter().flatten().copied().collect(), shells: shells.iter().map(|s| std::sync::Arc::new(Shell::new(s.clone()))).collect() };
+            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for sh in &one.shells {
+                mn = mn.min(sh.mn);
+                mx = mx.max(sh.mx);
+            }
+            let ext = mx - mn;
+                        let pitch = ext.x;
+            let off = Vec3::new(pitch, 0.0, 0.0);
+            let two = ShellWorld {
+                tris: one.tris.iter().copied().chain(one.tris.iter().map(|t| t.map(|q| q + off))).collect(),
+                shells: one.shells.iter().cloned().chain(one.shells.iter().map(|s| std::sync::Arc::new(Shell::new(s.tris.iter().map(|t| t.map(|q| q + off)).collect())))).collect(),
+            };
+            let mut spots: Vec<(Vec3, bool)> = Vec::new();
+            for i in 0..5 {
+                for j in 0..5 {
+                    for k in 0..5 {
+                        let f = |n: i32| 0.1 + 0.2 * n as f32;
+                        spots.push((mn + ext * Vec3::new(f(i), f(j), f(k)) - Vec3::Z * 0.3, false));
+                    }
+                }
+            }
+            for dz in [0.1f32, 0.4] {
+                for dy in [0.2f32, 0.5, 0.8] {
+                    for dx in [-0.03f32, 0.0, 0.03] {
+                        spots.push((Vec3::new(mx.x + dx, mn.y + ext.y * dy, mn.z + ext.z * dz), true));
+                    }
+                }
+            }
+            for (feet, seam) in spots {
+                let w = if seam { &two } else { &one };
+                let inside = PlayerState::axis_samples(feet, p.height_standing, r).iter().any(|c| w.shells.iter().any(|s| s.contains(*c)));
+                if !inside {
+                    continue;
+                }
+                trapped += 1;
+                seam_cases += seam as usize;
+                // before: the controller without the shells
+                let mut b = PlayerState::standing_at(feet, 0.0);
+                for _ in 0..90 {
+                    b.step(&MoveInput::default(), &p, &NoShells(w), 1.0 / 60.0);
+                }
+                let sc = |s: &PlayerState| PlayerState::axis_samples(s.pos, p.height_standing, r).iter().any(|c| w.shells.iter().any(|sh| sh.contains(*c)));
+                stuck_before += sc(&b) as usize;
+                let mut st = PlayerState::standing_at(feet, 0.0);
+                let first = st.step(&MoveInput::default(), &p, w, 1.0 / 60.0);
+                let moved = (st.pos - feet).length();
+                // ORACLE for an axis-aligned BOX shell (its triangles fill their own AABB: 12 of
+                // them) that is the only one the body is in: the shortest axis translation that
+                // takes the whole axis out of it, plus the radius the contact solver then adds.
+                // Moving further than that is leaving by the wrong way (through the far side).
+                let pts = PlayerState::axis_samples(feet, p.height_standing, r);
+                let hit: Vec<_> = w.shells.iter().filter(|sh| pts.iter().any(|q| sh.contains(*q))).collect();
+                if let [sh] = hit.as_slice() {
+                    if sh.tris.len() == 12 {
+                        let (lo, hi) = (pts[0], *pts.last().unwrap());
+                        let e = (sh.mx.x - feet.x).min(feet.x - sh.mn.x).min(sh.mx.y - feet.y).min(feet.y - sh.mn.y).min(sh.mx.z - lo.z).min(hi.z - sh.mn.z);
+                        if moved > e + r + 0.06 || first.escaped != 1 {
+                            too_far += 1;
+                            if report.len() < 10 {
+                                report.push(format!("{name}: from {feet:?} moved {moved:.3} in {} move(s), the shortest axis exit says {:.3}", first.escaped, e + r));
+                            }
+                        }
+                    }
+                }
+                let mut trace = Vec::new();
+                for k in 0..90 {
+                    let o = st.step(&MoveInput::default(), &p, w, 1.0 / 60.0);
+                    if k < 6 { trace.push(format!("t{k} esc {} pos {:.3?}", o.escaped, st.pos)); }
+                }
+                if PlayerState::overlaps_at(st.pos, &p, w, 0.03) {
+                    stuck_after += 1;
+                    if report.len() < 8 {
+                        let why = {
+                            let cs = PlayerState::spheres_at(st.pos, p.height_standing, r);
+                            let inside = cs.iter().filter(|c| w.shells.iter().any(|sh| sh.contains(**c))).count();
+                            let mut tr: Vec<[Vec3; 3]> = Vec::new();
+                            w.gather(st.pos - Vec3::splat(1.0), st.pos + Vec3::splat(2.0), &mut tr);
+                            let deep = cs.iter().flat_map(|c| tr.iter().filter_map(|t| sphere_tri_contact(*c, r, 0.0, t)).map(|h| h.depth)).fold(0.0f32, f32::max);
+                            format!("{inside} sphere centres inside a shell, deepest tri contact {deep:.3}")
+                        };
+                        let dbg: Vec<String> = w.shells.iter().filter(|sh| PlayerState::spheres_at(st.pos, p.height_standing, r).iter().any(|c| sh.contains(*c))).map(|sh| format!("shell {:?}..{:?} {} tris", sh.mn, sh.mx, sh.tris.len())).collect();
+                        report.push(format!("{name}: from {feet:?} ended overlapping at {:?}: {why}; in {dbg:?}; {trace:?}", st.pos));
+                    }
+                }
+            }
+        }
+        println!("{blocks} blocks, {trapped} trapped placements ({seam_cases} at a seam): ended INSIDE a shell before {stuck_before}, after the fix {stuck_after} overlapping; {too_far} single-move exits that did not go by the nearest face");
+        for l in &report {
+            println!("   {l}");
+        }
+        assert!(blocks >= 60 && trapped >= 3000 && seam_cases >= 300, "liveness: {blocks} blocks, {trapped} placements, {seam_cases} at seams");
+        assert!(stuck_before > trapped / 4, "the fixture does not trap the unfixed controller ({stuck_before} of {trapped})");
+        assert_eq!((stuck_after, too_far), (0, 0));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // tiny obstacles: steps, gaps, ledges -- the body must never be pushed or sent backward
+    // -----------------------------------------------------------------------------------------
+
+    /// A local-frame obstacle course turned by `yaw` about the origin: closed bevelled block
+    /// shells exactly as the production hulls are made (`padded_hull`, radius 0.0164), plus
+    /// optional bare terrain triangles.
+    fn course(boxes: &[Vec<Vec3>], terrain: &[[Vec3; 3]], yaw: f32) -> ShellWorld {
+        let rot = glam::Quat::from_rotation_z(yaw);
+        let mut w = ShellWorld { tris: Vec::new(), shells: Vec::new() };
+        for pts in boxes {
+            let pts: Vec<Vec3> = pts.iter().map(|p| rot * *p).collect();
+            let t = crate::object_hulls::padded_hull(&pts, 0.0164);
+            w.tris.extend(t.iter().copied());
+            w.shells.push(std::sync::Arc::new(Shell::new(t)));
+        }
+        w.tris.extend(terrain.iter().map(|t| t.map(|p| rot * p)));
+        w
+    }
+
+    fn cuboid(mn: Vec3, mx: Vec3) -> Vec<Vec3> {
+        (0..8).map(|i| Vec3::new(if i & 1 == 0 { mn.x } else { mx.x }, if i & 2 == 0 { mn.y } else { mx.y }, if i & 4 == 0 { mn.z } else { mx.z })).collect()
+    }
+
+    fn flat_terrain(z: f32) -> Vec<[Vec3; 3]> {
+        let (a, b) = (Vec3::new(-8.0, -8.0, z), Vec3::new(8.0, 8.0, z));
+        vec![[a, Vec3::new(b.x, a.y, z), b], [a, b, Vec3::new(a.x, b.y, z)]]
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Frame {
+        Fixed(f32),
+        Jittered,
+    }
+
+    /// What one walk did.
+    #[derive(Default, Debug, Clone)]
+    struct Walk {
+        backward: usize,
+        worst_back: f32,
+        teleports: usize,
+        relocated: usize,
+        escaped: usize,
+        flips: usize,
+        progress: f32,
+        jitter: f32,
+        end: Vec3,
+        first: String,
+    }
+
+    /// Walk a body along local +x (or +y when `along`) of a course rotated by `yaw`, from 2.2 wu
+    /// before the origin, for 3 s of held input. Backward = a tick whose displacement points
+    /// against the commanded direction by more than 3 mm; teleport = a tick that moves more than
+    /// 3x the commanded speed (+5 cm) horizontally or rises more than 5 cm.
+    fn walk(p: &PlayerPhysics, w: &ShellWorld, yaw: f32, sprint: bool, along: bool, start_h: f32, frame: Frame) -> Walk {
+        let dir_local = if along { Vec3::Y } else { Vec3::X };
+        let rot = glam::Quat::from_rotation_z(yaw);
+        let dir = rot * dir_local;
+        let face = dir.y.atan2(dir.x);
+        let start = rot * (-dir_local * 2.2 + if along { Vec3::new(0.0, 0.0, 0.0) } else { Vec3::ZERO }) + Vec3::Z * (start_h + 0.05);
+        let mut st = PlayerState::standing_at(start, face);
+        for _ in 0..40 {
+            st.step(&MoveInput { yaw: face, ..Default::default() }, p, w, 1.0 / 60.0);
+        }
+        let input = MoveInput { fwd: 1.0, yaw: face, sprint, ..Default::default() };
+        let speed = if sprint { p.run_forward * p.sprint_full_speed_multiplier } else { p.run_forward };
+        let mut out = Walk::default();
+        let begin = st.pos;
+        let mut prev_grounded = st.grounded;
+        let mut tail: Vec<Vec3> = Vec::new();
+        let mut rng = 0x1234_5678u32;
+        let mut clock = 0.0f32;
+        let mut f = 0usize;
+        while clock < 3.0 {
+            let dt = match frame {
+                Frame::Fixed(h) => 1.0 / h,
+                Frame::Jittered => {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    0.004 + 0.03 * ((rng >> 8) as f32 / 16_777_216.0)
+                }
+            };
+            clock += dt;
+            f += 1;
+            let before = st.pos;
+            let o = st.step(&input, p, w, dt);
+            let d = st.pos - before;
+            let along_cmd = d.x * dir.x + d.y * dir.y;
+            let mech = format!("tick {f}: back {along_cmd:.4}, escaped {}, relocated {}, grounded {}->{}", o.escaped, o.relocated, prev_grounded, st.grounded);
+            if along_cmd < -0.003 {
+                out.backward += 1;
+                out.worst_back = out.worst_back.min(along_cmd);
+                if out.first.is_empty() { out.first = mech.clone(); }
+            }
+            if Vec3::new(d.x, d.y, 0.0).length() > speed * dt * 3.0 + 0.05 || d.z > 0.1 || o.relocated {
+                out.teleports += 1;
+                if out.first.is_empty() { out.first = mech.clone(); }
+            }
+            out.relocated += o.relocated as usize;
+            out.escaped += (o.escaped > 0) as usize;
+            out.flips += (st.grounded != prev_grounded) as usize;
+            prev_grounded = st.grounded;
+            if clock >= 2.0 {
+                tail.push(st.pos);
+            }
+        }
+        out.progress = (st.pos - begin).dot(dir);
+        out.end = st.pos;
+        let (mn, mx) = tail.iter().fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+        out.jitter = (mx - mn).x.max((mx - mn).y);
+        out
+    }
+
+    /// How a walk into an obstacle must end.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Expect {
+        /// Climbs / crosses it: the body ends well past it.
+        Cross,
+        /// Cannot climb it: stops in front of it and stays still.
+        Stop,
+        /// Walks off an edge and falls.
+        Drop,
+        /// Wedges in a crack narrower than its sphere (the 35 degree surface bar): only
+        /// "no teleport" is asserted.
+        Wedge,
+    }
+
+    /// Every obstacle of the sweep: (name, boxes, terrain, start height, along, expectation).
+    fn obstacles() -> Vec<(String, Vec<Vec<Vec3>>, Vec<[Vec3; 3]>, f32, bool, Expect)> {
+        let big = |x0: f32, x1: f32, top: f32| cuboid(Vec3::new(x0, -6.0, top - 1.0), Vec3::new(x1, 6.0, top));
+        let mut v = Vec::new();
+        for h in [0.002f32, 0.004, 0.0083, 0.02, 0.0625] {
+            v.push((format!("step up {h} block->block"), vec![big(-6.0, 0.0, 0.0), big(0.0, 6.0, h)], vec![], 0.0, false, Expect::Cross));
+            v.push((format!("step up {h} terrain->block"), vec![big(0.0, 6.0, h)], flat_terrain(0.0), 0.0, false, Expect::Cross));
+            v.push((format!("step down {h} block->block"), vec![big(-6.0, 0.0, h), big(0.0, 6.0, 0.0)], vec![], h, false, Expect::Cross));
+        }
+        for g in [0.01f32, 0.05, 0.1, 0.2] {
+            v.push((format!("gap {g} across"), vec![big(-6.0, -g / 2.0, 0.0), big(g / 2.0, 6.0, 0.0)], vec![], 0.0, false, Expect::Cross));
+            v.push((format!("gap {g} along"), vec![big(-6.0, -g / 2.0, 0.0), big(g / 2.0, 6.0, 0.0)], vec![], 0.0, true, Expect::Cross));
+        }
+        // a crack of 0.3 is narrower than the 0.35 sphere: the contact normals at its two edges are
+        // 59 degrees from vertical, past the 35 degree bar -- the body wedges, in the engine too
+        v.push(("gap 0.3 across".into(), vec![big(-6.0, -0.15, 0.0), big(0.15, 6.0, 0.0)], vec![], 0.0, false, Expect::Wedge));
+        v.push(("ledge drop".into(), vec![big(-6.0, 0.0, 0.0)], vec![], 0.0, false, Expect::Drop));
+        for h in [0.2f32, 0.5, 1.0] {
+            v.push((format!("high ledge {h}"), vec![big(-6.0, 0.0, 0.0), big(0.0, 6.0, h)], vec![], 0.0, false, Expect::Stop));
+        }
+        // a ramp base lip: a 15 degree wedge up from a lip of height h
+        for h in [0.0083f32, 0.0625] {
+            let ramp = vec![
+                Vec3::new(0.0, -6.0, 0.0), Vec3::new(0.0, 6.0, 0.0), Vec3::new(0.0, -6.0, h), Vec3::new(0.0, 6.0, h),
+                Vec3::new(3.0, -6.0, h + 0.8), Vec3::new(3.0, 6.0, h + 0.8), Vec3::new(3.0, -6.0, 0.0), Vec3::new(3.0, 6.0, 0.0),
+            ];
+            v.push((format!("ramp lip {h}"), vec![big(-6.0, 0.0, 0.0), ramp], vec![], 0.0, false, Expect::Cross));
+        }
+        v
+    }
+
+    /// #collision  **TINY OBSTACLES NEVER MOVE THE BODY BACKWARD OR TELEPORT IT.** Steps of
+    /// 0.002..0.0625 wu (block to block, terrain to block, down), gaps of 0.01..0.2 wu across and
+    /// along, a ramp base lip, a platform edge to fall off and ledges the body cannot climb --
+    /// production bevelled hull shells -- walked into from 8 directions at run and sprint, at
+    /// 60 Hz, 144 Hz, 30 Hz and jittered frame times, for 3 s of held input. Per walk: no tick
+    /// moves the body backward (> 3 mm against the stick) or teleports it (> 3x the commanded
+    /// step + 5 cm, > 10 cm up, or a relocation), the stuck logic never fires (no shell escape, no
+    /// relocation), steps and gaps within the engine's emergent climb are CROSSED, higher ledges
+    /// STOP the body and it then stays still (< 1 cm of movement in the last second), edges
+    /// DROP it.
+    ///
+    /// SABOTAGE: (a) the fallback fires on mere contact -- `|| self.n_contacts > 0` in its
+    /// condition with `SQUEEZE_SECONDS` 0 and `SQUEEZE_PROGRESS` 100 -> relocations at every lip
+    /// and ledge; (b) the threshold lowered -- `SQUEEZE_DEPTH` 0 (`>=`), seconds 0, progress 100
+    /// -> the same. Both go red.
+    #[test]
+    fn tiny_obstacles_never_move_the_body_backward_or_teleport_it() {
+        let p = spartan();
+        let (mut walks, mut back, mut tele, mut reloc, mut escape) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut report: Vec<String> = Vec::new();
+        let (mut crossed, mut stopped, mut dropped, mut wedged) = (0usize, 0usize, 0usize, 0usize);
+        for (name, boxes, terrain, h0, along, expect) in obstacles() {
+            for k in 0..8 {
+                let yaw = k as f32 * std::f32::consts::FRAC_PI_4;
+                for (sprint, frame) in [(false, Frame::Fixed(60.0)), (true, Frame::Fixed(60.0)), (false, Frame::Fixed(144.0)), (true, Frame::Fixed(30.0)), (true, Frame::Jittered), (false, Frame::Jittered)] {
+                    let w = course(&boxes, &terrain, yaw);
+                    let o = walk(&p, &w, yaw, sprint, along, h0, frame);
+                    walks += 1;
+                    back += o.backward;
+                    tele += o.teleports;
+                    reloc += o.relocated;
+                    escape += o.escaped;
+                    let ok = match expect {
+                        Expect::Cross => { crossed += 1; o.progress > 3.5 }
+                        Expect::Stop => { stopped += 1; o.progress < 2.3 && o.jitter < 0.01 }
+                        Expect::Drop => { dropped += 1; o.progress > 3.0 && o.end.z < -0.5 }
+                        Expect::Wedge => { wedged += 1; true }
+                    };
+                    if !ok || o.backward + o.teleports + o.relocated + o.escaped > 0 {
+                        if report.len() < 12 {
+                            report.push(format!("{name} yaw {:.0} {} {frame:?}: progress {:.2} jitter {:.3} back {} tele {} reloc {} escape {} {}", yaw.to_degrees(), if sprint { "sprint" } else { "run" }, o.progress, o.jitter, o.backward, o.teleports, o.relocated, o.escaped, o.first));
+                        }
+                        if !ok {
+                            back += 1000; // an expectation failure is reported through the same assertion
+                        }
+                    }
+                }
+            }
+        }
+        println!("{walks} walks ({crossed} crossings, {stopped} stops, {dropped} drops, {wedged} wedges): backward ticks {back}, teleports {tele}, relocations {reloc}, shell escapes {escape}");
+        for r in &report { println!("   {r}"); }
+        assert!(walks >= 1400 && crossed >= 1000 && stopped >= 100 && dropped >= 40, "liveness: {walks} walks");
+        assert_eq!((back, tele, reloc, escape), (0, 0, 0, 0));
+    }
+
+
+    /// Real terrain (structure BSP + instances) with real Forge block shells laid on it.
+    struct TerrainAndBlocks<'a> {
+        soup: &'a crate::decal_projector::TriSoup,
+        tris: Vec<[Vec3; 3]>,
+        shells: Vec<std::sync::Arc<Shell>>,
+    }
+    impl StaticWorld for TerrainAndBlocks<'_> {
+        fn gather(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+            self.soup.tris_in_aabb(mn, mx, out);
+            self.tris.as_slice().gather(mn, mx, out);
+        }
+        fn solid_shells(&self, mn: Vec3, mx: Vec3, out: &mut Vec<std::sync::Arc<Shell>>) {
+            out.extend(self.shells.iter().filter(|s| (0..3).all(|k| s.mn[k] <= mx[k] && s.mx[k] >= mn[k])).cloned());
+        }
+    }
+
+    /// #collision  **NO RUBBERBAND ON REAL GROUND.** Real Forge blocks laid on real forge_halo terrain (structure BSP + instance collision) at lips of 0 / 0.0083 / 0.0625 wu /
+    /// 0.0625 / -0.02 wu, walked into at run and sprint from 8 directions: which mechanism moves
+    /// the body backward, or fires the stuck logic, when nothing solid is ahead?
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn real_blocks_on_real_terrain_never_rubberband() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let (_, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, crate::play_mode::Species::Spartan).unwrap();
+        let mut soup = crate::decal_projector::TriSoup::new(4.0);
+        let (mut main_t, mut inst_t, mut fall_t): (Vec<[Vec3; 3]>, Vec<[Vec3; 3]>, Vec<[Vec3; 3]>) = (Vec::new(), Vec::new(), Vec::new());
+        let mut diag = 0usize;
+        let mut bsp = None;
+        for &t in &native.tags_by_group(cache, "sbsp") {
+            let Some(b) = crate::collision_bsp::CollisionBsp::for_sbsp(native, cache, t) else { continue };
+            if b.surface_count() < 20000 { continue; }
+            for (tr, _) in b.solid_triangles() { soup.add_tri_owned(tr[0], tr[1], tr[2], (0, 0, -1), u32::MAX); main_t.push(tr); }
+            let i = crate::collision_bsp::instance_tris(native, cache, t).unwrap();
+            for tr in i.placed.iter().chain(&i.fallback) { soup.add_tri_owned(tr[0], tr[1], tr[2], (0, 0, -1), u32::MAX); }
+            inst_t.extend(i.placed.iter().copied());
+            fall_t.extend(i.fallback.iter().copied());
+            bsp = Some(b);
+        }
+        let b = bsp.expect("the big BSP");
+        // the blocks
+        let want: [&str; 0] = [];
+        let mut shapes: Vec<(String, Vec<Vec<[Vec3; 3]>>)> = Vec::new();
+        for &tag in native.tags_by_group(cache, "bloc").iter() {
+            let name = native.tag_name(cache, tag).unwrap_or_default();
+            if !name.contains("levels\\forge\\ff_") { continue; }
+            let ph = native.resolve_phmo(cache, tag);
+            let Some(blk) = crate::object_hulls::read_blocks(native, cache, ph) else { continue };
+            if let Some(sh) = crate::object_hulls::hull_shells(&blk, &crate::object_hulls::mode_node_xforms(native, cache, tag)) {
+                shapes.push((name.rsplit('\\').next().unwrap_or("").to_string(), sh));
+            }
+        }
+        assert!(shapes.len() >= 5, "found {} block shapes", shapes.len());
+        let (mn, mx) = {
+            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for t in soup.tris() { for v in t { mn = mn.min(*v); mx = mx.max(*v); } }
+            (mn, mx)
+        };
+        let mut seed = 0xBADC0DEu32;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; (seed >> 8) as f32 / 16_777_216.0 };
+        let (mut walks, mut back_free, mut fired_escape, mut fired_reloc, mut flips) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut report: Vec<String> = Vec::new();
+        let mut reloc_report: Vec<String> = Vec::new();
+        let mut steep_back = 0usize;
+        let (mut stalled, mut stall_by_lip): (usize, std::collections::BTreeMap<String, (usize, usize)>) = (0, Default::default());
+        let mut stall_report: Vec<String> = Vec::new();
+        let mut spots = 0;
+        let mut attempts = 0;
+        while spots < 6 && attempts < 20000 {
+            attempts += 1;
+            let (x, y) = (mn.x + (mx.x - mn.x) * rnd(), mn.y + (mx.y - mn.y) * rnd());
+            let from = Vec3::new(x, y, mx.z + 1.0);
+            let to = Vec3::new(x, y, mn.z - 1.0);
+            let Some((t, s)) = b.ray(from, to) else { continue };
+            let Some(poly) = b.polygon(s) else { continue };
+            let n = (poly[1] - poly[0]).cross(poly[2] - poly[0]).normalize_or_zero();
+            if n.z.abs() < 0.97 { continue; }
+            let hit = from + (to - from) * t;
+            spots += 1;
+            for (name, sh) in &shapes {
+            for lip in &[0.0f32, 0.0083, 0.0625] {
+            let lip = *lip;
+                for k in 0..8 {
+                    // (yaw below is both the walk direction and, with the block fixed, 8 approaches)
+                    // the block sits with its top-surface lip `lip` above the terrain; the walker
+                    // approaches from 2.2 wu away along direction k
+                    let yaw = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let tops = sh.iter().flatten().flatten().map(|v| v.z).fold(f32::MIN, f32::max);
+                    let at = Vec3::new(hit.x, hit.y, hit.z + lip - tops);
+                    let shells: Vec<std::sync::Arc<Shell>> = sh.iter().map(|s| std::sync::Arc::new(Shell::new(s.iter().map(|t| t.map(|q| q + at)).collect()))).collect();
+                    let tris: Vec<[Vec3; 3]> = shells.iter().flat_map(|s| s.tris.iter().copied()).collect();
+                    let w = TerrainAndBlocks { soup: &soup, tris, shells };
+                    let dir = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+                    for sprint in [true] {
+                        let start = hit - dir * 2.2 + Vec3::Z * 0.4;
+                        let mut st = PlayerState::standing_at(start, yaw);
+                        for _ in 0..40 { st.step(&MoveInput { yaw, ..Default::default() }, &p, &w, 1.0 / 60.0); }
+                        // a start inside instance geometry is a body that is stuck, not walking
+                        if PlayerState::overlaps_at(st.pos, &p, &w, 0.05) { continue; }
+                        let input = MoveInput { fwd: 1.0, yaw, sprint, ..Default::default() };
+                        walks += 1;
+                        let mut prev_g = st.grounded;
+                        let (mut run, mut worst_run) = (0usize, 0usize);
+                        let mut stall_at = st.pos;
+                        let cmd = p.run_forward * p.sprint_full_speed_multiplier;
+                        for f in 0..180 {
+                            let before = st.pos;
+                            let vz_before = st.vel.z;
+                            let o = st.step(&input, &p, &w, 1.0 / 60.0);
+                            let d = st.pos - before;
+                            let front_free = !PlayerState::overlaps_at(before + dir * 0.25, &p, &w, 0.08);
+                            // the law: a face steeper than the 35 degree bar underfoot, or a slot -- a ceiling
+                            // contact (normal facing down) squeezing the body between floor and overhang
+                            let steep = st.contacts().iter().any(|c| (c.surface.z < 0.819 && c.surface.z > -0.3 && c.normal.z < 0.819) || c.normal.z < -0.1)
+                                // ...or free fall off an edge with the momentum of the slide that led to it
+                                || (!st.grounded && st.contacts().is_empty())
+                                // ...or still carrying the momentum of a fall / slide down (sliding off a
+                                // drop onto a slope keeps going downhill for a moment)
+                                || vz_before < -0.3;
+                            let back_any = f > 20 && d.dot(dir) < -0.003 && front_free;
+                            if back_any && steep { steep_back += 1; }
+                            let back = back_any && !steep;
+                            if f > 20 && front_free && st.ground_speed < 0.5 * cmd { run += 1; if run == 1 { stall_at = before; } worst_run = worst_run.max(run); } else { run = 0; }
+                            fired_escape += (o.escaped > 0) as usize;
+                            fired_reloc += o.relocated as usize;
+                            flips += (st.grounded != prev_g) as usize;
+                            prev_g = st.grounded;
+                            if o.relocated {
+                                reloc_report.push(format!("{name} lip {lip} yaw {:.0} tick {f} at ({:.3},{:.3},{:.3}) -> ({:.3},{:.3},{:.3}); residual {:.3}, escaped {}, vel ({:.2},{:.2},{:.2})", yaw.to_degrees(), before.x, before.y, before.z, st.pos.x, st.pos.y, st.pos.z, o.residual, o.escaped, st.vel.x, st.vel.y, st.vel.z));
+                            }
+                            if back || o.escaped > 0 {
+                                back_free += back as usize;
+                                if report.len() < 4 {
+                                    report.push(format!("{name} lip {lip} yaw {:.0} tick {f} at ({:.2},{:.2},{:.3}): along {:.4}, up {:.3}; escaped {} relocated {} grounded {}", yaw.to_degrees(), before.x, before.y, before.z, d.dot(dir), d.z, o.escaped, o.relocated, st.grounded));
+                                }
+                            }
+                        }
+                        let e = stall_by_lip.entry(format!("lip {lip}")).or_insert((0, 0));
+                        e.1 += 1;
+                        if worst_run >= 12 {
+                            stalled += 1;
+                            e.0 += 1;
+                            if stall_report.len() < 14 {
+                                stall_report.push(format!("{name} lip {lip} yaw {:.0}: stalled {worst_run} ticks from ({:.3},{:.3},{:.3}), front free", yaw.to_degrees(), stall_at.x, stall_at.y, stall_at.z));
+                            }
+                        }
+                    }
+                }
+            }
+            }
+        }
+        println!("{stalled} stalled walks with the front free (steep terrain faces and falls included); by lip {stall_by_lip:?}");
+        for r in &stall_report { println!("   STALL {r}"); }
+        println!("{walks} walks over {spots} terrain spots: {steep_back} backward ticks on a face steeper than 35 deg or in a floor/ceiling slot (the law), {back_free} unexplained backward ticks with the front free, {fired_escape} ticks with a shell escape, {fired_reloc} relocations, {flips} grounded flips");
+        for r in &report { println!("   {r}"); }
+        for r in &reloc_report { println!("   RELOC {r}"); }
+        assert!(walks >= 10000 && shapes.len() >= 100, "liveness: {walks} walks over {} block shapes", shapes.len());
+        assert_eq!((back_free, fired_escape, fired_reloc), (0, 0, 0), "the stuck logic fired, or the body went backward, in normal walking");
+    }
+
+    /// #collision  Same walkers over three worlds -- main BSP only, + placed instance collision,
+    /// + the render triangles kept for definitions without collision -- counting ticks that move
+    /// the body BACKWARD with the front free (a capsule 0.25 ahead overlaps by < 0.08) and stalls
+    /// (>= 12 ticks under half speed with the front free).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_which_instance_geometry_makes_barriers() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let (_, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, crate::play_mode::Species::Spartan).unwrap();
+        let (mut main, mut placed, mut fallback) = (Vec::new(), Vec::new(), Vec::new());
+        let mut bsp = None;
+        for &t in &native.tags_by_group(cache, "sbsp") {
+            let Some(b) = crate::collision_bsp::CollisionBsp::for_sbsp(native, cache, t) else { continue };
+            if b.surface_count() < 20000 { continue; }
+            main.extend(b.solid_triangles().into_iter().map(|(t, _)| t));
+            let i = crate::collision_bsp::instance_tris(native, cache, t).unwrap();
+            placed.extend(i.placed.iter().copied());
+            fallback.extend(i.fallback.iter().copied());
+            bsp = Some(b);
+        }
+        let b = bsp.unwrap();
+        let build = |sets: &[&Vec<[Vec3; 3]>]| {
+            let mut s = crate::decal_projector::TriSoup::new(4.0);
+            for set in sets { for tr in set.iter() { s.add_tri_owned(tr[0], tr[1], tr[2], (0, 0, -1), u32::MAX); } }
+            SoupWorld(s)
+        };
+        let worlds = [("main only", build(&[&main])), ("main + placed instances", build(&[&main, &placed])), ("main + placed + fallback render tris", build(&[&main, &placed, &fallback]))];
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for t in &main { for v in t { mn = mn.min(*v); mx = mx.max(*v); } }
+        let mut seed = 0xC0FFEEu32;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; (seed >> 8) as f32 / 16_777_216.0 };
+        let mut starts = Vec::new();
+        let mut attempts = 0;
+        while starts.len() < 400 && attempts < 40000 {
+            attempts += 1;
+            let (x, y) = (mn.x + (mx.x - mn.x) * rnd(), mn.y + (mx.y - mn.y) * rnd());
+            let from = Vec3::new(x, y, mx.z + 1.0);
+            let to = Vec3::new(x, y, mn.z - 1.0);
+            let Some((t, s)) = b.ray(from, to) else { continue };
+            let Some(poly) = b.polygon(s) else { continue };
+            if (poly[1] - poly[0]).cross(poly[2] - poly[0]).normalize_or_zero().z.abs() < 0.9 { continue; }
+            starts.push(from + (to - from) * t);
+        }
+        for (label, w) in &worlds {
+            let (mut walks, mut back, mut stalls, mut stalled_walks) = (0, 0, 0, 0);
+            for hit in &starts {
+                for k in 0..8 {
+                    let yaw = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let dir = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+                    let mut st = PlayerState::standing_at(*hit + Vec3::Z * 0.3, yaw);
+                    let mut settled = 0;
+                    for _ in 0..40 { st.step(&MoveInput { yaw, ..Default::default() }, &p, w, 1.0 / 60.0); settled += st.grounded as usize; }
+                    if settled < 20 { continue; }
+                    walks += 1;
+                    let input = MoveInput { fwd: 1.0, yaw, sprint: false, ..Default::default() };
+                    let (mut run, mut worst) = (0usize, 0usize);
+                    for f in 0..150 {
+                        let before = st.pos;
+                        st.step(&input, &p, w, 1.0 / 60.0);
+                        let d = st.pos - before;
+                        let free = !PlayerState::overlaps_at(before + dir * 0.25, &p, w, 0.08);
+                        if f > 30 && free && d.dot(dir) < -0.003 { back += 1; }
+                        if f > 30 && free && st.ground_speed < 0.5 * p.run_forward { run += 1; worst = worst.max(run); } else { run = 0; }
+                    }
+                    if worst >= 12 { stalls += 1; stalled_walks += 1; }
+                }
+            }
+            println!("{label:<40} {walks} walks: {back} backward ticks with the front free, {stalled_walks} stalled walks with the front free");
+            let _ = stalls;
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // the real tags
+    // -----------------------------------------------------------------------------------------
+
+    /// #play-gate  **THE REAL ROW.** Prints every authored ground-physics field of both species
+    /// off `forge_halo` and checks the five `runtime_*` values the ENGINE stored at tag
+    /// post-process (`bipd` ground struct `+0x1C..+0x2C`) against the ones
+    /// [`PlayerPhysics`] recomputes from the authored angles -- so the formulas that
+    /// `postprocess_character_physics_field_struct` runs (`cos`, `sin(-x)`, `sin(x)`) are
+    /// verified on the cache rather than trusted from a decompile.
+    ///
+    /// `cargo test -p hms-app --release play_ctl::tests::probe_the_authored_ground_physics -- --ignored --nocapture`
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_the_authored_ground_physics() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else {
+            eprintln!("play_ctl probes SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        for sp in [crate::play_mode::Species::Spartan, crate::play_mode::Species::Elite] {
+            let (path, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, sp).expect("a player biped");
+            println!("\n=== {} ===\n{path}\n{}\n{}", sp.label(), p.describe(), law_summary(&p));
+            let name = path.split("  (").next().unwrap_or("").to_string();
+            let tag = bipeds.iter().find(|(_, n)| *n == name).map(|(t, _)| *t).expect("the biped's tag");
+            let g = crate::play_phys::BIPD_PHYSICS + crate::play_phys::PHYSICS_GROUND;
+            let m = native.tag_meta(cache, tag, 0, (g + 0x44) as u32).expect("bipd meta");
+            let f = |o: usize| f32::from_le_bytes([m[g + o], m[g + o + 1], m[g + o + 2], m[g + o + 3]]);
+            let stored = [f(0x1C), f(0x20), f(0x24), f(0x28), f(0x2C)];
+            let mine = [
+                p.min_normal_k(),
+                (-p.downhill_falloff).sin(),
+                (-p.downhill_cutoff).sin(),
+                p.uphill_falloff.sin(),
+                p.uphill_cutoff.sin(),
+            ];
+            println!("   runtime k stored {stored:?}\n   runtime k mine   {mine:?}");
+            for (i, (a, b)) in stored.iter().zip(mine.iter()).enumerate() {
+                assert!((a - b).abs() < 1e-5, "runtime k[{i}]: the engine stored {a}, the formula gives {b}");
+            }
+        }
+    }
+
+    // =========================================================================================
+    // #play-gate  THE ENGINE'S CONTROLLER (2026-10-20 port). Every expectation below is a
+    // LITERAL worked by hand from the decompiled law, or a closed form derived from it in the
+    // test -- never the production function's own output. Each gate names its SABOTAGE.
+    // =========================================================================================
+
+    /// The forge_halo SPARTAN, as `probe_the_authored_ground_physics` reads it off the cache
+    /// (that probe prints the same numbers). Separate from the stand-in, whose values are
+    /// deliberately not Reach's.
+    fn spartan() -> PlayerPhysics {
+        PlayerPhysics {
+            walk_speed: 0.512,
+            run_forward: 2.200,
+            run_backward: 1.980,
+            run_sideways: 1.980,
+            run_acceleration: 8.5,
+            sneak_forward: 0.900,
+            sneak_backward: 0.810,
+            sneak_sideways: 0.810,
+            sneak_acceleration: 6.1,
+            airborne_acceleration: 1.05,
+            sprint_seconds_to_start: 0.0,
+            sprint_seconds_to_full: 1.0,
+            sprint_full_speed_multiplier: 1.623,
+            jump_velocity: 2.3,
+            height_standing: 0.65,
+            height_crouching: 0.5,
+            radius: 0.175,
+            max_slope: 50f32.to_radians(),
+            // `slope speed`: x1.5 past a 45 degree descent, x0.5 from 45 to 50 up -- beyond every
+            // walkable face, so inert on ground the biped can stand on.
+            downhill_falloff: 45f32.to_radians(),
+            downhill_cutoff: 50f32.to_radians(),
+            uphill_falloff: 45f32.to_radians(),
+            uphill_cutoff: 50f32.to_radians(),
+            downhill_velocity_scale: 1.5,
+            uphill_velocity_scale: 0.5,
+            ..phys()
+        }
+    }
+
+    /// Run `n` frames at 60 Hz recording the state after each.
+    fn trace(st: &mut PlayerState, input: &MoveInput, p: &PlayerPhysics, w: &Vec<[Vec3; 3]>, n: usize) -> Vec<PlayerState> {
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            st.step(input, p, w, 1.0 / 60.0);
+            v.push(*st);
+        }
+        v
+    }
+
+    fn contact(n: Vec3) -> Contact {
+        Contact { normal: n.normalize(), surface: n.normalize() }
+    }
+
+    /// Hand-worked: a valley of two faces tilted 20 degrees to either side sums to a LEVEL plane
+    /// that neither face is alone, a contact being left faster than 0.468 wu/s is not ground, a
+    /// face steeper than the global 35 degrees raises the bar above itself, and a roof is never
+    /// ground.
+    ///
+    /// SABOTAGE: take the best SINGLE contact instead of the best subset (loop `mask` over powers
+    /// of two only) -> the valley reads 0.9397 instead of 1.0 and `valley` goes red.
+    /// SABOTAGE: drop the `LEAVING_SPEED` clause -> `leaving` goes red. SABOTAGE: drop the
+    /// surface loop -> `steep` goes red (a 40-degree face would be standable at an authored 50).
+    #[test]
+    fn the_ground_plane_is_the_best_subset_of_the_flattest_eligible_contacts() {
+        let k50 = 50f32.to_radians().cos();
+        let tilt = 20f32.to_radians();
+        let left = contact(Vec3::new(-tilt.sin(), 0.0, tilt.cos()));
+        let right = contact(Vec3::new(tilt.sin(), 0.0, tilt.cos()));
+        // 1. the valley
+        let valley = ground_plane(&[left, right], Vec3::ZERO, k50).expect("a valley is ground");
+        assert!((valley.z - 1.0).abs() < 1e-5 && valley.x.abs() < 1e-5, "valley plane {valley:?}, want straight up");
+        assert!(left.normal.z < 0.95, "the fixture's single faces must be worse than the sum, or this proves nothing");
+        // order is irrelevant: there is no order to be wrong about
+        let rev = ground_plane(&[right, left], Vec3::ZERO, k50).unwrap();
+        assert!((rev - valley).length() < 1e-6, "the answer depends on contact order: {rev:?} vs {valley:?}");
+        // 2. leaving: the floor is moving away at 1.0 wu/s along its normal (> 0.468) -> not ground,
+        //    and with nothing else touching there is NO ground at all
+        let floor = contact(Vec3::Z);
+        assert!(ground_plane(&[floor], Vec3::new(0.0, 0.0, 1.0), k50).is_none(), "a floor being left at 1.0 wu/s is ground");
+        //    ...but at 0.4 wu/s (< 0.468) it still is
+        assert!(ground_plane(&[floor], Vec3::new(0.0, 0.0, 0.4), k50).is_some(), "a floor being left at 0.4 wu/s is not ground");
+        // 3. the surface bar: a 40-degree face (normal z 0.766) passes an authored 50 on its
+        //    CONTACT normal and is refused on its SURFACE normal; a 30-degree one stands
+        let face = |deg: f32| {
+            let n = Vec3::new(-deg.to_radians().sin(), 0.0, deg.to_radians().cos());
+            Contact { normal: n, surface: n }
+        };
+        assert!(ground_plane(&[face(40.0)], Vec3::ZERO, k50).is_none(), "a 40 degree face is standable");
+        assert!(ground_plane(&[face(30.0)], Vec3::ZERO, k50).is_some(), "a 30 degree face is not standable");
+        // ...whereas the SAME contact normal on a flat surface (the edge of a step) is fine:
+        // contact normal 40 degrees, surface level.
+        let edge = Contact { normal: face(40.0).normal, surface: Vec3::Z };
+        assert!(ground_plane(&[edge], Vec3::ZERO, k50).is_some(), "the edge of a step was refused on its contact normal");
+        //    and a 55-degree EDGE normal fails the authored 50 even on a level surface
+        let edge55 = Contact { normal: face(55.0).normal, surface: Vec3::Z };
+        assert!(ground_plane(&[edge55], Vec3::ZERO, k50).is_none(), "the authored limit does not apply to the contact normal");
+        // 4. a roof is never ground
+        assert!(ground_plane(&[contact(-Vec3::Z)], Vec3::ZERO, k50).is_none());
+        // 5. a wall touching as well as a floor changes nothing (it is eligible, z = 0, and loses)
+        let wall = Contact { normal: Vec3::X, surface: Vec3::X };
+        let both = ground_plane(&[wall, floor], Vec3::ZERO, k50).expect("floor + wall is ground");
+        assert!((both.z - 1.0).abs() < 1e-5, "{both:?}");
+        // 6. only the five FLATTEST are kept: six contacts whose flattest is listed last
+        let tilted = |deg: f32, az: f32| {
+            let r = deg.to_radians();
+            let n = Vec3::new(r.sin() * az.cos(), r.sin() * az.sin(), r.cos());
+            Contact { normal: n, surface: n }
+        };
+        let mut six: Vec<Contact> = (0..5).map(|i| tilted(25.0, i as f32 * 1.2566)).collect();
+        six.push(floor);
+        let kept = ground_plane(&six, Vec3::ZERO, k50).unwrap();
+        assert!((kept.z - 1.0).abs() < 1e-5, "the flattest contact was dropped because it was listed last: {kept:?}");
+    }
+
+    /// Hand-worked velocities, one per rule of `sub_1406C4A20`, at `dt = 1/60` (one engine tick:
+    /// `game_time_globals` seconds_per_tick, which both the acceleration clamp and the gravity
+    /// term multiply by) so the engine's per-tick numbers can be written as literals.
+    ///
+    /// * at rest on the flat the body is pressed into the ground at the MINIMUM adhesion, 0.12 x
+    ///   30/60 = 0.06 (the engine divides the 30 Hz-tuned literals by `tick_rate / 30`);
+    /// * cruising at 2.2 it is pressed at the MAXIMUM, 0.234 x 0.5 = 0.117;
+    /// * from rest, a full stick is acceleration-limited to 8.5 / 60 = 0.14167 wu/s, the clamp is
+    ///   saturated, so adhesion (0.06) AND gravity (4.1712594 / 60 = 0.069521) both apply;
+    /// * on a 20 degree plane the target aims UP the plane at the commanded SPEED (2.2);
+    /// * in the air the same stick adds only 1.05 / 60 = 0.0175 wu/s and gravity is the only z.
+    ///
+    /// SABOTAGE: drop the adhesion subtraction -> `rest` red; apply gravity unconditionally ->
+    /// `cruise` red; drop the slope-following z -> `ramp` red; use the ground acceleration in
+    /// the air -> `air` red; drop the 30/tick_rate adhesion scale -> `rest` red.
+    #[test]
+    fn the_velocity_update_is_the_engines_own_arithmetic() {
+        let p = spartan();
+        let dt = 1.0 / 60.0;
+        let g = 4.1712594f32;
+        // rest
+        let rest = control_velocity(Vec3::ZERO, Some(Vec3::Z), Vec3::ZERO, &p, 0.0, dt);
+        assert!((rest - Vec3::new(0.0, 0.0, -0.06)).length() < 1e-6, "rest {rest:?}");
+        // cruise: error zero, so the clamp is NOT saturated and there is no gravity
+        let cruise = control_velocity(Vec3::new(2.2, 0.0, 0.0), Some(Vec3::Z), Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
+        assert!((cruise - Vec3::new(2.2, 0.0, -0.117)).length() < 1e-5, "cruise {cruise:?}");
+        // launch
+        let go = control_velocity(Vec3::ZERO, Some(Vec3::Z), Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
+        let want = Vec3::new(8.5 / 60.0, 0.0, -0.06 - g / 60.0);
+        assert!((go - want).length() < 1e-5, "launch {go:?}, want {want:?}");
+        // ramp: plane normal of a 20 degree face rising toward +x; already moving along it
+        let a = 20f32.to_radians();
+        let n = Vec3::new(-a.sin(), 0.0, a.cos());
+        let tangent = Vec3::new(a.cos(), 0.0, a.sin());
+        let v = tangent * 2.2;
+        let on_ramp = control_velocity(v, Some(n), Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
+        // error zero (the target IS the current velocity), so only adhesion at speed 2.2
+        assert!((on_ramp - (v - n * 0.117)).length() < 1e-5, "ramp {on_ramp:?}");
+        // ...and from a standstill the first tick accelerates ALONG the plane, not along x
+        let up = control_velocity(Vec3::ZERO, Some(n), Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
+        let along = (up + n * 0.06 + Vec3::Z * (g / 60.0)).normalize();
+        assert!((along - tangent).length() < 1e-4, "the first tick left the plane: {along:?} vs {tangent:?}");
+        // air: horizontal chase at the AIRBORNE acceleration, z is gravity alone
+        let air = control_velocity(Vec3::ZERO, None, Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
+        assert!((air - Vec3::new(1.05 / 60.0, 0.0, -g / 60.0)).length() < 1e-5, "air {air:?}");
+        // ...and with the stick released the air STILL pulls the velocity toward zero (it is not
+        // a coast): 2.0 wu/s becomes 2.0 - 0.0175
+        let drag = control_velocity(Vec3::new(2.0, 0.0, 1.0), None, Vec3::ZERO, &p, 0.0, dt);
+        assert!((drag.x - (2.0 - 1.05 / 60.0)).abs() < 1e-5 && (drag.z - (1.0 - g / 60.0)).abs() < 1e-5, "drag {drag:?}");
+    }
+
+    /// FLAT GROUND DOES NOT MOVE THE BODY VERTICALLY, AT ALL. The old controller teleported
+    /// `pos.z` to a probed height and wandered by millimetres; the engine's body is never moved
+    /// to stay grounded, so standing and walking on a dead-flat floor must hold z to float
+    /// rounding -- 1e-6 wu, a thousandth of the old 1e-3 tolerance.
+    ///
+    /// SABOTAGE: re-add `self.pos.z = <anything but the contact's own resolution>` after the
+    /// resolve (e.g. `self.pos.z += 2e-6` when grounded) -> red.
+    #[test]
+    fn flat_ground_holds_the_vertical_position_to_float_rounding() {
+        let p = spartan();
+        let w = floor(0.0, 60.0);
+        // Start beside the floor's diagonal seam (y = x) so the walk crosses it.
+        let mut st = PlayerState::standing_at(Vec3::new(-1.0, 0.0, 0.3), 0.0);
+        settle(&mut st, &p, &w);
+        assert!(st.grounded);
+        let z0 = st.pos.z;
+        // ABSOLUTE as well as steady: the floor is at z = 0, and a body that rested a few
+        // microns above it (an extra writer on z that the contact then holds in place) would
+        // pass a test that only compares the body with itself.
+        assert!(z0.abs() < 1e-6, "the body rests at z {z0:e} on a floor at z = 0");
+        let mut samples = 0;
+        let mut worst = 0.0f32;
+        let mut sides = std::collections::BTreeSet::new();
+        // standing still, then walking, then strafing and backing, then stopping
+        for input in [
+            MoveInput::default(),
+            MoveInput { fwd: 1.0, ..Default::default() },
+            MoveInput { fwd: 1.0, right: 1.0, ..Default::default() },
+            MoveInput { fwd: -1.0, ..Default::default() },
+            MoveInput::default(),
+        ] {
+            for s in trace(&mut st, &input, &p, &w, 90) {
+                worst = worst.max(s.pos.z.abs());
+                assert!(s.grounded, "left the floor while crossing it: {}", s.describe(&p));
+                sides.insert((s.pos.y - s.pos.x).is_sign_positive());
+                samples += 1;
+            }
+        }
+        assert_eq!(samples, 450);
+        assert!(st.pos.x.abs() > 1.0 || st.pos.y.abs() > 1.0, "it never actually travelled, so this proved nothing");
+        assert_eq!(sides.len(), 2, "the walk never crossed the floor's triangle seam, so it proved nothing about seams");
+        assert!(worst < 1e-6, "z wandered {worst:e} wu on flat ground (started {z0:e})");
+    }
+
+    /// Climb and descend a ramp at several angles: z never goes the wrong way and each frame's
+    /// rise is the slope's, with the tick-to-tick scatter bounded far below what a player sees.
+    ///
+    /// The per-frame rise is compared with `dx * tan(angle)`: on a plane the capsule's z moves by
+    /// exactly that, so any residual is the controller wobbling. Measured scatter is asserted
+    /// against a fixed 2e-4 wu (0.6 mm at Halo scale), 25 times tighter than the old gate's 5e-3.
+    ///
+    /// SABOTAGE: add the old position snap back (set `pos.z` from a probe each frame) -> the
+    /// scatter bound goes red; drop the adhesion subtraction -> the body is "airborne" for whole
+    /// frames on the descent (`grounded` assertion); set the leaving filter to `<= 0.0` -> the
+    /// uphill assertion on `grounded` goes red.
+    #[test]
+    fn walking_a_ramp_is_monotone_and_its_per_frame_rise_is_the_slope() {
+        let p = spartan();
+        let mut frames_seen = 0usize;
+        for deg in [8.0f32, 15.0, 25.0, 33.0] {
+            let t = deg.to_radians().tan();
+            // --- UP
+            let mut w = floor(0.0, 8.0);
+            w.extend(ramp(deg, 40.0, 8.0));
+            let mut st = PlayerState::standing_at(Vec3::new(-3.0, 0.0, 0.2), 0.0);
+            settle(&mut st, &p, &w);
+            let input = MoveInput { fwd: 1.0, ..Default::default() };
+            trace(&mut st, &input, &p, &w, 150); // reach the ramp and get onto it
+            let tr = trace(&mut st, &input, &p, &w, 180);
+            let mut prev = tr[0];
+            for s in &tr[1..] {
+                assert!(s.pos.x > 1.0, "{deg}: still on the flat");
+                assert!(s.grounded, "{deg} deg UP: airborne at x {:.3}", s.pos.x);
+                let (dx, dz) = (s.pos.x - prev.pos.x, s.pos.z - prev.pos.z);
+                assert!(dz > -1e-6, "{deg} deg UP: z went DOWN by {dz:e}");
+                assert!((dz - dx * t).abs() < 2e-4, "{deg} deg UP: rose {dz:.6} for {dx:.6} of x (slope says {:.6})", dx * t);
+                prev = *s;
+                frames_seen += 1;
+            }
+            assert!(tr.last().unwrap().pos.z > tr[0].pos.z + 0.3, "{deg}: did not climb");
+            // --- DOWN
+            // The crest is a convex edge: a body running off it leaves the ground (the contact
+            // normal rotates past the 0.468 leaving speed) and lands further down, so the
+            // measured window starts well after the landing.
+            let w = downramp(deg, 60.0, 8.0, 8.0);
+            let mut st = PlayerState::standing_at(Vec3::new(-3.0, 0.0, 0.3), 0.0);
+            settle(&mut st, &p, &w);
+            trace(&mut st, &input, &p, &w, 360);
+            let tr = trace(&mut st, &input, &p, &w, 180);
+            let mut prev = tr[0];
+            for s in &tr[1..] {
+                assert!(s.pos.x > 1.0, "{deg}: still on the shelf");
+                assert!(s.grounded, "{deg} deg DOWN: airborne at x {:.3}", s.pos.x);
+                let (dx, dz) = (s.pos.x - prev.pos.x, s.pos.z - prev.pos.z);
+                assert!(dz < 1e-6, "{deg} deg DOWN: z went UP by {dz:e}");
+                assert!((dz + dx * t).abs() < 2e-4, "{deg} deg DOWN: fell {dz:.6} for {dx:.6} of x (slope says {:.6})", -dx * t);
+                prev = *s;
+                frames_seen += 1;
+            }
+        }
+        assert!(frames_seen > 8 * 179 - 8, "only {frames_seen} frames were examined");
+    }
+
+    /// WALKABILITY STRADDLES THE GLOBAL 35 DEGREES, and the authored slope limit is not what
+    /// decides it. Ramps at 34.5 degrees and below are climbed grounded; ramps at 35.5 and above
+    /// are never stood on -- not at 40, not at 50 (the authored limit!), not at 60 -- and the
+    /// slope limit visibly fires. Handing the biped a kinder authored limit (70) changes nothing
+    /// about a 40 degree face, because that limit is tested on the CONTACT normal and a face's
+    /// contact normal IS its surface normal, which the global limit has already refused.
+    ///
+    /// SABOTAGE: make `surface_slope_cos()` return 0.0 (no surface bar) -> the 40 and 50 degree
+    /// rows go red (the authored 50 would let a 40 degree face be climbed); make it return
+    /// cos(45) -> the 34.5 row stays green and the 40 row goes red.
+    #[test]
+    fn walkability_straddles_the_global_35_degrees() {
+        let p = spartan();
+        let climb = |q: &PlayerPhysics, deg: f32| -> (PlayerState, Vec<StepOut>, usize) {
+            let mut w = floor(0.0, 6.0);
+            w.extend(ramp(deg, 40.0, 6.0));
+            let mut st = PlayerState::standing_at(Vec3::new(-1.5, 0.0, 0.2), 0.0);
+            settle(&mut st, q, &w);
+            let input = MoveInput { fwd: 1.0, ..Default::default() };
+            let mut outs = Vec::new();
+            let mut grounded_on_ramp = 0usize;
+            for _ in 0..360 {
+                outs.push(st.step(&input, q, &w, 1.0 / 60.0));
+                if st.grounded && st.pos.x > 0.5 {
+                    grounded_on_ramp += 1;
+                }
+            }
+            (st, outs, grounded_on_ramp)
+        };
+        for deg in [10.0f32, 20.0, 30.0, 34.5] {
+            let (st, _, on) = climb(&p, deg);
+            assert!(st.pos.z > 0.6, "{deg} deg: could not climb (z {:.3})", st.pos.z);
+            assert!(on > 200, "{deg} deg: only {on} grounded frames on the ramp");
+        }
+        for (q, deg, label) in [
+            (p, 35.5f32, "authored 50"),
+            (p, 40.0, "authored 50"),
+            (p, 50.0, "authored 50 (the limit itself)"),
+            (p, 60.0, "authored 50"),
+            (PlayerPhysics { max_slope: 70f32.to_radians(), ..p }, 40.0, "authored 70"),
+        ] {
+            let (st, outs, on) = climb(&q, deg);
+            assert!(st.pos.z < 0.3, "{deg} deg ({label}): climbed to z {:.3}", st.pos.z);
+            assert_eq!(on, 0, "{deg} deg ({label}): stood on the face for {on} frames");
+            assert!(outs.iter().any(|o| o.steep_contacts > 0), "{deg} deg ({label}): the slope limit never fired -- the body never reached the face");
+        }
+    }
+
+    /// THE LEDGE THE CONTACT LAW KEEPS ON THE GROUND. No step height exists anywhere; a ledge's
+    /// top edge meets the bottom sphere at a contact normal of `z = (r - h) / r`, which must beat
+    /// `cos(authored slope)` for the edge to count as ground. That puts the boundary at
+    /// `h* = r (1 - cos 50) = 0.0625 wu` on the Spartan (r = 0.175, 50 degrees), derived HERE
+    /// from the radius and the authored limit, not read from the code.
+    ///
+    /// What the boundary decides is whether the body stays in the GROUND mode (full acceleration,
+    /// adhesion, slope-following) while it goes over the edge. Two observables, both measured:
+    ///
+    /// 1. the pure decision: `ground_plane` accepts a ledge contact exactly when `h < h*`, for
+    ///    several (radius, authored limit) pairs -- 0.98 h* yes, 1.02 h* no;
+    /// 2. the integrated walk: over a staircase of risers 0.5 h* and 0.9 h* high the body reaches
+    ///    the top and is **never airborne on the way** (zero frames); over risers 1.3 h* high it
+    ///    IS airborne on some frames (the edge stops being ground and the body is in the air
+    ///    mode for the contact); and risers of 3 h* and 4 h* stop it at the first one.
+    ///
+    /// What the boundary does NOT decide, measured (`measure_step_up`): how tall a ledge the body
+    /// can still SLIDE over on momentum alone. That is Havok's half (the contact solve) and on
+    /// this approximation it is about 0.11 wu for authored limits of 15, 50 and 70 degrees alike.
+    ///
+    /// The authored pair decides: a capsule of twice the radius keeps a 1.8 h* ledge on the
+    /// ground, and a 15 degree authored limit puts even a 0.5 h* one in the air.
+    ///
+    /// SABOTAGE: classify by height instead of normal (accept an edge contact when
+    /// `contact_rise <= 0.0625`) -> the radius and limit rows of the pure decision go red;
+    /// ignore the 0.468 leaving filter -> the first integrated row goes red (the floor being left
+    /// stays "ground" and masks the edge).
+    #[test]
+    fn a_ledge_stays_ground_exactly_while_its_contact_normal_beats_the_authored_slope() {
+        let p = spartan();
+        let hstar = |q: &PlayerPhysics| q.radius * (1.0 - q.max_slope.cos());
+        assert!((hstar(&p) - 0.0625).abs() < 1e-3, "the Spartan's closed form is {:.4}, expected 0.0625", hstar(&p));
+        // 1. the pure decision, from the geometry of a sphere on an edge
+        let edge_accepted = |q: &PlayerPhysics, h: f32| {
+            let n = Vec3::new(-((q.radius * q.radius - (q.radius - h).powi(2)).sqrt()), 0.0, q.radius - h).normalize();
+            ground_plane(&[Contact { normal: n, surface: Vec3::Z }], Vec3::ZERO, q.min_normal_k()).is_some()
+        };
+        for q in [p, PlayerPhysics { radius: p.radius * 2.0, ..p }, PlayerPhysics { max_slope: 15f32.to_radians(), ..p }, PlayerPhysics { max_slope: 70f32.to_radians(), ..p }] {
+            assert!(edge_accepted(&q, hstar(&q) * 0.98), "r {} limit {:.0}: a ledge just under h* = {:.4} was refused", q.radius, q.max_slope.to_degrees(), hstar(&q));
+            assert!(!edge_accepted(&q, hstar(&q) * 1.02), "r {} limit {:.0}: a ledge just over h* = {:.4} was accepted", q.radius, q.max_slope.to_degrees(), hstar(&q));
+        }
+        // 2. the integrated walk
+        let stairs = |h: f32, n: usize| -> Vec<[Vec3; 3]> {
+            let mut w = floor(0.0, 30.0);
+            for i in 0..n {
+                let x0 = 1.0 + 0.5 * i as f32;
+                w.extend(block(Vec3::new(x0, -4.0, -1.0), Vec3::new(28.0, 4.0, h * (i + 1) as f32)));
+            }
+            w
+        };
+        // (final z, frames spent airborne between the first riser and the top step)
+        let walk = |q: &PlayerPhysics, h: f32| -> (f32, usize) {
+            let w = stairs(h, 6);
+            let mut st = PlayerState::standing_at(Vec3::new(-0.5, 0.0, 0.2), 0.0);
+            settle(&mut st, q, &w);
+            let input = MoveInput { fwd: 1.0, ..Default::default() };
+            let mut air = 0;
+            for s in trace(&mut st, &input, q, &w, 300) {
+                if !s.grounded && s.pos.x > 0.8 && s.pos.x < 4.2 {
+                    air += 1;
+                }
+            }
+            (st.pos.z, air)
+        };
+        for k in [0.5f32, 0.9] {
+            let h = hstar(&p) * k;
+            let (z, air) = walk(&p, h);
+            assert!(z > h * 5.0, "{k} h* ({h:.4} wu risers): reached only z {z:.4}, the top is {:.4}", h * 6.0);
+            assert_eq!(air, 0, "{k} h* ({h:.4} wu risers): airborne for {air} frames on the way up");
+        }
+        let (z, air) = walk(&p, hstar(&p) * 1.3);
+        assert!(air > 0, "1.3 h* risers never took the body off the ground: the edge is still being treated as ground (z {z:.4})");
+        for k in [3.0f32, 4.0] {
+            let h = hstar(&p) * k;
+            let (z, _) = walk(&p, h);
+            assert!(z < h * 0.5, "{k} h* ({h:.4} wu risers): got up to z {z:.4}");
+        }
+        // The authored pair decides.
+        let big = PlayerPhysics { radius: p.radius * 2.0, ..p };
+        let h = hstar(&p) * 1.8;
+        let (z, air) = walk(&big, h);
+        assert!(z > h * 5.0 && air == 0, "a capsule of twice the authored radius must walk up {h:.4} wu risers on the ground (z {z:.4}, {air} airborne frames)");
+        let harsh = PlayerPhysics { max_slope: 15f32.to_radians(), ..p };
+        let (_, air) = walk(&harsh, hstar(&p) * 0.5);
+        assert!(air > 0, "a 15 degree authored limit must put a 0.5 h* riser in the air mode");
+    }
+
+    /// THE JUMP: apex and airtime from the authored velocity and the engine's authored gravity,
+    /// as LITERALS. Spartan: v = 2.3 wu/s, g = 4.1712594 -> apex v^2/2g = 0.63414 wu, airtime
+    /// 2v/g = 1.10279 s. Half gravity (the jump's `sub_140DCB3B0(unit, 0.5)`) would give apex
+    /// 1.268 and airtime 2.206: for a PLAYER that scale never reaches the physics input
+    /// (`sub_140E18320` multiplies the player's gravity by the PLAYER-TRAIT table -- 1.0 by
+    /// default -- and reads the biped scale only for AI), and the writer is undone by
+    /// `sub_140E40650` in the same call that applies the velocity anyway, so full gravity it is.
+    ///
+    /// SABOTAGE: halve gravity in `control_velocity`'s air branch -> both assertions red.
+    #[test]
+    fn the_jump_apex_and_airtime_are_the_authored_arithmetic() {
+        let p = spartan();
+        let w = floor(0.0, 40.0);
+        let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.3), 0.0);
+        settle(&mut st, &p, &w);
+        let base = st.pos.z;
+        let mut peak = base;
+        let mut air_frames = 0;
+        let mut inp = MoveInput { jump: true, ..Default::default() };
+        for i in 0..240 {
+            inp.jump = i == 0;
+            st.step(&inp, &p, &w, 1.0 / 60.0);
+            peak = peak.max(st.pos.z);
+            if !st.grounded {
+                air_frames += 1;
+            }
+        }
+        let apex = peak - base;
+        let air = air_frames as f32 / 60.0;
+        assert!((apex - 0.63414).abs() < 0.03, "apex {apex:.4} wu, expected 0.6341 (v^2/2g)");
+        assert!((air - 1.10279).abs() < 0.06, "airtime {air:.3} s, expected 1.103 (2v/g)");
+        assert!(st.grounded, "never came back down");
+    }
+
+    /// A STEEP FACE SLIDES YOU DOWN, WHATEVER YOU PUSH. Past 35 degrees nothing is ground, so the
+    /// body is in the air mode, where the authored `airborne acceleration` (1.05 wu/s^2) is far
+    /// below gravity along the face (`g sin 50 = 3.2`). Standing on a 50 degree ramp, with and
+    /// without the stick held UP the slope, the body ends up lower on it and moving down-slope;
+    /// on a 30 degree ramp the same body does not creep at all (contrast: this is not just
+    /// "everything slides").
+    ///
+    /// SABOTAGE: give the air mode the ground acceleration (8.5) -> the pushed row climbs and
+    /// goes red; apply gravity only when saturated in the air branch -> the slide never starts.
+    #[test]
+    fn a_steep_face_slides_the_body_down_whatever_it_pushes() {
+        let p = spartan();
+        let steep = |deg: f32| {
+            let mut w = floor(0.0, 12.0);
+            w.extend(ramp(deg, 30.0, 12.0));
+            w
+        };
+        for (push, label) in [(0.0f32, "no stick"), (1.0, "stick held up the slope")] {
+            let w = steep(50.0);
+            let x0 = 4.0;
+            let z0 = x0 * 50f32.to_radians().tan() + p.radius * (1.0 / 50f32.to_radians().cos() - 1.0) + 0.02;
+            let mut st = PlayerState::standing_at(Vec3::new(x0, 0.0, z0), 0.0);
+            let input = MoveInput { fwd: push, ..Default::default() };
+            let tr = trace(&mut st, &input, &p, &w, 90);
+            let landed = tr[10];
+            let after = tr[89];
+            assert!(tr.iter().all(|s| !s.grounded), "{label}: stood on a 50 degree face");
+            assert!(after.pos.x < landed.pos.x - 0.25, "{label}: did not slide down (x {:.3} -> {:.3})", landed.pos.x, after.pos.x);
+            assert!(after.vel.x < -0.5, "{label}: velocity is not down-slope: {:?}", after.vel);
+        }
+        // contrast: a 30 degree face holds a standing body still
+        let w = steep(30.0);
+        let mut st = PlayerState::standing_at(Vec3::new(4.0, 0.0, 4.0 * 30f32.to_radians().tan() + 0.1), 0.0);
+        trace(&mut st, &MoveInput::default(), &p, &w, 120);
+        assert!(st.grounded);
+        let rest = st.pos;
+        trace(&mut st, &MoveInput::default(), &p, &w, 120);
+        assert!((st.pos - rest).length() < 1e-4, "a body at rest on a 30 degree face crept by {:e}", (st.pos - rest).length());
+    }
+
+    /// A CEILING STOPS THE JUMP and a wall CORNER holds a body that runs into it. Under a roof
+    /// 0.25 wu above the standing height a jump's head never passes the roof, its upward
+    /// velocity is gone the frame it touches (no ratcheting through), and it lands. Running
+    /// diagonally into the inside corner of two walls it ends outside both by at least the
+    /// radius, and once stopped it is STILL: no jitter in x, y or z.
+    ///
+    /// SABOTAGE: skip the velocity clip in `resolve` -> the roof row goes red (it presses into
+    /// the roof every frame and `vel.z` stays up); push out along only the deepest contact
+    /// instead of the merged sum -> the corner row goes red.
+    #[test]
+    fn a_ceiling_and_a_wall_corner_hold_the_body() {
+        let p = spartan();
+        // --- ceiling
+        let roof = p.height_standing + 0.25;
+        let mut w = floor(0.0, 20.0);
+        w.extend(floor(roof, 20.0).into_iter().map(|t| [t[0], t[2], t[1]]));
+        let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.05), 0.0);
+        settle(&mut st, &p, &w);
+        let mut inp = MoveInput { jump: true, ..Default::default() };
+        let mut touched = 0;
+        let mut head_max = f32::MIN;
+        for i in 0..200 {
+            inp.jump = i == 0;
+            st.step(&inp, &p, &w, 1.0 / 60.0);
+            head_max = head_max.max(st.pos.z + p.height_standing);
+            // On any frame the head is on the roof it must not be rising: the contact clips the
+            // upward velocity the frame it is touched.
+            if st.pos.z + p.height_standing > roof - 1e-4 {
+                touched += 1;
+                assert!(st.vel.z <= 0.01, "still rising ({:.3}) with the head on the roof", st.vel.z);
+            }
+        }
+        assert!(touched >= 1, "the jump never reached the roof, so this proved nothing (head max {head_max:.3}, roof {roof:.3})");
+        assert!(head_max < roof + 0.005, "the head went through the roof: {head_max:.4} > {roof:.4}");
+        assert!(st.grounded, "never came back down from under the roof");
+        // --- corner: walls at x = 3 and y = 3, running at 45 degrees into the inside corner
+        let mut w = floor(0.0, 20.0);
+        w.extend(block(Vec3::new(3.0, -10.0, 0.0), Vec3::new(4.0, 10.0, 3.0)));
+        w.extend(block(Vec3::new(-10.0, 3.0, 0.0), Vec3::new(10.0, 4.0, 3.0)));
+        let yaw = std::f32::consts::FRAC_PI_4;
+        let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.2), yaw);
+        settle(&mut st, &p, &w);
+        let input = MoveInput { fwd: 1.0, yaw, ..Default::default() };
+        let tr = trace(&mut st, &input, &p, &w, 360);
+        let last = tr.last().unwrap();
+        assert!(last.pos.x < 3.0 - p.radius * 0.9 && last.pos.y < 3.0 - p.radius * 0.9, "ended inside a wall at {:?}", last.pos);
+        assert!(last.pos.x > 2.5 && last.pos.y > 2.5, "never reached the corner: {:?}", last.pos);
+        let still = &tr[300..];
+        let (mut dx, mut dy, mut dz) = (0.0f32, 0.0f32, 0.0f32);
+        for s in still {
+            dx = dx.max((s.pos.x - last.pos.x).abs());
+            dy = dy.max((s.pos.y - last.pos.y).abs());
+            dz = dz.max((s.pos.z - last.pos.z).abs());
+        }
+        assert!(dx < 1e-3 && dy < 1e-3 && dz < 1e-5, "jitter in the corner: {dx:e} {dy:e} {dz:e}");
+    }
+
+    /// A BODY AT REST IN THE CREASE BETWEEN TWO SLOPES STAYS PUT. Faceted ground -- every curved
+    /// Forge block -- puts the capsule on two planes at once, with the adhesion velocity pressing
+    /// it into only the flatter one; pushing out of the other must not walk it along the surface.
+    /// (The real `ff_ramp_circle_small` still settles ~3 mm a second on its faceted curve --
+    /// `probe_walk_the_real_forge_ramps` measures it; a Havok-style speculative contact clip was
+    /// tried and did not change that, so it is not here.) The fixture lists the steeper facet
+    /// FIRST so the push-out meets it first, the order that exposed the drift.
+    ///
+    /// SABOTAGE: apply gravity unconditionally on the ground -> the body slides down the crease
+    /// and this goes red.
+    #[test]
+    fn a_body_resting_in_a_crease_between_two_slopes_does_not_creep() {
+        let p = spartan();
+        let (ta, tb) = (9f32.to_radians().tan(), 22f32.to_radians().tan());
+        let a = vec![[Vec3::new(-8.0, -4.0, -8.0 * ta), Vec3::new(0.0, -4.0, 0.0), Vec3::new(0.0, 4.0, 0.0)], [Vec3::new(-8.0, -4.0, -8.0 * ta), Vec3::new(0.0, 4.0, 0.0), Vec3::new(-8.0, 4.0, -8.0 * ta)]];
+        let b = vec![[Vec3::new(0.0, -4.0, 0.0), Vec3::new(8.0, -4.0, 8.0 * tb), Vec3::new(8.0, 4.0, 8.0 * tb)], [Vec3::new(0.0, -4.0, 0.0), Vec3::new(8.0, 4.0, 8.0 * tb), Vec3::new(0.0, 4.0, 0.0)]];
+        let mut w = b;
+        w.extend(a);
+        let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.6), 0.0);
+        trace(&mut st, &MoveInput::default(), &p, &w, 240);
+        assert!(st.grounded, "never settled in the crease");
+        let touching = st.contacts().len();
+        assert!(touching >= 2, "the body is on {touching} plane(s), not in the crease, so this proves nothing");
+        let rest = st.pos;
+        let mut worst = 0.0f32;
+        for s in trace(&mut st, &MoveInput::default(), &p, &w, 120) {
+            worst = worst.max((s.pos - rest).length());
+        }
+        assert!(worst < 2e-4, "the body crept {worst:e} wu in two seconds at rest in a crease");
+    }
+
+    /// THE RUN-UP AND THE STOP TAKE THE AUTHORED ACCELERATION, and strafing is slower than going
+    /// forward because the AXES carry their own caps. Spartan: 0 -> 2.2 wu/s at 8.5 wu/s^2 is
+    /// 0.2588 s = 15.5 frames at 60 Hz; stopping is the same; crouched, 0.9 wu/s at the sneak
+    /// 6.1 wu/s^2 is 0.1475 s = 8.9 frames; a diagonal run reaches 2.0928 wu/s (hand-worked from
+    /// the circle-clamped stick, 0.7071 x 2.2 and 0.7071 x 1.98).
+    ///
+    /// SABOTAGE: use the sneak acceleration when standing (or the run one when crouched) -> the
+    /// frame counts go red; skip the circle clamp in `commanded_velocity` -> the diagonal reads
+    /// 2.96.
+    #[test]
+    fn the_run_up_and_the_stop_take_the_authored_acceleration() {
+        let p = spartan();
+        let w = floor(0.0, 400.0);
+        let frames_to = |input: MoveInput, from_speed: f32, done: &dyn Fn(f32) -> bool| -> usize {
+            let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.1), 0.0);
+            settle(&mut st, &p, &w);
+            st.crouched = input.crouch;
+            st.crouch_t = if input.crouch { 1.0 } else { 0.0 };
+            st.vel = Vec3::new(from_speed, 0.0, 0.0);
+            for i in 1..=300 {
+                st.step(&input, &p, &w, 1.0 / 60.0);
+                if done(st.ground_speed) {
+                    return i;
+                }
+            }
+            usize::MAX
+        };
+        let go = MoveInput { fwd: 1.0, ..Default::default() };
+        let up = frames_to(go, 0.0, &|v| v >= 2.2 - 1e-3);
+        assert!((up as f32 - 15.5).abs() <= 1.5, "0 -> 2.2 wu/s took {up} frames, 8.5 wu/s^2 says 15.5");
+        let stop = frames_to(MoveInput::default(), 2.2, &|v| v < 1e-3);
+        assert!((stop as f32 - 15.5).abs() <= 1.5, "2.2 -> 0 took {stop} frames, 8.5 wu/s^2 says 15.5");
+        let crouch_up = frames_to(MoveInput { crouch: true, ..go }, 0.0, &|v| v >= 0.9 - 1e-3);
+        assert!((crouch_up as f32 - 8.9).abs() <= 1.5, "crouched 0 -> 0.9 took {crouch_up} frames, 6.1 wu/s^2 says 8.9");
+        // the diagonal's top speed, with a long enough run that it has arrived
+        let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.1), 0.0);
+        settle(&mut st, &p, &w);
+        trace(&mut st, &MoveInput { fwd: 1.0, right: 1.0, ..Default::default() }, &p, &w, 90);
+        assert!((st.ground_speed - 2.0928).abs() < 0.01, "a diagonal run settles at {:.4}, hand-worked 2.0928", st.ground_speed);
+    }
+
+    /// MOMENTUM, FROM THE TAGS. Releasing the stick at the run speed stops in `v^2 / 2a` with
+    /// `a` the run acceleration (the engine decelerates with the SAME clamp it accelerates with):
+    /// 2.2^2 / 17 = 0.2847 wu for the Spartan, crouched 0.9^2 / 12.2 = 0.0664 wu (the sneak
+    /// acceleration, blended by the crouch fraction). In the air there is no coast: a jump
+    /// taken at the run speed with the stick released loses horizontal speed at the airborne
+    /// acceleration, 1.05 wu/s^2, so after half a second 2.2 - 0.525 = 1.675 wu/s.
+    ///
+    /// SABOTAGE: halve the clamp in `control_velocity`'s ground branch (`accel * dt * 0.5`) ->
+    /// both stopping distances double; make the air branch coast (skip the horizontal pull) ->
+    /// the air row stays at 2.2.
+    #[test]
+    fn stopping_distance_and_air_momentum_follow_the_authored_accelerations() {
+        let p = spartan();
+        let w = floor(0.0, 400.0);
+        let stop = |crouch: bool, v0: f32| -> f32 {
+            let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.1), 0.0);
+            settle(&mut st, &p, &w);
+            st.crouched = crouch;
+            st.crouch_t = if crouch { 1.0 } else { 0.0 };
+            st.vel = Vec3::new(v0, 0.0, 0.0);
+            let x0 = st.pos.x;
+            let inp = MoveInput { crouch, ..Default::default() };
+            for _ in 0..200 {
+                st.step(&inp, &p, &w, 1.0 / 60.0);
+            }
+            st.pos.x - x0
+        };
+        let d_run = stop(false, 2.2);
+        assert!((d_run - 0.2847).abs() < 0.02, "stopped from a run in {d_run:.4} wu, v^2/2a says 0.2847");
+        let d_crouch = stop(true, 0.9);
+        assert!((d_crouch - 0.0664).abs() < 0.01, "stopped from a crouch-walk in {d_crouch:.4} wu, v^2/2a says 0.0664");
+        // air: take off at the run speed, release everything, read the horizontal speed 0.5 s later
+        let mut st = PlayerState::standing_at(Vec3::new(0.0, 0.0, 0.1), 0.0);
+        settle(&mut st, &p, &w);
+        st.vel = Vec3::new(2.2, 0.0, 0.0);
+        st.step(&MoveInput { jump: true, ..Default::default() }, &p, &w, 1.0 / 60.0);
+        for _ in 0..29 {
+            st.step(&MoveInput::default(), &p, &w, 1.0 / 60.0);
+        }
+        assert!(!st.grounded, "the jump landed within half a second");
+        assert!((st.vel.x - 1.675).abs() < 0.03, "after 0.5 s in the air with the stick released the speed is {:.3}, 2.2 - 1.05 x 0.5 says 1.675", st.vel.x);
+    }
+
+    /// The slope-speed scale is the engine's piecewise function of the travel direction's z.
+    ///
+    /// SABOTAGE: swap the uphill/downhill scales, or use the cutoff angle for the downhill step
+    /// -> a row goes red.
+    #[test]
+    fn the_slope_speed_scale_is_the_engines_piecewise_function() {
+        let p = PlayerPhysics {
+            downhill_falloff: 10f32.to_radians(),
+            downhill_cutoff: 40f32.to_radians(),
+            uphill_falloff: 5f32.to_radians(),
+            uphill_cutoff: 35f32.to_radians(),
+            downhill_velocity_scale: 1.5,
+            uphill_velocity_scale: 0.6,
+            ..spartan()
+        };
+        let z = |deg: f32| deg.to_radians().sin();
+        assert_eq!(p.slope_speed_scale(z(0.0)), 1.0, "level ground is unscaled");
+        assert_eq!(p.slope_speed_scale(z(-5.0)), 1.0, "a shallow descent is unscaled (the step is at the falloff angle)");
+        assert_eq!(p.slope_speed_scale(z(-12.0)), 1.5, "past the downhill falloff the full downhill scale applies");
+        assert_eq!(p.slope_speed_scale(z(-30.0)), 1.5);
+        assert_eq!(p.slope_speed_scale(z(3.0)), 1.0, "below the uphill falloff");
+        let mid = p.slope_speed_scale(z(20.0));
+        // linear in z between sin(5) and sin(35): (z - k0) / (k1 - k0) = 0.5 at z(20) -> check
+        let (k0, k1) = (z(5.0), z(35.0));
+        let want = 1.0 + (z(20.0) - k0) / (k1 - k0) * (0.6 - 1.0);
+        assert!((mid - want).abs() < 1e-5 && mid < 1.0 && mid > 0.6, "uphill midpoint {mid}, want {want}");
+        assert_eq!(p.slope_speed_scale(z(35.0)), 0.6);
+        assert_eq!(p.slope_speed_scale(z(50.0)), 0.6);
+    }
+
+    /// #play-gate  **THE REAL FORGE RAMPS.** The shipped `forge_halo` ramp blocks' own physics
+    /// hulls, on a floor at their base, walked up from the foot by the Spartan the cache
+    /// describes: `ff_ramp_1x2_shallow` (13 deg) and `ff_ramp_1x2` (26 deg) must be climbed and
+    /// stood on, `ff_ramp_2x2_steep` (45 and 66 degree faces) must not be stood on at all. Then
+    /// the body is DROPPED onto the centroid of every walkable inclined triangle of every
+    /// ramp / stair block in the map and must come to rest and stay still.
+    ///
+    /// The slope of an object is read off its own triangles (the area-weighted mean of its
+    /// inclined faces), never assumed. **Liveness is asserted** -- how many ramps were walked, how
+    /// many frames the body spent on an incline, how many steep frames touched the face -- so the
+    /// probe cannot pass by finding nothing to test.
+    ///
+    /// `cargo test -p hms-app --profile quick play_ctl::tests::probe_walk_the_real_forge_ramps -- --ignored --nocapture`
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_walk_the_real_forge_ramps() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else {
+            eprintln!("play_ctl probes SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let (_, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, crate::play_mode::Species::Spartan).expect("a Spartan");
+        let (mut walked_up, mut refused, mut incline_frames, mut steep_touch) = (0usize, 0usize, 0usize, 0usize);
+        let mut expected_frames = 0.0f32;
+        for want in ["ff_ramp_1x2_shallow", "ff_ramp_1x2", "ff_ramp_2x2_steep"] {
+            let Some(&tag) = native
+                .tags_by_group(cache, "bloc")
+                .iter()
+                .find(|&&t| native.tag_name(cache, t).map_or(false, |n| n.ends_with(&format!("\\{want}"))))
+            else {
+                println!("{want}: not in this cache");
+                continue;
+            };
+            let phmo = native.resolve_phmo(cache, tag);
+            let geo = if phmo != 0 && phmo != 0xFFFF_FFFF { native.phmo_geometry(cache, phmo) } else { None }.or_else(|| {
+                let c = native.resolve_coll(cache, tag);
+                if c != 0 && c != 0xFFFF_FFFF { native.coll_geometry(cache, c) } else { None }
+            });
+            let Some((v, idx)) = geo else { continue };
+            let pt = |k: u32| Vec3::new(v[k as usize * 3], v[k as usize * 3 + 1], v[k as usize * 3 + 2]);
+            let mut tris: Vec<[Vec3; 3]> = idx.chunks_exact(3).map(|f| [pt(f[0]), pt(f[1]), pt(f[2])]).collect();
+            let base = tris.iter().flatten().map(|q| q.z).fold(f32::MAX, f32::min);
+            // the inclined faces: the family of the LARGEST inclined triangle (normals within 5
+            // degrees of it), their mean normal, extent and rise. (A block with two ramps back to
+            // back averages to a lie, so one family is taken.)
+            let face = |t: &[Vec3; 3]| {
+                let c = (t[1] - t[0]).cross(t[2] - t[0]);
+                // NOT flipped: a closed hull is wound outward, and only its TOP faces (outward
+                // normal pointing up) can be walked on -- flipping the underside would send the
+                // walk the wrong way up the slab.
+                (c.normalize_or_zero(), c.length() * 0.5)
+            };
+            let inclined = |t: &[Vec3; 3]| {
+                let (n, a) = face(t);
+                n.z > 0.2 && n.z < 0.985 && a > 1e-4
+            };
+            let Some(lead) = tris.iter().filter(|t| inclined(t)).max_by(|a, b| face(a).1.total_cmp(&face(b).1)).map(|t| face(t).0) else {
+                println!("{want}: no inclined faces");
+                continue;
+            };
+            let (mut nsum, mut area_sum) = (Vec3::ZERO, 0.0f32);
+            let mut inc: Vec<[Vec3; 3]> = Vec::new();
+            for t in tris.iter().filter(|t| inclined(t)) {
+                let (n, a) = face(t);
+                if n.dot(lead) > 5f32.to_radians().cos() {
+                    nsum += n * a;
+                    area_sum += a;
+                    inc.push(*t);
+                }
+            }
+            if inc.is_empty() {
+                println!("{want}: no inclined faces");
+                continue;
+            }
+            let nmean = (nsum / area_sum).normalize();
+            let slope = nmean.z.acos().to_degrees();
+            let up = Vec3::new(-nmean.x, -nmean.y, 0.0).normalize();
+            let along = |q: Vec3| q.dot(up);
+            let lo = inc.iter().flatten().map(|q| along(*q)).fold(f32::MAX, f32::min);
+            let hi = inc.iter().flatten().map(|q| along(*q)).fold(f32::MIN, f32::max);
+            let ztop = inc.iter().flatten().map(|q| q.z).fold(f32::MIN, f32::max);
+            let centre = inc.iter().flatten().fold(Vec3::ZERO, |a, q| a + *q) / (inc.len() * 3) as f32;
+            let obj_lo = tris.iter().flatten().map(|q| along(*q)).fold(f32::MAX, f32::min);
+            // a floor under the whole thing, at the object's base
+            let fl = floor(base, 40.0);
+            tris.extend(fl.into_iter().map(|t| [t[0] + Vec3::new(centre.x, centre.y, 0.0), t[1] + Vec3::new(centre.x, centre.y, 0.0), t[2] + Vec3::new(centre.x, centre.y, 0.0)]));
+            // Start on the floor before the WHOLE OBJECT's low end along the walking direction
+            // (a ramp built of two slopes has its steeper one higher up, and a start beneath the
+            // family would be inside the block).
+            let start = Vec3::new(centre.x, centre.y, base + 0.2) + up * (obj_lo - along(centre) - 1.5);
+            let yaw = up.y.atan2(up.x);
+            let mut st = PlayerState::standing_at(start, yaw);
+            settle(&mut st, &p, &tris);
+            let input = MoveInput { fwd: 1.0, yaw, ..Default::default() };
+            let (mut on, mut steep, mut zmax) = (0usize, 0usize, base);
+            for _ in 0..600 {
+                let o = st.step(&input, &p, &tris, 1.0 / 60.0);
+                zmax = zmax.max(st.pos.z);
+                let a = along(st.pos);
+                if a > lo + 0.1 && a < hi && st.pos.z > base + 0.04 && st.grounded {
+                    on += 1;
+                }
+                if !st.grounded && o.steep_contacts > 0 && a > lo - 0.5 && a < hi {
+                    steep += 1;
+                }
+            }
+            let rise = ztop - base;
+            println!(
+                "{want}: slope {slope:.1} deg, {:.2} wu long, rise {rise:.3} | reached z +{:.3}, {on} grounded frames on the incline, {steep} frames refused at the face",
+                hi - lo,
+                zmax - base
+            );
+            if slope < 33.0 {
+                // At the authored run speed the incline takes (length / speed) seconds to cross;
+                // the body must have been standing on it for most of that.
+                let expected = (hi - lo) / (p.run_forward / 60.0);
+                assert!(zmax - base > rise * 0.7, "{want}: a {slope:.1} deg ramp was not climbed (+{:.3} of {rise:.3})", zmax - base);
+                assert!(on as f32 > expected * 0.7, "{want}: only {on} grounded frames on a {slope:.1} deg incline that takes {expected:.0} to cross");
+                walked_up += 1;
+                incline_frames += on;
+                expected_frames += expected;
+            } else if slope > 37.0 {
+                assert_eq!(on, 0, "{want}: stood on a {slope:.1} deg face for {on} frames");
+                // It may SLIDE a little way up on the momentum of its run-up (a frictionless
+                // capsule does: measured +0.31 of 1.97 on the 45 degree block) but never gets
+                // anywhere near the top, because nothing it touches is ground.
+                assert!(zmax - base < rise * 0.5, "{want}: climbed a {slope:.1} deg face to +{:.3} of {rise:.3}", zmax - base);
+                refused += 1;
+                steep_touch += steep;
+            }
+        }
+        // --- every walkable inclined triangle of every ramp / stair block: drop, settle, stay ---
+        // THE BOUND IS THE LAW'S, not a number read off a run. A body at rest is pressed into the
+        // ground PLANE at the minimum adhesion speed, 0.12 x 30/60 = 0.06 wu/s. The plane is the
+        // FLATTEST eligible contact within Havok's 0.0328 tolerance; on faceted ground (every
+        // curved Forge block) that can be a facet the body is hovering over while a steeper one
+        // is what actually holds it, and pressing along the flat normal into the steeper face
+        // leaves the in-plane component: `0.06 x sin(tilt of the supporting contact)`. That is
+        // the most a resting body can drift (measured 0.0197 against 0.0222 on a 21.7 degree
+        // facet). Same engine rule, so the engine drifts the same way on that geometry.
+        const ADHESION_AT_REST: f32 = 0.12 * 30.0 / 60.0;
+        let (mut samples, mut stood) = (0usize, 0usize);
+        let mut worst_creep = 0.0f32;
+        let mut names = Vec::new();
+        for group in ["bloc", "scen"] {
+            for &t in &native.tags_by_group(cache, group) {
+                let n = native.tag_name(cache, t).unwrap_or_default().to_lowercase();
+                if n.contains("ramp") || n.contains("stair") {
+                    names.push(t);
+                }
+            }
+        }
+        for tag in names {
+            let phmo = native.resolve_phmo(cache, tag);
+            let geo = if phmo != 0 && phmo != 0xFFFF_FFFF { native.phmo_geometry(cache, phmo) } else { None };
+            let Some((v, idx)) = geo else { continue };
+            let pt = |k: u32| Vec3::new(v[k as usize * 3], v[k as usize * 3 + 1], v[k as usize * 3 + 2]);
+            let tris: Vec<[Vec3; 3]> = idx.chunks_exact(3).map(|f| [pt(f[0]), pt(f[1]), pt(f[2])]).collect();
+            for t in &tris {
+                let c = (t[1] - t[0]).cross(t[2] - t[0]);
+                let (n, area) = (c.normalize_or_zero(), c.length() * 0.5);
+                let slope = n.z.clamp(-1.0, 1.0).acos().to_degrees();
+                if n.z <= 0.0 || !(3.0..32.0).contains(&slope) || area < 0.1 {
+                    continue;
+                }
+                let centre = (t[0] + t[1] + t[2]) / 3.0;
+                let mut st = PlayerState::standing_at(Vec3::new(centre.x, centre.y, centre.z + 0.4), 0.0);
+                for _ in 0..150 {
+                    st.step(&MoveInput::default(), &p, &tris, 1.0 / 60.0);
+                }
+                samples += 1;
+                // Only a body that stayed on THIS face is judged (one that rolled off, or landed
+                // on the lip of something else, is not a sample of this triangle).
+                if (st.pos - centre).truncate().length() > 0.12 {
+                    continue;
+                }
+                let rest = st.pos;
+                let mut log = Vec::new();
+                for k in 0..60 {
+                    st.step(&MoveInput::default(), &p, &tris, 1.0 / 60.0);
+                    if k < 8 {
+                        let cs: Vec<String> = st.contacts().iter().map(|c| format!("n({:.3},{:.3},{:.3})", c.normal.x, c.normal.y, c.normal.z)).collect();
+                        log.push(format!("   k{k} d=({:+.5},{:+.5},{:+.5}) v=({:+.4},{:+.4},{:+.4}) g={} {}", st.pos.x - rest.x, st.pos.y - rest.y, st.pos.z - rest.z, st.vel.x, st.vel.y, st.vel.z, st.grounded, cs.join(" ")));
+                    }
+                }
+                let tilt = st.contacts().iter().filter(|c| c.normal.z > 0.0).map(|c| c.normal.z.clamp(-1.0, 1.0).acos()).fold(0.0f32, f32::max);
+                let creep_limit = ADHESION_AT_REST * tilt.sin() * 1.15 + 1e-4;
+                worst_creep = worst_creep.max((st.pos - rest).length());
+                if (st.pos - rest).length() >= creep_limit {
+                    println!("CREEP on '{}' tri {:?} slope {slope:.1} area {area:.2}\n{}", native.tag_name(cache, tag).unwrap_or_default(), t, log.join("\n"));
+                }
+                assert!(st.grounded, "a {slope:.1} deg face of a real block did not hold the body (at {centre:?})");
+                assert!(
+                    (st.pos - rest).length() < creep_limit,
+                    "a body resting on a {slope:.1} deg real face (supporting contact tilt {:.1} deg) crept {:e} wu in a second, past the law's {creep_limit:e}",
+                    tilt.to_degrees(),
+                    (st.pos - rest).length()
+                );
+                stood += 1;
+            }
+        }
+        println!("dropped onto {samples} real inclined triangles, {stood} stayed on their face and stood still (worst creep {worst_creep:.5} wu in a second)");
+        assert!(samples >= 100 && stood >= 100, "only {samples} real inclined triangles ({stood} judged) were exercised");
+        println!("walked {walked_up} walkable ramps ({incline_frames} incline frames), refused {refused} steep ones ({steep_touch} refused frames)");
+        assert!(walked_up >= 2, "only {walked_up} walkable real ramps were exercised");
+        assert!(expected_frames > 90.0 && incline_frames as f32 > expected_frames * 0.7, "{incline_frames} frames on real inclines, of {expected_frames:.0} expected");
+        assert!(refused >= 1 && steep_touch > 0, "no real steep ramp was exercised ({refused}, {steep_touch})");
+    }
+
+    /// #play  A TRACE, not a gate: the first frames of walking into a ledge of a given height.
+    #[test]
+    #[ignore]
+    fn trace_a_ledge() {
+        let p = spartan();
+        let h = std::env::var("LEDGE").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.03125);
+        let mut w = floor(0.0, 30.0);
+        w.extend(block(Vec3::new(1.0, -4.0, -1.0), Vec3::new(6.0, 4.0, h)));
+        let mut st = PlayerState::standing_at(Vec3::new(0.2, 0.0, 0.2), 0.0);
+        settle(&mut st, &p, &w);
+        println!("settled z={:.5} ledge h={h}", st.pos.z);
+        let input = MoveInput { fwd: 1.0, ..Default::default() };
+        for i in 0..90 {
+            let o = st.step(&input, &p, &w, 1.0 / 60.0);
+            let cs: Vec<String> = st.contacts().iter().map(|c| format!("n({:.2},{:.2},{:.2})/s({:.1},{:.1},{:.1})", c.normal.x, c.normal.y, c.normal.z, c.surface.x, c.surface.y, c.surface.z)).collect();
+            println!(
+                "f{i:02} x={:.4} z={:.5} v=({:.2},{:.2},{:.2}) g={} hits={} {}",
+                st.pos.x, st.pos.z, st.vel.x, st.vel.y, st.vel.z, st.grounded, o.contacts, cs.join(" ")
+            );
+        }
+    }
+
+    /// #play  A TRACE, not a gate: walking +x across the floor's seam with the stand-in biped.
+    #[test]
+    #[ignore]
+    fn trace_a_seam_walk() {
+        let p = phys();
+        let w = floor(0.0, 40.0);
+        let mut st = PlayerState::standing_at(Vec3::new(-5.0, 0.0, 0.5), 0.0);
+        settle(&mut st, &p, &w);
+        let input = MoveInput { fwd: 1.0, ..Default::default() };
+        run(&mut st, &input, &p, &w, 1.0);
+        println!("start of window: x={:.4} z={:+.6}", st.pos.x, st.pos.z);
+        for i in 0..180 {
+            let o = st.step(&input, &p, &w, 1.0 / 60.0);
+            if st.pos.z.abs() > 1e-5 || (st.pos.x > -0.3 && st.pos.x < 0.3) {
+                let cs: Vec<String> = st.contacts().iter().map(|c| format!("n({:.3},{:.3},{:.3})", c.normal.x, c.normal.y, c.normal.z)).collect();
+                println!("f{i:02} x={:.4} z={:+.6} v=({:.2},{:.2},{:+.3}) g={} hits={} {}", st.pos.x, st.pos.z, st.vel.x, st.vel.y, st.vel.z, st.grounded, o.contacts, cs.join(" "));
+            }
+        }
+    }
+
+    /// #play  A MEASUREMENT, not a gate: sweep a single ledge's height and report whether a
+    /// Spartan walking at it ends up on top, for the authored 50 degree limit and for 15 and 70.
+    #[test]
+    #[ignore]
+    fn measure_step_up() {
+        let p = spartan();
+        for deg in [15.0f32, 50.0, 70.0] {
+            let q = PlayerPhysics { max_slope: deg.to_radians(), ..p };
+            let hstar = q.radius * (1.0 - q.max_slope.cos());
+            let mut row = String::new();
+            let mut h = 0.01f32;
+            while h < 0.30 {
+                let mut w = floor(0.0, 30.0);
+                w.extend(block(Vec3::new(1.0, -4.0, -1.0), Vec3::new(28.0, 4.0, h)));
+                let mut st = PlayerState::standing_at(Vec3::new(-0.5, 0.0, 0.2), 0.0);
+                settle(&mut st, &q, &w);
+                trace(&mut st, &MoveInput { fwd: 1.0, ..Default::default() }, &q, &w, 180);
+                row += if st.pos.z > h - 0.01 { "#" } else { "." };
+                h += 0.01;
+            }
+            println!("limit {deg:>4} deg  h* = {hstar:.4}  ledge 0.01 .. 0.30 step 0.01:  {row}");
+        }
+    }
+
+    /// A GHOST EDGE IS RECOGNISED, A REAL ONE IS NOT. The edge of a floor triangle's neighbour,
+    /// under a sphere resting 1 cm sunk beside the seam, is a ghost (the face under the sphere
+    /// owns the contact); the top edge of a ledge the sphere is beside, with no face under it
+    /// but the lower floor's, is a real obstacle. Both directions are asserted on the production
+    /// `is_ghost`, with the contacts built by the production `sphere_tri_contact`.
+    ///
+    /// SABOTAGE: make `is_ghost` return false -> the first half goes red; make it return true for
+    /// every edge -> the second half goes red.
+    #[test]
+    fn a_neighbouring_triangles_edge_is_a_ghost_and_a_ledge_edge_is_not() {
+        let p = spartan();
+        let r = p.radius;
+        // --- the seam of a floor (diagonal y = x), sphere over the y > x triangle, 1 cm sunk
+        let w = floor(0.0, 30.0);
+        let c = Vec3::new(0.28, 0.3, r - 0.01);
+        let (faces, nf) = face_contacts(c, r, 0.0, &w);
+        assert_eq!(nf, 1, "exactly one floor triangle is touched through its face");
+        let mut ghosts = 0;
+        for t in &w {
+            if let Some(h) = sphere_tri_contact(c, r, 0.0, t) {
+                if !h.interior {
+                    assert!(h.normal.x.abs() > 0.01, "the fixture's edge contact must be tilted, or this proves nothing");
+                    assert!(is_ghost(&h, &faces[..nf], &w), "the seam's neighbour edge was not recognised as a ghost");
+                    ghosts += 1;
+                }
+            }
+        }
+        assert_eq!(ghosts, 1, "the fixture must produce one edge contact");
+        // --- a 5 cm ledge (block from x = 1) with the sphere beside its top edge, over the floor
+        let mut w = floor(0.0, 30.0);
+        w.extend(block(Vec3::new(1.0, -4.0, -1.0), Vec3::new(6.0, 4.0, 0.05)));
+        let c = Vec3::new(0.97, 0.0, r);
+        let (faces, nf) = face_contacts(c, r, 0.0, &w);
+        let mut real = 0;
+        for t in &w {
+            if let Some(h) = sphere_tri_contact(c, r, 0.0, t) {
+                if !h.interior {
+                    assert!(!is_ghost(&h, &faces[..nf], &w), "a ledge's top edge was thrown away as a ghost");
+                    real += 1;
+                }
+            }
+        }
+        assert!(real >= 1, "the fixture must touch the ledge's edge");
+    }
+
+    /// A `StaticWorld` over a `TriSoup` (the same structure `Scene::static_tris_in_aabb` uses).
+    struct SoupWorld(crate::decal_projector::TriSoup);
+    impl StaticWorld for SoupWorld {
+        fn gather(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
+            self.0.tris_in_aabb(mn, mx, out);
+        }
+    }
+
+    /// #play-gate  **THE SLOPE-BARRIER SWEEP, on the real Forge World collision.** Walkers are
+    /// started on walkable engine-collision surfaces of `forge_halo` (found by casting the
+    /// engine's own ray down at pseudo-random places), in all 8 directions relative to the local
+    /// slope, at the authored run speed and at the sprint top speed, and walked for 2 s. A STALL
+    /// is a stretch of >= 12 frames, after the first half second, in which the body moves at less
+    /// than 50% of its commanded speed while the engine's collision has NOTHING ahead: a
+    /// chest-height ray 0.45 wu forward hits nothing, and a knee-height ray hits nothing or a
+    /// walkable (>= 35 degree flat) surface. That is "I hit an invisible barrier".
+    ///
+    /// Liveness: the number of walkers, of walkers that crossed a slope change (the ground
+    /// normal's angle changed by > 3 degrees during the walk) and the stall count are printed
+    /// and asserted. `cargo test -p hms-app --profile quick play_ctl::tests::probe_sweep -- --ignored --nocapture`
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_sweep_the_real_terrain_for_invisible_barriers() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let (_, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, crate::play_mode::Species::Spartan).expect("a Spartan");
+        let mut worlds = Vec::new();
+        for &t in &native.tags_by_group(cache, "sbsp") {
+            if let Some(b) = crate::collision_bsp::CollisionBsp::for_sbsp(native, cache, t) {
+                let mut soup = crate::decal_projector::TriSoup::new(4.0);
+                for (tr, _) in b.solid_triangles() {
+                    soup.add_tri_owned(tr[0], tr[1], tr[2], (0, 0, -1), u32::MAX);
+                }
+                if soup.len() > 20_000 {
+                    worlds.push((b, SoupWorld(soup)));
+                }
+            }
+        }
+        assert!(!worlds.is_empty(), "no big structure collision BSP");
+        let (b, w) = &worlds[0];
+        let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for t in w.0.tris() {
+            for v in t {
+                mn = mn.min(*v);
+                mx = mx.max(*v);
+            }
+        }
+        let mut seed = 0xC0FFEEu32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed >> 8) as f32 / 16_777_216.0
+        };
+        let hstar = p.radius * (1.0 - p.min_normal_k());
+        let (mut walkers, mut sloped, mut stalls, mut law_explained) = (0usize, 0usize, 0usize, 0usize);
+        let mut reports: Vec<String> = Vec::new();
+        let (mut back_ticks, mut tele_ticks, mut reloc_ticks, mut back_walkers) = (0usize, 0usize, 0usize, 0usize);
+        let mut kicks: Vec<String> = Vec::new();
+        let mut attempts = 0;
+        while walkers < 3000 && attempts < 40000 {
+            attempts += 1;
+            let x = mn.x + (mx.x - mn.x) * rnd();
+            let y = mn.y + (mx.y - mn.y) * rnd();
+            let from = Vec3::new(x, y, mx.z + 1.0);
+            let Some((t, s)) = b.ray(from, Vec3::new(x, y, mn.z - 1.0)) else { continue };
+            let hit = from + (Vec3::new(x, y, mn.z - 1.0) - from) * t;
+            let Some(poly) = b.polygon(s) else { continue };
+            let n = (poly[1] - poly[0]).cross(poly[2] - poly[0]).normalize_or_zero();
+            if n.z.abs() < 0.82 {
+                continue;
+            }
+            for speed_label in ["run", "sprint"] {
+                for k in 0..8 {
+                    let yaw = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let mut st = PlayerState::standing_at(hit + Vec3::Z * 0.3, yaw);
+                    let mut settled = 0;
+                    for _ in 0..40 {
+                        st.step(&MoveInput { yaw, ..Default::default() }, &p, w, 1.0 / 60.0);
+                        settled += st.grounded as usize;
+                    }
+                    if settled < 20 {
+                        continue;
+                    }
+                    walkers += 1;
+                    let start = st.pos;
+                    let input = MoveInput { fwd: 1.0, yaw, sprint: speed_label == "sprint", ..Default::default() };
+                    let (mut run_len, mut worst_run) = (0usize, 0usize);
+                    let (mut n0, mut tilt_range) = (st.ground_normal, 0.0f32);
+                    let mut where_ = start;
+                    let dirv = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+                    let mut walker_back = false;
+                    for f in 0..120 {
+                        let before = st.pos;
+                        let o = st.step(&input, &p, w, 1.0 / 60.0);
+                        let d = st.pos - before;
+                        let sp = if speed_label == "sprint" { p.run_forward * p.sprint_full_speed_multiplier } else { p.run_forward };
+                        let back = d.dot(dirv) < -0.003;
+                        let tele = Vec3::new(d.x, d.y, 0.0).length() > sp / 60.0 * 3.0 + 0.05 || d.z > 0.05 || o.relocated;
+                        back_ticks += back as usize;
+                        tele_ticks += tele as usize;
+                        reloc_ticks += o.relocated as usize;
+                        walker_back |= back || tele;
+                        if (back || tele) && kicks.len() < 10 {
+                            kicks.push(format!("{speed_label} yaw {:.0} tick {f} at ({:.2},{:.2},{:.2}): moved {:.4} along the command, {:.3} up; escaped {} relocated {} grounded {}", yaw.to_degrees(), before.x, before.y, before.z, d.dot(dirv), d.z, o.escaped, o.relocated, st.grounded));
+                        }
+                                        if st.grounded {
+                            tilt_range = tilt_range.max(n0.dot(st.ground_normal).clamp(-1.0, 1.0).acos().to_degrees());
+                        }
+                        if f < 30 {
+                            n0 = st.ground_normal;
+                            continue;
+                        }
+                        let commanded = if speed_label == "sprint" { p.run_forward * p.sprint_full_speed_multiplier } else { p.run_forward };
+                        if st.ground_speed < 0.5 * commanded && st.grounded {
+                            run_len += 1;
+                            if run_len == 1 {
+                                where_ = st.pos;
+                            }
+                            worst_run = worst_run.max(run_len);
+                        } else {
+                            run_len = 0;
+                        }
+                    }
+                    back_walkers += walker_back as usize;
+                    if tilt_range > 3.0 {
+                        sloped += 1;
+                    }
+                    if worst_run >= 12 {
+                        let dir = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+                        let chest = b.ray(where_ + Vec3::Z * 0.3, where_ + Vec3::Z * 0.3 + dir * 0.45);
+                        let knee = b.ray(where_ + Vec3::Z * (hstar + 0.02), where_ + Vec3::Z * (hstar + 0.02) + dir * 0.45);
+                        let knee_blocks = knee.map_or(false, |(_, s2)| b.polygon(s2).map_or(true, |pg| {
+                            (pg[1] - pg[0]).cross(pg[2] - pg[0]).normalize_or_zero().z.abs() < 0.82
+                        }));
+                        // A face steeper than the engine's global 35 degrees under (or just
+                        // ahead of) the stall IS the engine's own barrier: nothing standable.
+                        let steep_face = [0.0f32, 0.3].iter().any(|ahead| {
+                            let c = where_ + dir * *ahead;
+                            b.ray(c + Vec3::Z * 0.5, c - Vec3::Z * 0.5).map_or(false, |(_, s2)| {
+                                b.polygon(s2).map_or(false, |pg| {
+                                    let z = (pg[1] - pg[0]).cross(pg[2] - pg[0]).normalize_or_zero().z.abs();
+                                    z < 35f32.to_radians().cos()
+                                })
+                            })
+                        });
+                        if chest.is_none() && !knee_blocks && steep_face {
+                            law_explained += 1;
+                        } else if chest.is_none() && !knee_blocks {
+                            stalls += 1;
+                            if reports.len() < 12 {
+                                reports.push(format!("{speed_label} yaw {:.0} from ({:.2},{:.2},{:.2}) stalled {worst_run} frames at ({:.3},{:.3},{:.3}) grounded n=({:.2},{:.2},{:.2})",
+                                    yaw.to_degrees(), start.x, start.y, start.z, where_.x, where_.y, where_.z, st.ground_normal.x, st.ground_normal.y, st.ground_normal.z));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("backward ticks {back_ticks}, teleport ticks {tele_ticks}, relocations {reloc_ticks}, in {back_walkers} walkers");
+        for k in &kicks {
+            println!("   KICK {k}");
+        }
+        println!("swept {walkers} walkers ({sloped} crossed a slope change > 3 deg), {law_explained} stalls on faces steeper than 35 deg (the law), {stalls} unexplained stalls");
+        for r in &reports {
+            println!("   STALL {r}");
+        }
+        assert!(walkers >= 2000 && sloped >= 200, "the sweep barely looked: {walkers} walkers, {sloped} on slope changes");
+        assert_eq!(stalls, 0, "{stalls} walkers lost most of their speed with nothing ahead in the engine's collision");
+        assert_eq!((tele_ticks, reloc_ticks), (0, 0), "the body was teleported while walking on the structure collision");
+    }
+
+    /// #play-gate  **BLOCK SEAMS.** A floor made the way a Forge player makes one: a 5 x 5 grid of
+    /// the shipped `ff_plat_1x1_flat` blocks butted edge to edge at their authored 1.0 wu pitch,
+    /// using their real physics hulls. (Each hull is 0.0164 wu SMALLER per side than the block --
+    /// the Havok shape's convex radius, which the triangle decode does not add back -- so there
+    /// is a 3.3 cm crack between neighbours.) Walkers cross the grid in all 8 directions, at the
+    /// run and the sprint speed: they must keep their speed (no catching on a crack or a lip) and
+    /// never leave the ground. Liveness: the number of seam crossings is counted and asserted.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_sweep_block_seams() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let (_, p) = crate::play_mode::player_physics_for(native, cache, &bipeds, crate::play_mode::Species::Spartan).unwrap();
+        let tag = *native
+            .tags_by_group(cache, "bloc")
+            .iter()
+            .find(|&&t| native.tag_name(cache, t).map_or(false, |n| n.ends_with("\\ff_plat_1x1_flat")))
+            .expect("ff_plat_1x1_flat");
+        let ph = native.resolve_phmo(cache, tag);
+        // the production hull: boxes with the Havok convex radius put back (`physics_world_tris`)
+        let blocks = crate::object_hulls::read_blocks(native, cache, ph).expect("its phmo blocks");
+        let hull = crate::object_hulls::hull_tris(&blocks, &crate::object_hulls::mode_node_xforms(native, cache, tag)).expect("its hull");
+        let top = hull.iter().flatten().map(|q| q.z).fold(f32::MIN, f32::max);
+        let mut world: Vec<[Vec3; 3]> = Vec::new();
+        for gx in -2..=2 {
+            for gy in -2..=2 {
+                let off = Vec3::new(gx as f32, gy as f32, 0.0);
+                world.extend(hull.iter().map(|t| [t[0] + off, t[1] + off, t[2] + off]));
+            }
+        }
+        let (mut walkers, mut crossings, mut bad) = (0usize, 0usize, Vec::new());
+        for sprint in [false, true] {
+            for k in 0..8 {
+                let yaw = k as f32 * std::f32::consts::FRAC_PI_4;
+                for ox in [-0.31f32, 0.0, 0.27] {
+                    let dir = Vec3::new(yaw.cos(), yaw.sin(), 0.0);
+                    let start = Vec3::new(ox, 0.1, top + 0.2) - dir * 1.0;
+                    let mut st = PlayerState::standing_at(start, yaw);
+                    for _ in 0..50 {
+                        st.step(&MoveInput { yaw, ..Default::default() }, &p, &world, 1.0 / 60.0);
+                    }
+                    if !st.grounded {
+                        continue;
+                    }
+                    walkers += 1;
+                    let input = MoveInput { fwd: 1.0, yaw, sprint, ..Default::default() };
+                    let cmd = if sprint { p.run_forward * p.sprint_full_speed_multiplier } else { p.run_forward };
+                    let (mut slow, mut air, mut last_cell) = (0usize, 0usize, (st.pos.x.round() as i32, st.pos.y.round() as i32));
+                    let mut crossed = 0;
+                    let mut min_z = f32::MAX;
+                    for f in 0..150 {
+                        st.step(&input, &p, &world, 1.0 / 60.0);
+                        let cell = (st.pos.x.round() as i32, st.pos.y.round() as i32);
+                        if cell != last_cell {
+                            crossed += 1;
+                            last_cell = cell;
+                        }
+                        if f > 60 && st.ground_speed < 0.85 * cmd {
+                            slow += 1;
+                        }
+                        air += (!st.grounded) as usize;
+                        min_z = min_z.min(st.pos.z);
+                        if st.pos.x.abs() > 2.3 || st.pos.y.abs() > 2.3 {
+                            break;
+                        }
+                    }
+                    crossings += crossed;
+                    if slow > 3 || air > 2 {
+                        bad.push(format!("{} yaw {:.0} offset {ox}: {slow} slow frames, {air} airborne, lowest z {min_z:.3} (top {top:.3})", if sprint { "sprint" } else { "run" }, yaw.to_degrees()));
+                    }
+                }
+            }
+        }
+        println!("{walkers} walkers, {crossings} seam crossings, {} caught", bad.len());
+        for b in &bad {
+            println!("   CAUGHT {b}");
+        }
+        assert!(walkers >= 40 && crossings >= 100, "the seam sweep barely looked: {walkers} walkers, {crossings} crossings");
+        assert!(bad.is_empty(), "{} walkers lost speed or left the ground crossing block seams", bad.len());
+    }
+
 }

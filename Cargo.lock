@@ -1599,7 +1599,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "hms-app"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1630,7 +1630,7 @@ dependencies = [
 
 [[package]]
 name = "hms-inject"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "log",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "hms-ipc"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1649,14 +1649,14 @@ dependencies = [
 
 [[package]]
 name = "hms-mcp"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "hms-native"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "libloading",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "hms-render"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1674,11 +1674,12 @@ dependencies = [
  "half",
  "log",
  "naga",
+ "pollster 0.3.0",
 ]
 
 [[package]]
 name = "hms-sound"
-version = "1.4.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "cpal",

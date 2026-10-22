@@ -1031,9 +1031,28 @@ pub struct PlayHud {
     pub reload_clip: String,
     /// Trigger pulls refused this session because the magazine was empty.
     pub dry_pulls: u32,
+    /// #seat-hud  The HUDs the seat the player is in puts on screen, keyed by the `(vehi tag,
+    /// seat index)` they were read for. `None` on foot.
+    pub seat_huds: Option<((u32, usize), crate::reach_unit_hud::SeatHuds)>,
 }
 
 impl PlayHud {
+    /// #seat-hud  Bind to the seat being ridden (`None` = on foot). A no-op while the seat is
+    /// unchanged, so it costs one comparison per frame; the tag reads happen once per boarding.
+    pub fn bind_seat(&mut self, native: &NativeDll, cache: CacheHandle, riding: Option<(u32, usize)>) {
+        let Some(key) = riding else {
+            self.seat_huds = None;
+            return;
+        };
+        if self.seat_huds.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let huds = crate::reach_seats::UnitSeats::read(native, cache, key.0)
+            .and_then(|u| u.seats.get(key.1).map(|s| crate::reach_unit_hud::SeatHuds::for_seat(native, cache, key.0, s)))
+            .unwrap_or_default();
+        self.seat_huds = Some((key, huds));
+    }
+
     /// Bind to a biped: read its vitality and its authored grenades. Called on entering test mode
     /// and whenever the biped changes.
     pub fn bind(&mut self, native: &NativeDll, cache: CacheHandle, biped: u32) {
@@ -1104,6 +1123,29 @@ impl PlayHud {
         self.dry_pulls += 1;
         self.start_reload();
         false
+    }
+
+    /// #weapon-fire  The weapon's barrel made an EMPTY CLICK (a pull with too little ammunition,
+    /// decided by [`crate::play_fire`] from the barrel's own `rounds per shot` / `minimum rounds
+    /// loaded`). Counted exactly as [`PlayHud::before_fire`] counts a dry pull -- the dry-fire sound
+    /// and the report read it -- and the engine's reaction to it, a reload, is started.
+    pub fn note_dry_pull(&mut self) {
+        if let Some(a) = self.ammo.as_mut() {
+            a.dry_pulls += 1;
+        }
+        self.dry_pulls += 1;
+        self.start_reload();
+    }
+
+    /// #weapon-fire  Take the weapon machine's exact magazine count. The machine spends precisely
+    /// the barrel's `rounds per shot` for every round it fires, which the "one round per pull"
+    /// accounting of [`Ammo::account_shots`] could only assume; `shots` is [`crate::play_mode::PlayMode::shots`]
+    /// so that accounting does not count the same rounds a second time.
+    pub fn adopt_rounds(&mut self, loaded: i32, shots: u32) {
+        if let Some(a) = self.ammo.as_mut() {
+            a.loaded = loaded.clamp(0, a.mag.rounds_loaded_maximum.max(0));
+            a.shots_seen = shots;
+        }
     }
 
     /// Begin a reload, if one is possible. The duration is the magazine's authored

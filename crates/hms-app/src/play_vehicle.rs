@@ -30,6 +30,24 @@
 //! leak the other way shows none — so [`Riding::hidden_datum`] is the single source of both and
 //! [`gates`] asserts each direction.
 //!
+//! # Getting in, the chase camera, getting out (#ride-phase / #ride-camera / #ride-entry)
+//!
+//! A ride has three phases ([`RidePhase`]). **Boarding** plays the seat's authored `<seat>:enter`
+//! clip on the rider -- in place on the seat marker, because the clip is authored in the marker's
+//! frame -- and the stick is dead until the clip's own length has elapsed. **Seated** is the only
+//! phase a driver drives in. **Exiting** plays `<seat>:exit` with the vehicle released to coast,
+//! and only then does the rider leave. The vehicle stays where it was left
+//! (`PlayMode::parked`); see [`duplicate_report`] for why that matters.
+//!
+//! The camera is the engine's, in [`crate::reach_unit_camera`]: a third-person seat
+//! ([`seat_wants_third_person`]) gets the CHASE camera -- the seat's authored `trak` track, searched
+//! by look pitch -- reached by the engine's 0.55 s quintic blend from the first-person eye, and left
+//! by a 0.5 s one. [`seat_shot`] is the single producer of the seat's view.
+//!
+//! The keys are [`drive_input`]: the lateral axis STEERS a wheeled or tracked vehicle, and the LOOK
+//! steers only the hover families -- the class is the drive model's own turn law
+//! ([`ControlClass`]).
+//!
 //! # What the prompt says, and when it says nothing
 //!
 //! The text is the game's own, through the key convention
@@ -90,6 +108,11 @@ pub struct VehicleEntry {
 }
 
 impl VehicleEntry {
+    /// The first marker of a named group, if the render model carries it.
+    pub fn first_marker(&self, native: &NativeDll, cache: CacheHandle, name: &str) -> Option<crate::reach_skel::Marker> {
+        self.model.as_ref()?.marker_group(native, cache, name)?.markers.first().copied()
+    }
+
     /// A marker group's frames in MODEL space, empty when the model does not carry it.
     pub fn marker_frames(&self, native: &NativeDll, cache: CacheHandle, name: &str) -> Vec<Mat4> {
         let (Some(m), Some(p)) = (&self.model, &self.pose) else { return Vec::new() };
@@ -106,6 +129,12 @@ impl VehicleEntry {
 pub struct VehicleIndex {
     by_tag: HashMap<u32, VehicleEntry>,
     strings: Option<ReachStrings>,
+    /// #ride-camera  `trak` tags already read (`None` = unreadable, remembered so it is tried once).
+    tracks: HashMap<u32, Option<crate::reach_unit_camera::CameraTrack>>,
+    /// #ride-camera  `matg`'s camera block, read once per cache.
+    camera_globals: Option<crate::reach_unit_camera::CameraGlobals>,
+    /// #ride-camera  `obje +0x10 bounding offset` per object tag.
+    bounding: HashMap<u32, Vec3>,
 }
 
 impl VehicleIndex {
@@ -152,7 +181,10 @@ impl VehicleIndex {
             }
             let driver = seats.seats.iter().find(|s| s.is_driver()).or_else(|| seats.seats.first());
             let drive = match &phys {
-                Some(p) => DriveModel::for_vehicle(p, driver),
+                // #jeep-law  The rigid body (`phmo` mass / centre / inertia) the engine's wheel law
+                // needs; a jeep without one stays on the kinematic path.
+                Some(p) => DriveModel::for_vehicle(p, driver)
+                    .map(|d| d.with_rigid_body(crate::reach_vehicle::read_rigid_body(native, cache, vehi_tag).as_ref())),
                 None => Err("this vehicle's physics block could not be read".to_string()),
             };
             let seat_family = crate::film_anim::seat_family_for(&path);
@@ -180,6 +212,43 @@ impl VehicleIndex {
             );
         }
         self.by_tag.get(&vehi_tag)
+    }
+
+    /// #ride-camera  A camera track, read once per tag.
+    pub fn track(&mut self, native: &NativeDll, cache: CacheHandle, tag: u32) -> Option<&crate::reach_unit_camera::CameraTrack> {
+        self.tracks
+            .entry(tag)
+            .or_insert_with(|| crate::reach_unit_camera::CameraTrack::read(native, cache, tag))
+            .as_ref()
+    }
+
+    /// #ride-camera  The globals camera block (transition times, obstruction defaults, default track).
+    pub fn camera_globals(&mut self, native: &NativeDll, cache: CacheHandle) -> crate::reach_unit_camera::CameraGlobals {
+        *self
+            .camera_globals
+            .get_or_insert_with(|| crate::reach_unit_camera::CameraGlobals::read(native, cache))
+    }
+
+    /// #ride-camera  The object's `bounding offset` (`obje +0x10`, a point in the object's frame).
+    ///
+    /// **This is the chase camera's focus** when the seat names no camera marker. `unit_get_camera_
+    /// info` (`sub_140D76980`) takes `sub_140D5BE70(root object)`, which is `sub_140D467A0`: the
+    /// object's runtime "center" (`objects.h:1323 "center"`, datum `+0x20`) -- the centre of its
+    /// BOUNDING SPHERE, i.e. the origin carried by the bounding offset -- and NOT the model origin.
+    /// The authored `trak` offsets (Warthog level pitch: 0.85 up) are relative to that centre,
+    /// which sits well above the ground-level origin; measured with `probe_camera_focus`.
+    pub fn bounding_offset(&mut self, native: &NativeDll, cache: CacheHandle, tag: u32) -> Vec3 {
+        *self.bounding.entry(tag).or_insert_with(|| {
+            native
+                .tag_meta(cache, tag, 0x10, 12)
+                .filter(|b| b.len() >= 12)
+                .map(|b| {
+                    let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+                    Vec3::new(f(0), f(4), f(8))
+                })
+                .filter(|v| v.is_finite() && v.length() < 50.0)
+                .unwrap_or(Vec3::ZERO)
+        })
     }
 
     /// The localized-string reader, built once per cache.
@@ -318,7 +387,7 @@ fn collect(
     let seats = entry.seats.clone();
     let mut found: Vec<(usize, EntryTest)> = Vec::new();
     for s in &seats.seats {
-        if !s.player_allowed() {
+        if !s.enterable_in_empty_vehicle() {
             continue;
         }
         let group = s.entry_marker_group();
@@ -416,6 +485,33 @@ pub struct Riding {
     /// the placement AND the editor's per-datum maps. Default = the tag's own appearance, which
     /// is exactly the old behaviour, so an un-filled field changes nothing.
     pub appearance: RideAppearance,
+    /// #ride-phase  Where the ride is in getting in, being seated and getting out.
+    pub phase: RidePhase,
+    /// Seconds spent in [`Riding::phase`].
+    pub phase_age: f32,
+    /// #ride-phase  The AUTHORED length, in seconds, of the rider's `<seat>:enter` / `:exit`
+    /// clips -- `Some(0.0)` when the rider's graph authors none, `None` until the host has looked.
+    /// Control transfers when the age reaches it; `None` holds the phase (the host fills these
+    /// within a frame of the ride starting, and a missing value must never mean "instantly").
+    pub enter_len: Option<f32>,
+    pub exit_len: Option<f32>,
+    /// #ride-camera  The anti-wall filter's state; persists between frames.
+    pub obstruction: crate::reach_unit_camera::Obstruction,
+    /// #ride-weapon  The seat's `allows weapons` flag: may the rider use the biped's own weapon?
+    pub allows_weapons: bool,
+}
+
+/// #ride-phase  The three stages of a ride. The engine's seat entry is a MOTOR TASK that plays an
+/// authored animation (`unit_enter`, `motor_tasks_common.cpp`) and the unit is only the occupant
+/// -- able to drive -- once it has finished; getting out is the same task in reverse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RidePhase {
+    /// Playing `<seat>:enter`. The body is on the seat marker, the controls are dead.
+    Boarding,
+    /// In the seat. Only here does a driver's stick move the vehicle.
+    Seated,
+    /// Playing `<seat>:exit`. The vehicle is released to coast.
+    Exiting,
 }
 
 /// #vehicle-ride  The per-PLACEMENT appearance a ride has to carry with it.
@@ -513,6 +609,10 @@ pub fn begin(
         }
         None => (String::new(), Err("this vehicle's tag could not be read".to_string())),
     };
+    let allows_weapons = index
+        .entry(native, cache, offer.vehi_tag)
+        .and_then(|e| e.seats.seats.get(offer.seat))
+        .is_some_and(|s| s.allows_weapons());
     Riding {
         hidden_datum: offer.parent_datum.unwrap_or(offer.datum),
         vehi_tag: offer.vehi_tag,
@@ -527,7 +627,67 @@ pub fn begin(
         yaw,
         pitch: 0.0,
         appearance: RideAppearance::default(),
+        phase: RidePhase::Boarding,
+        phase_age: 0.0,
+        enter_len: None,
+        exit_len: None,
+        obstruction: Default::default(),
+        allows_weapons,
     }
+}
+
+impl Riding {
+    /// #ride-phase  Only a SEATED occupant drives, and only a driver seat has a stick that means
+    /// anything (`seat flags` bit 2). One predicate, so the controls and the gates read the same
+    /// rule.
+    pub fn controls_live(&self, seat_is_driver: bool) -> bool {
+        self.phase == RidePhase::Seated && seat_is_driver
+    }
+}
+
+/// #ride-phase  What advancing the phase clock did this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseEvent {
+    None,
+    /// The enter clip has finished: the rider is now seated.
+    Seated,
+    /// The exit clip has finished: the rider leaves the seat.
+    Exited,
+}
+
+/// #ride-phase  Advance the ride's phase clock by `dt` seconds.
+///
+/// Control transfers when the AUTHORED clip length has elapsed, not before: `enter_len` is the
+/// rider graph's own frame count over 30 fps, so a 30-frame `warthog_d:enter` takes one second
+/// before the stick does anything. A clip length that is not yet known holds the phase.
+pub fn advance_phase(r: &mut Riding, dt: f32) -> PhaseEvent {
+    r.phase_age += dt.max(0.0);
+    match r.phase {
+        RidePhase::Boarding => match r.enter_len {
+            Some(len) if r.phase_age >= len => {
+                r.phase = RidePhase::Seated;
+                r.phase_age = 0.0;
+                PhaseEvent::Seated
+            }
+            _ => PhaseEvent::None,
+        },
+        RidePhase::Seated => PhaseEvent::None,
+        RidePhase::Exiting => match r.exit_len {
+            Some(len) if r.phase_age >= len => PhaseEvent::Exited,
+            _ => PhaseEvent::None,
+        },
+    }
+}
+
+/// #ride-phase  Start getting out. Only a SEATED rider can: refused while boarding (the engine's
+/// enter task is not interruptible) and while already leaving. Returns whether it started.
+pub fn begin_exit(r: &mut Riding) -> bool {
+    if r.phase != RidePhase::Seated {
+        return false;
+    }
+    r.phase = RidePhase::Exiting;
+    r.phase_age = 0.0;
+    true
 }
 
 /// Where the rider's BODY goes: the vehicle's transform times the seat marker.
@@ -541,7 +701,7 @@ pub fn rider_pose(
     cache: CacheHandle,
     riding: &Riding,
 ) -> Option<(Vec3, f32)> {
-    let world = riding.world();
+    let world = seat_vehicle_world(index, native, cache, riding);
     let entry = index.entry(native, cache, riding.vehi_tag)?;
     let seat = entry.seats.seats.get(riding.seat)?;
     let frames = entry.marker_frames(native, cache, &seat.marker_name);
@@ -550,26 +710,394 @@ pub fn rider_pose(
     Some((w.w_axis.truncate(), riding.drive.yaw))
 }
 
-/// The seat's camera for this frame — the pure `(eye, forward, fov)` function, computed from the
-/// vehicle's pose and the seat's own `unit_camera_struct` so it cannot go stale.
-pub fn seat_camera(
+/// #ride-camera  What a seat's camera produced this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeatShot {
+    pub pose: crate::reach_unit_camera::CamPose,
+    /// True for the chase (following) camera, false for a first-person seat camera. The host
+    /// uses it to decide which camera MODE it is in and so which transition to run.
+    pub third_person: bool,
+    /// The seat's authored `override fov` in radians; `0.0` = inherit.
+    pub fov: f32,
+}
+
+/// #ride-camera  Which camera MODE a seat asks for in a given phase: `unit_should_be_third_person`
+/// (`sub_1401DA050`). `third person camera` (bit 4) is the seat's answer; `third person on enter`
+/// (bit 6) keeps third person for the length of the boarding animation on a seat that is itself
+/// first person.
+pub fn seat_wants_third_person(seat: &reach_seats::Seat, phase: RidePhase) -> bool {
+    seat.third_person() || (seat.third_person_on_enter() && phase == RidePhase::Boarding)
+}
+
+/// The look the camera uses: the rider's own, limited by the seat's authored range.
+fn seat_look(seat: &reach_seats::Seat, riding: &Riding) -> (f32, f32) {
+    reach_seats::clamp_seat_look(seat, riding.drive.yaw, riding.yaw, riding.pitch)
+}
+
+/// #ride-camera  The seat's shot for this frame, wall filter included.
+///
+/// * a seat that is third person (see [`seat_wants_third_person`]) gets the CHASE camera of
+///   `reach_unit_camera`: the seat's `trak` track searched by look pitch, focused on the seat's
+///   camera marker (the vehicle's origin when it names none);
+/// * any other seat looks through the camera marker (or the seat marker) along the rider's look,
+///   as before.
+///
+/// `dt` advances the obstruction filter, which is why `riding` is `&mut`.
+pub fn seat_shot(
     index: &mut VehicleIndex,
     native: &NativeDll,
     cache: CacheHandle,
-    riding: &Riding,
-    fov_default: f32,
-) -> Option<reach_seats::SeatView> {
-    let world = riding.world();
+    riding: &mut Riding,
+    scene: &dyn ObjectScene,
+    dt: f32,
+) -> Option<SeatShot> {
+    use crate::reach_unit_camera as uc;
+    let world = seat_vehicle_world(index, native, cache, riding);
+    let globals = index.camera_globals(native, cache);
     let entry = index.entry(native, cache, riding.vehi_tag)?;
     let seat = entry.seats.seats.get(riding.seat)?.clone();
     let seat_marker = entry.marker_frames(native, cache, &seat.marker_name).first().copied().unwrap_or(Mat4::IDENTITY);
-    let cam_marker = if seat.camera_marker.is_empty() {
+    let cam_marker = if seat.camera.marker.is_empty() {
         None
     } else {
-        entry.marker_frames(native, cache, &seat.camera_marker).first().copied()
+        entry.marker_frames(native, cache, &seat.camera.marker).first().copied()
     };
-    let (yaw, pitch) = reach_seats::clamp_seat_look(&seat, riding.drive.yaw, riding.yaw, riding.pitch);
-    Some(reach_seats::seat_view(&seat, cam_marker.map(|m| world * m), world * seat_marker, yaw, pitch, fov_default))
+    let (yaw, pitch) = seat_look(&seat, riding);
+    if !seat_wants_third_person(&seat, riding.phase) {
+        let v = reach_seats::seat_view(&seat, cam_marker.map(|m| world * m), world * seat_marker, yaw, pitch, 0.0);
+        return Some(SeatShot {
+            pose: uc::CamPose { eye: v.eye, yaw, pitch },
+            third_person: false,
+            fov: v.fov,
+        });
+    }
+    // THE CHASE CAMERA. Index 0 of the (max 2) tracks; 1 is the "tight" one, which only
+    // `unit_set_prefer_tight_camera_track` selects and nothing in test mode asks for. An entry
+    // that names no `trak` takes the globals' default track.
+    let track_tag = seat.camera.tracks.first().copied().map(|t| t.or(globals.default_track)).unwrap_or(None);
+    let track = track_tag.and_then(|t| index.track(native, cache, t)).cloned();
+    let (focus, marker_forward) = match cam_marker {
+        Some(m) => {
+            let w = world * m;
+            (w.w_axis.truncate(), Some(w.transform_vector3(reach_seats::MARKER_FORWARD).normalize_or_zero()))
+        }
+        // The ROOT object's bounding-sphere centre (`sub_140D48000` walks to the root, which for a
+        // turret seat is the hull), not its model origin at ground level.
+        None => {
+            let root = riding.world();
+            let off = index.bounding_offset(native, cache, riding.placement_tag);
+            (root.transform_point3(off), None)
+        }
+    };
+    let (eye, forward, _t) = uc::chase_shot(&uc::ShotInput {
+        cam: &seat.camera,
+        track: track.as_ref(),
+        focus,
+        marker_forward,
+        look_yaw: yaw,
+        look_pitch: pitch,
+    });
+    // The anti-wall filter. The ridden vehicle's own placement is excluded from the rays: its
+    // hull is solid to a ray and would "obstruct" a camera that is meant to sit outside it.
+    let params = uc::resolve_params(seat.camera.obstruction, globals.obstruction);
+    let hidden = [riding.hidden_datum];
+    let clear = clear_fraction(scene, &hidden, focus, eye, &params);
+    let t = riding.obstruction.step(clear, &params, dt.max(1e-4));
+    let eye = focus + (eye - focus) * t;
+    Some(SeatShot {
+        pose: uc::CamPose { eye, yaw: forward.y.atan2(forward.x), pitch: forward.z.clamp(-1.0, 1.0).asin() },
+        third_person: true,
+        fov: seat.camera.override_fov.max(0.0),
+    })
+}
+
+/// #ride-camera  The largest fraction `t` of the focus-to-eye line that is clear of the world:
+/// the engine's six-ray test (`camera_obstruction_update_internal`, `sub_140414F50`), here a
+/// centre ray plus six around it on a cone of the authored test angle. A small standoff keeps the
+/// near plane off the wall.
+pub fn clear_fraction(scene: &dyn ObjectScene, hidden: &[u32], focus: Vec3, eye: Vec3, params: &[f32; 6]) -> f32 {
+    const STANDOFF: f32 = 0.05;
+    let line = eye - focus;
+    let len = line.length();
+    if len < 1e-3 {
+        return 1.0;
+    }
+    let dir = line / len;
+    let u = dir.cross(Vec3::Z).try_normalize().unwrap_or(Vec3::Y);
+    let v = dir.cross(u);
+    let spread = params[1].sin() * len;
+    let start_r = spread * params[0].clamp(0.0, 1.0);
+    let mut t = 1.0f32;
+    for k in 0..7 {
+        let ring = if k == 0 {
+            Vec3::ZERO
+        } else {
+            let a = (k - 1) as f32 * std::f32::consts::FRAC_PI_3;
+            u * a.cos() + v * a.sin()
+        };
+        let from = focus + ring * start_r;
+        let to = eye + ring * spread;
+        let d = to - from;
+        let dl = d.length();
+        if dl < 1e-3 {
+            continue;
+        }
+        if let Some(hit) = scene.raycast_solid_excluding(from, d / dl, dl, hidden) {
+            // The centre ray defines the line; a ring ray's fraction applies to the same line.
+            t = t.min(((hit - STANDOFF) / dl).clamp(0.0, 1.0));
+        }
+    }
+    t
+}
+
+/// #ride-entry  The animation names a rider's graph is asked for while a ride is in `phase`, best
+/// first. Empty while SEATED -- the ordinary seated candidates (`film_anim::anim_candidates`) apply.
+///
+/// **The naming is the shipped graph's, read off the Spartan and Elite `jmad`s** (`probe_ride_entry_
+/// and_exit_clips`): a driver seat authors `<seat>:enter` and `<seat>:exit` (`warthog_d:enter`, 30
+/// frames; `ghost_d:enter`, 36), a passenger seat authors them per weapon class
+/// (`warthog_p:rifle:enter`) beside a class-less `warthog_p:enter`, and the hijack seats author
+/// `<seat>:board`. A class-specific clip is preferred, the class-less one is the fallback.
+pub fn phase_clip_candidates(mode: &str, class: &str, phase: RidePhase) -> Vec<String> {
+    let leaf = match phase {
+        RidePhase::Seated => return Vec::new(),
+        RidePhase::Boarding => "enter",
+        RidePhase::Exiting => "exit",
+    };
+    vec![format!("{mode}:{class}:{leaf}"), format!("{mode}:any:{leaf}"), format!("{mode}:{leaf}")]
+}
+
+/// #ride-pose  The idle clips a SEATED rider's graph answers a seat with, best first -- only names
+/// the graph really HAS, and never a standing one.
+///
+/// **The naming is the shipped graphs' and it is not uniform** (`probe_seat_pose_table`, 217 seat
+/// rows over `forge_halo`'s 36 vehicles): the jmad names a clip `mode:class[:type]:state[:var]`,
+/// and the seat graphs author the class slot as the held weapon's class (`warthog_p:rifle:idle`,
+/// `pelican_p_l05:rifle:idle`), `any` (`warthog_d:any:idle`), BOTH slots `any`
+/// (`wraith_d:any:any:idle`), `unarmed` (`scorpion_d:unarmed:idle`), `fixed` (the Elite gunner,
+/// `warthog_g:fixed:idle`) or nothing (`ghost_d:idle`), and the Elite's often carry the variant
+/// suffix (`idle:var0`). Before this list knew all of those, 87 of the 217 rows fell through to the
+/// list's last entry, `combat:<class>:idle` -- the STANDING idle -- and a rider "stood straight up
+/// in the seat" (the Elite Warthog gunner, both riders of the Wraith, the Scorpion's Elite
+/// driver).
+///
+/// A seat whose graph authors no clip at all (`sabre_d` in both graphs, `pelican_p_l04` /
+/// `r04` / `r05` for the Spartan, the Elite's `falcon_p_*` and `pelican_p_*`) is answered by, in
+/// order, a SIBLING seat of the same family (`pelican_p_l05` for `pelican_p_l04`) and then the
+/// role's stand-in (`warthog_d` for a driver, `warthog_g` / `warthog_p` ...). Those two are
+/// INFERRED -- the engine has no clip to play there and the owner's report is that a rider must
+/// not stand -- and they are listed after every authored name.
+pub fn seated_idle_candidates(graph: &crate::reach_actor::AnimGraph, mode: &str, class: &str) -> Vec<String> {
+    let has = |n: &str| authors_base_clip(graph, n);
+    let structured = |m: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        for cls in ["any", class, "unarmed", "fixed", ""] {
+            for ty in ["", "any"] {
+                for var in ["", ":var0"] {
+                    let mut n = m.to_string();
+                    for part in [cls, ty] {
+                        if !part.is_empty() {
+                            n.push(':');
+                            n.push_str(part);
+                        }
+                    }
+                    n.push_str(":idle");
+                    n.push_str(var);
+                    if has(&n) && !out.contains(&n) {
+                        out.push(n);
+                    }
+                }
+            }
+        }
+        out
+    };
+    let mut out = structured(mode);
+    if !out.is_empty() {
+        return out;
+    }
+    // A sibling seat of the same family: `pelican_p_l04` -> any `pelican_p_*` with an idle.
+    if let Some(cut) = mode.rfind('_') {
+        let family = &mode[..=cut];
+        let sib = graph.anims.iter().map(|a| a.name.as_str()).find(|n| n.starts_with(family) && n.contains(":idle") && !n.starts_with(mode) && authors_base_clip(graph, n));
+        if let Some(n) = sib {
+            out.push(n.to_string());
+            return out;
+        }
+    }
+    // The role's stand-in: the seat's role letter is the one after the vehicle's name.
+    let role = mode.split('_').nth(1).and_then(|r| r.chars().next());
+    let stand_ins: &[&str] = match role {
+        Some('d') => &["warthog_d", "ghost_d", "mongoose_d"],
+        Some('g') => &["warthog_g", "wraith_g"],
+        Some('p') => &["warthog_p", "mongoose_p"],
+        _ => &[],
+    };
+    for m in stand_ins {
+        out.extend(structured(m));
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+/// #ride-look  The aim / look overlays a SEATED rider's graph may author, best first. Measured on
+/// the shipped Spartan and Elite graphs: `warthog_d:aim_still_up`, `warthog_p:<class>:aim_still_up`,
+/// `ghost_d:aim_still_up`, `mongoose_d:look_still_up` (an overlay whose blend screen labels the
+/// yaw/pitch grid, driven like the on-foot `combat:<class>:aim_still_up`).
+pub fn seat_aim_candidates(mode: &str, class: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for verb in ["aim_still_up", "look_still_up"] {
+        out.push(format!("{mode}:{class}:{verb}"));
+        out.push(format!("{mode}:any:{verb}"));
+        out.push(format!("{mode}:{verb}"));
+    }
+    out
+}
+
+/// #ride-entry  Does the graph author a BASE clip named exactly `name`?
+///
+/// **Exact, and only a base clip.** `AnimGraph::find` falls back to a SUBSTRING match, so a request
+/// for `mongoose_d:rifle:exit` -- which the Mongoose does not author -- resolved to
+/// `mongoose_d:rifle:exit_pose`, a one-frame OVERLAY, and the exit "lasted" two ticks; the same
+/// substring rule would hand `warthog_p:rifle:enter` any `...:enter_a`. A boarding, leaving or
+/// seated clip is a base clip authored under exactly the name asked for (Theater's
+/// `film_riders::exact_base_clip` is the same rule).
+pub fn authors_base_clip(graph: &crate::reach_actor::AnimGraph, name: &str) -> bool {
+    graph.anims.iter().any(|a| a.name.eq_ignore_ascii_case(name) && a.anim_type == crate::reach_jmad::AnimType::Base)
+}
+
+/// #ride-entry  The first of `cands` the rider's graph authors exactly (see [`authors_base_clip`]),
+/// as `(name, length in seconds)`.
+pub fn first_authored_clip(graph: &crate::reach_actor::AnimGraph, cands: &[String]) -> Option<(String, f32)> {
+    cands.iter().find_map(|c| {
+        let a = graph.anims.iter().find(|a| a.name.eq_ignore_ascii_case(c) && a.anim_type == crate::reach_jmad::AnimType::Base)?;
+        Some((a.name.clone(), a.frame_count.max(0) as f32 / crate::film_anim::CLIP_FPS))
+    })
+}
+
+/// #ride-grip  The marker names a rider's hand can be gripped to, best first.
+///
+/// Measured over the 36 vehicles of `forge_halo` (`probes::probe_hand_markers`): the vehicle
+/// carries one marker per hand and, on most, a SPECIES-specific copy of it, and the naming is not
+/// uniform -- `left_hand_d_spartan` (Warthog, pickup, cart, forklift), `left_hand_spartan`
+/// (ONI van), `d_left_hand_spartan` (Falcon, Sabre), `revenant_d_left_hand` (Revenant), and the
+/// bare `left_hand` (Mongoose, Ghost, shades). `species` is `"spartan"` or `"elite"`.
+pub fn hand_marker_candidates(seat_label: &str, left: bool, species: &str) -> Vec<String> {
+    let side = if left { "left" } else { "right" };
+    // #ride-smooth  **Only a DRIVER seat takes the shared names.** `left_hand_d_spartan`,
+    // `d_left_hand_spartan` and the bare `left_hand` are the DRIVER's steering-node markers
+    // (measured: Warthog `left_hand_d_spartan` @ `b_steering_wheel`, Mongoose `left_hand` @
+    // `b_steering`), so a passenger matched against them had his hands pulled onto the driver's
+    // wheel and moved with every steering input -- the Warthog passenger's "really rough" hands.
+    // A passenger's own markers carry the seat label (`mongoose_p_left_hand[_elite]`,
+    // `revenant_p_left_hand`); a seat with none (the Warthog's) holds no marker and keeps the
+    // pose its clip authored.
+    if !seat_label.ends_with("_d") {
+        return vec![format!("{seat_label}_{side}_hand_{species}"), format!("{seat_label}_{side}_hand")];
+    }
+    vec![
+        format!("{side}_hand_d_{species}"),
+        format!("{side}_hand_{species}"),
+        format!("d_{side}_hand_{species}"),
+        format!("{seat_label}_{side}_hand"),
+        format!("{side}_hand"),
+    ]
+}
+
+/// #ride-seat  The rider's own placement: the seat vehicle's transform times the seat marker, a
+/// WHOLE matrix -- rotation included -- because the seat clips are authored in the marker's frame.
+/// `None` when the model carries no such marker.
+pub fn rider_world(index: &mut VehicleIndex, native: &NativeDll, cache: CacheHandle, riding: &Riding) -> Option<Mat4> {
+    let world = seat_vehicle_world(index, native, cache, riding);
+    let entry = index.entry(native, cache, riding.vehi_tag)?;
+    let seat = entry.seats.seats.get(riding.seat)?;
+    let m = entry.marker_frames(native, cache, &seat.marker_name).first().copied()?;
+    Some(world * m)
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE CONTROLS
+// ---------------------------------------------------------------------------------------------
+
+/// #ride-controls  How a vehicle takes its steering, which is what decides what the keys MEAN.
+///
+/// The class is the drive model's own turn law ([`crate::reach_vehicle::TurnLaw`], measured by the
+/// physics side): the engine's vehicle types differ in whether the HULL answers the lateral stick
+/// or the LOOK direction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlClass {
+    /// `human_jeep` -- Warthog, Mongoose, pickup, vans, trucks, carts: the road wheels steer toward
+    /// the unit's facing, which is the LOOK direction; the lateral axis does not steer.
+    SteeredWheels,
+    /// `human_tank` -- Scorpion: the lateral axis drives the two tracks apart; looking does not
+    /// steer (the turret aims, the hull does not follow).
+    Tracked,
+    /// `alien_scout` (Ghost, Wraith, Revenant), `alien_fighter`, `vtol`, planes, space fighters:
+    /// the hull turns toward where the driver LOOKS -- "the vehicle follows the camera" -- and the
+    /// lateral axis slides.
+    FollowsLook,
+}
+
+pub fn control_class(law: crate::reach_vehicle::TurnLaw) -> ControlClass {
+    use crate::reach_vehicle::TurnLaw;
+    match law {
+        TurnLaw::Bicycle { .. } => ControlClass::SteeredWheels,
+        TurnLaw::Differential { .. } => ControlClass::Tracked,
+        TurnLaw::HeadingServo => ControlClass::FollowsLook,
+    }
+}
+
+/// #ride-controls  The drive model's input for one frame of a DRIVER's controls.
+///
+/// # What the engine does with a vehicle driver's input (PROVEN, `reach_tag_test.exe`)
+///
+/// `sub_1401AA090` (the per-tick player-to-unit hand-over, calling `player_build_facing_vector_from_
+/// throttle`, `players.cpp:8375`) builds the unit's FACING vector as **the player's own aiming
+/// vector** (`sub_14019D0E0(player, pitch, yaw)`, the view angles the look input accumulates) and
+/// passes the move stick through as the unit's throttle `(forward, left)` UNCHANGED -- the
+/// "build facing from throttle" function only validates both and copies. `unit_control`
+/// (`0xD6FEE0`) stores the facing at `unit +0x1E4`, and the jeep steers toward exactly that
+/// (`sub_140E62270`: signed angle hull-forward -> facing, overdampen curve, slew at `turn rate`).
+///
+/// So a Warthog or Mongoose **steers toward where the camera looks**, the lateral stick (A/D) does
+/// NOT steer it (it only widens the throttle magnitude, `min(|(fwd, left)|, 1)`), and there is **no
+/// keyboard ramp to implement**: the steering input is the mouse-driven look, which is continuous
+/// and is shaped by the vehicle's own overdampen curve and wheel slew. "Most vehicles follow the
+/// camera" is literally true of the jeeps too. (INFERRED: that the shipped `haloreach.dll` agrees --
+/// it is stripped of the assert strings this was read from -- and that the signed angle is taken
+/// in the hull's horizontal plane, i.e. the YAW difference, pitch ignored.)
+///
+/// | input | value fed | meaning |
+/// |---|---|---|
+/// | W / S (`fwd`) | `throttle` -1..1 | the stick's forward axis; the drive model applies the engine's own throttle law |
+/// | mouse look (`yaw`) | `want_yaw`, world radians | the unit FACING. Steers every class that turns its hull toward it |
+/// | A / D (`right`) | `slide` = the move stick's left axis | a jeep takes it only into its throttle magnitude (`min(|(fwd, left)|, 1)`); a TRACKED vehicle (law not read) and a hover vehicle also steer / slide on it |
+/// | Ctrl (`crouch`, held) | `brake` | the handbrake |
+///
+/// `_steer_saturation` is no longer used: the jeep now reads the facing (`want_yaw`) directly, so the
+/// stand-in that converted a look into a stick is gone. The parameter stays only so the call site in
+/// `play_mode.rs` is untouched.
+///
+/// UNRESOLVED, not wired: Reach's boost (a vehicle `unit boost` block, `trigger to boost` mapping)
+/// has no field in [`crate::reach_vehicle::DriveInput`], and the engine's button for it was not
+/// recoverable from the tags.
+pub fn drive_input(
+    class: ControlClass,
+    input: &crate::play_ctl::MoveInput,
+    hull_yaw: f32,
+    _steer_saturation: Option<f32>,
+) -> DriveInput {
+    let slide = (-input.right).clamp(-1.0, 1.0);
+    DriveInput {
+        throttle: input.fwd.clamp(-1.0, 1.0),
+        slide,
+        want_yaw: match class {
+            ControlClass::SteeredWheels | ControlClass::FollowsLook => input.yaw,
+            ControlClass::Tracked => hull_yaw,
+        },
+        brake: input.crouch,
+    }
 }
 
 /// #vehicle-drivetrain  The distance the WHEELS have rolled, which is what a wheel-spin
@@ -591,6 +1119,51 @@ pub fn drive_wheel_distance(
         .and_then(|e| e.drive.as_ref().ok())
         .map_or(false, |m| m.drivetrain.is_some());
     if geared { riding.drive.wheel_travel } else { riding.drive.odometer }
+}
+
+/// #vehicle-dup  **HOW MANY COPIES OF THE RIDDEN VEHICLE ARE THERE?** One line for the ride
+/// caption.
+///
+/// Reported: *"You are also still spawning a duplicate vehicle for some reason!"* Every path that
+/// could draw the original beside the ridden copy was read and closed:
+///
+/// * the hide chain is intact -- `hidden_datums` -> the pipeline fingerprint
+///   (`object_pipeline_sig`, which folds the hidden set in) -> [`shown`] -> the rebuild;
+/// * an attachment is NOT a separate placement -- `offer` enumerates children off the TAG with
+///   `datum = o.datum`, so hiding the parent hides the turret with it;
+/// * [`draw_pieces`] cannot emit the parent twice -- one push, then only attachments;
+/// * none of the eight `last_objects` consumers is a draw, overlay or instance path;
+/// * an orphaned actor set is already handled -- `PlayMode::leave` drains the ride's and every
+///   parked vehicle's actors.
+///
+/// **The one real "second vehicle" was the EXIT.** Getting out removed the ride's actors, so the
+/// editor's placement -- hidden for the ride -- came straight back at its ORIGINAL spot: the
+/// vehicle you had just parked vanished and a fresh one stood where it began. A vehicle left behind
+/// is now PARKED where it was left (`PlayMode::parked`), drawn by the same actors, and re-entered as
+/// the same vehicle.
+///
+/// What this line reports (note `objects` is the editor's table, which still holds the placement --
+/// only the RENDER set loses it):
+///
+/// * `hidden 1` -- the ridden placement is in the table and is being kept out of the render set;
+///   `0` would mean the table has lost it;
+/// * `other N` -- there are genuinely N other placements of the same vehicle within 3 wu, i.e. the
+///   map (or the variant merge) has it twice and the ride is innocent;
+/// * `actor pieces` -- how many models the ride itself draws (a Warthog is 2).
+pub fn duplicate_report(riding: &Riding, shown: &[ObjectInfo], pieces: usize) -> String {
+    let here = riding.drive.pos;
+    let mut hidden = 0usize;
+    let mut other = 0usize;
+    for o in shown {
+        if o.primary_tag != riding.placement_tag {
+            continue;
+        }
+        if (Vec3::from(o.pos) - here).length() > 3.0 {
+            continue;
+        }
+        if o.datum == riding.hidden_datum { hidden += 1 } else { other += 1 }
+    }
+    format!("copies near the ride: hidden placement {hidden} (kept out of the render set), other placements {other}, actor pieces {pieces}")
 }
 
 /// #vehicle-ride  The per-datum world-transform override a ride needs: the ridden placement,
@@ -678,25 +1251,43 @@ pub fn step(
     riding.drive = model.step(riding.drive, input, dt, &ground);
 }
 
-/// Where the player ends up on getting out: beside the seat marker, along the entry marker's own
-/// forward, at the authored entry radius — i.e. exactly where they would have been standing to
-/// get in. `None` when the markers cannot be resolved, and then the caller must leave the player
-/// where they are rather than teleport them somewhere invented.
-pub fn exit_position(
+/// Every place the rider could step out to, best first: the seat's own entry marker(s) pushed out
+/// along their forward by the seat's entry radius (where they would have stood to get in), then
+/// the other seats' markers of the same vehicle nearest first (the far door when the near one is
+/// against a wall). The caller tests each against the world and takes the first free one --
+/// the vehicle may have been driven up against, or into, a block, and a marker offset that lands
+/// inside it is not a place to stand.
+///
+/// (The engine's own order and search are not decoded: its `unit_exit_vehicle` runs the exit clip
+/// and lets the character controller depenetrate. This is the behaviour, not its constants.)
+pub fn exit_candidates(
     index: &mut VehicleIndex,
     native: &NativeDll,
     cache: CacheHandle,
     riding: &Riding,
-) -> Option<Vec3> {
-    let world = riding.world();
-    let entry = index.entry(native, cache, riding.vehi_tag)?;
-    let seat = entry.seats.seats.get(riding.seat)?.clone();
-    let group = seat.entry_marker_group().to_string();
-    let frames = entry.marker_frames(native, cache, &group);
-    let m = frames.first().copied()?;
-    let w = world * m;
-    let fwd = w.transform_vector3(reach_seats::MARKER_FORWARD).normalize_or_zero();
-    Some(w.w_axis.truncate() + fwd * seat.entry_radius)
+) -> Vec<Vec3> {
+    let world = seat_vehicle_world(index, native, cache, riding);
+    let Some(entry) = index.entry(native, cache, riding.vehi_tag) else { return Vec::new() };
+    let seats = entry.seats.seats.clone();
+    let spot = |seat: &reach_seats::Seat| -> Vec<Vec3> {
+        let group = seat.entry_marker_group().to_string();
+        entry
+            .marker_frames(native, cache, &group)
+            .into_iter()
+            .map(|m| {
+                let w = world * m;
+                let fwd = w.transform_vector3(reach_seats::MARKER_FORWARD).normalize_or_zero();
+                w.w_axis.truncate() + fwd * seat.entry_radius
+            })
+            .collect()
+    };
+    let Some(own) = seats.get(riding.seat) else { return Vec::new() };
+    let mut out = spot(own);
+    let anchor = out.first().copied().unwrap_or(riding.drive.pos);
+    let mut others: Vec<Vec3> = seats.iter().enumerate().filter(|(i, _)| *i != riding.seat).flat_map(|(_, s)| spot(s)).collect();
+    others.sort_by(|a, b| a.distance(anchor).total_cmp(&b.distance(anchor)));
+    out.extend(others);
+    out
 }
 
 /// The velocity the player carries out with them: the vehicle's own.
@@ -773,17 +1364,39 @@ pub fn draw_pieces(
     riding: &Riding,
     placement_variant_sid: u32,
 ) -> Vec<DrawPiece> {
-    let world = riding.world();
+    // The placement's editor scale is part of how it is drawn (the static pipeline scales the
+    // object and everything attached to it).
+    let world = riding.world() * scale_matrix(riding.appearance.scale);
+    object_pieces(index, native, cache, riding.placement_tag, world, placement_variant_sid)
+}
+
+/// The uniform editor-scale matrix (identity at 1.0).
+pub fn scale_matrix(scale: f32) -> Mat4 {
+    if scale.is_finite() && scale > 0.0 && (scale - 1.0).abs() > 1e-4 { Mat4::from_scale(Vec3::splat(scale)) } else { Mat4::IDENTITY }
+}
+
+/// [`draw_pieces`] for ANY placed object, not only a ridden vehicle: the object's own render
+/// model at `world`, then the children its model variant attaches. The one place that decides
+/// which pieces an object is drawn as, so a ridden vehicle, a parked one and a prop the physics
+/// has moved cannot disagree (and a displaced crate with an attachment keeps it).
+pub fn object_pieces(
+    index: &mut VehicleIndex,
+    native: &NativeDll,
+    cache: CacheHandle,
+    placement_tag: u32,
+    world: Mat4,
+    placement_variant_sid: u32,
+) -> Vec<DrawPiece> {
     let mut out = Vec::new();
-    let parent_mode = native.resolve_mode(cache, riding.placement_tag);
+    let parent_mode = native.resolve_mode(cache, placement_tag);
     if parent_mode != 0 && parent_mode != u32::MAX {
-        out.push(DrawPiece { mode_tag: parent_mode, world, obj_tag: riding.placement_tag });
+        out.push(DrawPiece { mode_tag: parent_mode, world, obj_tag: placement_tag });
     }
-    let rows = native.enumerate_attachments(cache, riding.placement_tag);
+    let rows = native.enumerate_attachments(cache, placement_tag);
     // `obje +0x60 default model variant`, read here rather than taken from `scene.rs`'s private
     // copy of the same read.
     let default_sid = native
-        .tag_meta(cache, riding.placement_tag, 0x60, 4)
+        .tag_meta(cache, placement_tag, 0x60, 4)
         .filter(|b| b.len() >= 4)
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .filter(|&v| v != u32::MAX)
@@ -803,27 +1416,103 @@ pub fn draw_pieces(
         if !keep {
             continue;
         }
-        let parent_marker = Mat4::from_rotation_translation(
-            glam::Quat::from_xyzw(a.rot[0], a.rot[1], a.rot[2], a.rot[3]).normalize(),
-            Vec3::from(a.pos),
-        );
-        // The child's own marker of the same name, cancelled out. When the child's model does not
-        // carry it the engine puts the child's ORIGIN on the parent's marker, which is what
-        // leaving the inverse out gives.
-        let child_marker = native
-            .string_id(cache, a.marker_sid)
-            .filter(|n| !n.is_empty())
-            .and_then(|name| {
-                index.entry(native, cache, a.child_obj).and_then(|e| e.marker_frames(native, cache, &name).first().copied())
-            })
-            .unwrap_or(Mat4::IDENTITY);
         out.push(DrawPiece {
             mode_tag: a.child_mode,
-            world: crate::reach_actor::attach_child(world, parent_marker, child_marker),
+            world: attachment_world(index, native, cache, world, a),
             obj_tag: a.child_obj,
         });
     }
     out
+}
+
+/// The `[primary, secondary]` colours a placement's Forge `(team, colour)` is drawn with. Both
+/// change colours get the one Forge tint (see [`drive_actors`] for the approximation).
+pub fn tint_of(ap: &RideAppearance) -> Option<[[f32; 3]; 2]> {
+    ap.forge_color.map(|tc| {
+        let c = crate::scene::forge_tint(Some(tc));
+        [[c[0], c[1], c[2]], [c[0], c[1], c[2]]]
+    })
+}
+
+/// #placement-appearance  THE ONE IMPLEMENTATION of "draw this actor as its placement is drawn":
+/// the Forge colour and the damage state, applied to every piece of an object. Used by the ridden
+/// vehicle, the parked one and any prop the physics has moved.
+pub fn apply_appearance(actors: &mut crate::reach_actor::ActorScene, ids: &[u32], ap: &RideAppearance) {
+    let tint = tint_of(ap);
+    for &id in ids {
+        if let Some(a) = actors.get_mut(id) {
+            if a.skin != tint {
+                a.skin = tint;
+                a.meshes_dirty = true;
+                actors.rebuild = true;
+            }
+        }
+        // The damage state selects other draw parts, so it goes through the setter that marks the
+        // actor's meshes dirty rather than being written into the field.
+        actors.set_damage(id, ap.damage);
+    }
+}
+
+/// The placement's `hlmt` model variant, on the actor that draws the object's own model (the
+/// first piece). 0 = the model's default. The static pipeline picks the render-model
+/// permutations with the same `variant_name_sid`.
+pub fn set_variant(actors: &mut crate::reach_actor::ActorScene, id: u32, variant_sid: u32) {
+    if variant_sid == 0 {
+        return;
+    }
+    if let Some(a) = actors.get_mut(id) {
+        if a.variant_sid != variant_sid {
+            a.variant_sid = variant_sid;
+            a.variant_name.clear();
+            a.meshes_dirty = true;
+            actors.rebuild = true;
+        }
+    }
+}
+
+/// One attachment row's child, placed on its parent: the engine's `object_attach_to_marker`.
+///
+/// The child's own marker of the same name is cancelled out. When the child's model does not
+/// carry it the engine puts the child's ORIGIN on the parent's marker, which is what leaving the
+/// inverse out gives.
+pub fn attachment_world(
+    index: &mut VehicleIndex,
+    native: &NativeDll,
+    cache: CacheHandle,
+    parent_world: Mat4,
+    a: &hms_native::ZhAttachment,
+) -> Mat4 {
+    let parent_marker = Mat4::from_rotation_translation(
+        glam::Quat::from_xyzw(a.rot[0], a.rot[1], a.rot[2], a.rot[3]).normalize(),
+        Vec3::from(a.pos),
+    );
+    let child_marker = native
+        .string_id(cache, a.marker_sid)
+        .filter(|n| !n.is_empty())
+        .and_then(|name| {
+            index.entry(native, cache, a.child_obj).and_then(|e| e.marker_frames(native, cache, &name).first().copied())
+        })
+        .unwrap_or(Mat4::IDENTITY);
+    crate::reach_actor::attach_child(parent_world, parent_marker, child_marker)
+}
+
+/// #ride-seat  The world transform of the object the SEAT'S markers are in.
+///
+/// For a seat on the placement itself that is the ride's hull. **For a Warthog's gunner it is the
+/// CHILD turret's frame**: the seat, its camera marker and its entry marker are authored in
+/// `warthog_chaingun`'s model space, not the hull's, so composing them with the hull's transform
+/// (as the first version did) put the gunner at the hull origin and his camera inside the bonnet.
+pub fn seat_vehicle_world(index: &mut VehicleIndex, native: &NativeDll, cache: CacheHandle, riding: &Riding) -> Mat4 {
+    let world = riding.world();
+    if riding.vehi_tag == riding.placement_tag {
+        return world;
+    }
+    native
+        .enumerate_attachments(cache, riding.placement_tag)
+        .iter()
+        .find(|a| a.child_obj == riding.vehi_tag)
+        .map(|a| attachment_world(index, native, cache, world, a))
+        .unwrap_or(world)
 }
 
 /// #vehicle-anim  ANIMATE the actors that draw a ridden vehicle: its own base clip, plus the
@@ -892,18 +1581,7 @@ pub fn drive_actors(
     // for an armoured biped. A vehicle whose model uses the secondary mask for something else
     // would take the Forge colour there too; nothing in the shipped vehicles was seen doing that,
     // and it is a visible-and-reportable approximation rather than a silent one.
-    let tint = riding.appearance.forge_color.map(|tc| {
-        let c = crate::scene::forge_tint(Some(tc));
-        [[c[0], c[1], c[2]], [c[0], c[1], c[2]]]
-    });
-    for &id in ids.iter() {
-        if let Some(a) = actors.get_mut(id) {
-            a.skin = tint;
-        }
-        // The damage state selects other draw parts, so it goes through the setter that marks the
-        // actor's meshes dirty rather than being written into the field.
-        actors.set_damage(id, riding.appearance.damage);
-    }
+    apply_appearance(actors, ids, &riding.appearance);
     for (&id, p) in ids.iter().zip(pieces.iter()) {
         // Each piece has its OWN graph: a Warthog's body and its chaingun are two objects with
         // two graphs, and the turret's `any:idle` is not the hog's.
@@ -1557,6 +2235,12 @@ mod gates {
         fn raycast_solid(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {
             (dir.z < -0.5 && origin.z > 0.0 && origin.z <= max).then_some(origin.z)
         }
+        // The ride's wheels cast through THIS one (`play_vehicle::step` excludes the ridden
+        // placement), and the trait's default builds it from `raycast_scene` + objects, both of
+        // which are empty here -- so without this override the floor does not exist to a wheel.
+        fn raycast_solid_excluding(&self, origin: Vec3, dir: Vec3, max: f32, _x: &[u32]) -> Option<f32> {
+            self.raycast_solid(origin, dir, max)
+        }
         // #play  The SAME floor as two triangles. The trait has no default for this any more
         // (an empty one is how Halo 3 shipped a frictionless void), so a stand-in has to say
         // what it is -- and a stand-in called `Floor` whose triangle gather was empty would
@@ -1601,7 +2285,7 @@ mod gates {
         };
 
         // Exactly what `play_mode::sync_vehicle_actors` does, in the same order.
-        let mut install = |actors: &mut ActorScene, ids: &mut Vec<u32>, index: &mut VehicleIndex, riding: &Riding| {
+        let install = |actors: &mut ActorScene, ids: &mut Vec<u32>, index: &mut VehicleIndex, riding: &Riding| {
             let pieces = draw_pieces(index, native, cache, riding, 0);
             if ids.is_empty() {
                 for p in &pieces {
@@ -1637,9 +2321,14 @@ mod gates {
         for _ in 0..120 {
             step(&mut index, native, cache, &mut riding, input, 1.0 / 60.0, &floor);
         }
-        let travelled = riding.drive.odometer;
-        println!("drove {travelled:.4} wu in 2 s");
-        assert!(travelled > 1.0, "the Warthog must actually move: odometer {travelled}");
+        // #jeep-law  The wheels turn by the distance THEY rolled (`wheel_travel`, the engine's own
+        // rolling phase), not by the distance the hull covered: under the engine's wheel law a
+        // standing start spins the tyres, and the animation shows it (`drive_wheel_distance`).
+        let hull_moved = riding.drive.odometer;
+        let travelled = riding.drive.wheel_travel;
+        println!("drove {hull_moved:.4} wu in 2 s, the wheels rolled {travelled:.4}");
+        assert!(hull_moved > 1.0, "the Warthog must actually move: odometer {hull_moved}");
+        assert!(travelled >= hull_moved, "the driven wheels cannot have rolled less than the hull moved: {travelled} vs {hull_moved}");
         install(&mut actors, &mut ids, &mut index, &riding);
         let turned = wheel_roll(&actors, body, "b_wheel_front_left");
         // A rolling wheel turns `d / r` radians, wrapped into the shortest signed angle because
@@ -1735,6 +2424,254 @@ mod gates {
         assert!(entry.drive.is_err());
         r.drive.pos = before;
         assert_eq!(r.drive.pos, Vec3::new(1.0, 2.0, 3.0));
+    }
+
+    /// **THE GUNNER GATE.** A Warthog's gunner seat is on the CHILD turret, so its markers are in
+    /// the turret's model space: the rider and the seat camera's focus must be composed with the
+    /// turret's attachment transform, not the hull's. The old composition put the gunner on the
+    /// hull origin.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn a_gunner_sits_in_the_turrets_frame_and_not_the_hulls() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("play_vehicle gates SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let mut index = VehicleIndex::default();
+        let hog = native
+            .tags_by_group(cache, "vehi")
+            .into_iter()
+            .find(|&t| native.tag_name(cache, t).as_deref() == Some("objects\\vehicles\\human\\warthog\\warthog"))
+            .expect("forge_halo carries the Warthog");
+        let rows = native.enumerate_attachments(cache, hog);
+        let chain = *rows
+            .iter()
+            .find(|a| { let c = a.child_obj; native.tag_name(cache, c).is_some_and(|n| n.ends_with("warthog_chaingun")) })
+            .expect("the Warthog attaches a chaingun");
+        let chain_tag = chain.child_obj;
+        let placement = obj(0x2468, hog, Vec3::new(10.0, 20.0, 30.0));
+        let o = VehicleOffer {
+            datum: 0x2468,
+            parent_datum: Some(0x2468),
+            vehi_tag: chain_tag,
+            vehi_path: "warthog_chaingun".into(),
+            seat: 0,
+            seat_label: "warthog_g".into(),
+            prompt_id: String::new(),
+            prompt: None,
+            substituted: Vec::new(),
+            test: EntryTest { distance: 0.0, radius: 1.25, cone: 0.0, cone_limit: 1.3, facing: 0.0, facing_limit: 1.0, relative_speed: 0.0, relative_speed_limit: 3.5 },
+        };
+        let r = begin(&mut index, native, cache, &o, &placement);
+        assert_eq!(r.hidden_datum, 0x2468, "the PARENT is what gets hidden");
+        assert_eq!(r.vehi_tag, chain_tag);
+        let turret = attachment_world(&mut index, native, cache, r.world(), &chain);
+        let marker = {
+            let e = index.entry(native, cache, chain_tag).expect("the turret reads");
+            let seat = &e.seats.seats[0];
+            e.marker_frames(native, cache, &seat.marker_name).first().copied().expect("the seat marker")
+        };
+        let placed = rider_world(&mut index, native, cache, &r).expect("the gunner is placed").w_axis.truncate();
+        let want = (turret * marker).w_axis.truncate();
+        let old = (r.world() * marker).w_axis.truncate();
+        println!("gunner at {placed:?}; turret frame says {want:?}; the hull frame (the old composition) said {old:?}");
+        assert!((placed - want).length() < 1e-4, "the gunner is not on the turret's seat marker");
+        assert!((placed - old).length() > 0.3, "the old and new placements agree, so this gate cannot tell them apart: {}", (placed - old).length());
+        // And the turret IS where the draw puts it.
+        let drawn = draw_pieces(&mut index, native, cache, &r, 0);
+        let piece = drawn.iter().find(|p| p.obj_tag == chain_tag).expect("the turret is drawn");
+        assert!((piece.world.w_axis - turret.w_axis).length() < 1e-4, "the camera/seat frame and the drawn turret disagree");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #ride-phase / #ride-controls  Pure gates: no cache.
+    // -----------------------------------------------------------------------------------------
+
+    fn fixture() -> Riding {
+        Riding {
+            hidden_datum: 1,
+            vehi_tag: 2,
+            vehi_path: "objects\\vehicles\\warthog".into(),
+            placement_tag: 2,
+            seat: 0,
+            seat_label: "warthog_d".into(),
+            seat_mode: "warthog_d".into(),
+            drive: Default::default(),
+            start: Mat4::IDENTITY,
+            drivable: Ok(()),
+            yaw: 0.0,
+            pitch: 0.0,
+            appearance: Default::default(),
+            phase: RidePhase::Boarding,
+            phase_age: 0.0,
+            enter_len: Some(1.0),
+            exit_len: Some(0.5),
+            obstruction: Default::default(),
+            allows_weapons: false,
+        }
+    }
+
+    /// **THE CONTROL-TRANSFER GATE.** A rider only drives once the AUTHORED enter clip has played:
+    /// held back for its whole length, handed over on the frame it ends, not one frame early.
+    #[test]
+    fn control_is_handed_over_when_the_authored_enter_clip_has_played_and_not_before() {
+        let dt = 1.0 / 60.0;
+        let mut r = fixture();
+        let mut frames = 0;
+        let mut seated_at = None;
+        while frames < 300 {
+            let ev = advance_phase(&mut r, dt);
+            frames += 1;
+            if ev == PhaseEvent::Seated {
+                assert!(seated_at.is_none(), "seated twice");
+                seated_at = Some(frames);
+            }
+            if seated_at.is_none() {
+                assert!(!r.controls_live(true), "frame {frames}: the stick was live while the enter clip was still playing");
+            }
+        }
+        let at = seated_at.expect("never seated");
+        let secs = at as f32 * dt;
+        assert!((secs - 1.0).abs() <= dt * 1.01, "control passed at {secs} s but the clip is 1.0 s long");
+        assert!(r.controls_live(true), "after the clip the driver drives");
+        assert!(!r.controls_live(false), "a passenger's stick never moves a vehicle");
+    }
+
+    /// An unknown clip length HOLDS the phase: a missing value must never mean "instantly".
+    #[test]
+    fn an_unknown_clip_length_holds_the_boarding_phase() {
+        let mut r = fixture();
+        r.enter_len = None;
+        for _ in 0..1000 {
+            assert_eq!(advance_phase(&mut r, 1.0 / 60.0), PhaseEvent::None);
+        }
+        assert_eq!(r.phase, RidePhase::Boarding);
+        // A seat the rider's graph has no clip for has length 0 and passes at once.
+        r.enter_len = Some(0.0);
+        assert_eq!(advance_phase(&mut r, 1.0 / 60.0), PhaseEvent::Seated);
+    }
+
+    #[test]
+    fn getting_out_waits_for_the_exit_clip_and_cannot_start_while_boarding() {
+        let dt = 1.0 / 60.0;
+        let mut r = fixture();
+        assert!(!begin_exit(&mut r), "cannot leave while still getting in");
+        r.phase = RidePhase::Seated;
+        assert!(begin_exit(&mut r));
+        assert_eq!(r.phase, RidePhase::Exiting);
+        assert!(!begin_exit(&mut r), "cannot start leaving twice");
+        assert!(!r.controls_live(true), "a leaving rider's stick is dead");
+        let mut n = 0;
+        loop {
+            n += 1;
+            if advance_phase(&mut r, dt) == PhaseEvent::Exited {
+                break;
+            }
+            assert!(n < 100, "never exited");
+        }
+        assert!((n as f32 * dt - 0.5).abs() <= dt * 1.01, "left after {} s, the exit clip is 0.5 s", n as f32 * dt);
+    }
+
+    #[test]
+    fn the_clip_names_are_the_shipped_graphs_with_the_class_clip_preferred() {
+        let c = phase_clip_candidates("warthog_p", "rifle", RidePhase::Boarding);
+        assert_eq!(c, vec!["warthog_p:rifle:enter", "warthog_p:any:enter", "warthog_p:enter"]);
+        let c = phase_clip_candidates("ghost_d", "rifle", RidePhase::Exiting);
+        assert_eq!(c.last().map(String::as_str), Some("ghost_d:exit"));
+        assert!(phase_clip_candidates("ghost_d", "rifle", RidePhase::Seated).is_empty());
+    }
+
+    #[test]
+    fn a_seat_is_third_person_by_its_flag_and_on_enter_by_the_other_one() {
+        let chase = reach_seats::Seat { flags: reach_seats::FLAG_THIRD_PERSON_CAMERA, ..Default::default() };
+        let fp_on_enter = reach_seats::Seat { flags: reach_seats::FLAG_THIRD_PERSON_ON_ENTER, ..Default::default() };
+        let fp = reach_seats::Seat::default();
+        for ph in [RidePhase::Boarding, RidePhase::Seated, RidePhase::Exiting] {
+            assert!(seat_wants_third_person(&chase, ph));
+            assert!(!seat_wants_third_person(&fp, ph));
+        }
+        assert!(seat_wants_third_person(&fp_on_enter, RidePhase::Boarding), "third person while boarding");
+        assert!(!seat_wants_third_person(&fp_on_enter, RidePhase::Seated), "...and back to first person once seated");
+    }
+
+    /// **THE CONTROLS GATE.** What each input is fed to the drive model, per class. The engine's
+    /// rule (proven): a jeep steers toward the unit's FACING (`want_yaw` = the look) and the lateral
+    /// stick only reaches its throttle magnitude; a hover vehicle also follows the look and slides on
+    /// A/D; a tank keeps its lateral stick. That the jeep really steers by `want_yaw` and ignores
+    /// `slide` is gated where the physics lives (`reach_vehicle_drive::jeep_gates`).
+    #[test]
+    fn the_inputs_reach_the_drive_model_per_vehicle_class() {
+        use crate::play_ctl::MoveInput;
+        let sat = Some(0.5f32);
+        let hull = 0.4;
+        // A jeep: the look IS the facing, passed through untouched; A/D arrive as the stick's left
+        // axis (they widen the throttle, they do not steer -- the facing is unchanged by them).
+        let look_left = MoveInput { fwd: 1.0, yaw: 2.0, crouch: true, ..Default::default() };
+        let d = drive_input(ControlClass::SteeredWheels, &look_left, hull, sat);
+        assert_eq!(d.throttle, 1.0);
+        assert_eq!(d.want_yaw, 2.0, "the facing IS the look");
+        assert_eq!(d.slide, 0.0, "no key held: no lateral stick");
+        assert!(d.brake);
+        let along = MoveInput { fwd: 1.0, right: 1.0, yaw: hull, ..Default::default() };
+        let d = drive_input(ControlClass::SteeredWheels, &along, hull, sat);
+        assert_eq!((d.want_yaw, d.slide), (hull, -1.0), "holding D leaves the facing on the hull and is the stick's left axis");
+        // The seam: the facing is the raw look; the SHORT way round is the drive model's business.
+        let seam = MoveInput { yaw: -3.0, ..Default::default() };
+        assert_eq!(drive_input(ControlClass::SteeredWheels, &seam, 3.0, sat).want_yaw, -3.0);
+        // A tank keeps A/D and ignores the look; a hover vehicle follows the look and slides on A/D.
+        let keys = MoveInput { fwd: 1.0, right: 1.0, yaw: 2.5, ..Default::default() };
+        let t = drive_input(ControlClass::Tracked, &keys, hull, sat);
+        assert_eq!((t.slide, t.want_yaw), (-1.0, hull));
+        let h = drive_input(ControlClass::FollowsLook, &keys, hull, sat);
+        assert_eq!((h.slide, h.want_yaw), (-1.0, 2.5));
+        // Reverse, nothing held.
+        let back = drive_input(ControlClass::SteeredWheels, &MoveInput { fwd: -1.0, yaw: hull, ..Default::default() }, hull, sat);
+        assert_eq!((back.throttle, back.slide, back.brake), (-1.0, 0.0, false));
+    }
+
+    /// **THE OCCUPANCY GATE (pure).** What a player may sit in when nobody is aboard.
+    #[test]
+    fn an_empty_vehicle_offers_only_the_seats_a_walk_up_player_may_take() {
+        use reach_seats::*;
+        let seat = |flags: u32| Seat { flags, ..Default::default() };
+        assert!(seat(FLAG_DRIVER).enterable_in_empty_vehicle());
+        assert!(seat(FLAG_ALLOWS_WEAPONS | FLAG_THIRD_PERSON_CAMERA).enterable_in_empty_vehicle(), "a plain passenger seat");
+        assert!(!seat(FLAG_BOARDING_SEAT).enterable_in_empty_vehicle(), "a hijack seat needs an occupant to hijack");
+        assert!(!seat(FLAG_NOT_VALID_WITHOUT_DRIVER | FLAG_ALLOWS_WEAPONS).enterable_in_empty_vehicle(), "the Mongoose passenger needs its driver");
+        assert!(!seat(FLAG_BOARDING_NEEDS_PASSENGER).enterable_in_empty_vehicle());
+        assert!(!seat(FLAG_LOCKED).enterable_in_empty_vehicle());
+        assert!(!seat(FLAG_INVALID_FOR_PLAYER).enterable_in_empty_vehicle());
+        // And the preference order never hands back a seat the filter refuses.
+        let u = UnitSeats {
+            unit_tag: 0,
+            seats: vec![seat(FLAG_BOARDING_SEAT), seat(FLAG_NOT_VALID_WITHOUT_DRIVER), seat(FLAG_DRIVER)],
+        };
+        assert_eq!(u.best(&[0, 1]), None);
+        assert_eq!(u.best(&[0, 1, 2]), Some(2));
+    }
+
+    /// **THE WEAPON-SEAT GATE (pure).** `allows weapons` is bit 5 and nothing else, and a hidden
+    /// held weapon draws nothing.
+    #[test]
+    fn a_seat_allows_the_riders_weapon_by_its_bit_and_a_hidden_weapon_draws_nothing() {
+        use reach_seats::*;
+        assert!(Seat { flags: 1 << 5, ..Default::default() }.allows_weapons());
+        assert!(!Seat { flags: !(1u32 << 5), ..Default::default() }.allows_weapons(), "every OTHER bit set, this one clear");
+        let m = Mat4::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        let shown = crate::reach_actor::held_weapon_palette(m, 6, false);
+        let hidden = crate::reach_actor::held_weapon_palette(m, 6, true);
+        assert!(shown.iter().all(|x| *x == m) && shown.len() == 6);
+        assert!(hidden.iter().all(|x| *x == Mat4::ZERO), "a zero matrix collapses every vertex of the weapon to a point");
+        assert_eq!(hidden.len(), shown.len());
+    }
+
+    #[test]
+    fn the_control_class_is_the_drive_models_turn_law() {
+        use crate::reach_vehicle::TurnLaw;
+        assert_eq!(control_class(TurnLaw::Bicycle { wheelbase: 1.3 }), ControlClass::SteeredWheels);
+        assert_eq!(control_class(TurnLaw::Differential { track: 1.7 }), ControlClass::Tracked);
+        assert_eq!(control_class(TurnLaw::HeadingServo), ControlClass::FollowsLook);
     }
 }
 
@@ -1854,6 +2791,162 @@ mod probes {
             }
         }
         println!("\n{missing} of {total} seats have no resolvable seat marker in the render model");
+    }
+
+    /// #ride-entry  PRINT-ONLY. Every animation in the riders' own graphs whose name belongs to a
+    /// seat family, and every one that is NOT a plain `idle` -- i.e. what the shipped biped graph
+    /// authors for getting in, getting out, boarding and the in-seat actions.
+    #[test]
+    #[ignore = "print-only probe; run alone with --ignored"]
+    fn probe_ride_entry_and_exit_clips() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        let mut seen: Vec<String> = Vec::new();
+        for (t, path) in &bipeds {
+            if !(path.contains("spartan") || path.contains("elite")) {
+                continue;
+            }
+            let leaf = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
+            if seen.contains(&leaf) {
+                continue;
+            }
+            let Some(g) = resolve_jmad(native, cache, *t).and_then(|j| AnimGraph::read(native, cache, j)) else { continue };
+            seen.push(leaf.clone());
+            println!("== {leaf}: {} anims", g.anims.len());
+            for a in &g.anims {
+                let n = &a.name;
+                let seat = ["warthog", "ghost", "mongoose", "scorpion", "wraith", "banshee", "falcon", "pelican", "phantom",
+                    "truck", "pickup", "van", "sabre", "revenant", "seraph", "shade", "turret", "cart", "forklift", "vehicle", "enter", "exit", "board", "mount", "get_"]
+                    .iter().any(|k| n.contains(k));
+                if seat && !n.ends_with(":idle") {
+                    println!("   [{:>4}] {:<46} {:?} frames {:>4} loop {:>4}", a.index, n, a.anim_type, a.frame_count, a.loop_frame);
+                }
+            }
+        }
+    }
+
+    /// #ride-camera  PRINT-ONLY. Every seat of every vehicle: its flags, its camera struct, its
+    /// `trak` tracks (point count, the offset the engine's search lands on at several look pitches).
+    #[test]
+    #[ignore = "print-only probe; run alone with --ignored"]
+    fn probe_seat_cameras() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let mut index = VehicleIndex::default();
+        let mut tags = native.tags_by_group(cache, "vehi");
+        tags.sort_by_key(|&t| native.tag_name(cache, t).unwrap_or_default());
+        for t in tags {
+            let path = native.tag_name(cache, t).unwrap_or_default();
+            let leaf = path.rsplit('\\').next().unwrap_or(&path).to_string();
+            let Some(e) = index.entry(native, cache, t) else { continue };
+            for s in &e.seats.seats {
+                if !s.player_allowed() {
+                    continue;
+                }
+                let c = &s.camera;
+                println!(
+                    "{leaf:<22} seat {} '{}' flags[{}] camflags {:#x} marker '{}' pitch_range [{:.3},{:.3}] auto_level {:.3} yaw [{:.3},{:.3}] fov {:.3} tracks {} obstr {:?} springs {:.3}/{:.3}/{:.3} look acc/dec {:.1}/{:.1}",
+                    s.index, s.label, s.flag_names().join(","), c.flags, c.marker,
+                    c.pitch_range[0], c.pitch_range[1], c.pitch_auto_level, s.yaw_range[0], s.yaw_range[1],
+                    c.override_fov, c.tracks.len(), c.obstruction,
+                    c.pitch_min_spring, c.pitch_max_spring, c.spring_velocity, c.look_acceleration, c.look_deceleration
+                );
+                for tr in c.tracks.iter().flatten().copied() {
+                    let Some(k) = crate::reach_unit_camera::CameraTrack::read(native, cache, tr) else {
+                        println!("      track {} UNREADABLE", native.tag_name(cache, tr).unwrap_or_default());
+                        continue;
+                    };
+                    print!("      track {} n={}:", native.tag_name(cache, tr).unwrap_or_default(), k.positions.len());
+                    for deg in [-30.0f32, -15.0, 0.0, 15.0, 30.0, 45.0] {
+                        let (tt, off) = k.solve(deg.to_radians());
+                        print!(" [{deg:>4}deg t{tt:.2} ({:.2},{:.2},{:.2})]", off.x, off.y, off.z);
+                    }
+                    println!();
+                    println!("      track pitch range {:.1}..{:.1} deg", k.pitch(0.0).to_degrees(), k.pitch(1.0).to_degrees());
+                }
+            }
+        }
+    }
+
+    /// #ride-entry  PRINT-ONLY. What a boarding clip DOES to the body: its root movement and
+    /// the pelvis translation at the start, middle and end, next to the seat's idle pose.
+    #[test]
+    #[ignore = "print-only probe; run alone with --ignored"]
+    fn probe_boarding_clip_motion() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let bipeds = crate::reach_actor::ActorScene::list_bipeds(native, cache);
+        for (t, path) in &bipeds {
+            if !(path.ends_with("spartans") || path.ends_with("elite") || path.ends_with("elites")) {
+                continue;
+            }
+            let Some(g) = resolve_jmad(native, cache, *t).and_then(|j| AnimGraph::read(native, cache, j)) else { continue };
+            println!("== {path}  nodes: {}", g.node_names.iter().take(6).cloned().collect::<Vec<_>>().join(" "));
+            for name in ["warthog_d:idle", "warthog_d:enter", "warthog_d:exit", "ghost_d:enter", "ghost_d:exit", "mongoose_d:enter",
+                         "warthog_p:enter", "warthog_p:rifle:enter", "warthog_p:idle", "warthog_g:enter", "warthog_g:idle", "warthog_b_d:board:var0", "warthog_b_d:enter"] {
+                let Some(ai) = g.find(name) else { println!("  {name}: absent"); continue };
+                let a = &g.anims[ai];
+                let Some(d) = g.load(native, cache, ai) else { println!("  {name}: load failed"); continue };
+                let mv = d.movement();
+                let tot = mv.iter().fold((0.0f32, 0.0f32, 0.0f32, 0.0f32), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3));
+                print!("  {name:<26} {:?} frames {} movement type {} total ({:.3},{:.3},{:.3}, yaw {:.3})", a.anim_type, d.frame_count, d.movement_data_type, tot.0, tot.1, tot.2, tot.3);
+                let last = (d.frame_count.max(1) - 1) as f32;
+                for f in [0.0, last * 0.5, last] {
+                    let ch = crate::reach_jmad::sample(&d, a.anim_type, f);
+                    if let Some(c) = ch.get(1) {
+                        if let Some(p) = c.trans {
+                            print!(" | f{f:.0} n1 t=({:.3},{:.3},{:.3})", p.x, p.y, p.z);
+                        }
+                    }
+                }
+                println!();
+            }
+        }
+    }
+
+    /// #ride-grip  PRINT-ONLY. The hand / wheel / handlebar markers of every vehicle, with the
+    /// node each one is carried by: what a rider's hands could be gripped to.
+    #[test]
+    #[ignore = "print-only probe; run alone with --ignored"]
+    fn probe_hand_markers() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let mut index = VehicleIndex::default();
+        let mut tags = native.tags_by_group(cache, "vehi");
+        tags.sort_by_key(|&t| native.tag_name(cache, t).unwrap_or_default());
+        for t in tags {
+            let path = native.tag_name(cache, t).unwrap_or_default();
+            let leaf = path.rsplit('\\').next().unwrap_or(&path).to_string();
+            let Some(e) = index.entry(native, cache, t) else { continue };
+            let Some(m) = e.model.as_ref() else { continue };
+            let mut line = Vec::new();
+            for g in &m.markers {
+                let name = native.string_id(cache, g.name).unwrap_or_default();
+                if ["hand", "wheel_h", "steer", "grip", "handle"].iter().any(|k| name.contains(k)) && !name.contains("wheel_front") && !name.contains("wheel_back") {
+                    for mk in &g.markers {
+                        let node = m.node_names.get(mk.node.max(0) as usize).cloned().unwrap_or_default();
+                        let w = e.pose.as_ref().map(|p| p.marker_model(mk).w_axis.truncate()).unwrap_or_default();
+                        line.push(format!("{name}@{node}({:.2},{:.2},{:.2})", w.x, w.y, w.z));
+                    }
+                }
+            }
+            if !line.is_empty() {
+                println!("{leaf:<22} {}", line.join("  "));
+            }
+        }
     }
 
     /// What one vehicle OVERLAY actually does across its frames: the per-node rotation delta in

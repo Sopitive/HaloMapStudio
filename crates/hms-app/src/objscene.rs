@@ -132,6 +132,11 @@ pub trait ObjectScene {
     /// #settle World-space triangles of the object's physics hull (else its collision hull), posed
     /// and scaled like the overlays: what OTHER objects settle against.
     fn physics_world_tris(&self, _o: &ObjectInfo) -> Vec<[Vec3; 3]> { Vec::new() }
+    /// #collision  The object's CLOSED convex shells (one per box / polyhedron shape, triangles
+    /// wound outward, placed and scaled like [`physics_world_tris`](Self::physics_world_tris)).
+    /// Empty when the physics model is not made only of such shapes: those objects have no known
+    /// inside, so a body overlapping them is only pushed along the nearest face.
+    fn physics_world_shells(&self, _o: &ObjectInfo) -> Vec<Vec<[Vec3; 3]>> { Vec::new() }
     /// #settle #play Level geometry triangles overlapping a world box (the raycast soup),
     /// appended.
     ///
@@ -160,6 +165,12 @@ pub trait ObjectScene {
     fn h4_shadow_setup(&self) -> Option<(Option<(Vec3, Vec3)>, Option<hms_render::H4CascadeCfg>)> { None }
 
     // --- camera clearance (Reach overrides with its own primitive) ---
+    /// #play-sound  The BSP render-material index of the level triangle under `origin` (a ray
+    /// straight down, at most `max` long) -- what a footstep is keyed on. `None` where the level
+    /// geometry is not what is underfoot.
+    fn ground_material_index(&self, _origin: Vec3, _max: f32) -> Option<i32> {
+        None
+    }
     /// Distance to the nearest solid surface along a ray - map geometry AND placed objects -
     /// capped at `max`. Default: the two raycasts above, so the Halo 4 scene gets it for free.
     fn raycast_solid(&self, origin: Vec3, dir: Vec3, max: f32) -> Option<f32> {

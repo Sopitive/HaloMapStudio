@@ -3,7 +3,7 @@
 
 # Halo Map Studio
 
-**Current release: v1.4.0** — [downloads](https://github.com/Sopitive/HaloMapStudio/releases/latest) · [changelog](https://sopitive.github.io/HaloMapStudio/changelog.html). The app can check for new releases itself (Help ▸ Software update…; opt-in, see the [user guide](https://sopitive.github.io/HaloMapStudio/getting-started.html#updating)). Release archives are named `HaloMapStudio-<version>-linux-x64.zip` / `HaloMapStudio-<version>-windows-x64.zip` (see `RELEASING.md`).
+**Current release: v1.6.0** — [downloads](https://github.com/Sopitive/HaloMapStudio/releases/latest) · [changelog](https://sopitive.github.io/HaloMapStudio/changelog.html). The app can check for new releases itself (Help ▸ Software update…; opt-in, see the [user guide](https://sopitive.github.io/HaloMapStudio/getting-started.html#updating)). Release archives are named `HaloMapStudio-<version>-linux-x64.zip` / `HaloMapStudio-<version>-windows-x64.zip` (see `RELEASING.md`).
 
 A standalone map viewer and Forge editor for **Halo: Reach**, **Halo 3**,
 **Halo 4** and **Halo 2 Anniversary** from *Halo: The Master Chief Collection*

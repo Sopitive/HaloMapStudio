@@ -12,82 +12,20 @@ second bullet.
 
 ## not yet released
 
-### Performance
-- **Halo Map Studio no longer runs flat out while you are using something else.** "We essentially
-  want to make it not a pain to run it alongside MCC" -- and it was a pain, because the editor had
-  **no idea whether anyone was looking at it**. Alt-tab to the game and HMS carried on doing the
-  whole thing: the full `update()`, the full offscreen 3D render, and a command submission of
-  **4,349 draw calls, sixty times a second**, for a window behind the game. It now redraws a few
-  times a second while its window is not the one you are using, and slower still when it is
-  minimised or completely covered. Measured in production with the window left behind another
-  app: **406 scene frames drawn and 391 skipped**, i.e. the viewport was being redrawn about ten
-  times a second instead of at the display's rate. **A film keeps PLAYING and keeps its timing** --
-  the playback clock runs on real elapsed time, so nothing drifts and nothing pauses; it is simply
-  drawn less often. Settings > Graphics > **"Throttle when not in focus"**, on by default, turn it
-  off if you keep playback running on a second monitor. The saving is not only frames: the particle
-  simulation, the 3D render and the exposure metering are each skipped on a frame nobody can see,
-  so a background frame costs the interface and nothing else.
-- **A new install now renders at 100% instead of 200%, which is most of the answer to "are we
-  hogging the GPU".** We were, and now there is a number for it: per-pass GPU timing of a real
-  playback frame says HMS asked the graphics card for **10.7 ms a frame, 9.9 ms of it the scene
-  pass** -- roughly two thirds of a high-end card at sixty frames a second, with a game running.
-  The reason was the shipped render scale. HMS has always drawn the 3D scene at **200%: true 2x
-  supersampling, four times the pixels**. Nobody chose that; it was simply the default. New
-  installs render at 100%, and **200% is still there under Settings > Graphics > Render scale** for
-  screenshots and calibration work, where four times the pixels is exactly what you want.
-  **An existing install keeps whatever it already has** -- a saved 200% is indistinguishable from
-  someone who picked it deliberately, so nothing is migrated and nobody's picture changes under
-  them; pick Medium, or set Render scale yourself, to take the new default.
-  Measured on the same clip at the same tick, before and after: **10.71 ms of graphics-card time a
-  frame at 200% (9.90 ms of it the scene pass) against 3.93 ms at 100% (3.40 ms scene) -- 2.7x
-  less GPU asked for, and 2.9x less of the scene pass.**
-  Worth being clear about what this does and does not change: render scale is **resolution only**.
-  It does not touch the calibrated lighting, exposure or tonemap laws, so the entire difference is
-  how jagged an edge looks -- not the colour of anything.
-  HMS's own frame RATE, separately, is limited by the processor rather than the card (33.9 ms of a
-  34.6 ms Theater frame was CPU inside one `update()`), which is why the background throttle above
-  is the thing that actually gets HMS out of a game's way. Both were true at once.
-  (Headless captures are deliberately unchanged and still render supersampled: they never go
-  through the Graphics settings, and every calibration reference image in this project was taken
-  that way.)
+### Added
 
-- **Theater: "FPS is terrible in the theater playback", and "the program is EXTREMELY laggy now in
-  theater mode".** It is, and it was CPU, not the graphics card: measured on the 7-minute
-  16-player Forge clip with nothing else running, a playback frame took **34.6 ms (28.9 fps), with
-  a 75.7 ms p99 and a worst frame of 157.8 ms** -- and **33.9 of those 34.6 ms were the CPU inside
-  one `update()`**, so the GPU was idle waiting for it. Worse, the cost DEPENDED ON HOW FAR INTO
-  THE CLIP YOU WERE: the same clip at 1:00 ran at 30.2 ms a frame and at 7:00 at 99.8 ms, which is
-  the "it gets laggier the longer you watch" nobody could pin down. Theater now reports its own
-  frame times (`film perf`, below) so none of this has to be guessed at again, and four costs are
-  gone from the per-frame path:
-  - **The animation PHASE was re-integrated over each body's entire past, every frame.** What
-    drives a body's walk cycle is the ground it has covered, and that was computed by walking
-    every position sample the recording holds for it from the start of its life up to the
-    playhead -- once per drawn body, once per frame, so one frame's cost grew with the playhead.
-    It is a running total, so it is now accumulated once and read with a binary search. The number
-    that comes out is **bit-for-bit the same `f32`**, not an approximation, which matters more than
-    the speed does: the phase decides the pose, and a Theater frame has to be a pure function of
-    the playhead or the same tick reached two different ways would look different. A gate asserts
-    the bit equality over 701 ticks of a track containing respawn teleports, repeated ticks, gait
-    changes and stand-still stretches.
-  - **Every corpse on the ground was fully animated before being overwritten.** A ragdolled body's
-    joints come from the physics solver, but the clip was still sampled, cross-faded, overlaid and
-    chained up the skeleton first -- and then the solver's pose overwrote all of it, line for line.
-    Up to fourteen bodies lie on the ground at once, each paying for a pose nothing could see.
-  - **Every posed body re-sorted its own skeleton, every frame.** Composing a pose needs parents
-    before children, and that order was recomputed -- two allocations and a comparison sort of all
-    ~130 nodes -- on every body on every frame, for an answer fixed when the model was decoded.
-  - **A settled ragdoll re-scanned the whole placed-object table every frame.** The physics step
-    returns immediately once a body is asleep, but the collision geometry it would have needed was
-    gathered first: with fourteen corpses down, fourteen scans of every Forge piece on the map per
-    frame, for a result nothing read.
-- **Theater: `film perf` now reports the whole playback frame, as a distribution.** Mean, median,
-  p95, p99 and worst frame for both the frame period and the CPU inside `update()`, then every one
-  of seventeen stages of a Theater frame with its mean, its share, its own p99 and its worst --
-  plus the five phases inside the body placement and the frame's draw-call census. "Laggy" is a
-  complaint about the worst frames, not the average, and an average hides them. `film perf reset`
-  empties the ten-second window so a change can be measured without restarting. Always on while a
-  clip is open; the whole cost is seventeen clock reads a frame.
+### Fixed
+
+### Test mode (experimental)
+
+### Performance
+
+---
+
+## 1.5.0 — 2026-10-14
+
+Published. These entries are in `docs/changelog.html` and in
+`dist/release/RELEASE-NOTES-1.5.0.md`; kept here as history, the same way 1.4.0 is.
 
 ### Added
 - **Vehicles now sit on the ground they are on, and they have a real engine.** "Vehicles are still

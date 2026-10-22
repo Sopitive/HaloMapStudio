@@ -1569,6 +1569,12 @@ pub struct CrosshairPart {
     pub offset: [f32; 2],
     /// `color output A` — the index into [`SKIN_COLORS`] this part draws in.
     pub color: Option<usize>,
+    /// `widget origin`: the PIVOT, the point of the sprite (0..1) that sits on the placement point.
+    pub origin: [f32; 2],
+    /// `chud_widget_bitmap_flags` bits 0 / 1, `mirror horizontal` / `mirror vertical`: the sprite is
+    /// ALSO drawn reflected about the placement point. The assault rifle's ring is one quadrant
+    /// authored with both set and its corner as the pivot.
+    pub mirror: [bool; 2],
 }
 
 impl CrosshairPart {
@@ -1647,24 +1653,38 @@ pub fn widget_uses_crosshair_anchor(native: &NativeDll, cache: CacheHandle, widg
 pub fn weapon_crosshair(native: &NativeDll, cache: CacheHandle, weap_tag: u32) -> Option<Crosshair> {
     let meta = native.tag_meta(cache, weap_tag, 0, 0x400)?;
     let chud = tag_ref(&meta, WEAPON_CHUD_INTERFACE)?;
+    chud_crosshair(native, cache, chud)
+}
+
+/// The same read, from a `chdt` directly -- which is what a SEAT names (`reach_unit_hud`): a
+/// Warthog driver's reticule is the `crosshair` collection of `ui\chud\v_driver`, with no weapon
+/// anywhere in the chain.
+pub fn chud_crosshair(native: &NativeDll, cache: CacheHandle, chud: u32) -> Option<Crosshair> {
     let cmeta = native.tag_meta(cache, chud, 0, 0x28)?;
     let colls = block(native, cache, &cmeta, 0x00, 220, 32);
     let sid = |v: u32| native.string_id(cache, v).unwrap_or_default();
-    let mut chosen: Option<&[u8]> = None;
+    // Every collection the engine would draw as a reticule AT REST: `crosshair`, and the weapons
+    // that split it (`crosshair_locking` on the rocket launcher, `crosshair_fullscreen` /
+    // `_halfscreen` on the plasma turret) -- each judged by its OWN states, so the half-screen twin
+    // of a full-screen reticle is not drawn on top of it.
+    let mut chosen: Vec<&[u8]> = Vec::new();
     for coll in colls.chunks_exact(220) {
-        if sid(rd_u32(coll, 0)?) == CROSSHAIR_COLLECTION {
-            chosen = Some(coll);
-            break;
+        let n = sid(rd_u32(coll, 0)?);
+        if (n == CROSSHAIR_COLLECTION || n.starts_with("crosshair_")) && crate::reach_hud::widget_draws_at_rest(native, cache, coll) {
+            chosen.push(coll);
         }
     }
-    let coll = chosen.or_else(|| {
-        colls.chunks_exact(220).find(|c| {
+    if chosen.is_empty() {
+        chosen.extend(colls.chunks_exact(220).find(|c| {
             block(native, cache, c, 0x98, 156, 32)
                 .chunks_exact(156)
                 .any(|b| block(native, cache, b, 0x28 + 0x10, 28, 5).chunks_exact(28).any(|p| p[1] == ANCHOR_CROSSHAIR))
-        })
-    })?;
-    let bitmaps = block(native, cache, coll, 0x98, 156, 32);
+        }));
+    }
+    if chosen.is_empty() {
+        return None;
+    }
+    let bitmaps: Vec<u8> = chosen.iter().flat_map(|coll| block(native, cache, coll, 0x98, 156, 32)).collect();
     // EVERY bitmap widget the engine draws with no condition on it, not just the first.
     //
     // A reticule is COMPOSED. Taking "the first" picks whatever leads in tag order, which on the
@@ -1696,6 +1716,11 @@ pub fn weapon_crosshair(native: &NativeDll, cache: CacheHandle, weap_tag: u32) -
             scale: [rd_f32(p, 0x14).unwrap_or(1.0), rd_f32(p, 0x18).unwrap_or(1.0)],
             offset: [rd_f32(p, 0x0C).unwrap_or(0.0), rd_f32(p, 0x10).unwrap_or(0.0)],
             color,
+            origin: [rd_f32(p, 0x04).unwrap_or(0.5), rd_f32(p, 0x08).unwrap_or(0.5)],
+            mirror: {
+                let f = rd_u32(w, 0x7C).unwrap_or(0);
+                [f & 1 != 0, f & 2 != 0]
+            },
         })
     };
     let anchored: Vec<CrosshairPart> = bitmaps
@@ -1721,6 +1746,9 @@ thread_local! {
     /// One decoded reticule per (cache, weapon). `None` = that weapon authors none.
     static CROSSHAIRS: std::cell::RefCell<std::collections::HashMap<(u64, u32), Option<std::rc::Rc<CrosshairArt>>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// The same per (cache, chdt): the reticule a SEAT's own `chud` authors.
+    static CHUD_CROSSHAIRS: std::cell::RefCell<std::collections::HashMap<(u64, u32), Option<std::rc::Rc<CrosshairArt>>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// The open cache's reticule for one weapon, decoded and uploaded once.
@@ -1730,43 +1758,66 @@ pub fn crosshair_for(
     cache: CacheHandle,
     weap_tag: u32,
 ) -> Option<std::rc::Rc<CrosshairArt>> {
-    use eframe::egui;
     CROSSHAIRS.with(|m| {
         if let Some(v) = m.borrow().get(&(cache.0, weap_tag)) {
             return v.clone();
         }
-        let made = (|| {
-            let ch = weapon_crosshair(native, cache, weap_tag)?;
-            // One texture + UV PER PART: a composed reticule's halves can come from different
-            // sheets, and even on one sheet each part is its own sprite rectangle.
-            let mut art: Vec<(egui::TextureHandle, egui::Rect)> = Vec::with_capacity(ch.parts.len());
-            for (i, part) in ch.parts.iter().enumerate() {
-                let sp = part.sprite;
-                // The reticule sheet is white coverage like the navpoint one: the ALPHA is the shape.
-                let (bgra, w, h) =
-                    native.decode_bitmap_keep_alpha(cache, sp.bitmap_tag, sp.bitmap_index as u32, 0)?;
-                if w == 0 || h == 0 || bgra.len() < (w as usize * h as usize * 4) {
-                    return None;
-                }
-                let px: Vec<egui::Color32> = bgra
-                    .chunks_exact(4)
-                    .take(w as usize * h as usize)
-                    .map(|c| egui::Color32::from_rgba_unmultiplied(c[2], c[1], c[0], c[3]))
-                    .collect();
-                let img = egui::ColorImage { size: [w as usize, h as usize], pixels: px };
-                let tex =
-                    ctx.load_texture(format!("reach-reticule-{weap_tag}-{i}"), img, egui::TextureOptions::LINEAR);
-                // A NEGATIVE authored scale mirrors the sprite on that axis (the spartan laser
-                // reuses one half for both sides), which is a flipped UV rectangle.
-                let (u0, u1) = if part.scale[0] < 0.0 { (sp.uv[1], sp.uv[0]) } else { (sp.uv[0], sp.uv[1]) };
-                let (v0, v1) = if part.scale[1] < 0.0 { (sp.uv[3], sp.uv[2]) } else { (sp.uv[2], sp.uv[3]) };
-                art.push((tex, egui::Rect::from_min_max(egui::pos2(u0, v0), egui::pos2(u1, v1))));
-            }
-            Some(std::rc::Rc::new(CrosshairArt { crosshair: ch, parts: art }))
-        })();
+        let made = weapon_crosshair(native, cache, weap_tag).and_then(|ch| upload_crosshair(ctx, native, cache, ch, weap_tag));
         m.borrow_mut().insert((cache.0, weap_tag), made.clone());
         made
     })
+}
+
+/// [`crosshair_for`], for the reticule a `chdt` authors directly (a seat's HUD).
+pub fn crosshair_for_chud(
+    ctx: &eframe::egui::Context,
+    native: &NativeDll,
+    cache: CacheHandle,
+    chud: u32,
+) -> Option<std::rc::Rc<CrosshairArt>> {
+    CHUD_CROSSHAIRS.with(|m| {
+        if let Some(v) = m.borrow().get(&(cache.0, chud)) {
+            return v.clone();
+        }
+        let made = chud_crosshair(native, cache, chud).and_then(|ch| upload_crosshair(ctx, native, cache, ch, chud));
+        m.borrow_mut().insert((cache.0, chud), made.clone());
+        made
+    })
+}
+
+/// Upload one decoded reticule's sprites.
+fn upload_crosshair(
+    ctx: &eframe::egui::Context,
+    native: &NativeDll,
+    cache: CacheHandle,
+    ch: Crosshair,
+    key: u32,
+) -> Option<std::rc::Rc<CrosshairArt>> {
+    use eframe::egui;
+    // One texture + UV PER PART: a composed reticule's halves can come from different
+    // sheets, and even on one sheet each part is its own sprite rectangle.
+    let mut art: Vec<(egui::TextureHandle, egui::Rect)> = Vec::with_capacity(ch.parts.len());
+    for (i, part) in ch.parts.iter().enumerate() {
+        let sp = part.sprite;
+        // The reticule sheet is white coverage like the navpoint one: the ALPHA is the shape.
+        let (bgra, w, h) = native.decode_bitmap_keep_alpha(cache, sp.bitmap_tag, sp.bitmap_index as u32, 0)?;
+        if w == 0 || h == 0 || bgra.len() < (w as usize * h as usize * 4) {
+            return None;
+        }
+        let px: Vec<egui::Color32> = bgra
+            .chunks_exact(4)
+            .take(w as usize * h as usize)
+            .map(|c| egui::Color32::from_rgba_unmultiplied(255, 255, 255, c[3]))
+            .collect();
+        let img = egui::ColorImage { size: [w as usize, h as usize], pixels: px };
+        let tex = ctx.load_texture(format!("reach-reticule-{key}-{i}"), img, egui::TextureOptions::LINEAR);
+        // A NEGATIVE authored scale mirrors the sprite on that axis (the spartan laser
+        // reuses one half for both sides), which is a flipped UV rectangle.
+        let (u0, u1) = if part.scale[0] < 0.0 { (sp.uv[1], sp.uv[0]) } else { (sp.uv[0], sp.uv[1]) };
+        let (v0, v1) = if part.scale[1] < 0.0 { (sp.uv[3], sp.uv[2]) } else { (sp.uv[2], sp.uv[3]) };
+        art.push((tex, egui::Rect::from_min_max(egui::pos2(u0, v0), egui::pos2(u1, v1))));
+    }
+    Some(std::rc::Rc::new(CrosshairArt { crosshair: ch, parts: art }))
 }
 
 /// Paint the resting reticule at the crosshair anchor, scaled the way the chud scales everything.
@@ -1791,7 +1842,12 @@ pub fn paint_crosshair(
             viewport.center().x + part.offset[0] * vpx,
             viewport.center().y + part.offset[1] * vpx,
         );
-        let rect = egui::Rect::from_center_size(c, egui::vec2(size[0] * vpx, size[1] * vpx));
+        let (w, h) = (size[0] * vpx, size[1] * vpx);
+        // `widget origin` is the pivot: the point (0..1) of the sprite that sits on `c`.
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(c.x + (0.5 - part.origin[0]) * w, c.y + (0.5 - part.origin[1]) * h),
+            egui::vec2(w, h),
+        );
         // `color output A` is the resting colour -- `crosshair normal` on every shipped weapon,
         // which the skin authors opaque (a = 1.0). The enemy/friendly outputs are a
         // target-under-the-reticule state a film does not replicate.
@@ -1802,13 +1858,39 @@ pub fn paint_crosshair(
             }
             None => egui::Color32::WHITE,
         };
-        let mut mesh = egui::Mesh::with_texture(tex.id());
-        mesh.add_rect_with_uv(rect, *uv, col);
-        painter.add(egui::Shape::mesh(mesh));
-        union = Some(match union {
-            Some(u) => u.union(rect),
-            None => rect,
-        });
+        // The sprite, then its reflections about `c` when `mirror horizontal` / `vertical` are set.
+        let mut copies = vec![(rect, *uv)];
+        for (axis, on) in part.mirror.iter().enumerate() {
+            if !*on {
+                continue;
+            }
+            let more: Vec<(egui::Rect, egui::Rect)> = copies
+                .iter()
+                .map(|(r, u)| {
+                    if axis == 0 {
+                        (
+                            egui::Rect::from_min_max(egui::pos2(2.0 * c.x - r.max.x, r.min.y), egui::pos2(2.0 * c.x - r.min.x, r.max.y)),
+                            egui::Rect::from_min_max(egui::pos2(u.max.x, u.min.y), egui::pos2(u.min.x, u.max.y)),
+                        )
+                    } else {
+                        (
+                            egui::Rect::from_min_max(egui::pos2(r.min.x, 2.0 * c.y - r.max.y), egui::pos2(r.max.x, 2.0 * c.y - r.min.y)),
+                            egui::Rect::from_min_max(egui::pos2(u.min.x, u.max.y), egui::pos2(u.max.x, u.min.y)),
+                        )
+                    }
+                })
+                .collect();
+            copies.extend(more);
+        }
+        for (r, u) in copies {
+            let mut mesh = egui::Mesh::with_texture(tex.id());
+            mesh.add_rect_with_uv(r, u, col);
+            painter.add(egui::Shape::mesh(mesh));
+            union = Some(match union {
+                Some(un) => un.union(r),
+                None => r,
+            });
+        }
     }
     union.unwrap_or_else(|| egui::Rect::from_center_size(viewport.center(), egui::Vec2::ZERO))
 }

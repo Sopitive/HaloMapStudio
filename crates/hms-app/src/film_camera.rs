@@ -662,6 +662,10 @@ impl CameraTimeline {
 /// across the corpus). An exit names the seat the body was *in*, so an exit that falls at or just
 /// after the end of a ride states that ride's seat and nothing else does.
 pub fn seat_index_of_ride(idx: &crate::film_decode::FilmIndex, ride: &crate::film_anim::Ride) -> Option<u8> {
+    // #film-riders  A ride built from the recording's parent link carries its seat already.
+    if ride.seat.is_some() {
+        return ride.seat;
+    }
     idx.events
         .iter()
         .filter(|e| {
