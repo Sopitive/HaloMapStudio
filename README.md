@@ -1,5 +1,7 @@
-<img width="1887" height="1138" alt="Halo Map Studio — map viewport" src="https://github.com/user-attachments/assets/4ea79701-e559-43d0-9ad9-4256da8b6f55" />
-<img width="1887" height="1138" alt="Halo Map Studio — Forge editing" src="https://github.com/user-attachments/assets/7b94d894-8bf3-4438-ad72-2b25532e503f" />
+<img width="1887" height="1165" alt="viewer_last" src="https://github.com/user-attachments/assets/e427bdb1-3a5a-4a35-bd79-cb42bdace61b" />
+<img width="1887" height="1165" alt="viewer_last" src="https://github.com/user-attachments/assets/cb9b79ce-bac4-49ad-9cdf-d44ffa922688" />
+<img width="1887" height="1165" alt="viewer_last" src="https://github.com/user-attachments/assets/f5365c0a-e5d4-4f52-b7cf-0292fc9f80b8" />
+
 
 # Halo Map Studio
 
