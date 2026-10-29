@@ -234,6 +234,50 @@ pub fn classify(group: &str, tag_path: &str, moves: bool) -> Draw {
     }
 }
 
+/// #film-hill-markers  Where the recording puts `tr` at tick `t`, FOLLOWING its parent.
+///
+/// A child that rides something stops replicating a position of its own (base field 12; measured
+/// on the HT Ignition race clip: 42 of 10,129 position samples of its hill markers fall inside an
+/// attachment). Interpolating between the last sample before it attached and the next one after
+/// it let go draws a straight slide across the map -- a median 6.6 wu and up to 41.6 wu away from
+/// the player the marker is glued to. So while the latest attachment statement has no position
+/// after it, the child is where its parent is (recursively: a marker on a player on a Mongoose is
+/// where the Mongoose is). The
+/// authored offset (at most ~1.1 wu, in the parent NODE's frame) is not applied: it needs the
+/// parent's pose.
+pub fn follow_position<'a>(
+    lookup: &dyn Fn(u32) -> Option<&'a crate::film_decode::EntityTrack>,
+    tr: &'a crate::film_decode::EntityTrack,
+    t: f32,
+    depth: u8,
+) -> Option<glam::Vec3> {
+    let tick = t.max(0.0) as u32;
+    if depth < 3 {
+        let i = tr.attachments.partition_point(|(k, _)| *k <= tick);
+        if i > 0 {
+            if let (k, Some(a)) = tr.attachments[i - 1] {
+                let j = tr.positions.partition_point(|&(pt, _)| pt <= tick);
+                // The CHILD keeps a position it stated after attaching (a carried flag may send
+                // its own); a PARENT in the chain is followed regardless -- a body seated in a
+                // vehicle re-states a stale "boarding" position that is not where it is.
+                // A generic object (type 13: the hill markers) is followed while attached whatever it
+                // states -- on the race clip its odd mid-attachment sample is 10 wu from where its
+                // release sample proves it was.
+                let stale = depth > 0 || tr.entity_type == 13 || j == 0 || tr.positions[j - 1].0 <= k;
+                if stale {
+                    if let Some(p) = lookup(a.parent)
+                        .filter(|p| p.alive_at(tick))
+                        .and_then(|p| follow_position(lookup, p, t, depth + 1))
+                    {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    crate::film_vehicle::position_at(tr, t)
+}
+
 /// One recorded object, identified.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ObjectIdent {
@@ -288,6 +332,8 @@ pub struct ObjectTable {
     /// Counts by verdict, indexed by [`Draw::bucket`]: objective, loose weapon, debris, already
     /// in the scene, no world presence.
     pub by_draw: [usize; 6],
+    /// Net id -> index into `FilmIndex::tracks`, so a rider can find its parent.
+    pub track_of: std::collections::HashMap<u32, usize>,
 }
 
 impl ObjectTable {
@@ -303,7 +349,8 @@ impl ObjectTable {
         spawns: &[(u32, [f32; 3])],
     ) -> ObjectTable {
         let mut t = ObjectTable::default();
-        for tr in &idx.tracks {
+        for (ti, tr) in idx.tracks.iter().enumerate() {
+            t.track_of.insert(tr.net_id, ti);
             if tr.entity_type == crate::film_play::BIPED_TYPE || tr.entity_type == crate::film_anim::VEHICLE_TYPE {
                 t.other_lane += 1;
                 continue;
@@ -312,7 +359,7 @@ impl ObjectTable {
                 t.unresolved += 1;
                 continue;
             };
-            let draw = classify(&group, &path, tr.moves());
+            let draw = classify(&group, &path, tr.moves() || tr.rides());
             t.by_draw[draw.bucket()] += 1;
             if !draw.drawn() {
                 continue;
@@ -362,7 +409,8 @@ impl ObjectTable {
             if !tr.alive_at(tick) {
                 continue;
             }
-            let Some(p) = tr.sample(tick) else { continue };
+            let lookup = |n: u32| self.track_of.get(&n).and_then(|&i| idx.tracks.get(i));
+            let Some(p) = follow_position(&lookup, tr, tick as f32, 0).map(|v| v.to_array()) else { continue };
             out.push((o, p, tr.orientation_at(tick)));
         }
         out

@@ -468,6 +468,43 @@ pub fn reload_seconds(native: &NativeDll, cache: CacheHandle, weap: u32) -> Opti
     Some((graph.anims[i].duration_seconds(), graph.anims[i].name.clone()))
 }
 
+/// #fp-reload  The frame count of every reload clip in the weapon's first-person graph, by exact
+/// name (`first_person:reload_empty` 68, `first_person:reload_enter` 14, ...). Read once per weapon;
+/// the sequence a reload plays and its length are both derived from this, so the HUD's clock and
+/// the arms can never disagree about when a reload ends.
+pub fn reload_clip_frames(native: &NativeDll, cache: CacheHandle, weap: u32) -> std::collections::HashMap<String, u32> {
+    let mut out = std::collections::HashMap::new();
+    let Some(h) = native.tag_meta(cache, weap, WEAP_FIRST_PERSON as u32, 8) else { return out };
+    let (Some(n), Some(ptr)) = (
+        h.get(0..4).map(|b| i32::from_le_bytes(b.try_into().unwrap())),
+        h.get(4..8).map(|b| u32::from_le_bytes(b.try_into().unwrap())),
+    ) else {
+        return out;
+    };
+    if n <= 0 || n > 2 || ptr == 0 || ptr == u32::MAX {
+        return out;
+    }
+    let Some(b) = native.tag_ptr_bytes(cache, ptr, (n as usize * FIRST_PERSON_ELEM) as u32) else { return out };
+    let Some(e) = b.get(0..FIRST_PERSON_ELEM) else { return out };
+    let Some(datum) = e
+        .get(FIRST_PERSON_ANIMATIONS + 0x0C..FIRST_PERSON_ANIMATIONS + 0x10)
+        .map(|x| u32::from_le_bytes(x.try_into().unwrap()))
+    else {
+        return out;
+    };
+    if datum == u32::MAX {
+        return out;
+    }
+    if let Some(g) = crate::reach_actor::AnimGraph::read(native, cache, datum & 0xFFFF) {
+        for a in &g.anims {
+            if a.name.contains("reload") && a.frame_count > 0 {
+                out.insert(a.name.clone(), a.frame_count as u32);
+            }
+        }
+    }
+    out
+}
+
 /// A held weapon's live ammunition.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ammo {
@@ -1029,6 +1066,11 @@ pub struct PlayHud {
     pub reload_duration: f32,
     /// Which authored clip gave [`PlayHud::reload_duration`], for the report. Empty = none did.
     pub reload_clip: String,
+    /// #fp-reload  The held weapon's reload clips and their lengths (see [`reload_clip_frames`]).
+    pub reload_frames: std::collections::HashMap<String, u32>,
+    /// #fp-reload  The reload in progress began with an EMPTY magazine, and loads this many rounds.
+    pub reload_empty: bool,
+    pub reload_missing: u32,
     /// Trigger pulls refused this session because the magazine was empty.
     pub dry_pulls: u32,
     /// #seat-hud  The HUDs the seat the player is in puts on screen, keyed by the `(vehi tag,
@@ -1083,6 +1125,7 @@ impl PlayHud {
         }
         self.reloading = None;
         self.recharge_carry = 0.0;
+        self.reload_frames = reload_clip_frames(native, cache, weapon);
         match reload_seconds(native, cache, weapon) {
             Some((s, clip)) => {
                 self.reload_duration = s;
@@ -1158,6 +1201,16 @@ impl PlayHud {
         if a.reserve.unwrap_or(0) <= 0 {
             return false;
         }
+        // #fp-reload  Which clips this reload plays decides how long it takes: a rifle's empty and
+        // tactical reloads differ (68 / 59 frames), and the shotgun loads one shell per clip.
+        let (empty, missing) = (a.loaded <= 0, (a.mag.rounds_loaded_maximum - a.loaded).max(0) as u32);
+        let seq = crate::film_play::ActorDriver::fp_reload_sequence(&|n| self.reload_frames.get(n).copied(), empty, missing);
+        if !seq.is_empty() {
+            self.reload_duration = crate::film_play::ActorDriver::fp_reload_ticks(&seq) as f32 / 60.0;
+            self.reload_clip = seq[0].0.to_string();
+        }
+        self.reload_empty = empty;
+        self.reload_missing = missing;
         self.reloading = Some(0.0);
         true
     }

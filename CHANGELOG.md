@@ -12,13 +12,7 @@ second bullet.
 
 ## not yet released
 
-### Added
-
-### Fixed
-
-### Test mode (experimental)
-
-### Performance
+(nothing yet -- 1.7.0 was released 2026-10-29; its entries are in `docs/changelog.html` and `dist/release/RELEASE-NOTES-1.7.0.md`.)
 
 ---
 

@@ -391,20 +391,101 @@ fn yaw_rate_at(t: &crate::film_decode::EntityTrack, tick: u32) -> Option<f32> {
 /// pairing — and is deliberately left as its own change rather than bolted on here.
 pub fn airborne_age(t: &crate::film_decode::EntityTrack, tick: u32) -> Option<u32> {
     const MAX: u32 = 180; // 3 s; every airborne clip is finished well inside it
-    if !airborne_at(t, tick) {
-        return None;
-    }
-    for k in 1..=MAX {
-        let Some(back) = tick.checked_sub(k) else { return Some(k.saturating_sub(1)) };
-        if velocity_at(t, back).is_none() {
-            return Some(k);
+    let (start, _) = flight_episode(t, tick)?;
+    Some(tick.saturating_sub(start).min(MAX))
+}
+
+/// #fall-legs  Gaps in the raw airborne test shorter than this are one flight, ticks.
+const FLIGHT_BRIDGE: u32 = 18;
+/// #fall-legs  A flight shorter than this is a slope, a stair or a lip, not a jump or a fall, ticks.
+/// A Reach jump lasts about 2 * vz / g = 1.4 s; 36 ticks is 0.6 s.
+pub const FLIGHT_MIN_SPAN: u32 = 36;
+const FLIGHT_HOPS: u32 = 200;
+
+/// #fall-legs  The FLIGHT this tick belongs to, as `(first tick, last tick)`, or `None`.
+///
+/// **Why it exists, measured.** The raw test ([`airborne_at`], a vertical-speed cut on a position
+/// stream that is sparse) flickers: over 6 films, 3,480 bodies, it found 36,099 airborne
+/// episodes, of which 28,250 (78%) lasted 24 ticks or less, 18,742 (52%) never exceeded 0.6 of
+/// the ground speed in vertical speed (walking a ramp or stair) and 22,261 (62%) began within 18
+/// ticks of the previous one ending. Every flip swapped the whole-body clip between the ground
+/// gait and `airborne_arc`, so the legs snapped between two unrelated poses several times a
+/// second -- "falling animations are inconsistent, especially around the legs".
+///
+/// The rule, a pure function of the tick (scrub-safe): raw-airborne stretches separated by less
+/// than [`FLIGHT_BRIDGE`] ticks are one flight, and a flight shorter than [`FLIGHT_MIN_SPAN`] is
+/// not a flight at all.
+pub fn flight_episode(t: &crate::film_decode::EntityTrack, tick: u32) -> Option<(u32, u32)> {
+    // #film-open-perf  The vertical-speed cut is evaluated MANY times per query -- every probe of
+    // every `near` search re-asks it for the same ticks -- and a grounded body (the common case)
+    // paid ~600 `velocity_at` calls to learn "no flight". The cut is a pure function of
+    // (track, tick), so it is memoised over the window the first searches touch; a tick outside
+    // the window (a long flight's far hops) is asked directly. Same answers, same order.
+    const REACH: u32 = FLIGHT_BRIDGE + AIRBORNE_APEX_WINDOW + 2;
+    let lo = tick.saturating_sub(REACH);
+    let memo = std::cell::RefCell::new([0u8; (2 * REACH + 1) as usize]);
+    let moving = |k: u32| -> bool {
+        let i = k.wrapping_sub(lo) as usize;
+        let mut m = memo.borrow_mut();
+        match m.get(i).copied() {
+            Some(0) => {
+                let v = airborne_moving(t, k);
+                m[i] = 1 + v as u8;
+                v
+            }
+            Some(c) => c == 2,
+            None => airborne_moving(t, k),
         }
-        // The first grounded tick behind us is where this flight began.
-        if !airborne_at(t, back) {
-            return Some(k);
+    };
+    flight_episode_with(tick, &moving)
+}
+
+/// The un-memoised [`flight_episode`]: every cut asked of `velocity_at` directly. The reference the
+/// memo is gated against.
+#[cfg(test)]
+pub(crate) fn flight_episode_direct(t: &crate::film_decode::EntityTrack, tick: u32) -> Option<(u32, u32)> {
+    flight_episode_with(tick, &|k| airborne_moving(t, k))
+}
+
+/// #film-open-perf  [`flight_episode`] over a caller-supplied vertical-speed cut, so a caller that
+/// asks about every tick of a track (the stats census) can answer the cut from one table.
+fn flight_episode_with(tick: u32, moving: &dyn Fn(u32) -> bool) -> Option<(u32, u32)> {
+    let raw = |k: u32| airborne_with(k, moving);
+    // The nearest raw-airborne tick on one side within the bridge, probed every tick (an even-only probe missed odd gaps and made the episode depend on where you stood).
+    let near = |from: u32, back: bool| -> Option<u32> {
+        (1..=FLIGHT_BRIDGE).find_map(|d| {
+            let k = if back { from.checked_sub(d)? } else { from + d };
+            raw(k).then_some(k)
+        })
+    };
+    let (mut start, mut end) = if raw(tick) {
+        (tick, tick)
+    } else {
+        let (b, f) = (near(tick, true)?, near(tick, false)?);
+        // Only a gap the clusters themselves bridge: a wider one is two flights, and a tick in
+        // the middle of it must not see them merged (the answer would depend on where you stand).
+        if f - b > FLIGHT_BRIDGE {
+            return None;
+        }
+        (b, f)
+    };
+    let mut hops = 0;
+    while let Some(k) = near(start, true) {
+        start = k;
+        hops += 1;
+        if hops > FLIGHT_HOPS {
+            break;
         }
     }
-    Some(MAX)
+    hops = 0;
+    while let Some(k) = near(end, false) {
+        end = k;
+        hops += 1;
+        if hops > FLIGHT_HOPS {
+            break;
+        }
+    }
+    (end - start >= FLIGHT_MIN_SPAN).then_some((start, end))
 }
 
 /// #jump-apex  Is this body OFF THE GROUND at `tick`, including at the top of its own jump?
@@ -426,8 +507,20 @@ pub fn airborne_age(t: &crate::film_decode::EntityTrack, tick: u32) -> Option<u3
 /// and `velocity_at`'s ±6-tick smoothing widens that — so the samples are taken 30 ticks out,
 /// comfortably past the widest apex a Reach jump can have while still inside any real flight.
 pub fn airborne_at(t: &crate::film_decode::EntityTrack, tick: u32) -> bool {
-    const APEX_WINDOW: u32 = 30;
-    let moving = |k: u32| velocity_at(t, k).is_some_and(|v| v[2].abs() > cuts::AIRBORNE_VZ);
+    airborne_with(tick, &|k| airborne_moving(t, k))
+}
+
+/// The apex search radius of [`airborne_at`], ticks.
+const AIRBORNE_APEX_WINDOW: u32 = 30;
+
+/// The vertical-speed cut at one tick: clearly moving up or down.
+fn airborne_moving(t: &crate::film_decode::EntityTrack, k: u32) -> bool {
+    velocity_at(t, k).is_some_and(|v| v[2].abs() > cuts::AIRBORNE_VZ)
+}
+
+/// [`airborne_at`] over a caller-supplied (possibly memoised) `moving` test.
+fn airborne_with(tick: u32, moving: &dyn Fn(u32) -> bool) -> bool {
+    const APEX_WINDOW: u32 = AIRBORNE_APEX_WINDOW;
     if moving(tick) {
         return true;
     }
@@ -435,7 +528,7 @@ pub fn airborne_at(t: &crate::film_decode::EntityTrack, tick: u32) -> bool {
     // offset: a fixed offset has to be wider than the apex and narrower than the flight at once,
     // and a 30-tick probe from early in a jump lands before the takeoff. Searching has neither
     // boundary to straddle.
-    let near_back = (1..=APEX_WINDOW).any(|d| tick.checked_sub(d).is_some_and(moving));
+    let near_back = (1..=APEX_WINDOW).any(|d| tick.checked_sub(d).is_some_and(|k| moving(k)));
     near_back && (1..=APEX_WINDOW).any(|d| moving(tick + d))
 }
 
@@ -453,26 +546,54 @@ pub fn airborne_at(t: &crate::film_decode::EntityTrack, tick: u32) -> bool {
 /// Called ONCE per body per frame by the driver, never from inside [`derive`] — see
 /// [`BodyState::land_ticks`].
 pub fn land_age(t: &crate::film_decode::EntityTrack, tick: u32) -> Option<u32> {
-    // On the ground now, or this is a fall in progress and not a landing.
-    let now = velocity_at(t, tick)?;
-    if now[2].abs() > cuts::AIRBORNE_VZ {
+    // #fall-legs  On the ground now (not inside a real flight), and a real flight ended within
+    // the clip's window. The flight's own END is the touchdown, so the age is exact.
+    velocity_at(t, tick)?;
+    if flight_episode(t, tick).is_some() {
         return None;
     }
-    // The most recent tick inside the clip's window at which the body was clearly falling.
-    for k in 1..=cuts::LAND_TICKS {
-        let Some(back) = tick.checked_sub(k) else { return None };
-        if let Some(v) = velocity_at(t, back) {
-            if v[2] < -cuts::AIRBORNE_VZ {
-                return Some(k);
-            }
-        }
-    }
-    None
+    (1..=cuts::LAND_TICKS).step_by(4).find_map(|k| {
+        let (_, end) = flight_episode(t, tick.checked_sub(k)?)?;
+        let age = tick.checked_sub(end)?;
+        (age >= 1 && age <= cuts::LAND_TICKS).then_some(age)
+    })
 }
 
 /// Derive a body's state at `tick` from its recorded track. `seat` is supplied by the caller
 /// because it comes from the vehicle catalog, not from the track.
 pub fn derive(t: &crate::film_decode::EntityTrack, tick: u32, seat: Option<Seat>) -> BodyState {
+    derive_inner(t, tick, seat, &|| flight_episode(t, tick).is_some())
+}
+
+/// #film-open-perf  The vertical-speed cut of EVERY tick of one track, answered from a table.
+/// `velocity_at` is defined only between the first position key and 6 ticks past the last (before
+/// it the bracketing fails, after it both samples are the last key so the speed is 0), and the cut
+/// is false outside that range.
+pub struct MovingMap {
+    lo: u32,
+    v: Vec<bool>,
+}
+
+impl MovingMap {
+    pub fn build(t: &crate::film_decode::EntityTrack) -> MovingMap {
+        let (Some(&(first, _)), Some(&(last, _))) = (t.positions.first(), t.positions.last()) else {
+            return MovingMap { lo: 0, v: Vec::new() };
+        };
+        let hi = last.saturating_add(7);
+        MovingMap { lo: first, v: (first..hi).map(|k| airborne_moving(t, k)).collect() }
+    }
+    pub fn at(&self, k: u32) -> bool {
+        k.checked_sub(self.lo).and_then(|i| self.v.get(i as usize)).copied().unwrap_or(false)
+    }
+}
+
+/// [`derive`] with the flight test answered from a [`MovingMap`] built once per track. The same
+/// state, tick for tick.
+pub fn derive_mapped(t: &crate::film_decode::EntityTrack, tick: u32, seat: Option<Seat>, map: &MovingMap) -> BodyState {
+    derive_inner(t, tick, seat, &|| flight_episode_with(tick, &|k| map.at(k)).is_some())
+}
+
+fn derive_inner(t: &crate::film_decode::EntityTrack, tick: u32, seat: Option<Seat>, in_flight: &dyn Fn() -> bool) -> BodyState {
     let mut st = BodyState::default();
     if let Some(s) = seat {
         // A seated body's pose is fixed by the seat; nothing is derived and nothing is guessed.
@@ -508,7 +629,7 @@ pub fn derive(t: &crate::film_decode::EntityTrack, tick: u32, seat: Option<Seat>
 
     // Off the ground. Checked FIRST, because a man-cannon launch or a fall off a tower is the
     // single most obvious thing the old speed ladder got wrong — it jogged through the air.
-    if v[2].abs() > cuts::AIRBORNE_VZ {
+    if in_flight() {
         st.stance = Stance::Flight;
         st.gait = if ground > cuts::WALK { Gait::RunFront } else { Gait::Idle };
         st.because = "airborne: vertical speed above the ground-contact cut";
@@ -2254,6 +2375,15 @@ pub fn accepted_rides(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
     out
 }
 
+/// #film-open-perf  [`accepted_rides`], read back from the index's folded results when the decode
+/// worker has made them (the open path), else computed. Identical lists either way.
+pub fn accepted_rides_cached(idx: &crate::film_decode::FilmIndex) -> Vec<Ride> {
+    match idx.derived_valid() {
+        Some(d) => d.rides.clone(),
+        None => accepted_rides(idx),
+    }
+}
+
 /// #film-riders  Every seat membership the recording STATES: a biped whose base field 12 names a
 /// vehicle as its parent and a seat index.
 ///
@@ -2522,7 +2652,7 @@ impl VehicleTable {
         idx: &crate::film_decode::FilmIndex,
         mut resolve: impl FnMut(u16, u8) -> Option<(u32, String)>,
     ) -> VehicleTable {
-        let mut t = VehicleTable { rides: accepted_rides(idx), ..Default::default() };
+        let mut t = VehicleTable { rides: accepted_rides_cached(idx), ..Default::default() };
         // Resolve the variant's vehicle spawns ONCE; the palette walk is not free.
         let spawns: Vec<([f32; 3], u32, String)> = idx
             .variant_objects
@@ -4163,19 +4293,20 @@ mod tests {
     fn a_body_that_has_just_landed_plays_the_landing_and_then_gives_the_body_back() {
         // Falls for half a second, then stands on the floor. 60 Hz ticks.
         let mut pts: Vec<(u32, [f32; 3])> = Vec::new();
-        for k in 0..30u32 {
+        // (a full second: a flight shorter than FLIGHT_MIN_SPAN is a slope or a stair, #fall-legs)
+        for k in 0..60u32 {
             // -4 wu/s descent, well past the AIRBORNE_VZ cut of 1.6.
             pts.push((k, [k as f32 / 60.0, 0.0, 20.0 - 4.0 * k as f32 / 60.0]));
         }
-        let touchdown = 30u32;
+        let touchdown = 60u32;
         for k in 0..180u32 {
-            pts.push((touchdown + k, [(touchdown + k) as f32 / 60.0, 0.0, 18.0]));
+            pts.push((touchdown + k, [(touchdown + k) as f32 / 60.0, 0.0, 16.0]));
         }
         let t = track(&pts, 0.0);
 
         // Mid-fall: no landing, and the body is airborne.
-        assert_eq!(land_age(&t, 15), None, "a body still in the air has not landed");
-        assert_eq!(derive(&t, 15, None).stance, Stance::Flight);
+        assert_eq!(land_age(&t, 30), None, "a body still in the air has not landed");
+        assert_eq!(derive(&t, 30, None).stance, Stance::Flight);
 
         // The window in which the landing owns the body. `velocity_at` is SMOOTHED over +-6
         // ticks, so the touchdown is not a sharp edge and the exact first tick is a property of

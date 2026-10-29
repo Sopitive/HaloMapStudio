@@ -151,15 +151,30 @@ impl Manifold {
     pub fn update(&mut self, fresh: &[Candidate], adm: &Admission) -> bool {
         let mut changed = false;
         let old = std::mem::take(&mut self.points);
-        // 1. persistent points
+        // 1. persistent points. A stored point follows its candidate by id; when the id is gone (a face pair swapped its reference
+        // roles as the body rocked) the candidate at the same place with the same normal is the same point and keeps its state.
+        let mut used = vec![false; fresh.len()];
         for p in old.iter() {
-            match fresh.iter().find(|c| c.point.id == p.id) {
-                Some(c) if c.point.dist < adm.tolerance => self.points.push(ContactPoint { id: p.id, pos: c.point.pos, normal: c.point.normal, dist: c.point.dist, st: p.st }),
+            let by_id = fresh.iter().position(|c| c.point.id == p.id);
+            let hit = by_id.or_else(|| {
+                fresh
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, c)| !used[*k] && !old.iter().any(|o| o.id == c.point.id) && (c.point.pos - p.pos).length_squared() < SAME_POINT * SAME_POINT && c.point.normal.dot(p.normal) > 0.95 && (c.point.dist - p.dist).abs() < SAME_POINT_DIST)
+                    .min_by(|a, b| (a.1.point.pos - p.pos).length_squared().total_cmp(&(b.1.point.pos - p.pos).length_squared()))
+                    .map(|(k, _)| k)
+            });
+            match hit {
+                Some(k) if fresh[k].point.dist < adm.tolerance => {
+                    used[k] = true;
+                    let c = &fresh[k];
+                    self.points.push(ContactPoint { id: p.id, pos: c.point.pos, normal: c.point.normal, dist: c.point.dist, st: p.st });
+                }
                 _ => changed = true,
             }
         }
         // 2. new points, deepest first
-        let mut news: Vec<&Candidate> = fresh.iter().filter(|c| !old.iter().any(|p| p.id == c.point.id)).collect();
+        let mut news: Vec<&Candidate> = fresh.iter().enumerate().filter(|(k, c)| !used[*k] && !old.iter().any(|p| p.id == c.point.id)).map(|(_, c)| c).collect();
         news.sort_by(|a, b| a.point.dist.partial_cmp(&b.point.dist).unwrap_or(std::cmp::Ordering::Equal));
         for c in news {
             let thr = if c.edge { adm.tolerance } else { adm.new_threshold };
@@ -167,9 +182,17 @@ impl Manifold {
                 continue;
             }
             let np = ContactPoint::new(c.point.id, c.point.pos, c.point.normal, c.point.dist);
-            if self.points.len() < MAX_POINTS {
+            if self.points.len() < adm.max_points {
                 self.points.push(np);
                 changed = true;
+            } else if adm.max_points > MAX_POINTS {
+                // a compound body's manifold holds four per child shape: past the cap the shallowest point makes room for a deeper one
+                if let Some((k, shallow)) = self.points.iter().enumerate().map(|(k, p)| (k, p.dist)).max_by(|a, b| a.1.total_cmp(&b.1)) {
+                    if np.dist < shallow {
+                        self.points[k] = np;
+                        changed = true;
+                    }
+                }
             } else if let Some(k) = choose_drop(&self.points, &np) {
                 self.points[k] = np;
                 changed = true;
@@ -181,6 +204,12 @@ impl Manifold {
         changed
     }
 }
+
+/// Two candidates this close (wu) with the same normal are one contact point whatever their ids say.
+pub const SAME_POINT: f32 = 0.03;
+/// ...and a gap that moved less than this (wu) since the last tick: a body rocking in place changes it slowly, one striking a
+/// wall does not.
+pub const SAME_POINT_DIST: f32 = 0.01;
 
 /// At most this many points per manifold (`PRED_GSK_AGENT3`: 4 per child pair).
 pub const MAX_POINTS: usize = 4;
@@ -203,6 +232,9 @@ pub struct Admission {
     pub tolerance: f32,
     pub new_threshold: f32,
     pub predicted: f32,
+    /// Points a manifold may hold: [`MAX_POINTS`] for one convex pair, four per child shape for a compound body (the engine
+    /// keeps one manifold per child pair).
+    pub max_points: usize,
 }
 
 impl Admission {
@@ -210,7 +242,7 @@ impl Admission {
     /// (`qualityInfo[q]`, `sub_180D0C1D0`: `+0x08 = -0.5 g dt^2`, `+0x0C = -2 * that`).
     pub fn engine(tolerance: f32, g: f32, dt: f32) -> Self {
         let v1 = 0.5 * g * dt * dt;
-        Admission { tolerance, new_threshold: -v1, predicted: -2.0 * v1 }
+        Admission { tolerance, new_threshold: -v1, predicted: -2.0 * v1, max_points: MAX_POINTS }
     }
 }
 

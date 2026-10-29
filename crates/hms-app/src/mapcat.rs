@@ -711,7 +711,18 @@ fn read_candidate(path: &Path) -> Option<MapCandidate> {
 /// Steam / Windows-Store detection and the `HMS_MCC_DIRS` override for free.
 /// `map_variants` (the editable ones) is listed before `hopper_map_variants`.
 /// Workshop folders fall out naturally: they have no sibling variants dir.
+/// Test seam (per thread, test builds only): pretend these are the only Reach variant folders, so a
+/// gate can run "a map with no saved variant anywhere" without touching the machine's real ones.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_VARIANT_DIRS: std::cell::RefCell<Option<Vec<PathBuf>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn variant_dirs() -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(d) = TEST_VARIANT_DIRS.with(|c| c.borrow().clone()) {
+        return d;
+    }
     let mut out: Vec<PathBuf> = Vec::new();
     for maps in probable_maps_folders() {
         let Some(haloreach) = maps.parent() else { continue };

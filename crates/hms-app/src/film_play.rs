@@ -108,6 +108,9 @@ pub fn oneshot_for(
 /// #fire  How long a firing overlay runs, in film ticks. The shipped `fire_1` clips are 10-19
 /// frames at 30 fps; the clip's own length clamps it.
 pub const FIRE_TICKS: u32 = 40;
+/// #projectile-sim  How far back a fire event can still have a shot on screen: the longest flight
+/// `film_shots::life_bound_ticks` allows (900) plus the time an ending's burst is kept (240).
+pub const FIRE_LOOKBACK_TICKS: u32 = 900 + 240;
 
 /// #melee  How long a swing is held, in film ticks. One melee clip: the shipped strikes are
 /// 24-33 frames at 30 fps against the film's 60 Hz tick line.
@@ -1216,6 +1219,44 @@ impl Playback {
         }
     }
 
+    /// #film-roster  The armour of the player the camera is riding, for the first-person arms:
+    /// `(a key that changes whenever the armour does, the ten slot options)`.
+    ///
+    /// It is the SEAT the roster names for the camera's body, as of this tick -- not the header's
+    /// record for the slot, which is the lobby's: on a team film the first tick replaces nearly
+    /// every header player, and a slot can change hands (or its occupant's armour) mid-match.
+    pub fn subject_armour(&self) -> Option<(u8, Vec<u8>)> {
+        let seat = self.subject_seat_index()?;
+        let look = self.index.roster.seats[seat].look?;
+        Some((u8::try_from(seat).unwrap_or(u8::MAX), look.slots[..10].iter().map(|&v| v as u8).collect()))
+    }
+
+    /// #film-roster  WHO the camera is following, as a roster seat (an index into
+    /// `index.roster.seats`), as of this tick.
+    ///
+    /// The one answer every "followed player" display reads -- the spectated-player card, the
+    /// first-person arms' armour and colours -- so they can never name different people. It asks
+    /// the BODY first (the roster ties each body to the person who held the slot when it
+    /// spawned), then the player the camera is keyed on: a slot resolves to whoever holds it NOW,
+    /// not to the header's lobby record, and an owner group to the body it has at this tick.
+    pub fn subject_seat_index(&self) -> Option<usize> {
+        let tick = self.tick.round().max(0.0) as u32;
+        let of_body = |net: u32| self.index.seat_index_of_entity(net);
+        let in_slot = |slot: u8| self.index.roster.seats.iter().rposition(|s| s.slot == slot && s.holds_at(tick));
+        if let Some(k) = self.hidden_entity().and_then(of_body) {
+            return Some(k);
+        }
+        match self.camera {
+            FilmCamera::FirstPerson(s) | FilmCamera::Follow(s) => {
+                self.index.entity_for_slot(s, tick).and_then(|b| of_body(b.net_id)).or_else(|| in_slot(s))
+            }
+            FilmCamera::FirstPersonOwner(o) | FilmCamera::FollowOwner(o) => {
+                self.index.entity_for_owner(o, tick).and_then(|t| of_body(t.net_id))
+            }
+            FilmCamera::Free => None,
+        }
+    }
+
     /// #team-colour  The owner stamp (raw, `index + 1`) of the body the camera is riding: the
     /// hidden first-person body's own stamp, else the camera's owner when it is keyed by one.
     pub fn subject_owner(&self) -> Option<u8> {
@@ -1449,6 +1490,23 @@ impl SyncProf {
 ///
 /// Moving an actor is just `pos`/`yaw` — the bone palette folds the placement in — so a frame of
 /// playback costs no mesh rebuild. Only CREATING the pool does, which happens once.
+/// #projectile-sim  What [`ActorDriver::synth_shots`] did at the last frame.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShotsReport {
+    /// Shots on screen now, by the source of their direction.
+    pub recorded: usize,
+    pub target: usize,
+    pub level: usize,
+    /// Fire events whose projectile the film REPLICATES (drawn from its own track instead).
+    pub replicated: usize,
+    /// Fire events whose weapon launches no projectile (a melee weapon, a beam).
+    pub no_projectile: usize,
+    /// Fire events with no weapon named for the body at that tick.
+    pub unarmed: usize,
+    /// The collision world was not available (no scene yet), so no shot could be flown.
+    pub no_world: bool,
+}
+
 #[derive(Debug)]
 pub struct ActorDriver {
     /// #film-perf  Where the time inside [`ActorDriver::sync`] goes, as a rolling distribution.
@@ -1521,6 +1579,8 @@ pub struct ActorDriver {
     /// `vehicle net id -> actor id`. A vehicle's actor is created on demand and kept, because
     /// creating one rebuilds meshes while moving one does not.
     pub vehicle_actor: HashMap<u32, u32>,
+    /// #film-wheels  Per vehicle track, the cumulative distance table its wheels roll by.
+    wheel_odo: HashMap<u32, crate::film_vehicle::Odometer>,
     /// Vehicles whose model could not be placed, with the reason — reported, never silent.
     pub vehicle_error: Option<String>,
     /// #film-riders  The per-`vehi`-tag seat / marker cache the riders are placed with (test mode's
@@ -1541,6 +1601,9 @@ pub struct ActorDriver {
     /// from shows no flag at all. The user asked for a toggle rather than being forced, so this
     /// is it, and it is the ONE switch for the whole lane.
     pub show_objects: bool,
+    /// #film-highlight  Every non-unit object definition the film names, resolved once: wire ->
+    /// (tag id, group, tag path). The highlight's tag names and hull lookups come from here.
+    pub def_tags: HashMap<u32, (u32, String, String)>,
     /// #film-objects  The most objects the stream may draw at one moment. An actor is a GPU mesh
     /// build, and a nine-minute clip accumulates 447 `weap` tracks, so there has to be a ceiling;
     /// the draw list is ordered objectives-first so a cap can never drop the flag.
@@ -1714,8 +1777,9 @@ pub struct ActorDriver {
     /// demand from `weap` +0x3B8 `player interface` -> `first person`.
     /// #fp-species  `(weap tag, species row) -> (first person model, first person graph)`.
     fp_weapon_of: HashMap<(u32, usize), (Option<u32>, Option<u32>)>,
-    /// #skin  Per player slot, `(synthetic armour variant sid, [primary, secondary] colours)`.
-    /// Built once per film; `None` until the open map can answer.
+    /// #skin  Per roster SEAT (an index into `FilmIndex::roster.seats`), `(synthetic armour
+    /// variant sid, [primary, secondary] colours)`. Built once per film; `None` until the open
+    /// map can answer.
     pub appearance: Option<HashMap<u8, (u32, Option<[[f32; 3]; 2]>)>>,
     /// #team-colour  In a TEAM game (the embedded variant's teams bit), `[primary, secondary]`
     /// armour colours per team index 0..7: what every player body on that team wears instead of
@@ -1732,6 +1796,10 @@ pub struct ActorDriver {
     /// #fire  Per body, the ticks at which the recording says it FIRED (`action_weapon_fire`,
     /// kind 26, ref 0 = the biped), sorted.
     pub fire_of: HashMap<u32, Vec<u32>>,
+    /// #fp-reload  `net id -> sorted ticks` of the recorded `weapon_reload` events.
+    pub reload_of: HashMap<u32, Vec<u32>>,
+    /// #fp-reload  Per first-person graph tag, the frame count of each of its reload clips.
+    fp_reload_frames: HashMap<u32, HashMap<String, u32>>,
     /// #aim  The one player slot whose aim is LIVE in this recording, if the test is unambiguous.
     ///
     /// A player's own input is captured locally and written exactly; every other slot's aim field
@@ -1775,6 +1843,8 @@ pub struct ActorDriver {
     biped_cache: Option<u64>,
     /// #film-action  What `resolve_bipeds` found, in words, for the caption.
     pub biped_status: String,
+    /// #monitor-names  Whose each Forge monitor body is, as far as the recording says.
+    pub monitor_owner: HashMap<u32, crate::film_roster::MonitorOwner>,
     /// #projectile  Recorded projectiles drawn as a MODEL at the last sync, and those whose
     /// definition carries no render model at all (a bullet): the engine draws nothing of those
     /// either, so they are left to their attached effect rather than reported as an error.
@@ -1795,6 +1865,18 @@ pub struct ActorDriver {
     /// default -- without it a Theater clip is a gunfight with no muzzle flashes and no
     /// explosions, which is the report this lane exists for.
     pub show_projectile_fx: bool,
+    /// #projectile-sim  The shots Theater SIMULATES (the rounds a film never replicates): the
+    /// field they are shown through, each shot's flight (flown once, then looked up by tick), and
+    /// what the last [`ActorDriver::synth_shots`] did, for the caption.
+    pub shots: crate::play_projectile::Field,
+    pub flights: HashMap<(u32, u32), Option<std::sync::Arc<crate::play_projectile::Flight>>>,
+    pub shots_report: ShotsReport,
+    /// Where each flown shot's direction came from, for the caption and the gates.
+    pub shot_sources: HashMap<(u32, u32), crate::film_shots::AimSource>,
+    /// #projectile-sim  The light volumes (plasma streaks, tracers) the last [`ActorDriver::film_effects`]
+    /// wants drawn -- recorded projectiles' and simulated shots' together.
+    pub beams: Vec<crate::film_projectile::FilmBeam>,
+    pub contrails: Vec<crate::film_projectile::FilmContrail>,
     /// #projectile  What the last [`ActorDriver::film_effects`] asked for, split by kind.
     pub fx_muzzle: usize,
     pub fx_trail: usize,
@@ -1860,6 +1942,12 @@ impl Default for ActorDriver {
             body_actor: HashMap::new(),
             projectiles: None,
             show_projectile_fx: true,
+            shots: crate::play_projectile::Field::new(),
+            flights: HashMap::new(),
+            shots_report: ShotsReport::default(),
+            shot_sources: HashMap::new(),
+            beams: Vec::new(),
+            contrails: Vec::new(),
             fx_muzzle: 0,
             fx_trail: 0,
             fx_detonation: 0,
@@ -1867,12 +1955,14 @@ impl Default for ActorDriver {
             fx_no_effect: 0,
             fx_modelless: 0,
             vehicle_actor: HashMap::new(),
+            wheel_odo: HashMap::new(),
             rider_index: Default::default(),
             riders_unplaced: 0,
             rider_clips: HashMap::new(),
             vehicle_error: None,
             objects: None,
             show_objects: true,
+            def_tags: HashMap::new(),
             object_cap: 96,
             object_actor: HashMap::new(),
             objects_shown: 0,
@@ -1915,6 +2005,8 @@ impl Default for ActorDriver {
             sync: Vec::new(),
             melee_of: HashMap::new(),
             fire_of: HashMap::new(),
+            reload_of: HashMap::new(),
+            fp_reload_frames: HashMap::new(),
             live_aim: None,
             aim_shown: 0,
             aim_missing: 0,
@@ -1930,6 +2022,7 @@ impl Default for ActorDriver {
             species_shown: 0,
             biped_cache: None,
             biped_status: String::new(),
+            monitor_owner: HashMap::new(),
         }
     }
 }
@@ -1955,7 +2048,7 @@ impl ActorDriver {
     ///
     /// Done here rather than in `film_decode::build_index` because identifying a vehicle needs
     /// the loaded map's scenario sandbox palette, which the decode worker thread does not have.
-    fn prepare(&mut self, pb: &Playback, scene_palette: &dyn Fn(u16, u8) -> Option<(u32, String)>) {
+    pub(crate) fn prepare(&mut self, pb: &Playback, scene_palette: &dyn Fn(u16, u8) -> Option<(u32, String)>) {
         self.track_of = pb.index.tracks.iter().enumerate().map(|(i, t)| (t.net_id, i)).collect();
         self.vehicles = Some(crate::film_anim::VehicleTable::build(&pb.index, |q, i| scene_palette(q, i)));
         // #film-action  The assassinations the recording states. Decoded, so this is a read of
@@ -1966,8 +2059,22 @@ impl ActorDriver {
         let (melee, fire) = Self::action_tables(&pb.index);
         self.melee_of = melee;
         self.fire_of = fire;
+        // #fp-reload  The recorded reloads, folded once per film.
+        self.reload_of.clear();
+        for ev in pb.index.events.iter().filter(|e| e.kind == crate::film_action::EV_RELOAD) {
+            if let Some(net) = ev.subject {
+                self.reload_of.entry(net).or_default().push(ev.tick);
+            }
+        }
+        for v in self.reload_of.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
         // #aim  Which slot's aim the recording actually states. See the field's own note.
         self.live_aim = pb.index.live_aim_slot();
+        // #projectile-sim  Every flown shot belongs to the film it was flown for.
+        self.flights.clear();
+        self.shot_sources.clear();
     }
 
     /// #melee / #fire  The two per-body action channels, folded off the decoded event channel:
@@ -2073,6 +2180,7 @@ impl ActorDriver {
         self.rider_index.reset();
         self.rider_clips.clear();
         self.biped_of.clear();
+        self.monitor_owner.clear();
         self.biped_status = "no map is open to resolve the definition each spawn message names".into();
         // #film-objects  The object lane is resolved off the SAME reference table, so it shares
         // every one of these early exits and its own status line says which one it took.
@@ -2114,6 +2222,10 @@ impl ActorDriver {
                 None => unresolved += 1,
             }
         }
+        // #monitor-names  A Forge monitor is a `monitor_editor` biped; its player is inferred.
+        let monitors: Vec<u32> =
+            self.biped_of.iter().filter(|(_, b)| b.rsplit('\\').next().is_some_and(|l| l.contains("monitor"))).map(|(n, _)| *n).collect();
+        self.monitor_owner = crate::film_roster::assign_monitors(&pb.index, &monitors);
         self.biped_status = if self.biped_of.is_empty() {
             format!("the map is open but no body's definition reference resolved to a biped ({unresolved} tried)")
         } else {
@@ -2205,6 +2317,17 @@ impl ActorDriver {
         // the map holds one entry per distinct definition (two on the measured clip) rather than
         // one per track.
         self.variant_spawns = spawns.clone();
+        // #film-highlight  every object-ish definition, resolved once (not only the drawn lane's)
+        self.def_tags.clear();
+        for tr in pb.index.tracks.iter().filter(|t| (12..=18).contains(&t.entity_type)) {
+            let Some(w) = tr.def_wire else { continue };
+            if self.def_tags.contains_key(&w) {
+                continue;
+            }
+            let Some(tag) = refs.resolve(w) else { continue };
+            let (Some(g), Some(n)) = (native.tag_class(cache, tag), native.tag_name(cache, tag)) else { continue };
+            self.def_tags.insert(w, (tag, g, n));
+        }
         self.vehicle_defs.clear();
         for tr in pb.index.tracks.iter().filter(|t| t.entity_type == crate::film_anim::VEHICLE_TYPE) {
             let Some(w) = tr.def_wire else { continue };
@@ -2491,6 +2614,87 @@ impl ActorDriver {
         Some((world, tag))
     }
 
+    /// #film-wheels  Turn a recorded vehicle's wheels and steering from its recorded motion.
+    ///
+    /// Play mode poses a vehicle through `play_vehicle::drive_piece` (its own graph, the base
+    /// loop, and the driven overlays at a `DrivenState`); this is the same call, fed with the
+    /// state the RECORDING implies: the signed distance rolled ([`crate::film_vehicle::Odometer`])
+    /// and the steering ([`crate::film_vehicle::steer_fraction_at`], the drive model's own bicycle
+    /// law inverted, against the authored turn limits). Both are pure functions of the clock.
+    fn pose_wheels(
+        &mut self,
+        pb: &Playback,
+        native: &hms_native::NativeDll,
+        cache: hms_native::CacheHandle,
+        net: u32,
+        obj_tag: u32,
+        id: u32,
+        ftick: f32,
+        actors: &mut crate::reach_actor::ActorScene,
+    ) {
+        let Some(tr) = self.track_of.get(&net).and_then(|&i| pb.index.tracks.get(i)) else { return };
+        let odo = self.wheel_odo.entry(net).or_insert_with(|| crate::film_vehicle::Odometer::build(tr));
+        let mut idx = self.rider_index.borrow_mut();
+        let steer = idx
+            .entry(native, cache, obj_tag)
+            .and_then(|e| e.drive.as_ref().ok().and_then(|d| Some((d.wheelbase?, d.turning?))))
+            .map_or(0.0, |(wb, t)| crate::film_vehicle::steer_fraction_at(tr, ftick, wb, t.max_left, t.max_right));
+        let st = crate::reach_vehicle_anim::DrivenState { odometer: odo.at(ftick), steer };
+        let mut notes = Vec::new();
+        crate::play_vehicle::drive_piece(&mut idx, native, cache, obj_tag, id, &st, None, ftick / 60.0, actors, &mut notes);
+    }
+
+    /// #film-child-follow  Re-place every vehicle-lane object that RIDES a drawn parent.
+    ///
+    /// A Warthog's turret is its own network object; the recording states its parent (base field
+    /// 12) and gives it a position of its own only now and then, at a different phase from the
+    /// hull's. Interpolating the two independently is what made the gun slide over the bonnet.
+    /// The engine does not do that: an attached child's world transform is the parent's node
+    /// matrix times the attachment marker, recomputed every frame. So here the child's matrix is
+    /// `vehicle_world` (hull placement at the SAME fractional clock x the tag's attachment row),
+    /// whatever positions the child itself reported, and a child that never reported one at all
+    /// (30 of 33 turrets on the 12:16 clip) is added to the lane because its parent is drawn.
+    fn follow_parents(
+        &self,
+        pb: &Playback,
+        mut live: Vec<(u32, u32, [f32; 3], f32, Option<glam::Mat4>, u8)>,
+        tick: u32,
+        ftick: f32,
+        native: &hms_native::NativeDll,
+        cache: hms_native::CacheHandle,
+    ) -> Vec<(u32, u32, [f32; 3], f32, Option<glam::Mat4>, u8)> {
+        let drawn: std::collections::HashSet<u32> = live.iter().map(|l| l.0).collect();
+        let parent_drawn = |tr: &crate::film_decode::EntityTrack| {
+            tr.attached_at(tick).is_some_and(|a| drawn.contains(&a.parent))
+        };
+        let place = |net: u32| self.vehicle_world(pb, net, ftick, native, cache, 0);
+        let put = |l: &mut (u32, u32, [f32; 3], f32, Option<glam::Mat4>, u8), w: glam::Mat4| {
+            l.2 = w.w_axis.truncate().to_array();
+            l.3 = w.x_axis.y.atan2(w.x_axis.x).to_degrees();
+            l.4 = Some(w);
+        };
+        for l in live.iter_mut() {
+            let Some(tr) = self.track_of.get(&l.0).and_then(|&i| pb.index.tracks.get(i)) else { continue };
+            if parent_drawn(tr) {
+                if let Some((w, _)) = place(l.0) {
+                    put(l, w);
+                }
+            }
+        }
+        for tr in pb.index.tracks.iter().filter(|t| t.entity_type == crate::film_anim::VEHICLE_TYPE) {
+            if drawn.contains(&tr.net_id) || !tr.alive_at(tick) || !parent_drawn(tr) {
+                continue;
+            }
+            if let Some((w, tag)) = place(tr.net_id) {
+                let state = self.veh_damage.get(&tr.net_id).map_or(0, |(tl, _)| tl.state_at(tick));
+                let mut l = (tr.net_id, tag, [0.0; 3], 0.0, None, state);
+                put(&mut l, w);
+                live.push(l);
+            }
+        }
+        live
+    }
+
     /// #film-riders  The seat the recording puts this body in, if it does, with the seat's own
     /// authored name.
     ///
@@ -2599,13 +2803,10 @@ impl ActorDriver {
     /// scrubbing to a moment twice plays the same thing, which is the rule the ragdolls, the
     /// death clips and the camera are already held to.
     ///
-    /// What it deliberately does NOT do: simulate a rifle round. A Reach film records one
-    /// player's look direction and zero-fills every other slot's (see [`ActorDriver::live_aim`]),
-    /// so for all but one body the recording does not state which way the shot went. Firing a
-    /// tracer along the body's yaw would be an invention, and an invention that would be visibly
-    /// horizontal. The bullet's own `proj` definition is read and available
-    /// ([`crate::film_projectile::WeaponShot::projectile`]) for the day the direction is; until
-    /// then the muzzle flash is what the recording can honestly support.
+    /// The rounds the film does NOT replicate (a rifle, pistol, plasma or needler round) are not
+    /// here: [`ActorDriver::synth_shots`] flies them from their fire events and this lane then asks
+    /// its field for their trails, light volumes, contrails and endings, so the recorded and the
+    /// simulated projectiles are drawn by the same producers.
     pub fn film_effects(
         &mut self,
         pb: &Playback,
@@ -2620,6 +2821,8 @@ impl ActorDriver {
         self.fx_unarmed = 0;
         self.fx_no_effect = 0;
         self.fx_modelless = 0;
+        self.beams.clear();
+        self.contrails.clear();
         if !self.show_projectile_fx {
             return Vec::new();
         }
@@ -2702,20 +2905,13 @@ impl ActorDriver {
                     }
                     if let Some(world) = crate::film_projectile::projectile_world(tr, ftick) {
                         let path = crate::film_projectile::recorded_path(tr);
-                        for (i, &effe) in fx.attached.iter().enumerate() {
-                            out.push(FilmEffect {
-                                seed: FILM_FX_SEED ^ 0x02 ^ ((o.net_id as u64) << 24) ^ ((i as u64) << 8),
-                                effe,
-                                mode: fx.mode,
-                                world,
-                                birth: born,
-                                // A MOVING source: the recorded flight, so the trail is left in
-                                // the air behind the projectile instead of dragged along with it.
-                                path: Some(path.clone()),
-                                label: format!("trail #{:#x} {}", o.net_id, fx.name),
-                            });
-                            self.fx_trail += 1;
-                        }
+                        // #projectile-sim  The ONE producer of a projectile's trail, shared with
+                        // test mode (`play_projectile`): see `film_projectile::trail_effects`.
+                        let trails = crate::film_projectile::trail_effects(o.net_id, fx, world, born, path);
+                        self.fx_trail += trails.len();
+                        out.extend(trails);
+                        self.beams.extend(crate::film_projectile::trail_beams(fx, world));
+                        self.contrails.extend(crate::film_projectile::trail_contrails(fx, world, born, crate::film_projectile::recorded_path(tr)));
                     }
                 }
                 // The DETONATION. A projectile's track ends when the engine destroyed the
@@ -2726,23 +2922,162 @@ impl ActorDriver {
                 let Some(det) = fx.detonation else { continue };
                 let end = tr.positions[tr.positions.len() - 1].1;
                 if ftick >= tr.last_tick as f32 && ftick <= tr.last_tick as f32 + 240.0 {
-                    out.push(FilmEffect {
-                        seed: FILM_FX_SEED ^ 0x03 ^ ((o.net_id as u64) << 24),
-                        effe: det,
-                        // A detonation is not on the projectile's model: it is an explosion in the
-                        // world, and its systems name no marker.
-                        mode: 0,
-                        world: glam::Mat4::from_translation(glam::Vec3::from(end)),
-                        birth: died,
-                        path: None,
-                        label: format!("detonation #{:#x} {}", o.net_id, fx.name),
-                    });
+                    // A detonation is not on the projectile's model: it is an explosion in the
+                    // world, and its systems name no marker.
+                    out.push(crate::film_projectile::burst_effect(
+                        crate::film_projectile::SEED_DETONATION,
+                        o.net_id,
+                        det,
+                        glam::Vec3::from(end),
+                        None,
+                        died,
+                        format!("detonation #{:#x} {}", o.net_id, fx.name),
+                    ));
                     self.fx_detonation += 1;
                 }
             }
         }
         let _ = (native, cache);
+        // #projectile-sim  And the shots Theater flew itself (`synth_shots`), through the SAME
+        // producers as the recorded ones above.
+        out.extend(self.shots.effects());
+        self.beams.extend(self.shots.beams());
+        self.contrails.extend(self.shots.contrails());
         out
+    }
+
+    /// #projectile-sim  Fly and show the rounds the film does NOT replicate.
+    ///
+    /// Every `action_weapon_fire` event whose weapon launches a `proj` the recording does not carry
+    /// as an entity becomes a real flight of that projectile ([`crate::play_projectile::Flight`]):
+    /// from the body's muzzle, along the best direction the recording supports
+    /// ([`crate::film_shots::aim`], which names its source), through the scene's collision and the
+    /// projectile's own flight law. A flight is flown ONCE and cached, and the frame shows it at
+    /// `tick - fire tick`, so the picture is a pure function of the tick and a scrub reproduces it.
+    ///
+    /// Called by both hosts right before [`ActorDriver::film_effects`], with the actor pool because
+    /// a projectile that has a render model is drawn on an object actor like any other.
+    pub fn synth_shots(
+        &mut self,
+        pb: &Playback,
+        world: Option<&dyn crate::play_projectile::World>,
+        actors: &mut crate::reach_actor::ActorScene,
+        native: &hms_native::NativeDll,
+        cache: hms_native::CacheHandle,
+    ) {
+        use crate::film_shots::{self, AimSource};
+        use glam::Vec3;
+        self.shots.clear_frame();
+        let mut rep = ShotsReport::default();
+        let Some(pt) = self.projectiles.as_ref() else {
+            self.shots.sync_actors(native, cache, actors);
+            self.shots_report = rep;
+            return;
+        };
+        if !self.show_projectile_fx {
+            self.shots.sync_actors(native, cache, actors);
+            self.shots_report = rep;
+            return;
+        }
+        let Some(world) = world else {
+            rep.no_world = true;
+            self.shots.sync_actors(native, cache, actors);
+            self.shots_report = rep;
+            return;
+        };
+        let ftick = pb.tick.max(0.0);
+        let tick = ftick.floor() as u32;
+        // The projectiles the recording carries as entities are drawn from their own tracks.
+        let replicated: std::collections::HashSet<u32> = self
+            .objects
+            .as_ref()
+            .map(|ot| ot.objects.values().filter(|o| o.draw == crate::film_objective::Draw::Projectile).map(|o| o.obj_tag).collect())
+            .unwrap_or_default();
+        let mut nets: Vec<u32> = self.fire_of.keys().copied().collect();
+        nets.sort_unstable(); // a pure function of the tick: the draw order must not depend on hashing
+        for net in nets {
+            let Some(&ti) = self.track_of.get(&net) else { continue };
+            let Some(tr) = pb.index.tracks.get(ti) else { continue };
+            let ticks = self.fire_of[&net].clone();
+            // A fire event matters while its flight (at most the longest bound, 900 ticks) can
+            // still be on screen.
+            let lo = ticks.partition_point(|&t| t + FIRE_LOOKBACK_TICKS < tick);
+            let hi = ticks.partition_point(|&t| t <= tick);
+            for (n, &ft) in ticks.iter().enumerate().take(hi).skip(lo) {
+                let Some(widx) = tr.weapon_at(ft) else {
+                    rep.unarmed += 1;
+                    continue;
+                };
+                let Some(&weap) = self.weap_tags.get(widx as usize) else {
+                    rep.unarmed += 1;
+                    continue;
+                };
+                let Some((proj, _)) = pt.by_weapon.get(&weap).and_then(|w| w.projectile) else {
+                    rep.no_projectile += 1;
+                    continue;
+                };
+                if replicated.contains(&proj) {
+                    rep.replicated += 1;
+                    continue;
+                }
+                let key = (net, ft);
+                if !self.flights.contains_key(&key) {
+                    let flight = (|| {
+                        let pos = Vec3::from(tr.sample(ft)?);
+                        let facing = tr.facing_at(ft).or_else(|| tr.sample_orientation(ft).map(|(f, _)| f[1].atan2(f[0]))).unwrap_or(0.0);
+                        let recorded = pb
+                            .index
+                            .slot_of_entity(net)
+                            .filter(|&s| self.live_aim == Some(s))
+                            .and_then(|s| pb.index.aim_at(s, ft))
+                            .map(|a| (a.yaw(), a.pitch()));
+                        let elite = self.biped_of.get(&net).is_some_and(|b| crate::film_anim::is_elite(b));
+                        let eye = if elite { ELITE_EYE_HEIGHT_WU } else { EYE_HEIGHT_WU };
+                        let others: Vec<Vec3> = pb
+                            .index
+                            .tracks
+                            .iter()
+                            .filter(|t| t.entity_type == BIPED_TYPE && t.net_id != net && ft >= t.first_tick && ft <= t.last_tick)
+                            .filter_map(|t| t.sample(ft).map(Vec3::from))
+                            .collect();
+                        let aim = film_shots::aim(pos, facing, recorded, eye, &others);
+                        let law = self.shots.law(native, cache, proj)?;
+                        let every = pt.by_weapon.get(&weap).map_or(0, |w| w.rounds_between_tracers).max(0) as usize;
+                        let tracer = n % (every + 1) == every;
+                        let seed = film_shots::shot_key(net, ft);
+                        let f = crate::play_projectile::Flight::simulate(
+                            &law,
+                            aim.origin,
+                            aim.dir,
+                            tracer,
+                            seed,
+                            film_shots::life_bound_ticks(&law.fx.def),
+                            world,
+                        );
+                        Some((std::sync::Arc::new(f), aim.source))
+                    })();
+                    self.flights.insert(key, flight.as_ref().map(|f| f.0.clone()));
+                    if let Some((_, src)) = flight {
+                        self.shot_sources.insert(key, src);
+                    }
+                }
+                let Some(Some(flight)) = self.flights.get(&key).cloned() else { continue };
+                let age = tick as i64 - ft as i64;
+                if age as usize > flight.ticks() + (crate::play_projectile::BURST_HOLD * 60.0) as usize {
+                    continue;
+                }
+                let id = film_shots::shot_key(net, ft);
+                if self.shots.show_flight(id, &flight, ft as f32 * crate::film_projectile::TICK_SECONDS, age) {
+                    match self.shot_sources.get(&key) {
+                        Some(AimSource::Recorded) => rep.recorded += 1,
+                        Some(AimSource::Target) => rep.target += 1,
+                        _ => rep.level += 1,
+                    }
+                }
+            }
+        }
+        self.shots.sync_actors(native, cache, actors);
+        self.shots_report = rep;
     }
 
     pub fn ground_corpses(&mut self, pb: &Playback, floor: &dyn Fn([f32; 3]) -> Option<f32>) {
@@ -2968,6 +3303,8 @@ impl ActorDriver {
                     .collect(),
                 None => Vec::new(),
             };
+            // #film-child-follow  A child riding a drawn parent is derived from it every frame.
+            let live = self.follow_parents(pb, live, tick, ftick, native, cache);
             self.veh_tilted = live
                 .iter()
                 .filter(|(_, _, _, _, w, _)| {
@@ -3009,6 +3346,7 @@ impl ActorDriver {
                 }
                 // #vehicle-damage  The authored damage permutations, driven by the recording.
                 actors.set_damage(id, state);
+                self.pose_wheels(pb, native, cache, net, obj_tag, id, ftick, actors);
             }
             // Park the vehicles that are not alive at this tick rather than destroying them: a
             // destroy would rebuild every mesh in the scene on the next scrub.
@@ -3051,7 +3389,7 @@ impl ActorDriver {
                             // Warthog are the same placement rule and have the same judder.
                             let (pos, orient) = match self.track_of.get(&o.net_id).and_then(|&i| pb.index.tracks.get(i)) {
                                 Some(tr) => (
-                                    crate::film_vehicle::position_at(tr, ftick).map(|p| p.to_array()).unwrap_or(pos),
+                                    crate::film_objective::follow_position(&|n| self.track_of.get(&n).and_then(|&i| pb.index.tracks.get(i)), tr, ftick, 0).map(|p| p.to_array()).unwrap_or(pos),
                                     crate::film_vehicle::orientation_at(tr, ftick).or(orient),
                                 ),
                                 None => (pos, orient),
@@ -3830,19 +4168,41 @@ impl ActorDriver {
             }
             let mut variants: Vec<crate::scene::PlayerVariant> = Vec::new();
             let mut table: HashMap<u8, (u32, Option<[[f32; 3]; 2]>)> = Default::default();
-            for p in film.header.players.iter().filter(|p| p.present()) {
-                let Some(a) = p.appearance() else { continue };
-                let sid = crate::scene::player_variant_sid(p.index as u8);
-                // #elite BOTH species' pick lists: a player has a Spartan loadout and an Elite
-                // loadout, and the render model the body is drawn from decides which one applies.
-                let v = sc.player_variant(sid, &a.slots);
-                let worn = v.worn();
-                if worn {
-                    variants.push(v);
-                }
-                let cols = sc.armour_colors(a.color_primary, a.color_secondary);
-                // sid 0 = "no synthetic variant", which leaves the model's own default on.
-                table.insert(p.index as u8, (if worn { sid } else { 0 }, cols));
+            // #film-roster  Armour is per SEAT, not per header slot: a slot's occupant (and so
+            // their armour) changes over a match, and the header's armour is the LOBBY's. Seats that
+            // state the same armour share one synthetic variant, so a 76-seat film installs the
+            // handful of distinct loadouts it really has. Keyed by seat index (`u8`: a film with
+            // more than 256 seats leaves the rest in the model's default, which is what any body
+            // without a recorded armour wears).
+            let mut distinct: Vec<(crate::film_decode::BipedAppearance, u32, Option<[[f32; 3]; 2]>)> = Vec::new();
+            for (k, seat) in pb.index.roster.seats.iter().enumerate().take(256) {
+                let Some(look) = seat.look else { continue };
+                let found = distinct.iter().find(|(l, _, _)| crate::film_roster::same_armour(l, &look)).map(|(_, sid, cols)| (*sid, *cols));
+                let (sid, cols) = match found {
+                    Some(f) => f,
+                    None => {
+                        let n = distinct.len().min(255) as u8;
+                        let sid = crate::scene::player_variant_sid(n);
+                        let mut slots = [0u8; crate::film::APPEARANCE_SLOTS];
+                        for (i, v) in slots.iter_mut().enumerate() {
+                            *v = look.slots[i] as u8;
+                        }
+                        // #elite BOTH species' pick lists: a player has a Spartan loadout and an
+                        // Elite loadout, and the render model the body is drawn from decides which
+                        // one applies.
+                        let v = sc.player_variant(sid, &slots);
+                        let worn = v.worn();
+                        if worn {
+                            variants.push(v);
+                        }
+                        let cols = sc.armour_colors(look.colors[0] as u8, look.colors[1] as u8);
+                        // sid 0 = "no synthetic variant", which leaves the model's own default on.
+                        let sid = if worn { sid } else { 0 };
+                        distinct.push((look, sid, cols));
+                        (sid, cols)
+                    }
+                };
+                table.insert(k as u8, (sid, cols));
             }
             sc.set_player_variants(variants);
             self.appearance = Some(table);
@@ -3859,7 +4219,12 @@ impl ActorDriver {
         let Some(table) = self.appearance.as_ref() else { return false };
         let mut dirty = false;
         for (&actor_id, &net) in self.pool.assigned.iter() {
-            let want = pb.index.slot_of_entity(net).and_then(|s| table.get(&s)).copied();
+            let want = pb
+                .index
+                .seat_index_of_entity(net)
+                .and_then(|k| u8::try_from(k).ok())
+                .and_then(|k| table.get(&k))
+                .copied();
             let Some(a) = actors.get_mut(actor_id) else { continue };
             let (vsid, mut skin) = want.unwrap_or((0, None));
             // #team-colour  In a team game the armour's COLOURS come from the body's TEAM, not
@@ -3917,7 +4282,11 @@ impl ActorDriver {
             .or_else(|| self.fp_reps.first())
             .and_then(|r| self.fp_actor_of.get(&r.hands).copied());
         if let Some(id) = fp_arms {
-            let mut skin = pb.subject_slot().and_then(|s| table.get(&s)).and_then(|&(_, c)| c);
+            let mut skin = pb
+                .subject_seat_index()
+                .and_then(|k| u8::try_from(k).ok())
+                .and_then(|k| table.get(&k))
+                .and_then(|&(_, c)| c);
             // #team-colour  The arms wear the same colours as the body they belong to.
             if let Some(gv) = film.header.gametype.as_ref() {
                 skin = choose_skin(self.team_skins.as_deref(), pb.subject_owner().and_then(|o| gv.team_of_owner(o)), skin);
@@ -4002,6 +4371,62 @@ impl ActorDriver {
     fn fp_subject_is_elite_slot(&self, slot: u8) -> bool {
         let _ = slot;
         self.fp_subject_elite
+    }
+
+    /// #fp-reload  The first-person clips one reload plays, in order, from what the weapon's OWN
+    /// graph authors (`frames_of` answers by exact name).
+    ///
+    /// Measured across every `weap` in `forge_halo`, the reload is never one name: a magazine weapon
+    /// (assault rifle, DMR, magnum, sniper, needler, rockets, grenade launcher...) authors
+    /// `reload_empty` AND `reload_full` of different lengths (assault rifle 68 / 59 frames, sniper
+    /// 86 / 72: the empty one racks a round), the spike rifle authors them as `:var1`, and the
+    /// SHOTGUN is shell-fed -- `reload_enter` (14f) then a `reload_continue_empty` (16f) per shell.
+    /// Plasma weapons author no reload at all (they vent / overheat), so they get none here.
+    ///
+    /// `empty` = the magazine was empty when the reload began; `missing` = rounds to load, which
+    /// only a shell-fed weapon cares about.
+    pub(crate) fn fp_reload_sequence(
+        frames_of: &dyn Fn(&str) -> Option<u32>,
+        empty: bool,
+        missing: u32,
+    ) -> Vec<(&'static str, u32)> {
+        if let Some(enter) = frames_of("first_person:reload_enter") {
+            let mut v = vec![("first_person:reload_enter", enter)];
+            for cont in ["first_person:reload_continue_empty", "first_person:reload_continue"] {
+                if let Some(f) = frames_of(cont) {
+                    for _ in 0..missing.max(1) {
+                        v.push((cont, f));
+                    }
+                    break;
+                }
+            }
+            return v;
+        }
+        let order: [&'static str; 4] = if empty {
+            ["first_person:reload_empty", "first_person:reload_empty:var1", "first_person:reload_full", "first_person:reload_full:var1"]
+        } else {
+            ["first_person:reload_full", "first_person:reload_full:var1", "first_person:reload_empty", "first_person:reload_empty:var1"]
+        };
+        order.iter().find_map(|n| frames_of(n).filter(|&f| f > 0).map(|f| vec![(*n, f)])).unwrap_or_default()
+    }
+
+    /// #fp-reload  Which clip of a reload sequence is playing `age_ticks` after it began, and how
+    /// many ticks into THAT clip. `None` once the whole sequence is over (30 fps clips on 60 Hz ticks).
+    pub(crate) fn fp_reload_at(seq: &[(&'static str, u32)], age_ticks: u32) -> Option<(&'static str, u32)> {
+        let mut t = age_ticks;
+        for &(name, frames) in seq {
+            let len = frames * 2;
+            if t < len {
+                return Some((name, t));
+            }
+            t -= len;
+        }
+        None
+    }
+
+    /// #fp-reload  The whole sequence's length in 60 Hz ticks.
+    pub(crate) fn fp_reload_ticks(seq: &[(&'static str, u32)]) -> u32 {
+        seq.iter().map(|&(_, f)| f * 2).sum()
     }
 
     /// #fp-anim  Choose the first-person BASE clip, its one-shot age, and the OVERLAYS to
@@ -4199,7 +4624,28 @@ impl ActorDriver {
                 // `(clip, the one-shot age in ticks)`. A one-shot is played from its event tick
                 // and then holds, so scrubbing backwards un-plays it, exactly like the
                 // third-person swing.
-                let (bases, oneshot, overlays) = Self::fp_clips(melee, fired, sprinting, airborne, moving);
+                let (mut bases, mut oneshot, mut overlays) = Self::fp_clips(melee, fired, sprinting, airborne, moving);
+                // #fp-reload  A recorded reload owns the arms until its clips are over -- unless a
+                // swing or a shot came after it (either cancels a reload; the shotgun's famous
+                // interrupt). Which clips, and how long, is the weapon's own graph's say.
+                if melee.is_none() && fired.is_none() {
+                    let age = net.and_then(|n| Self::action_age(&self.reload_of, n, tick, 600));
+                    if let (Some(age), Some(g)) = (age, fp_graph) {
+                        if !self.fp_reload_frames.contains_key(&g) {
+                            let m = crate::reach_actor::AnimGraph::read(native, cache, g)
+                                .map(|gr| gr.anims.iter().filter(|a| a.name.contains("reload")).map(|a| (a.name.clone(), a.frame_count.max(0) as u32)).collect())
+                                .unwrap_or_default();
+                            self.fp_reload_frames.insert(g, m);
+                        }
+                        let frames = &self.fp_reload_frames[&g];
+                        let seq = Self::fp_reload_sequence(&|n| frames.get(n).copied(), true, 1);
+                        if let Some((name, t)) = Self::fp_reload_at(&seq, age) {
+                            bases = vec![name];
+                            oneshot = Some(t);
+                            overlays.clear();
+                        }
+                    }
+                }
                 fp_bases = bases;
                 fp_oneshot = oneshot;
                 fp_overlays = overlays;
@@ -4415,7 +4861,12 @@ impl ActorDriver {
                 ", in the arms model's DEFAULT armour for this frame \u{2014} the recorded \
                  appearances are not resolved yet (player slot {sl})"
             ),
-            Some(sl) => match self.appearance.as_ref().and_then(|a| a.get(&sl)) {
+            Some(sl) => match pb
+                .hidden_entity()
+                .and_then(|net| pb.index.seat_index_of_entity(net))
+                .and_then(|k| u8::try_from(k).ok())
+                .and_then(|k| self.appearance.as_ref().and_then(|a| a.get(&k)))
+            {
                 None => format!(
                     ", in the arms model's DEFAULT armour \u{2014} player slot {sl} has no recorded \
                      appearance in this film"
@@ -4503,6 +4954,7 @@ impl ActorDriver {
         self.ragdoll_missing = None;
         self.vehicles = None;
         self.vehicle_actor.clear();
+        self.wheel_odo.clear();
         self.vehicle_error = None;
         // #film-objects  A stale `object net id -> actor id` entry would point at an actor built
         // from the PREVIOUS film's tag, so a new film's flag would be drawn as whatever used to
@@ -5120,13 +5572,26 @@ impl ActorDriver {
                                 format!("{} shot(s) came from a weapon whose barrel authors no firing effect. ", self.fx_no_effect)
                             } else { String::new() },
                         ));
-                        s.push_str(
-                            "A RIFLE ROUND IS NOT SIMULATED, and the reason is the recording: a Reach film captures one \
-                             player's look direction and zero-fills every other slot's, so for all but one body it does not \
-                             state which way the shot went. Firing a tracer along the body's yaw would be an invention, and a \
-                             visibly horizontal one. The bullet's `proj` definition is read and in hand (its initial velocity, \
-                             its gravity scale, its maximum range) for the day the direction is. ",
-                        );
+                        let r = &self.shots_report;
+                        s.push_str(&format!(
+                            "SIMULATED SHOTS: a film replicates grenades, rockets, missiles and flak as entities (drawn above \
+                             from their own tracks) but NOT a rifle, pistol, plasma or needler round -- only the \
+                             `action_weapon_fire` event. Each such event is flown here as the weapon's own `proj` (its \
+                             authored speed, gravity, range and fuse) from the shooter's muzzle through this map's collision, \
+                             by the same code test mode uses; {} on screen now ({} along the recorder's exact aim, {} at the \
+                             nearest body in front of the shooter, {} level along the body's facing). Only the recorder's \
+                             look direction is on the wire -- every other slot's is zero-filled -- so the other directions are \
+                             INFERRED from the recorded body facing and say so; the muzzle position is inferred too. \
+                             {} fire event(s) were of a projectile the film replicates and {} came from a weapon that \
+                             launches none.{}",
+                            r.recorded + r.target + r.level,
+                            r.recorded,
+                            r.target,
+                            r.level,
+                            r.replicated,
+                            r.no_projectile,
+                            if r.no_world { " (No collision world was available, so no shot was flown.)" } else { "" },
+                        ));
                     }
                     if ot.by_draw[0] > 0 {
                         // Name them, because "1 objective object" does not tell a viewer whether
@@ -7953,5 +8418,41 @@ mod assassination_jump_gates {
             "every kill on every clip here lacks an owned victim, so this gate proved nothing \
              about the camera"
         );
+    }
+}
+
+/// #fp-reload  The reload sequence rule, on the frame counts the real graphs author
+/// (`probe_first_person_reload_clips`): which clips a reload plays and for how long. Pure, so it
+/// runs without a map; the map-backed gate in `play_mode::map_gates` runs it against real graphs.
+#[cfg(test)]
+mod fp_reload_rule {
+    use super::ActorDriver as D;
+
+    fn graph(pairs: &'static [(&'static str, u32)]) -> impl Fn(&str) -> Option<u32> {
+        move |n| pairs.iter().find(|(k, _)| *k == n).map(|(_, f)| *f)
+    }
+
+    #[test]
+    fn a_magazine_weapon_reloads_with_its_empty_or_full_clip_and_a_shotgun_loads_per_shell() {
+        // assault rifle: reload_empty 68f, reload_full 59f
+        let ar = graph(&[("first_person:reload_empty", 68), ("first_person:reload_full", 59)]);
+        assert_eq!(D::fp_reload_sequence(&ar, true, 32), vec![("first_person:reload_empty", 68)]);
+        assert_eq!(D::fp_reload_sequence(&ar, false, 5), vec![("first_person:reload_full", 59)]);
+        // spike rifle authors only the :var1 clips
+        let sp = graph(&[("first_person:reload_empty:var1", 56), ("first_person:reload_full:var1", 56)]);
+        assert_eq!(D::fp_reload_sequence(&sp, true, 1)[0].0, "first_person:reload_empty:var1");
+        // shotgun: enter (14f) then one continue (16f) per missing shell
+        let sg = graph(&[("first_person:reload_enter", 14), ("first_person:reload_continue_empty", 16)]);
+        let seq = D::fp_reload_sequence(&sg, true, 4);
+        assert_eq!(seq.len(), 5);
+        assert_eq!(D::fp_reload_ticks(&seq), (14 + 4 * 16) * 2);
+        // plasma / melee weapons author none
+        assert!(D::fp_reload_sequence(&graph(&[("first_person:overheated", 44)]), true, 8).is_empty());
+        // timing: 30 fps clips on 60 Hz ticks, walked in order, None past the end
+        assert_eq!(D::fp_reload_at(&seq, 0), Some(("first_person:reload_enter", 0)));
+        assert_eq!(D::fp_reload_at(&seq, 27), Some(("first_person:reload_enter", 27)));
+        assert_eq!(D::fp_reload_at(&seq, 28), Some(("first_person:reload_continue_empty", 0)));
+        assert_eq!(D::fp_reload_at(&seq, 28 + 32 + 5), Some(("first_person:reload_continue_empty", 5)));
+        assert_eq!(D::fp_reload_at(&seq, D::fp_reload_ticks(&seq)), None);
     }
 }

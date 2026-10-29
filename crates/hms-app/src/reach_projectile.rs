@@ -53,6 +53,10 @@ pub const BARREL_ROUNDS_PER_SECOND: usize = 0x04; // real bounds
 /// (`primary_trigger` / `secondary_trigger` / `b_mount`); the rest leave it 0 and the firing
 /// EFFECT names its own markers instead — see [`effect_location_names`].
 pub const BARREL_MARKER_NAME: usize = 0x40;
+/// `rounds between tracers` (short). PROVEN: the counter `*(u16*)(runtime + 0x24E)` is compared
+/// against `*(i16*)(barrel + 0x3E)` in `weapon_barrel_create_projectiles` (`DE4290`).
+pub const BARREL_ROUNDS_BETWEEN_TRACERS: usize = 0x3E;
+pub const BARREL_PROJECTILES_PER_SHOT: usize = 0x6A;
 pub const BARREL_PROJECTILE: usize = 0x104; // tag reference -> proj
 pub const BARREL_FIRING_EFFECTS: usize = 0x178; // block -> barrel_firing_effect_block
 
@@ -157,6 +161,12 @@ pub struct Barrel {
     /// How many `firing effects` rows the barrel authored (>1 means the engine picks among them
     /// by shot count; this reader takes row 0 and the caller is told).
     pub firing_effect_rows: usize,
+    /// `rounds between tracers` — "the number of non-tracer rounds fired between tracers".
+    /// 0 means every round is a tracer (`weapon_barrel_create_projectiles` increments a per-barrel
+    /// counter and flags the round a tracer once it passes this).
+    pub rounds_between_tracers: i16,
+    /// `projectiles per shot` (+0x6A).
+    pub projectiles_per_shot: i16,
 }
 
 /// Every barrel of one `weap`.
@@ -175,6 +185,8 @@ pub fn weapon_barrels(native: &NativeDll, cache: CacheHandle, weap: u32) -> Vec<
                 firing_effect: (rows > 0).then(|| tag_ref(&fx, FIRING_EFFECT_EFFECT)).flatten(),
                 firing_damage: (rows > 0).then(|| tag_ref(&fx, FIRING_EFFECT_DAMAGE)).flatten(),
                 firing_effect_rows: rows,
+                rounds_between_tracers: rd_i16(e, BARREL_ROUNDS_BETWEEN_TRACERS),
+                projectiles_per_shot: rd_i16(e, BARREL_PROJECTILES_PER_SHOT),
             }
         })
         .collect()
@@ -260,6 +272,110 @@ pub fn projectile_def(native: &NativeDll, cache: CacheHandle, proj: u32) -> Opti
 }
 
 
+/// `conical spread` (+0x344): one element of 12 bytes. **This is the shotgun's pellet pattern.**
+///
+/// PROVEN from `projectile_initial_update` (`DD6C20`): the engine launches ONE projectile and then
+/// re-launches it `azimuth_strata * radial_strata` times, each pellet a stratified-jitter sample
+/// (`sub_1401B6270`: `(i + rand) / n`) of a cone around the aim: the radial fraction of stratum
+/// `r` of `radial_strata` is raised to `exponent` and scaled to `max_angle`; the azimuth is the
+/// fraction of stratum `a` of `azimuth_strata` times a full turn (`sub_1401B5C40`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Conical {
+    /// `*(i16*)(elem + 0)`: the OUTER loop count (azimuth strata).
+    pub azimuth_strata: i16,
+    /// `*(i16*)(elem + 2)`: the INNER loop count (radial strata).
+    pub radial_strata: i16,
+    /// `*(f32*)(elem + 4)`: exponent on the radial fraction.
+    pub exponent: f32,
+    /// `*(f32*)(elem + 8)`: the cone's outer half-angle in RADIANS (the engine clamps it to pi/2).
+    pub max_angle: f32,
+}
+
+impl Conical {
+    /// Pellets this block launches per shot.
+    pub fn pellets(&self) -> usize {
+        (self.azimuth_strata.max(0) as usize) * (self.radial_strata.max(0) as usize)
+    }
+}
+
+/// One `projectile_material_response_block` element (0x34 bytes, `proj` +0x320).
+///
+/// `response` is `*(i16*)(elem + 0x1C)` and the engine's `projectile_collision` (`DD10B0`)
+/// switches on it. Meaning (PROVEN from the switch): 0 and the default = the projectile ends on
+/// the surface (`action = detonate, reason = impact`); 2 = reflect (bounce) with `initial
+/// friction` `+0x28`; 4/5 = reflect with parallel/perpendicular friction `+0x2C/+0x30`; 3 and 8 =
+/// overpenetrate (pass through).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MaterialResponse {
+    /// `+0x04` global material index this row applies to.
+    pub material: i16,
+    pub flags: i16,
+    pub response: i16,
+    /// `+0x28`.
+    pub initial_friction: f32,
+    /// `+0x2C` / `+0x30`.
+    pub perpendicular_friction: f32,
+    pub parallel_friction: f32,
+}
+
+/// The `proj` fields the flight needs that [`ProjectileDef`] (a `Copy` summary) does not carry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ProjectileExtras {
+    /// `projectile_flags` (+0x168).
+    pub flags: u32,
+    /// `detonation timer starts` (+0x16C): 0 immediately, 1 after first bounce off a floor,
+    /// 2 when at rest, 3 after first bounce off any surface (`DD9CC0`).
+    pub timer_starts: i16,
+    /// `bounce maximum range` (+0x194).
+    pub bounce_maximum_range: f32,
+    /// `runtime acceleration bound inverse` (+0x304), the cache's baked `1 / (hi - lo)`.
+    pub acceleration_inverse: f32,
+    /// `conical spread` element 0, if authored.
+    pub conical: Option<Conical>,
+    pub responses: Vec<MaterialResponse>,
+}
+
+/// `projectile_flags` bit 0 `oriented along velocity` (the first name in the flag list; tested as
+/// `*(u8*)(def + 0x168) & 1` in `DD8350`).
+pub const PROJ_FLAG_ORIENTED_ALONG_VELOCITY: u32 = 0x1;
+pub const PROJ_FLAG_ALLOW_DECELERATION_BELOW_FINAL: u32 = 0x10_0000;
+pub const PROJ_CONICAL_SPREAD: usize = 0x344;
+pub const PROJ_MATERIAL_RESPONSES: usize = 0x320;
+pub const MATERIAL_RESPONSE_SIZE: usize = 0x34;
+
+pub fn projectile_extras(native: &NativeDll, cache: CacheHandle, proj: u32) -> Option<ProjectileExtras> {
+    let b = native.tag_meta(cache, proj, 0, PROJ_SIZE as u32)?;
+    let con = tag_block(native, cache, proj, PROJ_CONICAL_SPREAD, 12, 64);
+    let conical = (con.len() >= 12).then(|| Conical {
+        azimuth_strata: rd_i16(&con, 0),
+        radial_strata: rd_i16(&con, 2),
+        exponent: rd_f32(&con, 4),
+        max_angle: rd_f32(&con, 8),
+    });
+    let mr = tag_block(native, cache, proj, PROJ_MATERIAL_RESPONSES, MATERIAL_RESPONSE_SIZE, 64);
+    let responses = (0..mr.len() / MATERIAL_RESPONSE_SIZE)
+        .map(|i| {
+            let e = &mr[i * MATERIAL_RESPONSE_SIZE..];
+            MaterialResponse {
+                material: rd_i16(e, 4),
+                flags: rd_i16(e, 6),
+                response: rd_i16(e, 0x1C),
+                initial_friction: rd_f32(e, 0x28),
+                perpendicular_friction: rd_f32(e, 0x2C),
+                parallel_friction: rd_f32(e, 0x30),
+            }
+        })
+        .collect();
+    Some(ProjectileExtras {
+        flags: rd_u32(&b, PROJ_FLAGS),
+        timer_starts: rd_i16(&b, PROJ_DETONATION_TIMER_STARTS),
+        bounce_maximum_range: rd_f32(&b, 0x194),
+        acceleration_inverse: rd_f32(&b, 0x304),
+        conical,
+        responses,
+    })
+}
+
 /// The MARKER NAMES an `effe` names in its own `effect_locations` block (`effe` +0x20, **8-byte**
 /// elements with the marker string id first — the size `hms-fx-marker-fallback`'s sibling bug got
 /// wrong as 12). This is how a firing effect says where it goes: the weapon's barrel almost never
@@ -272,6 +388,13 @@ pub fn effect_location_names(native: &NativeDll, cache: CacheHandle, effe: u32) 
             (sid != 0).then(|| native.string_id(cache, sid)).flatten().filter(|s| !s.is_empty())
         })
         .collect()
+}
+
+/// The string ids of the locations an `effe` names, in order (the ids `effect_location_names`
+/// resolves to text), for a caller that looks a marker up by id.
+pub fn effect_location_sids(native: &NativeDll, cache: CacheHandle, effe: u32) -> Vec<u32> {
+    let b = tag_block(native, cache, effe, EFFE_LOCATIONS, EFFECT_LOCATION_SIZE, 64);
+    (0..b.len() / EFFECT_LOCATION_SIZE).map(|i| rd_u32(&b, i * EFFECT_LOCATION_SIZE)).filter(|&s| s != 0).collect()
 }
 
 /// `effect_definition` +0x20 `effect_locations`.
@@ -300,6 +423,130 @@ pub fn object_attachment_effects(native: &NativeDll, cache: CacheHandle, obj_tag
             Some((effe, rd_u32(e, 0x10), rd_u32(e, 0x18)))
         })
         .collect()
+}
+
+/// The LIGHT VOLUMES an object draws itself with, as `(ltvl tag, marker string id)`: its direct
+/// `ltvl` attachments (a plasma bolt's streak) and the `light_volume_system` parts of its `effe`
+/// attachments (a bullet's tracer). The marker is the part's own location when the effect names
+/// one, else the attachment's.
+///
+/// **Neither was ever drawn for a projectile.** The particle lane only knows `prt3` systems, and
+/// the lift lane only draws the light volumes of *placed* objects, so a plasma bolt (no model, no
+/// effect, one `ltvl`) and a rifle tracer (an effect that is a light volume and nothing else)
+/// drew nothing at all -- which is what "we can't see the projectiles" was.
+pub fn projectile_beam_parts(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> Vec<(u32, u32)> {
+    let ltvl = u32::from_be_bytes(*b"ltvl");
+    let effe = u32::from_be_bytes(*b"effe");
+    let b = tag_block(native, cache, obj_tag, OBJE_ATTACHMENTS, OBJE_ATTACHMENT_SIZE, 24);
+    let mut out = Vec::new();
+    for i in 0..b.len() / OBJE_ATTACHMENT_SIZE {
+        let e = &b[i * OBJE_ATTACHMENT_SIZE..(i + 1) * OBJE_ATTACHMENT_SIZE];
+        let (cls, marker) = (rd_u32(e, 0), rd_u32(e, 0x10));
+        let Some(tag) = tag_ref(e, 0) else { continue };
+        if cls == ltvl {
+            out.push((tag, marker));
+        } else if cls == effe {
+            for (lv, loc) in effect_light_volume_parts(native, cache, tag) {
+                out.push((lv, if loc != 0 { loc } else { marker }));
+            }
+        }
+    }
+    out
+}
+
+/// Every `ltvl` part of an `effe` as `(ltvl tag, location string id or 0)`. The part stride is not
+/// pinned down in the tag, so -- like `SceneController::effect_light_volumes` -- the part block is
+/// scanned for `ltvl` references and the part's location index read 0x14 before the reference.
+pub fn effect_light_volume_parts(native: &NativeDll, cache: CacheHandle, effe: u32) -> Vec<(u32, u32)> {
+    effect_part_refs(native, cache, effe, *b"ltvl")
+}
+
+/// Every part of an `effe` whose type is `class`, as `(tag, location string id or 0)`.
+pub fn effect_part_refs(native: &NativeDll, cache: CacheHandle, effe: u32, class: [u8; 4]) -> Vec<(u32, u32)> {
+    let ltvl = u32::from_be_bytes(class);
+    let locs = tag_block(native, cache, effe, EFFE_LOCATIONS, EFFECT_LOCATION_SIZE, 64);
+    let loc_sid = |i: i16| -> u32 {
+        if i >= 0 && (i as usize + 1) * EFFECT_LOCATION_SIZE <= locs.len() { rd_u32(&locs, i as usize * EFFECT_LOCATION_SIZE) } else { 0 }
+    };
+    let events = tag_block(native, cache, effe, 0x2C, 0x40, 32);
+    let mut out = Vec::new();
+    for e in 0..events.len() / 0x40 {
+        let Some(pcnt) = Some(rd_u32(&events, e * 0x40 + 0x1c)).filter(|&c| c > 0 && c <= 32) else { continue };
+        let pptr = rd_u32(&events, e * 0x40 + 0x20);
+        let Some(pb) = native.tag_ptr_bytes(cache, pptr, pcnt * 0x70) else { continue };
+        let mut off = 0usize;
+        while off + 16 <= pb.len() {
+            if rd_u32(&pb, off) == ltvl {
+                if let Some(t) = tag_ref(&pb, off) {
+                    if off >= 0x14 {
+                        out.push((t, loc_sid(rd_i16(&pb, off - 0x14 + 4))));
+                    }
+                }
+            }
+            off += 4;
+        }
+    }
+    out
+}
+
+/// The CONTRAILS an object draws itself with, as `(cntl tag, marker string id)`: the `contrail_system`
+/// parts of its `effe` attachments (and any direct `cntl` attachment). A rifle bullet's tracer is
+/// exactly one of these and nothing else.
+pub fn projectile_contrail_parts(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> Vec<(u32, u32)> {
+    let cntl = u32::from_be_bytes(*b"cntl");
+    let effe = u32::from_be_bytes(*b"effe");
+    let b = tag_block(native, cache, obj_tag, OBJE_ATTACHMENTS, OBJE_ATTACHMENT_SIZE, 24);
+    let mut out = Vec::new();
+    for i in 0..b.len() / OBJE_ATTACHMENT_SIZE {
+        let e = &b[i * OBJE_ATTACHMENT_SIZE..(i + 1) * OBJE_ATTACHMENT_SIZE];
+        let (cls, marker) = (rd_u32(e, 0), rd_u32(e, 0x10));
+        let Some(tag) = tag_ref(e, 0) else { continue };
+        if cls == cntl {
+            out.push((tag, marker));
+        } else if cls == effe {
+            for (c, loc) in effect_part_refs(native, cache, tag, *b"cntl") {
+                out.push((c, if loc != 0 { loc } else { marker }));
+            }
+        }
+    }
+    out
+}
+
+/// `obje` +0xC0 `material effects` (a `foot` tag): what the engine plays when this object strikes a
+/// surface, keyed by the surface MATERIAL. PROVEN: `projectile_collision` (`DD10B0`) passes
+/// `*(u32*)(def + 0xCC)` (the datum of the tag reference at +0xC0) and an effect-type index to the
+/// material-effect spawner, and the shipped `foot` tags carry 23 effect-type elements of 36 bytes
+/// (`effects` rows at +0x18, 44 bytes each, material name at +0x20, effect at +0x00).
+pub const OBJE_MATERIAL_EFFECTS: usize = 0xC0;
+/// The effect-type element a projectile's IMPACT response plays (`projectile_collision` response
+/// 0 -> type 0xF), and the one a bouncing / detonating one plays.
+pub const MATERIAL_EFFECT_IMPACT: usize = 0x0F;
+pub const MATERIAL_EFFECT_ROWS_AT: usize = 0x18;
+pub const MATERIAL_EFFECT_ROW_SIZE: usize = 44;
+pub const MATERIAL_EFFECT_ROW_MATERIAL: usize = 0x20;
+
+/// The `foot` row the engine would use for a surface of material `material` (a name; empty = the
+/// default row `default_material`), for effect-type `kind`. `None` when the object has no
+/// `material effects` or the type authors no rows.
+///
+/// Test mode and Theater do not know the material of a surface a ray struck (the collision query
+/// returns geometry, not a material), so they ask for `default_material`: the row every surface
+/// falls back to. That is INFERRED to be what an unclassified surface plays; per-material rows
+/// (flesh, metal, ice ...) are in the tag and are not selected.
+pub fn material_effect(native: &NativeDll, cache: CacheHandle, obj_tag: u32, kind: usize, material: &str) -> Option<u32> {
+    let m = native.tag_meta(cache, obj_tag, OBJE_MATERIAL_EFFECTS as u32, 0x10)?;
+    let foot = tag_ref(&m, 0)?;
+    let el = tag_block(native, cache, foot, 0, 36, 64);
+    if (kind + 1) * 36 > el.len() {
+        return None;
+    }
+    let rows = block_at(native, cache, &el[kind * 36..], MATERIAL_EFFECT_ROWS_AT, MATERIAL_EFFECT_ROW_SIZE, 64);
+    let want = if material.is_empty() { "default_material" } else { material };
+    let pick = |name: &str| (0..rows.len() / MATERIAL_EFFECT_ROW_SIZE).find(|&i| {
+        native.string_id(cache, rd_u32(&rows, i * MATERIAL_EFFECT_ROW_SIZE + MATERIAL_EFFECT_ROW_MATERIAL)).as_deref() == Some(name)
+    });
+    let i = pick(want)?;
+    tag_ref(&rows[i * MATERIAL_EFFECT_ROW_SIZE..], 0)
 }
 
 /// `obje` +0x104 `attachments`.
@@ -471,6 +718,312 @@ mod probes {
             }
         }
         println!("\n{rows} barrels: {no_marker} with no authored marker, {no_fx} with no firing effect");
+    }
+
+    fn proj_named(native: &NativeDll, cache: CacheHandle, leaf: &str) -> u32 {
+        native
+            .tags_by_group(cache, "proj")
+            .into_iter()
+            .find(|&t| native.tag_name(cache, t).map_or(false, |n| n.rsplit('\\').next() == Some(leaf)))
+            .unwrap_or_else(|| panic!("forge_halo has no projectile '{leaf}'"))
+    }
+
+    /// **WHAT EACH SHOT IS DRAWN WITH.** A projectile is drawn by a render model, an attached
+    /// effect, an attached light volume (`ltvl`) or a contrail (`cntl`). Across every barrel of
+    /// every weapon the ONLY projectiles that author none of the four are the six below -- so a
+    /// seventh invisible shot is a regression, and one of these gaining a visual is news.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn every_weapon_projectile_draws_something_or_is_a_known_exception() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        const KNOWN_INVISIBLE: [&str; 6] = ["focus_rifle_beam", "magnum_bullet", "shotgun_bullet", "spartan_laser_beam", "spartan_laser_tracer", "target_laser_tracer"];
+        let mut seen = std::collections::BTreeSet::new();
+        let mut invisible = std::collections::BTreeSet::new();
+        for &w in &native.tags_by_group(cache, "weap") {
+            for b in weapon_barrels(native, cache, w) {
+                let Some(p) = b.projectile else { continue };
+                if !seen.insert(p) { continue }
+                let fx = crate::film_projectile::ProjectileFx::read(native, cache, p, |q| object_attachment_effects(native, cache, q).into_iter().map(|(e, _, _)| e).collect()).expect("readable");
+                let has_model = fx.mode != 0 && fx.mode != 0xFFFF_FFFF;
+                // An attached effect only counts when it carries a PARTICLE emitter (`cpem`): most
+                // bullets attach an effect that is nothing but a contrail, which counts as the
+                // contrail and not as an effect.
+                let particles = fx.attached.iter().any(|&e| !effect_part_refs(native, cache, e, *b"cpem").is_empty());
+                if !(has_model || particles || !fx.beams.is_empty() || !fx.contrails.is_empty()) {
+                    invisible.insert(fx.name.clone());
+                }
+            }
+        }
+        assert!(seen.len() >= 40, "liveness: only {} distinct projectiles were examined", seen.len());
+        assert_eq!(invisible.into_iter().collect::<Vec<_>>(), KNOWN_INVISIBLE.map(String::from).to_vec(), "the set of projectiles that author no visual changed");
+    }
+
+    /// **THE FLIGHT NUMBERS ARE THE SHIPPED TAGS**, by literal: initial / final velocity, the
+    /// acceleration window, gravity scale, fuse, range -- for the weapons the owner named.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_projectile_flight_numbers_are_the_shipped_tags() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        // (projectile, v0, vf, accel range, gravity scale, timer lo/hi, max range)
+        let want: [(&str, f32, f32, [f32; 2], f32, [f32; 2], f32); 11] = [
+            ("assault_rifle_bullet", 3000.0, 3000.0, [0.0, 0.0], 1.0, [0.0, 0.0], 100.0),
+            ("dmr_bullet", 3000.0, 3000.0, [0.0, 0.0], 0.0, [0.0, 0.0], 250.0),
+            ("magnum_bullet", 3000.0, 3000.0, [0.0, 0.0], 0.005, [0.0, 0.0], 100.0),
+            ("sniper_rifle_bullet", 6000.0, 6000.0, [0.0, 0.0], 0.0, [0.0, 0.0], 500.0),
+            ("shotgun_bullet", 480.0, 480.0, [0.0, 0.0], 0.0, [0.0, 0.0], 8.0),
+            ("plasma_rifle_bolt", 25.0, 25.0, [0.0, 0.0], 0.0, [0.0, 0.0], 40.0),
+            ("plasma_pistol_bolt", 20.0, 30.0, [0.0, 0.0], 0.0, [0.0, 0.0], 40.0),
+            ("needler_shard", 11.0, 11.0, [2.0, 4.0], 0.0, [0.0, 4.0], 26.0),
+            ("rocket_launcher_rocket", 8.0, 16.0, [0.0, 30.0], 0.02, [10.0, 10.0], 175.0),
+            ("grenade_launcher_grenade", 12.5, 7.5, [1.0, 10.0], 0.7, [0.5, 0.5], 100.0),
+            ("machinegun_turret_bullet", 100.0, 100.0, [0.0, 0.0], 0.0, [0.0, 0.0], 80.0),
+        ];
+        for (leaf, v0, vf, acc, grav, timer, range) in want {
+            let d = projectile_def(native, cache, proj_named(native, cache, leaf)).expect("readable");
+            let close = |a: f32, b: f32| (a - b).abs() < 1.0e-3;
+            assert!(close(d.initial_velocity, v0) && close(d.final_velocity, vf), "{leaf}: velocity {} -> {} (tag {v0} -> {vf})", d.initial_velocity, d.final_velocity);
+            assert!(close(d.acceleration_range[0], acc[0]) && close(d.acceleration_range[1], acc[1]), "{leaf}: acceleration range {:?} (tag {acc:?})", d.acceleration_range);
+            assert!(close(d.air_gravity_scale, grav), "{leaf}: gravity scale {} (tag {grav})", d.air_gravity_scale);
+            assert!(close(d.timer[0], timer[0]) && close(d.timer[1], timer[1]), "{leaf}: timer {:?} (tag {timer:?})", d.timer);
+            assert!(close(d.maximum_range, range), "{leaf}: maximum range {} (tag {range})", d.maximum_range);
+        }
+    }
+
+    /// **THE TRACER RULE AND THE VISUAL PARTS ARE THE SHIPPED TAGS.** `rounds between tracers` of the
+    /// automatics, and which of the four visual kinds each named projectile is made of.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_tracer_rounds_and_the_visual_parts_are_the_shipped_tags() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let tracer = |weap: &str| {
+            let w = native.tags_by_group(cache, "weap").into_iter().find(|&t| native.tag_name(cache, t).map_or(false, |n| n.rsplit('\\').next() == Some(weap))).unwrap();
+            weapon_barrels(native, cache, w)[0].rounds_between_tracers
+        };
+        assert_eq!(tracer("assault_rifle"), 0, "every assault rifle round is a tracer");
+        assert_eq!(tracer("machinegun_turret"), 3, "a turret shows every 4th round");
+        assert_eq!(tracer("plasma_repeater"), 1);
+        let parts = |leaf: &str| {
+            let p = proj_named(native, cache, leaf);
+            (projectile_beam_parts(native, cache, p).len(), projectile_contrail_parts(native, cache, p).len(), native.resolve_mode(cache, p) != 0xFFFF_FFFF)
+        };
+        // (light volumes, contrails, has a render model)
+        assert_eq!(parts("assault_rifle_bullet"), (0, 1, false), "a rifle round is one contrail and nothing else");
+        assert_eq!(parts("sniper_rifle_bullet"), (0, 1, false), "one contrail tag (which itself holds three contrails)");
+        assert_eq!(parts("plasma_rifle_bolt"), (1, 0, false), "a plasma bolt is one light volume and nothing else");
+        assert_eq!(parts("plasma_pistol_bolt"), (1, 0, false));
+        let rocket = parts("rocket_launcher_rocket");
+        assert!(rocket.0 >= 1 && rocket.1 >= 1 && rocket.2, "a rocket is a model with a light volume and a contrail: {rocket:?}");
+        // a surface-material default exists for the impact of a bullet that authors no impact effect
+        for leaf in ["assault_rifle_bullet", "magnum_bullet", "shotgun_bullet", "sniper_rifle_bullet"] {
+            assert!(
+                material_effect(native, cache, proj_named(native, cache, leaf), MATERIAL_EFFECT_IMPACT, "").is_some(),
+                "{leaf}: no default_material impact row in its material effects"
+            );
+        }
+    }
+
+    /// #projectile-sim  Where a bullet's IMPACT look lives: `obje` +0xC0 `material effects` (a `foot`
+    /// tag), whose `effects` block (36-byte elements, +0x18 = effect rows of 44 bytes with the
+    /// material name at +0x20) is indexed by the kind of response (`DD10B0`: 0xF impact, 0x10
+    /// detonate, 0x11 reflect, 0x12 overpenetrate, ...). Prints the rows for a few projectiles.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_projectile_material_effects() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        for leaf in ["assault_rifle_bullet", "magnum_bullet", "sniper_rifle_bullet", "shotgun_bullet", "plasma_rifle_bolt", "rocket_launcher_rocket", "needler_shard"] {
+            let Some(p) = native.tags_by_group(cache, "proj").into_iter().find(|&t| native.tag_name(cache, t).map_or(false, |n| n.rsplit('\\').next() == Some(leaf))) else { continue };
+            let Some(m) = native.tag_meta(cache, p, 0xC0, 0x10) else { continue };
+            let foot = tag_ref(&m, 0);
+            println!("== {leaf}: material effects tag {:?} {}", foot, foot.and_then(|f| native.tag_name(cache, f)).unwrap_or_default());
+            let Some(f) = foot else { continue };
+            let el = tag_block(native, cache, f, 0, 36, 64);
+            println!("   {} effect-type element(s)", el.len() / 36);
+            for k in 0..el.len() / 36 {
+                let e = &el[k * 36..];
+                let rows = block_at(native, cache, e, 0x18, 44, 64);
+                let snd = block_at(native, cache, e, 0x0C, 44, 64);
+                if rows.is_empty() && snd.is_empty() { continue }
+                let names: Vec<String> = (0..rows.len() / 44).map(|i| {
+                    let r = &rows[i * 44..];
+                    format!("{}:{}", native.string_id(cache, rd_u32(r, 0x20)).unwrap_or_default(), tag_ref(r, 0).and_then(|t| native.tag_name(cache, t)).map(|n| n.rsplit('\\').next().unwrap_or("").to_string()).unwrap_or_default())
+                }).collect();
+                println!("   [{k:>2}] {} effect row(s), {} sound row(s): {}", rows.len() / 44, snd.len() / 44, names.join(" ").chars().take(260).collect::<String>());
+            }
+        }
+    }
+
+    /// #projectile-sim  The raw contrail definition behind each projectile's tracer, so the
+    /// layout past the point `tagdefs` can name (the render-method shader is unsized) can be
+    /// read off real bytes: every 0x20 property block's runtime constant, plus the tail words.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_contrail_definitions() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let mut seen = std::collections::BTreeSet::new();
+        for &p in &native.tags_by_group(cache, "proj") {
+            let pname = native.tag_name(cache, p).unwrap_or_default();
+            for (cntl, mk) in projectile_contrail_parts(native, cache, p) {
+                if !seen.insert(cntl) { continue }
+                let n = tag_block(native, cache, cntl, 0, 640, 16);
+                println!("== {} -> {} | marker '{}' | {} contrail(s)", pname.rsplit('\\').next().unwrap_or(""), native.tag_name(cache, cntl).unwrap_or_default(), native.string_id(cache, mk).unwrap_or_default(), n.len() / 640);
+                for c in 0..n.len() / 640 {
+                    let e = &n[c * 640..(c + 1) * 640];
+                    println!("  name sid {:#x} origin-fade {:.2}/{:.2} edge {:.2}/{:.2} lod {:.1}/{:.1}/{:.1}/{:.1} sort {} emission-flags {:#x}",
+                        rd_u32(e, 0), rd_f32(e, 4), rd_f32(e, 8), rd_f32(e, 0xC), rd_f32(e, 0x10), rd_f32(e, 0x14), rd_f32(e, 0x18), rd_f32(e, 0x1C), rd_f32(e, 0x20), rd_i16(e, 0x24), rd_i16(e, 0x26));
+                    for (nm, off) in [("emission rate", 0x28usize), ("lifespan", 0x48), ("size", 0xA0), ("rotation", 0xF0), ("rot rate", 0x110)] {
+                        println!("   {nm:<14} in {} range {} mod {} modin {} const {:.4} flags {}", e[off], e[off + 1], e[off + 2], e[off + 3], rd_f32(e, off + 0x18), e[off + 0x1C]);
+                    }
+                    println!("   appearance flags {:#x} shape {} sides {}", rd_i16(e, 0x130), e[0x132], e[0x133]);
+                    for (nm, off) in [("EVAL emission", 0x28usize), ("EVAL lifespan", 0x48), ("EVAL size", 0xA0), ("EVAL color", 0x1A8), ("EVAL alpha", 0x1C8), ("EVAL alpha2", 0x1E8), ("EVAL blackpt", 0x208), ("EVAL palette", 0x228), ("EVAL intensity", 0x248)] {
+                        let (size, addr) = (rd_u32(e, off + 4), rd_u32(e, off + 0x10));
+                        let blob = if size >= 12 && size <= 0x400 && addr != 0 { native.tag_ptr_bytes(cache, addr, size) } else { None };
+                        let rc = rd_f32(e, off + 0x18);
+                        match blob.as_deref().and_then(crate::scene::MapFn::decode) {
+                            Some(f) => println!("   {nm:<15} fn[{size}B type {} colour {}] f(0)={:.3} f(.5)={:.3} f(1)={:.3} (runtime const {rc:.3})", blob.as_ref().unwrap()[0], blob.as_ref().unwrap()[2], f.eval(0.0), f.eval(0.5), f.eval(1.0)),
+                            None => println!("   {nm:<15} NO FUNCTION (size {size}) runtime const {rc:.3}"),
+                        }
+                    }
+                    let mut o = 0x134;
+                    while o + 16 <= 640 {
+                        let w: Vec<String> = (0..4).map(|k| format!("{:08x}", rd_u32(e, o + k * 4))).collect();
+                        println!("   +{o:#05x}: {}   f {:?}", w.join(" "), (0..4).map(|k| rd_f32(e, o + k * 4)).map(|f| (f * 1000.0).round() / 1000.0).collect::<Vec<_>>());
+                        o += 16;
+                    }
+                }
+            }
+        }
+    }
+
+    /// #projectile-sim  What the ENDING effects of a projectile are made of: its detonation (air /
+    /// ground), impact, object impact and the surface-material default, with the part classes of each.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_ending_effect_parts() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let parts = |effe: u32| {
+            let ev = tag_block(native, cache, effe, 0x2C, 0x40, 32);
+            let mut out = Vec::new();
+            for e in 0..ev.len() / 0x40 {
+                let ps = block_at(native, cache, &ev[e * 0x40..], 0x1c, 0x64, 32);
+                for i in 0..ps.len() / 0x64 {
+                    out.push(ps[i * 0x64 + 0x14..i * 0x64 + 0x18].iter().rev().map(|&c| if c.is_ascii_graphic() { c as char } else { '?' }).collect::<String>());
+                }
+            }
+            out
+        };
+        for leaf in ["rocket_launcher_rocket", "grenade_launcher_grenade", "concussion_rifle_grenade", "flak_bolt", "frag_grenade", "plasma_grenade", "assault_rifle_bullet", "sniper_rifle_bullet", "plasma_rifle_bolt", "needler_shard", "plasma_launcher_grenade", "sabre_missile"] {
+            let Some(p) = native.tags_by_group(cache, "proj").into_iter().find(|&t| native.tag_name(cache, t).map_or(false, |n| n.rsplit('\\').next() == Some(leaf))) else { continue };
+            let d = projectile_def(native, cache, p).unwrap();
+            let mat = material_effect(native, cache, p, MATERIAL_EFFECT_IMPACT, "");
+            for (what, e) in [("det-air", d.detonation_airborne), ("det-ground", d.detonation_ground), ("impact", d.impact_effect), ("obj-impact", d.object_impact_effect), ("material", mat)] {
+                if let Some(e) = e {
+                    println!("{leaf:<28} {what:<10} {:<64} parts {:?}", native.tag_name(cache, e).unwrap_or_default().rsplit("objects\\").next().unwrap_or(""), parts(e));
+                }
+            }
+        }
+    }
+
+    /// #projectile-sim  The PART TYPES of every projectile attachment `effe` (what the tracer of a
+    /// bullet is made of): `effe` +0x2C events (0x40), each with a parts block at +0x1C (0x64 each,
+    /// group at +0x14).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_projectile_effect_parts() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        for &p in &native.tags_by_group(cache, "proj") {
+            let name = native.tag_name(cache, p).unwrap_or_default();
+            for (effe, _, _) in object_attachment_effects(native, cache, p) {
+                let ename = native.tag_name(cache, effe).unwrap_or_default();
+                let ev = tag_block(native, cache, effe, 0x2C, 0x40, 32);
+                let mut summary = Vec::new();
+                for e in 0..ev.len() / 0x40 {
+                    let parts = block_at(native, cache, &ev[e * 0x40..], 0x1c, 0x64, 32);
+                    let classes: Vec<String> = (0..parts.len() / 0x64)
+                        .map(|i| parts[i * 0x64 + 0x14..i * 0x64 + 0x18].iter().rev().map(|&c| if c.is_ascii_graphic() { c as char } else { '?' }).collect::<String>())
+                        .collect();
+                    summary.push(format!("ev{e}{classes:?}"));
+                }
+                println!("{:<34} {} | {}", name.rsplit('\\').next().unwrap_or(""), ename.replace("objects\\", ""), summary.join(" "));
+            }
+        }
+    }
+
+    /// #projectile-sim  EVERY attachment of every projectile (`obje` +0x104, any group, not just
+    /// `effe`): what a plasma bolt with no render model and no effect actually draws with.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_projectile_attachments_of_every_group() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        for &p in &native.tags_by_group(cache, "proj") {
+            let name = native.tag_name(cache, p).unwrap_or_default();
+            let b = tag_block(native, cache, p, OBJE_ATTACHMENTS, OBJE_ATTACHMENT_SIZE, 24);
+            let mut rows = Vec::new();
+            for i in 0..b.len() / OBJE_ATTACHMENT_SIZE {
+                let e = &b[i * OBJE_ATTACHMENT_SIZE..(i + 1) * OBJE_ATTACHMENT_SIZE];
+                let grp = format!("{}/{}", String::from_utf8_lossy(&e[0..4]), e[0..4].iter().rev().map(|&c| c as char).collect::<String>());
+                let tr = tag_ref(e, 0).and_then(|t| native.tag_name(cache, t)).unwrap_or_default();
+                let mk = native.string_id(cache, rd_u32(e, 0x10)).unwrap_or_default();
+                rows.push(format!("{grp}:{}@{mk}", tr.rsplit('\\').next().unwrap_or("")));
+            }
+            println!("{:<44} mode {:#x} | {:?}", name.rsplit('\\').next().unwrap_or(""), native.resolve_mode(cache, p), rows);
+        }
+    }
+
+    /// #projectile-sim  Every projectile a barrel launches, with the fields the flight and the
+    /// look of a shot depend on, plus the two blocks the old reader did not know: `conical
+    /// spread` (+0x344, the shotgun's pellets) and `material responses` (+0x320).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_projectile_table() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let nm = |t: Option<u32>| {
+            t.and_then(|t| native.tag_name(cache, t)).map(|p| p.rsplit('\\').next().unwrap_or(&p).to_string()).unwrap_or_else(|| "-".into())
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for &w in &native.tags_by_group(cache, "weap") {
+            let wname = native.tag_name(cache, w).unwrap_or_default();
+            let bs = weapon_barrels(native, cache, w);
+            let raw = tag_block(native, cache, w, WEAP_BARRELS, BARREL_SIZE, WEAP_BARREL_MAX);
+            for (bi, b) in bs.iter().enumerate() {
+                let Some(p) = b.projectile else { continue };
+                let tracer = rd_i16(&raw[bi * BARREL_SIZE..], 0x3E);
+                println!("{} barrel {bi}: proj {} rounds-between-tracers {tracer} projs/shot {}", wname.rsplit('\\').next().unwrap(), nm(Some(p)), rd_i16(&raw[bi * BARREL_SIZE..], 0x6A));
+                if !seen.insert(p) { continue }
+                let Some(d) = projectile_def(native, cache, p) else { println!("   (unreadable)"); continue };
+                let Some(m) = native.tag_meta(cache, p, 0, PROJ_SIZE as u32) else { continue };
+                println!(
+                    "   v0 {:.1} vf {:.1} accel {:?} inv {:.4} grav {:.3} timer {:?} minv {:.2} range {:.1} bounce-range {:.1} radius {:.3} arming {:.2} flags {:#x} timer-starts {} mode {:#x}",
+                    d.initial_velocity, d.final_velocity, d.acceleration_range, rd_f32(&m, 0x304), d.air_gravity_scale, d.timer, d.minimum_velocity, d.maximum_range,
+                    rd_f32(&m, 0x194), d.collision_radius, d.arming_time, rd_u32(&m, 0x168), rd_i16(&m, 0x16C), native.resolve_mode(cache, p),
+                );
+                println!(
+                    "   det-air {} det-ground {} impact {} obj-impact {} | attachments {:?}",
+                    nm(d.detonation_airborne), nm(d.detonation_ground), nm(d.impact_effect), nm(d.object_impact_effect),
+                    object_attachment_effects(native, cache, p).iter().map(|(e, mk, _)| format!("{}@{}", nm(Some(*e)), native.string_id(cache, *mk).unwrap_or_default())).collect::<Vec<_>>(),
+                );
+                let con = tag_block(native, cache, p, 0x344, 12, 64);
+                for i in 0..con.len() / 12 {
+                    let e = &con[i * 12..];
+                    println!("   conical[{i}]: {} x {} exponent {:.3} max-angle {:.4} rad", rd_i16(e, 0), rd_i16(e, 2), rd_f32(e, 4), rd_f32(e, 8));
+                }
+                let mr = tag_block(native, cache, p, 0x320, 0x34, 64);
+                for i in 0..mr.len() / 0x34 {
+                    let e = &mr[i * 0x34..(i + 1) * 0x34];
+                    println!("   mresp[{i}]: mat {} flags {:#x} chance {:.2} angle [{:.2},{:.2}] speed [{:.1},{:.1}] RESPONSE {} noise {:.2}/{:.2} fric {:.2}/{:.2}/{:.2} effect {}",
+                        rd_i16(e, 4), rd_i16(e, 6), rd_f32(e, 8), rd_f32(e, 0xC), rd_f32(e, 0x10), rd_f32(e, 0x14), rd_f32(e, 0x18), rd_i16(e, 0x1C), rd_f32(e, 0x20), rd_f32(e, 0x24), rd_f32(e, 0x28), rd_f32(e, 0x2C), rd_f32(e, 0x30),
+                        nm(tag_ref(e, 0)));
+                }
+            }
+        }
     }
 }
 

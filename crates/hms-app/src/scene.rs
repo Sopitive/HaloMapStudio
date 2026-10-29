@@ -4506,6 +4506,8 @@ pub struct SceneController {
     /// (rebuilt with the object meshes) and of the effect_scenery placements (once per map).
     lens_def_cache: HashMap<u32, Option<std::sync::Arc<hms_render::LensFlareDef>>>,
     lens_sources_obj: Vec<hms_render::LensFlareInstance>,
+    /// #vehicle-fx  A driven vehicle's `lens` attachments (the glow at a lit lamp), per frame.
+    lens_sources_vehicle: Vec<hms_render::LensFlareInstance>,
     lens_sources_efsc: Option<Vec<hms_render::LensFlareInstance>>,
     /// 1×1 white texture bound to the untextured light-volume ribbons (fs_holo mode 4
     /// ignores the sampler but the mesh material needs a base view).
@@ -4527,12 +4529,34 @@ pub struct SceneController {
     /// SAVES AND RESTORES `particle_sources_obj` around an actor build so an actor can never
     /// disturb the Forge scene's particles, which also means an actor could never contribute one.
     particle_sources_actor: Vec<ParticleSource>,
+    /// #vehicle-fx  The DRIVEN vehicles' attached effects (`play_vehicle_fx`): persistent looping
+    /// sources that follow the vehicle, plus each source's `effect A scale` / `effect B scale`
+    /// (particle states 13 / 14), keyed by the source seed so the other lanes' sources -- which
+    /// never had either -- are untouched.
+    particle_sources_vehicle: Vec<ParticleSource>,
+    particle_scale_ab: HashMap<u64, [f32; 2]>,
+    /// #vehicle-fx  Lights that MOVE every frame (a driven vehicle's head- and brake lights),
+    /// packed with the Forge lights; `dyn_lights_changed` makes the app re-pack once more when
+    /// the last one goes out.
+    dyn_lights: Vec<DynLight>,
+    dyn_lights_changed: std::sync::atomic::AtomicBool,
+    /// real-time probe GI in engine mode is on: the baked stli lights are drawn per pixel (their direct term is in the
+    /// shipped atlas, not in the probes), packed once and cached
+    stli_direct: std::sync::atomic::AtomicBool,
+    stli_pack_cache: std::sync::Mutex<Option<std::sync::Arc<Vec<([f32; 3], [f32; 20])>>>>,
     /// #projectile  The FILM lane: a Theater clip's muzzle flashes, projectile trails and
     /// detonations. Written every frame by `film_play::install_film_effects` from what
     /// `ActorDriver::sync` decided, for the same reason the actor lane is its own list -- these
     /// sources are ONE-SHOT (`ParticleSource::birth`) and some of them MOVE
     /// (`ParticleSource::path`), neither of which a placed-object source ever is.
     particle_sources_film: Vec<ParticleSource>,
+    /// #projectile-sim  The LIGHT-VOLUME half of the same lane: a plasma bolt's streak, a rifle
+    /// round's tracer. Each is a decoded [`LiftBeam`] (model space) and the world frame it rides.
+    beam_sources_film: Vec<(Arc<LiftBeam>, Mat4)>,
+    /// `(ltvl, marker string id, model)` -> decoded beam, so a held trigger decodes a tag once.
+    beam_decode_film: HashMap<(u32, u32, u32), Option<Arc<LiftBeam>>>,
+    contrail_sources_film: Vec<FilmContrail>,
+    contrail_decode_film: HashMap<u32, Arc<Vec<ContrailDef>>>,
     particle_warned: std::collections::HashSet<u32>,
     /// Emission accumulators keyed by emitter seed
     particle_emit_state: HashMap<u64, EmitState>,
@@ -4756,6 +4780,43 @@ pub struct LiftBeam {
     pub looping: bool,
 }
 
+/// #projectile-sim  One `contrail_definition_block` element (640 bytes) of a `cntl` tag, decoded for
+/// the film lane. A rifle round's tracer is exactly one of these.
+///
+/// Offsets (PROVEN against `reverseme tagdefs` up to the shader and against
+/// `c_contrail_definition::populate_gpu_data` after it): emission rate +0x28, profile lifespan
+/// +0x48, profile size +0xA0, then -- past the unsized render-method shader -- uv tiling +0x198,
+/// profile color +0x1A8, alpha +0x1C8, secondary alpha +0x1E8, black point +0x208, palette +0x228
+/// and intensity +0x248, each a 32-byte `contrail_property` (input u8, range u8, output-modifier u8,
+/// modifier input u8, mapping-function data ref size +4 / address +0x10, runtime constant +0x18).
+/// WHICH property is which past the shader is INFERRED from the field-name order and from the
+/// values (alpha/intensity constants of 1.0, black point 0).
+#[derive(Clone, Debug)]
+pub struct ContrailDef {
+    /// `profile lifespan`, seconds.
+    pub lifespan: f32,
+    /// `emission rate`, profiles per second.
+    pub emission_rate: f32,
+    pub size: MapFn,
+    pub alpha: MapFn,
+    pub intensity: MapFn,
+    /// `profile color` as a function of profile age; white when the tag leaves it a scalar.
+    pub color: Option<Vec<u8>>,
+    pub tag: u32,
+}
+
+/// #projectile-sim  A contrail the film lane wants drawn: the `cntl` tag, the marker it hangs from
+/// on `mode`, the frame it rides, and the flight so far (scene seconds) its profiles are laid on.
+#[derive(Clone, Debug)]
+pub struct FilmContrail {
+    pub cntl: u32,
+    pub marker_sid: u32,
+    pub mode: u32,
+    pub world: Mat4,
+    pub birth: f32,
+    pub path: Arc<Vec<(f32, Vec3)>>,
+}
+
 /// The attached `ligh` dynamic light (model space).
 #[derive(Clone, Debug)]
 pub struct LiftLight {
@@ -4790,7 +4851,7 @@ impl LiftLight {
     /// Engine light colour = colour_fn(t) × intensity_fn(t) (reach_tag_test.exe
     /// light_update sub_140D61E60: `sub_14040E100(color_fn_out, intensity_fn_out, light+180)`), the
     /// value the simple-light packer uploads as LIGHT_COLOR. `t` = seconds (game time).
-    fn radiance_at(&self, t: f32) -> [f32; 3] {
+    pub(crate) fn radiance_at(&self, t: f32) -> [f32; 3] {
         let color = if self.color_blob.len() >= 0x14 {
             MapFn::decode(&self.color_blob)
                 .and_then(|f| MapFn::decode_color_at(&self.color_blob, f.eval(t)))
@@ -4811,6 +4872,20 @@ impl LiftLight {
 pub struct LiftFx {
     pub beams: Vec<LiftBeam>,
     pub lights: Vec<LiftLight>,
+}
+
+/// #vehicle-fx  One MOVING light: a driven vehicle's attached `ligh`, in world space this frame.
+/// `scale` is the attachment's primary scale function VALUE (`sub_140D61E60` multiplies the
+/// light's radiance by it); `cone` is `[cosCut, ratio, power]` for a frustum light and `None` for
+/// a sphere light, exactly the three numbers the simple-light packer (`sub_14082B6B0`) writes.
+#[derive(Clone, Debug)]
+pub struct DynLight {
+    pub pos: Vec3,
+    /// The direction the light SHINES.
+    pub dir: Vec3,
+    pub cone: Option<[f32; 3]>,
+    pub light: Arc<LiftLight>,
+    pub scale: f32,
 }
 
 /// One placed dynamic point light (a Forge ff_light_*, a grav lift,...): the
@@ -5756,6 +5831,7 @@ impl SceneController {
             lift_fx_cache: HashMap::new(),
             lens_def_cache: HashMap::new(),
             lens_sources_obj: Vec::new(),
+            lens_sources_vehicle: Vec::new(),
             lens_sources_efsc: None,
             lift_white_tex: None,
             effe_particle_cache: HashMap::new(),
@@ -5764,7 +5840,17 @@ impl SceneController {
             particle_sources_obj: Vec::new(),
             particle_sources_efsc: None,
             particle_sources_actor: Vec::new(),
+            particle_sources_vehicle: Vec::new(),
+            particle_scale_ab: HashMap::new(),
+            dyn_lights: Vec::new(),
+            dyn_lights_changed: std::sync::atomic::AtomicBool::new(false),
+            stli_direct: std::sync::atomic::AtomicBool::new(false),
+            stli_pack_cache: std::sync::Mutex::new(None),
             particle_sources_film: Vec::new(),
+            beam_sources_film: Vec::new(),
+            beam_decode_film: HashMap::new(),
+            contrail_sources_film: Vec::new(),
+            contrail_decode_film: HashMap::new(),
             particle_warned: std::collections::HashSet::new(),
             particle_emit_state: HashMap::new(),
             particle_event_clocks: HashMap::new(),
@@ -5887,6 +5973,7 @@ impl SceneController {
         self.lift_fx_cache.clear();
         self.lens_def_cache.clear();
         self.lens_sources_obj.clear();
+        self.lens_sources_vehicle.clear();
         self.lens_sources_efsc = None;
         self.effe_particle_cache.clear();
         self.prt3_cache.clear();
@@ -5894,7 +5981,14 @@ impl SceneController {
         self.particle_sources_obj.clear();
         self.particle_sources_efsc = None;
         self.particle_sources_actor.clear();
+        self.particle_sources_vehicle.clear();
+        self.particle_scale_ab.clear();
+        self.dyn_lights.clear();
         self.particle_sources_film.clear();
+        self.beam_sources_film.clear();
+        self.beam_decode_film.clear();
+        self.contrail_sources_film.clear();
+        self.contrail_decode_film.clear();
         self.particle_warned.clear();
         self.particle_emit_state.clear();
         self.particle_event_clocks.clear();
@@ -9579,6 +9673,40 @@ impl SceneController {
     /// How many posed-actor particle sources are installed (the gates and the status line).
     pub fn actor_particle_source_count(&self) -> usize { self.particle_sources_actor.len() }
 
+    /// #vehicle-fx  Install the driven vehicles' effect sources for this frame, each with its
+    /// `(effect A scale, effect B scale)`.
+    pub fn set_vehicle_particle_sources(&mut self, v: Vec<(ParticleSource, [f32; 2])>) {
+        self.particle_scale_ab = v.iter().map(|(s, ab)| (s.seed, *ab)).collect();
+        self.particle_sources_vehicle = v.into_iter().map(|(s, _)| s).collect();
+    }
+
+    /// #vehicle-fx  Install this frame's lens flares of the driven vehicles.
+    pub fn set_vehicle_lens_flares(&mut self, v: Vec<hms_render::LensFlareInstance>) {
+        self.lens_sources_vehicle = v;
+    }
+
+    /// #vehicle-fx  How many lens flares the driven vehicles have installed.
+    pub fn vehicle_lens_flare_count(&self) -> usize { self.lens_sources_vehicle.len() }
+
+    /// #vehicle-fx  A `lens` tag's decoded flare and sprite (`decode_lens_flare`, cached).
+    pub(crate) fn lens_flare_for(&mut self, lens: u32, device: &wgpu::Device, queue: &wgpu::Queue) -> Option<(std::sync::Arc<hms_render::LensFlareDef>, std::sync::Arc<(wgpu::TextureView, wgpu::Texture)>)> {
+        self.decode_lens_flare(lens, device, queue)
+    }
+
+    /// #vehicle-fx  How many driven-vehicle effect sources are installed (gates, status line).
+    pub fn vehicle_particle_source_count(&self) -> usize { self.particle_sources_vehicle.len() }
+
+    /// #vehicle-fx  Install this frame's moving lights (see [`DynLight`]).
+    pub fn set_dynamic_lights(&mut self, v: Vec<DynLight>) {
+        if !(self.dyn_lights.is_empty() && v.is_empty()) {
+            self.dyn_lights_changed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.dyn_lights = v;
+    }
+
+    /// #vehicle-fx  The moving lights installed now.
+    pub fn dynamic_lights(&self) -> &[DynLight] { &self.dyn_lights }
+
     /// #projectile  Install the FILM lane (muzzle flashes, projectile trails, detonations).
     ///
     /// Replaces the whole lane, like the actor lane, because the film driver recomputes it every
@@ -9604,6 +9732,191 @@ impl SceneController {
     }
 
     pub fn film_particle_source_count(&self) -> usize { self.particle_sources_film.len() }
+
+    /// #projectile-sim  Install the light volumes the film lane wants drawn this frame: `(ltvl tag,
+    /// marker string id, render model for the marker lookup, world frame)`. The beam is decoded
+    /// once per `(ltvl, marker, model)` and runs along the marker's forward (+X) axis, exactly as
+    /// the lift lane places a placed object's beam; with no marker (a model-less bullet) it sits on
+    /// the projectile's own origin along its forward, which is the engine's rule for an unlocated
+    /// part.
+    pub fn set_film_beams(&mut self, want: &[(u32, u32, u32, Mat4)]) {
+        let mut out = Vec::with_capacity(want.len());
+        for &(ltvl, marker, mode, world) in want {
+            let key = (ltvl, marker, mode);
+            if !self.beam_decode_film.contains_key(&key) {
+                let (pos, rot) = self.model_marker(mode, marker).unwrap_or((Vec3::ZERO, glam::Quat::IDENTITY));
+                let b = self.decode_light_volume(ltvl, pos, rot, marker).map(Arc::new);
+                self.beam_decode_film.insert(key, b);
+            }
+            if let Some(Some(b)) = self.beam_decode_film.get(&key) {
+                out.push((b.clone(), world));
+            }
+        }
+        self.beam_sources_film = out;
+    }
+
+    pub fn film_beam_count(&self) -> usize { self.beam_sources_film.len() + self.contrail_sources_film.len() }
+
+    pub fn set_film_contrails(&mut self, v: Vec<FilmContrail>) {
+        self.contrail_sources_film = v;
+    }
+
+    /// Decode every contrail of a `cntl` tag (cached). See [`ContrailDef`] for the offsets.
+    fn decode_contrails(&mut self, cntl: u32) -> Arc<Vec<ContrailDef>> {
+        if let Some(d) = self.contrail_decode_film.get(&cntl) {
+            return d.clone();
+        }
+        let mut out = Vec::new();
+        if let Some(c) = self.cache {
+            let rd32 = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let rdf = |b: &[u8], o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            if let Some(h) = self.native.tag_meta(c, cntl, 0, 8) {
+                let (cnt, ptr) = (rd32(&h, 0), rd32(&h, 4));
+                if cnt > 0 && cnt <= 16 {
+                    if let Some(blk) = self.native.tag_ptr_bytes(c, ptr, cnt * 640) {
+                        for i in 0..cnt as usize {
+                            let e = &blk[i * 640..(i + 1) * 640];
+                            let prop = |off: usize| &e[off..off + 0x20];
+                            let scalar = |off: usize| -> MapFn {
+                                let p = prop(off);
+                                let rc = rdf(p, 0x18);
+                                self.lift_fn_blob(p).and_then(|b| MapFn::decode(&b)).unwrap_or(MapFn::Const(if rc.is_finite() { rc } else { 0.0 }))
+                            };
+                            let eval0 = |f: &MapFn| { let v = f.eval(0.0); if v.is_finite() { v } else { 0.0 } };
+                            out.push(ContrailDef {
+                                lifespan: eval0(&scalar(0x48)).max(0.01),
+                                emission_rate: eval0(&scalar(0x28)),
+                                size: scalar(0xA0),
+                                alpha: scalar(0x1C8),
+                                intensity: scalar(0x248),
+                                color: self.lift_fn_blob(prop(0x1A8)).filter(|b| b.len() > 2 && b[2] != 0),
+                                tag: cntl,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        let a = Arc::new(out);
+        self.contrail_decode_film.insert(cntl, a.clone());
+        a
+    }
+
+    /// Ribbon geometry of one contrail source at scene time `t`: profiles are laid on the flight at
+    /// `emission rate`, live `profile lifespan` seconds, and are `profile size` wide, coloured and
+    /// scaled by `profile color` / `alpha` / `intensity` of their age. A profile is only emitted
+    /// while the projectile is flying (`t_k` inside the path), so a projectile that has ended
+    /// leaves a trail that ages out instead of one that keeps growing.
+    fn contrail_verts(defs: &[ContrailDef], src: &FilmContrail, local: Vec3, t: f32) -> (Vec<MeshVertex>, Vec<u32>) {
+        let (mut verts, mut indices) = (Vec::new(), Vec::new());
+        let Some(end) = src.path.last().map(|p| p.0) else { return (verts, indices) };
+        let off = src.world.transform_vector3(local);
+        for d in defs {
+            let rate = if d.emission_rate > 0.5 { d.emission_rate } else { 60.0 };
+            let period = 1.0 / rate;
+            let live_to = t.min(end);
+            let k0 = (((t - d.lifespan - src.birth) / period).ceil()).max(0.0) as i64;
+            let k1 = (((live_to - src.birth) / period).floor()) as i64;
+            if k1 < k0 { continue; }
+            // never more than 96 profiles per contrail: thin a very fast emitter evenly
+            let stride = (((k1 - k0 + 1) as f32) / 96.0).ceil().max(1.0) as i64;
+            let mut prof: Vec<(f32, Vec3)> = (k0..=k1).step_by(stride as usize).map(|k| { let tk = src.birth + k as f32 * period; (t - tk, Self::path_at(&src.path, tk) + off) }).collect();
+            // the head: the projectile where it is now (or where it ended)
+            prof.push((t - live_to, Self::path_at(&src.path, live_to) + off));
+            if prof.len() < 2 { continue; }
+            let base = verts.len() as u32;
+            for (i, &(age, pos)) in prof.iter().enumerate() {
+                let f = (age / d.lifespan).clamp(0.0, 1.0);
+                let axis = {
+                    let a = if i + 1 < prof.len() { prof[i + 1].1 - pos } else { pos - prof[i - 1].1 };
+                    let n = a.normalize_or_zero();
+                    if n == Vec3::ZERO { Vec3::X } else { n }
+                };
+                let w = d.size.eval(f).max(0.0);
+                let a = d.alpha.eval(f).clamp(0.0, 4.0);
+                let inten = d.intensity.eval(f).max(0.0);
+                let c = d.color.as_ref().and_then(|b| MapFn::decode_color_at(b, f)).unwrap_or([1.0, 1.0, 1.0]);
+                let k = a * inten;
+                let col = [c[0] * k, c[1] * k, c[2] * k, 1.0];
+                for (cx, uvx) in [(-0.5f32, 0.0f32), (0.5f32, 1.0f32)] {
+                    verts.push(MeshVertex {
+                        pos: pos.into(),
+                        normal: axis.into(),
+                        uv: [uvx, f],
+                        color: col,
+                        sway: [0.0; 3],
+                        uv2: [0.0, 0.0],
+                        tangent: [axis.x, axis.y, axis.z, cx * w],
+                        bone: [0, 0],
+                    });
+                }
+            }
+            for i in 0..(prof.len() as u32 - 1) {
+                let b = base + i * 2;
+                indices.extend_from_slice(&[b, b + 1, b + 3, b, b + 3, b + 2]);
+            }
+        }
+        (verts, indices)
+    }
+
+    /// #projectile-sim  The film lane's light volumes as additive ribbons (the same geometry the
+    /// lift lane builds for a placed object), one mesh per `ltvl` so each keeps its own
+    /// `center_offset / falloff / depth_fade` constants. Called every frame next to
+    /// [`SceneController::build_particle_meshes`]; empty when nothing is flying.
+    pub fn build_film_beam_meshes(&mut self, t: f32, mesh: &MeshRenderer, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<GpuMesh> {
+        if self.beam_sources_film.is_empty() && self.contrail_sources_film.is_empty() {
+            return Vec::new();
+        }
+        if self.lift_white_tex.is_none() {
+            self.lift_white_tex = Some(hms_render::upload_texture_bgra(device, queue, &[255, 255, 255, 255], 1, 1));
+        }
+        let mut by_tag: HashMap<u32, (Vec<MeshVertex>, Vec<u32>, [f32; 3])> = HashMap::new();
+        for (b, m) in &self.beam_sources_film {
+            let (verts, indices) = Self::build_lift_beam_verts(b, m, 1.0);
+            if verts.is_empty() {
+                continue;
+            }
+            let e = by_tag.entry(b.lvtl_tag).or_insert_with(|| (Vec::new(), Vec::new(), [b.center_offset, b.falloff, b.depth_fade]));
+            let base = e.0.len() as u32;
+            e.0.extend(verts);
+            e.1.extend(indices.into_iter().map(|i| i + base));
+        }
+        // The contrails: one soft additive ribbon mesh for every source this frame.
+        let mut cverts: Vec<MeshVertex> = Vec::new();
+        let mut cind: Vec<u32> = Vec::new();
+        let srcs = self.contrail_sources_film.clone();
+        for src in &srcs {
+            let defs = self.decode_contrails(src.cntl);
+            let local = self.model_marker(src.mode, src.marker_sid).map_or(Vec3::ZERO, |m| m.0);
+            let (v, i) = Self::contrail_verts(&defs, src, local, t);
+            let base = cverts.len() as u32;
+            cverts.extend(v);
+            cind.extend(i.into_iter().map(|x| x + base));
+        }
+        let mut out = Vec::new();
+        let Some((wview, _)) = self.lift_white_tex.as_ref() else { return out };
+        if !cverts.is_empty() {
+            out.push(mesh.upload_mesh(
+                device, queue, &cverts, &cind, &[Mat4::IDENTITY], Some(&[[1.0, 1.0, 1.0, 1.0]]),
+                Some(wview), Some(wview), None, None, None, [0.0, 0.0], [1.0, 1.0], [0.0; 4], 0.0, 0.0,
+                [0.0, -1.0], [0.0; 4],
+                [0.0, 0.0, 0.0, 4.0], [1.0, 1.0, 0.0, 0.0], [0.0; 4], [0.0; 4], None, false,
+                0.0, [0.0; 4], None, None, [0.0; 4], [0.0; 4], None, None, [0.0; 4], [0.0; 4], None,
+            ));
+        }
+        for (_, (verts, indices, k)) in by_tag {
+            out.push(mesh.upload_mesh(
+                device, queue, &verts, &indices, &[Mat4::IDENTITY], Some(&[[1.0, 1.0, 1.0, 1.0]]),
+                Some(wview), Some(wview), None, None, None, [0.0, 0.0], [1.0, 1.0], [0.0; 4], 0.0, 0.0,
+                [0.0, -1.0], [0.0; 4],
+                // bump_xform.w = 4 -> the ribbon billboard vertex path + the fs_holo circular
+                // light-volume lane; fine_xform = the ltvl's template constants (as the lift lane).
+                [0.0, 0.0, 0.0, 4.0], [k[0], k[1], k[2], 0.0], [0.0; 4], [0.0; 4], None, false,
+                0.0, [0.0; 4], None, None, [0.0; 4], [0.0; 4], None, None, [0.0; 4], [0.0; 4], None,
+            ));
+        }
+        out
+    }
 
     /// Every light_volume_system part of an effect → (ltvl tag, location marker sid).
     fn effect_light_volumes(&self, effe: u32) -> Vec<(u32, u32, bool)> {
@@ -9901,6 +10214,7 @@ impl SceneController {
     pub fn lens_flare_instances(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<hms_render::LensFlareInstance> {
         if ev("HMS_NO_LIFT_FX").is_ok() || self.cache.is_none() { return Vec::new(); }
         let mut v = self.lens_sources_obj.clone();
+        v.extend(self.lens_sources_vehicle.iter().cloned());
         v.extend(self.efsc_lens_sources(device, queue));
         v
     }
@@ -10940,7 +11254,7 @@ impl SceneController {
     fn simulate_emitter(
         e: &ParticleEmitterDef, sys: &ParticleSystemDef, def: &ParticleDef, seed: u64, world: &Mat4, marker: (Vec3, glam::Quat),
         t: f32, cam_pos: Vec3, cam_fwd: Vec3, stats: &mut (usize, usize), out: &mut Vec<LiveParticle>, es: &mut EmitState,
-        clock: Option<&EventClock>, path: Option<&[(f32, Vec3)]>,
+        clock: Option<&EventClock>, path: Option<&[(f32, Vec3)]>, ab: [f32; 2],
     ) {
         let cap: usize = ev("HMS_PARTICLE_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(400);
         // System-level states (particle terms zero): system age, system random, game time, location lod.
@@ -10965,6 +11279,11 @@ impl SceneController {
         // those events are exactly 1 s long. Feeding the scene clock keeps every effect on one shared
         // time base (sources stay in step with each other the way the engine's do).
         sys_st[12] = t;
+        // States 13 / 14 are `effect A scale` / `effect B scale` (`update_states_internal`
+        // `sub_140509250(system, 0/1)`): the attachment's primary / secondary scale function
+        // values. Only the vehicle lane supplies them; every other lane's stay 0.
+        sys_st[13] = ab[0];
+        sys_st[14] = ab[1];
         let sys_origin_w = world.transform_point3(marker.0);
         // Location LOD (state 11, multiplies rate + alpha): distance from the camera to the emitter's
         // BOUNDING SPHERE (override @0x30 else estimate @0x2C — the forge waterfall sheets carry 205 wu
@@ -11325,6 +11644,7 @@ impl SceneController {
             let t = t0 + i as f32 * step;
             for (src_i, src) in sources.iter().enumerate() {
                 if !tags.contains(&src.effe) { continue; }
+                let ab = self.particle_scale_ab.get(&src.seed).copied().unwrap_or([0.0; 2]);
                 let systems = src.systems.clone();
                 let Some(fx) = systems.first().map(|s| s.effect.clone()) else { continue };
                 let cseed = if fx.fixed_seed != 0 { fx.fixed_seed as u32 as u64 ^ 0xF1AE_D5EE_D000_0000 } else { src.seed };
@@ -11341,7 +11661,7 @@ impl SceneController {
                         let seed = src.seed ^ ((si as u64) << 48) ^ ((ei as u64) << 40) ^ (sys.prt3 as u64);
                         let es = states.entry(seed).or_default();
                         let mut live = Vec::new();
-                        Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, es, Some(&*clock), src.path.as_deref().map(|v| v.as_slice()));
+                        Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, es, Some(&*clock), src.path.as_deref().map(|v| v.as_slice()), ab);
                         let nl = live.len().max(1) as f32;
                         let ms = live.iter().map(|q| q.vel.length()).sum::<f32>() / nl;
                         let mf = live.iter().map(|q| q.frame0 as f32).sum::<f32>() / nl;
@@ -11372,6 +11692,8 @@ impl SceneController {
         // effect rides a bone, so its source is rebuilt every frame from the live pose instead of
         // once per object rebuild. It is simulated by exactly this code, with the same clock.
         sources.extend(self.particle_sources_actor.iter().cloned());
+        // #vehicle-fx  The driven vehicles' attachments (their own lane; see `particle_scale_ab`).
+        sources.extend(self.particle_sources_vehicle.iter().cloned());
         // #projectile  The FILM lane: one-shot muzzle flashes / detonations and moving projectile
         // trails. Same simulator, same clock -- only `birth` and `path` differ.
         sources.extend(self.particle_sources_film.iter().cloned());
@@ -11393,6 +11715,7 @@ impl SceneController {
         let trace: Vec<u32> = ev("HMS_EVENT_TRACE").ok().map(|v| v.split(',').filter_map(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default();
         for src in &sources {
             let systems = src.systems.clone();
+            let ab = self.particle_scale_ab.get(&src.seed).copied().unwrap_or([0.0; 2]);
             let lx = src.world.transform_vector3(Vec3::X); let ly = src.world.transform_vector3(Vec3::Y); let lz = src.world.transform_vector3(Vec3::Z);
             // Advance this placed effect's event state machine to scene time t. The clock is
             // seeded from the effe's fixed random seed when it has one (engine: both effect RNG seeds =
@@ -11444,7 +11767,7 @@ impl SceneController {
                     let mut live = Vec::new();
                     let seed = src.seed ^ ((si as u64) << 48) ^ ((ei as u64) << 40) ^ (sys.prt3 as u64);
                     let mut es = self.particle_emit_state.remove(&seed).unwrap_or_default();
-                    Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, &mut es, clock.as_ref(), src.path.as_deref().map(|v| v.as_slice()));
+                    Self::simulate_emitter(e, sys, &def, seed, &src.world, marker, t, cam_pos, cam_fwd, &mut stats, &mut live, &mut es, clock.as_ref(), src.path.as_deref().map(|v| v.as_slice()), ab);
                     let n_births = es.births.len();
                     self.particle_emit_state.insert(seed, es);
                     if tracing {
@@ -12767,6 +13090,60 @@ impl SceneController {
         self.native.tag_ptr_bytes(c, ptr + i * (size / 4), size)
     }
 
+    /// What the map's baked-lighting `stli` carries, for the real-time mode's light accounting:
+    /// (resolved lights, of them baking their DIRECT term into the lightmap (Bungie type 0/1), runtime-only
+    /// analytic ones (type 2/3/4), omni/spot among the baked).
+    pub(crate) fn stli_baked_positions(&self) -> Vec<([f32; 3], [f32; 3], f32)> {
+        self.stli_lights().into_iter().filter(|l| l.bakes_direct && l.light_type <= 1).map(|l| (l.pos, l.color, l.far[1])).collect()
+    }
+
+    /// The shipped bake's own direct lights (omni / spot with `bungie light type` 0 or 1: the ones whose direct term the
+    /// lightmapper put into the atlas) packed as engine SimpleLights (5 x vec4: pos + range^2 | dir + sphere% | colour |
+    /// cone (cosCut, ratio, power) | atten (0, farEnd, ratio)). In the real-time mode the probes carry only the BOUNCE of
+    /// these lights; the pixel shaders draw their DIRECT term from this list, with the tracer's own falloff
+    /// (`direct_irradiance` in rtgi.rs: colour x N.L x (1 - d/range)^2, spot cone linear in cos) and the shading side's
+    /// 1/pi. Returns (position, packed 20 floats).
+    pub(crate) fn stli_direct_pack(&self) -> Vec<([f32; 3], [f32; 20])> {
+        let mut out = Vec::new();
+        for (li, l) in self.stli_lights().into_iter().enumerate() {
+            if l.light_type > 1 || !l.bakes_direct { continue; }
+            let end = if l.far[1] > 0.1 { l.far[1] } else { 20.0 };
+            let omni = l.light_type == 0;
+            let cut = if l.cutoff_half > 1e-4 { l.cutoff_half } else { 0.75 };
+            let cos_cut = if omni { -1.0 } else if l.is_circular { cut.cos() } else {
+                let (sx, sy) = (l.aspect.max(1e-3).sqrt(), (1.0 / l.aspect.max(1e-3)).sqrt());
+                (1.0 / (1.0 + (cut.tan() * cut.tan()) * (sx * sx + sy * sy)).sqrt()).clamp(-1.0, 1.0)
+            };
+            let o = self.light_offsets.get(&(li as u32)).copied().unwrap_or([0.0; 3]);
+            let p = [l.pos[0] + o[0], l.pos[1] + o[1], l.pos[2] + o[2]];
+            let power = if omni { 1.0 } else if l.is_circular { l.hotspot_falloff.max(1.0) } else { 1.0 };
+            let ratio = if omni { 1.0 } else { 1.0 / (1.0 - cos_cut).max(1e-3) };
+            out.push((p, [
+                p[0], p[1], p[2], end * end,
+                l.dir[0], l.dir[1], l.dir[2], if omni { 1.0 } else { 0.0 },
+                l.color[0], l.color[1], l.color[2], 2.0,
+                cos_cut, ratio, power, 0.0,
+                0.0, end, 1.0 / end, 0.0,
+            ]));
+        }
+        out
+    }
+
+    /// Switch the per-pixel baked-light term (real-time probe GI in engine mode) on or off; the next frame re-packs the lights.
+    pub fn set_stli_direct(&self, on: bool) {
+        if self.stli_direct.swap(on, std::sync::atomic::Ordering::Relaxed) != on { self.dyn_lights_changed.store(true, std::sync::atomic::Ordering::Relaxed); }
+    }
+    pub fn stli_direct_on(&self) -> bool { self.stli_direct.load(std::sync::atomic::Ordering::Relaxed) }
+    fn stli_pack_cached(&self) -> std::sync::Arc<Vec<([f32; 3], [f32; 20])>> {
+        let mut c = self.stli_pack_cache.lock().unwrap();
+        c.get_or_insert_with(|| std::sync::Arc::new(self.stli_direct_pack())).clone()
+    }
+    pub(crate) fn stli_light_inventory(&self) -> (usize, usize, usize, usize) {
+        let all = self.stli_lights();
+        let baked: Vec<&StliLight> = all.iter().filter(|l| l.bakes_direct).collect();
+        (all.len(), baked.len(), all.len() - baked.len(), baked.iter().filter(|l| l.light_type <= 1).count())
+    }
+
     /// The lightmapper's own light list — every generic light INSTANCE joined with its
     /// DEFINITION. Definition = s_structure_lighting_generic_light_definition (80 B): @0 type u16 (0 omni,
     /// 1 spot, 2 directional), @2 flags u16, @4 shape u16 (0 rectangle, 1 circle), @6 pad, @8 colour rgb,
@@ -12886,9 +13263,9 @@ impl SceneController {
     }
     /// Move light `idx` by a world-space offset (accumulates). Real-time only — the offline
     /// bake always reads the map's own light positions.
-    pub fn set_light_offset(&mut self, idx: u32, off: [f32; 3]) { self.light_offsets.insert(idx, off); }
+    pub fn set_light_offset(&mut self, idx: u32, off: [f32; 3]) { self.light_offsets.insert(idx, off); *self.stli_pack_cache.lock().unwrap() = None; }
     pub fn light_offset(&self, idx: u32) -> [f32; 3] { self.light_offsets.get(&idx).copied().unwrap_or([0.0; 3]) }
-    pub fn clear_light_offsets(&mut self) { self.light_offsets.clear(); }
+    pub fn clear_light_offsets(&mut self) { self.light_offsets.clear(); *self.stli_pack_cache.lock().unwrap() = None; }
     pub fn has_light_offsets(&self) -> bool { !self.light_offsets.is_empty() }
 
     /// Lightmap quality presets, mirroring `tool.exe lightmaps <scenario> <bsp> <quality> <stop>`
@@ -12994,7 +13371,7 @@ impl SceneController {
     /// The map's SHIPPED airprobes in engine units (position, dual-vMF lobes, bandwidth t, direction): what
     /// the Tool's lightmapper wrote, for `rtgi_compare` to measure the probe field against.
     pub fn shipped_airprobes(&self) -> Vec<crate::rtgi_compare::ShippedProbe> {
-        self.probe.points.iter().map(|p| crate::rtgi_compare::ShippedProbe { pos: p.pos, dom: p.dom_rgb, fill: p.fill_rgb, t: p.bandwidth, dir: p.dom_dir }).collect()
+        self.probe.points.iter().map(|p| crate::rtgi_compare::ShippedProbe { pos: p.pos, dom: p.dom_rgb, fill: p.fill_rgb, t: p.bandwidth, dir: p.dom_dir, mask: p.mask }).collect()
     }
 
     /// The sky render_model's `sun 1st bounce scaler` / `sky light 1st bounce scaler` (cache `mode`
@@ -13544,6 +13921,51 @@ impl SceneController {
     // ---- Accessors (bake_compare.rs): read-only views for the bake-vs-shipped harness ----
     /// The atlas-lit BSP meshes retained for the lightmapper (world verts/normals/uv2 + atlas ids).
     pub(crate) fn lm_geom(&self) -> &[BspLmMesh] { &self.bsp_lm_geom }
+    /// Test seam: fill the atlas-lit mesh list (`lm_geom`) WITHOUT a renderer by running the same per-mesh decode the
+    /// loader runs (`decode_bsp_mesh`) over every structure BSP. The wgpu device is only used for the once-per-material
+    /// self-illum uploads, which are skipped here. Returns the number of atlas-lit meshes kept.
+    pub(crate) fn load_lm_geom_for_test(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<[f32; 3]> {
+        let Some(cache) = self.cache else { return Vec::new() };
+        let mut albedos: Vec<[f32; 3]> = Vec::new();
+        self.scnr = self.native.find_scenario(cache).unwrap_or(0xFFFF_FFFF);
+        self.bsp_lm_geom.clear();
+        // the per-BSP atlas brightness `open_cache` primes (attach_cache does not): without it every atlas decodes at k = 1
+        for sbsp in self.native.enumerate_sbsps(cache, self.scnr, 64) {
+            let b = self.native.bsp_brightness(cache, sbsp);
+            self.bsp_brightness.insert(sbsp, b);
+            if b != 1.0 && self.brightness == 1.0 { self.brightness = b; }
+        }
+        let atlas = std::sync::Mutex::new(HashMap::new());
+        let pvl = std::sync::Mutex::new(HashMap::new());
+        let cov = std::sync::Mutex::new(HashMap::new());
+        for sb in self.native.enumerate_sbsps(cache, self.scnr, 64) {
+            let Ok(b) = self.native.open_bsp(cache, sb) else { continue };
+            let bright = self.bsp_brightness.get(&sb).copied().filter(|v| v.is_finite() && *v > 0.001 && (*v - 1.0).abs() > 1e-4).unwrap_or(self.brightness);
+            for i in 0..self.native.bsp_mesh_count(b) {
+                let Some(mut dec) = decode_bsp_mesh(&self.native, cache, b, sb, i, bright, &atlas, &pvl, None, &cov, &self.probe, device, queue) else { continue };
+                if !(dec.lm_gpu && !dec.is_water) { continue; }
+                let (dm_w, dm_h) = self.native.find_bitmap(cache, dec.lm_dm_tag, dec.lm_dm_sub).map(|b| (b.width, b.height)).unwrap_or((0, 0));
+                if dm_w == 0 || dm_h == 0 { continue; }
+                // the loader's material albedo for this mesh (what rtgi_scene_data's bake_material_table feeds the tracer)
+                let albedo_color = if dec.terrain.is_some() { [1.0; 3] } else {
+                    self.native.bsp_material_shader_constants(b, dec.material_index).and_then(|c| c.real("albedo_color"))
+                        .filter(|v| v.iter().all(|x| x.is_finite())).map(|c| [c[0].max(0.0), c[1].max(0.0), c[2].max(0.0)]).unwrap_or([1.0; 3])
+                };
+                let shader_tag = self.native.bsp_material_shader_tag(b, dec.material_index).unwrap_or(0xFFFF_FFFF);
+                let lsm = Self::lm_sample_mesh_for(&mut dec, albedo_color, shader_tag);
+                let al = self.material_albedo(&lsm);
+                albedos.push(if al.iter().all(|v| v.is_finite()) { [al[0].clamp(0.0, 1.0), al[1].clamp(0.0, 1.0), al[2].clamp(0.0, 1.0)] } else { [0.5; 3] });
+                self.bsp_lm_geom.push(BspLmMesh {
+                    verts: dec.verts.iter().map(|v| (v.pos, v.normal, v.uv2)).collect(),
+                    indices: dec.indices.clone(),
+                    dm: (dec.lm_dm_tag, dec.lm_dm_sub), dm_w, dm_h,
+                    sdm: (dec.lm_sdm_tag, dec.lm_sdm_sub), hdr: dec.lm_hdr, k: dec.lm_k, diffuse: dec.diffuse_tag,
+                });
+            }
+            self.native.close_bsp(b);
+        }
+        albedos
+    }
     /// Decoded SHIPPED DM/SDM atlas submaps (CPU copy, cached) — feed `shipped_lm_texel`.
     pub(crate) fn shipped_lm_images(&self, dm: (u32, u32), sdm: (u32, u32)) -> Option<LmAtlasImages> { self.lm_atlas_images(dm, sdm) }
     /// Raycast the BSP soup and report the first BAKE OCCLUDER hit: `(dist, diffuse tag name)`. Meshes the
@@ -16140,7 +16562,9 @@ impl SceneController {
     /// app calls this each frame so which 8 lights are active tracks the camera.
     /// Whether any forge-light fixtures were collected (gates the per-frame re-pack).
     pub fn has_forge_lights(&self) -> bool {
-        !self.forge_lights.is_empty()
+        // #vehicle-fx  A driven vehicle's lights count, and so does the frame after the last one
+        // went out (the uniform must be packed once more without it).
+        !self.forge_lights.is_empty() || !self.dyn_lights.is_empty() || self.dyn_lights_changed.load(std::sync::atomic::Ordering::Relaxed) || self.stli_direct_on()
     }
     /// How many of `tags` are fully SETTLED for the variant progress bar — either
     /// GPU-ready (has a vertex buffer) OR processed-but-non-drawable so they'll never get one: decode
@@ -16171,27 +16595,49 @@ impl SceneController {
     pub fn simple_lights_with_forge(&self, cam: Vec3, t: f32) -> Vec<f32> {
         const MAX: usize = 8;
         let mut out = self.simple_lights();
+        // This pack includes whatever moving lights are installed now (see `has_forge_lights`).
+        self.dyn_lights_changed.store(false, std::sync::atomic::Ordering::Relaxed);
         let scnr_count = out.len() / 20;
-        if scnr_count >= MAX || self.forge_lights.is_empty() || std::env::var("HMS_NO_FORGE_LIGHTS").is_ok() {
+        let stli = if self.stli_direct_on() { Some(self.stli_pack_cached()) } else { None };
+        if scnr_count >= MAX || (self.forge_lights.is_empty() && self.dyn_lights.is_empty() && stli.as_ref().map_or(true, |p| p.is_empty())) || std::env::var("HMS_NO_FORGE_LIGHTS").is_ok() {
             return out;
         }
-        // Nearest forge lights first so the ones around the camera win the remaining slots.
-        let mut fl: Vec<&ForgeLight> = self.forge_lights.iter().collect();
-        fl.sort_by(|a, b| {
-            (a.pos - cam).length_squared().partial_cmp(&(b.pos - cam).length_squared()).unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for f in fl.into_iter().take(MAX - scnr_count) {
-            let (pos, l) = (f.pos, &f.light);
+        // Nearest lights first (a driven vehicle's included) so the ones around the camera win the
+        // remaining slots.
+        enum Cand<'a> { Forge(&'a ForgeLight), Moving(&'a DynLight), Stli(&'a [f32; 20]) }
+        let mut fl: Vec<(f32, Cand)> = self
+            .forge_lights
+            .iter()
+            .map(|f| ((f.pos - cam).length_squared(), Cand::Forge(f)))
+            .chain(self.dyn_lights.iter().map(|d| ((d.pos - cam).length_squared(), Cand::Moving(d))))
+            .chain(stli.iter().flat_map(|p| p.iter()).map(|(pos, pk)| ((Vec3::from(*pos) - cam).length_squared(), Cand::Stli(pk))))
+            .collect();
+        fl.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        for (_, f) in fl.into_iter().take(MAX - scnr_count) {
+            if let Cand::Stli(pk) = f { out.extend_from_slice(pk); continue; }
+            let (pos, l, col, dir, sphere, cone) = match f {
+                Cand::Stli(_) => unreachable!(),
+                Cand::Forge(f) => (f.pos, &f.light, f.light.radiance_at(t), Vec3::Z, 1.0, [-1.0, 1.0, 1.0]),
+                // #vehicle-fx  colour_fn * intensity_fn * the attachment function's value; a
+                // frustum light carries its cone, a sphere light the omni defaults.
+                Cand::Moving(d) => {
+                    let r = d.light.radiance_at(t);
+                    let col = [r[0] * d.scale, r[1] * d.scale, r[2] * d.scale];
+                    match d.cone {
+                        Some(c) => (d.pos, &*d.light, col, d.dir, 0.0, c),
+                        None => (d.pos, &*d.light, col, Vec3::Z, 1.0, [-1.0, 1.0, 1.0]),
+                    }
+                }
+            };
             let end = if l.radius > 0.0 { l.radius } else { 5.0 };
             let ratio = 1.0 / (end - l.atten_start).max(1e-4);
-            let col = l.radiance_at(t);
-            // pos + bounding_radius² (cull); dir(unused) + sphere%=1 (omni); colour + smooth=1;
-            // cone(cosCut=-1 omni, ratio=1, power=1); atten(cutoff=0, farEnd=end, farRatio=1/(end-start)).
+            // pos + bounding_radius² (cull); dir + sphere% (1 = omni); colour + smooth=1;
+            // cone(cosCut, ratio, power; omni -1, 1, 1); atten(cutoff=0, farEnd=end, farRatio=1/(end-start)).
             out.extend_from_slice(&[
                 pos.x, pos.y, pos.z, end * end,
-                0.0, 0.0, 1.0, 1.0,
+                dir.x, dir.y, dir.z, sphere,
                 col[0], col[1], col[2], 1.0,
-                -1.0, 1.0, 1.0, 0.0,
+                cone[0], cone[1], cone[2], 0.0,
                 0.0, end, ratio, 0.0,
             ]);
         }
@@ -29126,5 +29572,83 @@ mod fp_light_tests {
             }
         }
         assert!(n > 20, "the cache has object tags to check; saw {n}");
+    }
+}
+
+#[cfg(test)]
+mod contrail_gates {
+    //! #projectile-sim  The contrail ribbon geometry (the tracer of a bullet), against numbers worked
+    //! out by hand from a synthetic definition.
+    use super::*;
+
+    fn def() -> ContrailDef {
+        ContrailDef {
+            lifespan: 0.2,
+            emission_rate: 50.0, // a profile every 0.02 s
+            size: MapFn::Const(0.3),
+            alpha: MapFn::Const(1.0),
+            intensity: MapFn::Const(2.0),
+            color: None,
+            tag: 1,
+        }
+    }
+
+    fn source(path: Vec<(f32, Vec3)>, birth: f32) -> FilmContrail {
+        FilmContrail { cntl: 1, marker_sid: 0, mode: 0, world: Mat4::IDENTITY, birth, path: Arc::new(path) }
+    }
+
+    /// A projectile flying +x at 10 wu/s from t = 0 to t = 1.
+    fn flight() -> Vec<(f32, Vec3)> {
+        (0..=60).map(|i| (i as f32 / 60.0, Vec3::new(i as f32 / 6.0, 0.0, 0.0))).collect()
+    }
+
+    /// Sixteen-ish profiles live in a 0.2 s lifespan at 50/s, laid on the flight, each `size` wide.
+    #[test]
+    fn a_contrail_lays_profiles_on_the_flight_for_its_lifespan() {
+        let (v, i) = SceneController::contrail_verts(&[def()], &source(flight(), 0.0), Vec3::ZERO, 0.5);
+        // profiles at t = 0.30, 0.32 ... 0.50 (11) plus the head at the projectile's own position
+        let profiles = v.len() / 2;
+        assert!((11..=13).contains(&profiles), "{profiles} profiles at t = 0.5 with a 0.2 s lifespan at 50/s");
+        assert_eq!(i.len(), (profiles - 1) * 6, "one quad per pair of profiles");
+        // the ribbon starts a lifespan behind the head: x = 10 * 0.3 = 3.0 wu, and ends at x = 5.0 wu
+        let xs: Vec<f32> = v.iter().map(|m| m.pos[0]).collect();
+        let (lo, hi) = (xs.iter().cloned().fold(f32::MAX, f32::min), xs.iter().cloned().fold(f32::MIN, f32::max));
+        // the oldest profile is at most a lifespan old (x >= 3.0) and within one emission period
+        // (0.02 s * 10 wu/s = 0.2 wu) of that edge
+        assert!(lo >= 3.0 - 1.0e-3 && lo <= 3.0 + 0.21 && (hi - 5.0).abs() < 1.0e-3, "the trail spans x {lo}..{hi}, expected 3.0..5.0");
+        // every vertex is `size` wide (the tangent's w is the half-width signed by side)
+        assert!(v.iter().all(|m| (m.tangent[3].abs() - 0.15).abs() < 1.0e-6), "ribbon half-width must be size/2 = 0.15");
+        // colour = alpha * intensity
+        assert!(v.iter().all(|m| (m.color[0] - 2.0).abs() < 1.0e-5), "alpha 1 x intensity 2 = 2.0");
+    }
+
+    /// Nothing is emitted before the projectile exists, and a projectile that has ENDED leaves a trail
+    /// that ages out: still there a moment after, gone a lifespan after.
+    #[test]
+    fn a_trail_ages_out_after_the_projectile_ends() {
+        let mut p = flight();
+        p.truncate(31); // flight ends at t = 0.5, x = 5.0
+        let src = source(p, 0.0);
+        let n = |t: f32| SceneController::contrail_verts(&[def()], &src, Vec3::ZERO, t).0.len();
+        assert_eq!(n(-0.5), 0, "no trail before launch");
+        assert!(n(0.5) > 4, "liveness: a trail at the end of the flight");
+        let after = n(0.6);
+        assert!(after > 0 && after < n(0.5), "0.1 s after the end the trail has shortened ({after} < {})", n(0.5));
+        assert_eq!(n(0.5 + 0.2 + 0.05), 0, "a lifespan after the end nothing is left");
+        // it never grows past the end of the flight
+        let (v, _) = SceneController::contrail_verts(&[def()], &src, Vec3::ZERO, 0.6);
+        assert!(v.iter().all(|m| m.pos[0] <= 5.0 + 1.0e-3), "profiles were emitted past the end of the flight");
+    }
+
+    /// The width follows the `profile size` function of profile age, not a constant.
+    #[test]
+    fn the_width_follows_the_size_function_of_profile_age() {
+        let mut d = def();
+        d.size = MapFn::Identity { lo: 0.0, hi: 1.0 }; // 0 at birth, 1 wu at the end of the lifespan
+        let (v, _) = SceneController::contrail_verts(&[d], &source(flight(), 0.0), Vec3::ZERO, 0.5);
+        let head = v[v.len() - 1].tangent[3].abs() * 2.0;
+        let oldest = v[0].tangent[3].abs() * 2.0;
+        assert!(head < 0.05, "the newest profile is a point, got width {head}");
+        assert!(oldest > 0.9, "the oldest profile is a lifespan old: width {oldest}");
     }
 }

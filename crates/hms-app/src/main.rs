@@ -25,6 +25,8 @@ mod construct;
 mod euler;
 mod film; // Reach (MCC) Theater saved films -- BLF reader (re-notes/reach_saved_film_layout.md)
 mod film_export; // extract the map variant / game variant embedded in a saved film
+mod gamevariant; // #gamevariant-bin  the Reach game variant .bin: BLF container + bit-packed mpvr codec
+mod zdeflate; // exact madler-zlib level-9 deflate (the engine's compressor), for byte-exact game variants
 mod film_ui; // the saved-film metadata card (pure content + a thin egui card)
 mod film_decode; // #film  the per-tick record bitstream decoder + its measured throughput
 mod film_play; // #film  the playback clock, scrub and per-frame placement
@@ -36,12 +38,23 @@ mod film_variant; // #gamevariant  the GAME VARIANT a film was recorded under (l
 mod film_vehicle; // #vehicle-rot #vehicle-damage  a film's VEHICLES: recorded basis, damage state, the wreck
 mod film_objective; // #film-objects  a film's OBJECTIVE objects (the flag) + loose weapons + debris
 mod film_projectile; // #projectile  a film's PROJECTILES, weapon firing effects and explosions
+mod film_shots; // #projectile-sim  Theater: the rounds a film never replicates, flown from the fire events
 mod film_riders; // #film-riders  a film's RIDERS: seat membership from the recorded parent link
+mod film_roster; // #film-roster  who was in the room and when: the time-aware player roster of a film
+mod film_follow; // #film-follow  headless JSON-lines follower for a growing .temp (no GPU, no window)
+mod film_highlight; // #film-highlight  Theater: highlight script-relevant objects + placeholders for invisible ones
+mod film_objects; // #film-objects  object identity/lifetime/labels/zones of a film
+mod film_data; // #film-data  script/CLI read access to decoded film data (megalo variables, events, seats, score)
+mod film_megalo; // #film-megalo  the MEGALO VARIABLES a film records: declarations + value time series
 mod extimport; // externally imported OBJ/GLB models + their user-driven transform (#4)
 mod decal_projector;
 mod forge_scale;
 mod gfxbench; // the in-app graphics benchmark (frame period / update() CPU / per-pass GPU)
 mod film_perf; // #film-perf the Theater frame profiler (`film perf`)
+#[cfg(test)]
+mod film_openperf; // #film-open-perf  the open-path timing probe + budget gate
+#[cfg(test)]
+mod film_corrupt; // #film-crc  what a damaged / cut / padded clip does to the reader
 mod gfxsettings; // Settings ▸ Graphics & performance — the quality ladder and its knobs
 mod h2a; // Halo 2 Anniversary (MCC "groundhog") support -- the Halo 4 reader with one constant changed
 mod h3; // Halo 3 (MCC) support -- a Reach-family container (own reader, classic Gen3 resource paging)
@@ -67,6 +80,8 @@ mod play_mode; // #play  test mode: spawn as a Spartan / Elite and walk around t
 mod play_pickup; // #pickup  test mode: pick a weapon up off the map
 mod play_hud; // #play-hud  test mode's own HUD values: the weap magazines layout, player vitality, grenades
 mod play_vehicle; // #seat-entry  test mode's vehicles: the prompt, getting in, riding, driving
+mod play_vehicle_fx; // #vehicle-fx  vehicle lights + effects: the engine function inputs a driven vehicle feeds its ligh/effe attachments
+mod play_sound_proj; // #projectile-sound  a projectile's own looping sounds (its `lsnd` attachments)
 mod play_sound; // #play-sound  test mode's sound: vehicle engines, own weapon, footsteps
 mod physics_settle; // "Simulate physics": the phmo rigid-body settle (#settle)
 mod phmo_shapes; // phmo rigid bodies -> settle shapes, both games (#settle)
@@ -80,6 +95,7 @@ mod mvar;
 mod numfield; // signed numeric text entry (a '-' anywhere = sign flip)
 mod quant_error; // #quant-error  predict the pose a .mvar will actually hold (save-precision ghost + numbers)
 mod quant_error_ui; // #quant-error  the ghost overlay, the Object-panel numbers, snap-to-representable, `precision`
+mod man_cannon_preview; // #cannon-preview  editor: where a Spartan dropped into the selected man cannon lands
 mod prefab; // #prefab  saved object groups (GitHub issue #5): the file format, the geometry and the resolver
 mod prefab_app; // #prefab  the per-game adapter, the Tools > Prefabs panel and the `prefab` verb
 mod project;
@@ -96,6 +112,8 @@ mod reach_hud; // #reach-hud  the first-person HUD from the chud tags: ammo/gren
 mod reach_jmad; // Reach model_animation_graph decode: codecs + sampling (#reach-skin)
 mod reach_projectile; // #projectile  Reach `weap` BARRELS + `proj` tag fields (what a shot launches and plays)
 mod play_fire; // #weapon-fire  the engine's trigger / barrel / magazine state machines: held fire, recovery, bursts, heat, charge
+mod reach_vehicle_weapons; // #vehicle-weapons  what a vehicle fires (unit weapons block) and which seat works it
+mod play_projectile; // #projectile-sim  test mode: every shot is a `proj` that flies, collides, ends and is drawn on the Theater lane
 mod reach_weapon; // #weapon-fire  the Reach weap FIRING MODEL: trigger/barrel/magazine tags + the engine's per-tick fire state machine
 mod reach_damage; // #damage  Reach `jpt!` + an object model's vitality / damage sections / responses
 mod reach_physics; // #gravity  Reach's ONE gravity constant + the biped physics law
@@ -103,6 +121,12 @@ mod reach_havok; // #havok  the Havok rigid body UNDER the vehicle code: integra
 mod reach_havok_solver; // #havok-solver  the engine's Havok pipeline: contact solver, admission, TOI, sleep (research/havok/)
 #[cfg(test)]
 mod play_ledge_gates; // #ledge-gate  driving off edges through the real PlayMode::tick
+mod play_bump_gates; // #bump-gate  bumping a parked vehicle or prop never drops it; the player never walks through it
+mod bump_trace; // #bump-trace  always-on, print-only trace of which code owns, moves and draws a touched object (bump_trace.log)
+mod prop_fall; // #prop-fall  always-on, print-only fall diagnostic for loose bodies (prop_fall.log)
+mod prop_diag; // #bump-class  `play propdiag`: a print-only report of the prop world on the headless host's real scene
+mod play_driven; // #driven-sim  a driven vehicle's hull resolved by the engine's Havok pipeline (reach_havok_solver)
+mod play_launch; // #man-cannon  test mode: man cannons / grav lifts launch bipeds, vehicles and props
 mod play_world; // #play-world  test mode's rigid-body world: every physics-enabled object is simulated
 mod reach_collision; // #collision  Reach's COLLISION GROUPS: which physics collides with which
 mod reach_grip; // #ride-grip  a rider's hands follow the vehicle's steering node (two-bone solve)
@@ -1118,7 +1142,7 @@ fn main() -> eframe::Result<()> {
                     std::process::exit(1);
                 }
             };
-            let idx = film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+            let idx = film_decode::build_index_film(&f);
             let pb = film_play::Playback::new(idx);
             let roster = film_ui::roster_lines(&f, &pb, &std::collections::HashMap::new());
             let rows = film_ui::scoreboard_rows(&roster, None);
@@ -1230,6 +1254,38 @@ fn main() -> eframe::Result<()> {
                 Some(n) => film_stats::cli(&targets, json, n),
                 None => film_stats::cli(&targets, json, &film_stats::NoNames),
             };
+            drop(scene);
+            std::process::exit(code);
+        }
+        // #film-follow  `hms-app --film-follow <film|.temp> [--emit json-lines|csv] ...`: tail a growing
+        // film and print events as JSON lines. NO window, NO wgpu device, NO audio: this runs (and
+        // exits) before any of those are created, like `--film-stats` above. `--map` is only used
+        // to turn object definitions into tag paths.
+        if let Some(pos) = args.iter().position(|a| a == "--film-follow") {
+            let rest: Vec<String> = args[pos + 1..].to_vec();
+            let map = rest.iter().position(|a| a == "--map").and_then(|i| rest.get(i + 1)).cloned();
+            let mut scene = None;
+            let mut names: Option<film_stats::MapNames> = None;
+            if let Some(m) = &map {
+                match cli_scene_controller() {
+                    Some(mut sc) => match sc.open_cache(m) {
+                        Ok(()) => {
+                            if let (Some(c), n) = (sc.cache_handle(), sc.native_dll()) {
+                                names = Some(film_stats::MapNames::build_with_map(n, c, Some(std::path::Path::new(m))));
+                            }
+                            scene = Some(sc);
+                        }
+                        Err(e) => eprintln!("--film-follow: --map {m} did not open ({e:#}); tag names will not be resolved"),
+                    },
+                    None => eprintln!("--film-follow: no native library; tag names will not be resolved"),
+                }
+            }
+            let code = film_follow::run_cli(
+                &rest,
+                names.as_ref().map(|n| n as &dyn film_stats::NameSource),
+                &mut std::io::stdout().lock(),
+                &mut std::io::stderr(),
+            );
             drop(scene);
             std::process::exit(code);
         }
@@ -2906,6 +2962,9 @@ struct App {
     /// frame paint without it; only then does the (blocking) import run (loading
     /// inline would leave the dialog on screen for the whole load).
     pending_open_variant: Option<(std::path::PathBuf, u8)>,
+    /// #film-scene  The film's in-memory scene variant waiting for the scene to be warm (see
+    /// `film_render_scene`). Never a path.
+    film_scene_retry: Option<(std::sync::Arc<mvar::Variant>, u8)>,
     /// #film  WHICH variant path is THE FILM'S OWN Forge scene, so `import_mvar` does not tear
     /// the clip down when that one lands.
     ///
@@ -3027,6 +3086,8 @@ struct App {
     /// #projectile  What the FILM effect lane installed last frame (muzzle flashes, projectile
     /// trails, detonations) -- for the Theater caption.
     film_fx: film_projectile::FxReport,
+    /// #vehicle-fx  THEATER's recorded vehicles' lights and effects (test mode's live in `play`).
+    theater_fx: play_vehicle_fx::TheaterFx,
     film_timeline_open: bool,
     /// The worker building the index (a film is read and decoded off the UI thread).
     film_index_rx: Option<std::sync::mpsc::Receiver<Result<film_decode::FilmIndex, String>>>,
@@ -3035,6 +3096,8 @@ struct App {
     /// open clip re-decodes as the file grows, so a match can be watched while it is played.
     /// Persisted by `film::load_follow_live_setting` / `save_follow_live_setting`.
     film_follow_live: bool,
+    /// #film-highlight  Theater: highlight script-relevant objects + placeholders for invisible ones.
+    film_hl: film_highlight::State,
     /// #film-live  The length the open film had when it was last decoded. A `.temp` is written in
     /// 512 KiB blocks, so growth is the only reliable signal that there is more to read.
     film_follow_len: u64,
@@ -3209,6 +3272,8 @@ struct App {
     /// #quant-error  Signature of everything the ghost's geometry depends on, so the shared
     /// overlay lanes are only rebuilt when the ghost would change (it must follow a live drag).
     quant_ghost_sig: u64,
+    /// #cannon-preview  View > Man cannon trajectory (persisted `man_cannon_trajectory.txt`) and its cache.
+    cannon_preview: man_cannon_preview::State,
     /// Draw the structure-design soft ceilings (kill floor / acceleration /
     /// slip planes). Off by default, persisted (`soft_ceilings.txt`), script `softceilings`.
     show_soft_ceilings: bool,
@@ -3884,6 +3949,7 @@ impl App {
             spawn_status: String::new(),
             variant_browser_open: false,
             pending_open_variant: None,
+            film_scene_retry: None,
             film_own_scene: None,
             film_pending_scene_map: None,
             pending_open_film: None,
@@ -3903,6 +3969,7 @@ impl App {
             film_fp_cache: None,
             film_fp_armour: None,
             film_fx: Default::default(),
+            theater_fx: Default::default(),
             film_hide_editor: true,
             film_driver: Default::default(),
             play: None,
@@ -3914,6 +3981,7 @@ impl App {
             film_timeline_open: false,
             film_index_rx: None,
             film_follow_live: crate::film::load_follow_live_setting(),
+            film_hl: film_highlight::State::load(),
             film_follow_len: 0,
             film_follow_next: None,
             film_follow_rx: None,
@@ -3986,6 +4054,7 @@ impl App {
             wire_xray: wire_xray::load_setting(),
             quant_ghost: quant_error_ui::env_setting().unwrap_or_else(quant_error_ui::load_setting),
             quant_ghost_sig: 0,
+            cannon_preview: man_cannon_preview::State::for_app(),
             show_soft_ceilings: soft_ceilings::load_setting(),
             show_hard_floor: hard_floor::load_setting(),
             show_playable_bounds: hard_floor::load_playable_setting(),
@@ -4347,15 +4416,19 @@ impl App {
                         self.rtgi_gain = self.renderer.rtgi_default_gain();
                         self.rtgi_dyn = Default::default(); // the new tracer scene holds no placed pieces yet
                         self.renderer.rtgi_set_gain(&q, self.rtgi_gain);
+                        self.renderer.rtgi_focus([self.camera.pos.x, self.camera.pos.y, self.camera.pos.z]);
                         self.renderer.rtgi_warm_up(&dev, &q, 8);
                     }
                     None => { self.map_status = "Real-time lighting: no level geometry to trace.".into(); self.show_rtgi = false; return; }
                 }
             }
             self.renderer.set_rtgi_enabled(&q, true);
+            // the baked lights' direct term is in the shipped atlas, not in the probes: draw it per pixel while the probes light the map
+            if let Some(sc) = self.scene_ctl.as_ref() { sc.set_stli_direct(sc.engine_sky_lights().is_some()); }
             if self.sun_edited { self.apply_sun_edit(); } // keep a user-moved sun across scene rebuilds
         } else {
             self.renderer.set_rtgi_enabled(&q, false);
+            if let Some(sc) = self.scene_ctl.as_ref() { sc.set_stli_direct(false); }
         }
     }
 
@@ -5377,6 +5450,10 @@ impl App {
                 }
             }
         }
+        if self.film_scene_retry.is_some() && self.load_rx.is_none() && self.scene_ctl.is_some() && self.film.is_some() {
+            let (v, attempts) = self.film_scene_retry.take().unwrap();
+            self.film_render_scene(v, attempts);
+        }
         // HMS_DIAG object-path trace (throttled ~1/sec) so a live run reveals where the
         // forge-object pipeline breaks: MMF connected? object count? mode_tags resolved?
         let diag = {
@@ -5706,6 +5783,18 @@ impl App {
     /// forge-light repack and the selection-highlight refresh — split out so the object-pipeline
     /// early-out (#gfx-perf) can skip everything else without skipping these.
     fn tick_scene_per_frame(&mut self, anim_time: f32) {
+        // #vehicle-fx  A driven vehicle's head- and brake lights and attached effects, BEFORE the
+        // light re-pack below (they ride the same uniform).
+        if let Some(sc) = self.scene_ctl.as_mut() {
+            // (the particle lane's clock is the film's own while a film plays)
+            let t = self.film_play.as_ref().map_or(anim_time, |p| p.anim_seconds());
+            let fx = match self.play.as_mut() {
+                Some(p) => Some(&mut p.vehicle_fx),
+                None if self.film_play.is_some() => Some(&mut self.theater_fx.state),
+                None => None,
+            };
+            play_vehicle_fx::install(sc, fx, t, &self.render_state.device, &self.render_state.queue);
+        }
         // Forge lights ILLUMINATE — re-pack the SimpleLights uniform each frame so the 8
         // nearest the camera cast real light on nearby surfaces (not just self-glow). Gated so
         // maps with no forge lights keep their scenario-only lights uploaded at load.
@@ -6135,6 +6224,7 @@ impl App {
     fn update_actors(&mut self) {
         if self.actor_scene.actors.is_empty() && !self.actor_scene.rebuild {
             self.actor_clock = None;
+            self.theater_fx.state.frame = Default::default();
             // #armour-fx Nothing posed any more: drop the actor particle lane, or the last
             // frame's armour effect would hang in the air where the body used to be.
             if let Some(sc) = self.scene_ctl.as_mut() {
@@ -6145,6 +6235,18 @@ impl App {
         let now = std::time::Instant::now();
         let dt = self.actor_clock.map(|t| (now - t).as_secs_f32().min(0.25)).unwrap_or(0.0);
         self.actor_clock = Some(now);
+        // #projectile-sim  Theater's SIMULATED shots (the rounds a film never replicates) put their
+        // models on the actor pool, so this runs before the mesh rebuild below.
+        if let (Some(pb), Some(sc)) = (self.film_play.as_deref(), self.scene_ctl.as_ref()) {
+            if let Some(cache) = sc.cache_handle() {
+                let world = play_projectile::SceneWorld(sc as &dyn objscene::ObjectScene);
+                self.film_driver.synth_shots(pb, Some(&world), &mut self.actor_scene, sc.native_dll(), cache);
+            }
+        }
+        // #fp-wave  The first-person rig is drawn relative to the eye: the actors and the renderer get
+        // the SAME origin, before anything is posed, built or uploaded this frame.
+        self.actor_scene.set_fp_origin(self.camera.pos);
+        self.renderer.set_first_person_origin(self.camera.pos);
         if self.actor_scene.rebuild {
             let device = self.render_state.device.clone();
             let queue = self.render_state.queue.clone();
@@ -6173,11 +6275,16 @@ impl App {
                 sc.set_actor_particle_sources(srcs);
             }
         }
+        // #vehicle-fx  THEATER: the recorded vehicles' lights follow whoever the film seats in them.
+        match (self.film_play.as_deref(), self.scene_ctl.as_ref().and_then(|sc| sc.cache_handle().map(|c| (sc, c)))) {
+            (Some(pb), Some((sc, cache))) => self.theater_fx.step(&self.film_driver, pb, &self.actor_scene, sc.native_dll(), cache),
+            _ => self.theater_fx.state.frame = Default::default(),
+        }
         // #projectile  The FILM lane, from the same pose: the weapon firing effects, the recorded
         // projectiles' travelling effects and the detonations. Computed here rather than inside
         // `ActorDriver::sync` for exactly the reason the actor lane is -- a muzzle flash sits on a
         // marker of the gun in a hand, so it needs the pose `update` has just written.
-        let want_fx = match (self.film_play.as_deref(), self.scene_ctl.as_ref()) {
+        let mut want_fx = match (self.film_play.as_deref(), self.scene_ctl.as_ref()) {
             (Some(pb), Some(scene)) => match scene.cache_handle() {
                 Some(cache) => {
                     let native = scene.native_dll();
@@ -6187,9 +6294,27 @@ impl App {
             },
             _ => Vec::new(),
         };
+        // #projectile-sim  TEST MODE's projectiles ride the very same lane: the models on the
+        // actor lane, the trails and endings in the film particle lane.
+        // (The film driver's lists are only meaningful while a film is open: they are rewritten by
+        // `film_effects`, which nothing calls once the clip is closed.)
+        let (mut want_beams, mut want_trails): (Vec<film_projectile::FilmBeam>, Vec<film_projectile::FilmContrail>) =
+            if self.film_play.is_some() { (self.film_driver.beams.clone(), self.film_driver.contrails.clone()) } else { (Vec::new(), Vec::new()) };
+        if let (Some(pm), Some(sc)) = (self.play.as_mut(), self.scene_ctl.as_ref()) {
+            if let Some(cache) = sc.cache_handle() {
+                pm.projectiles.sync_actors(sc.native_dll(), cache, &mut self.actor_scene);
+            }
+            want_fx.extend(pm.projectiles.effects());
+            want_beams.extend(pm.projectiles.beams());
+            want_trails.extend(pm.projectiles.contrails());
+        }
         if let Some(sc) = self.scene_ctl.as_mut() {
             if !want_fx.is_empty() || sc.film_particle_source_count() > 0 {
                 self.film_fx = film_projectile::install(sc, &want_fx);
+            }
+            if !want_beams.is_empty() || !want_trails.is_empty() || sc.film_beam_count() > 0 {
+                film_projectile::install_beams(sc, &want_beams);
+                film_projectile::install_contrails(sc, want_trails);
             }
         }
     }
@@ -9786,6 +9911,10 @@ impl App {
             // then prove the raycast soup followed (settle an object onto it).
             // #film  Reach Theater saved films: open, describe, draw, extract.
             EditorCommand::Film { sub, args } => {
+                // #film-data  megalo / variant / events / seats / score: shared with the headless host.
+                if let Some(r) = film_data::dispatch(self.film_path.as_deref(), self.film.as_deref(), self.film_play.as_ref().map(|p| &p.index), sub.as_str(), &args) {
+                    return r;
+                }
                 match sub.as_str() {
                     "info" | "summary" => {
                         let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
@@ -10161,7 +10290,7 @@ impl App {
                         let mode = pb.name_tags;
                         reach_hud::save_name_tag_mode(mode);
                         let snapshot = pb.clone();
-                        let tags = film_ui::name_tags(&snapshot, self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]), self.film_driver.cap);
+                        let tags = film_ui::name_tags_with(&snapshot, self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]), self.film_driver.cap, &self.film_driver.monitor_owner);
                         let named = tags.iter().filter(|t| t.named).count();
                         Ok(format!(
                             "name tags {}; {} tag(s) at this moment, {named} with a gamertag\n",
@@ -10942,6 +11071,15 @@ impl App {
                     self.renderer.set_highlight_xray(on);
                 }
                 Ok(self.wire_xray_status())
+            }
+            // #cannon-preview  Persisted like the View checkbox.
+            EditorCommand::CannonPreview(set) => {
+                if let Some(on) = set {
+                    self.cannon_preview.on = on;
+                    man_cannon_preview::save_setting(on);
+                    self.overlays_dirty = true;
+                }
+                Ok(self.cannon_preview_status())
             }
             // Persisted like the View checkbox; `get` also lists every ceiling.
             EditorCommand::SoftCeilings(set) => {
@@ -13238,31 +13376,43 @@ impl App {
                 return;
             }
         }
-        // #film-action  ONE decision and one set of words, in `film_export::scene_request`.
-        // The APPLY stays here and must: the GUI switches canvas through its asynchronous
-        // `pending_open_variant` pipeline so the switch is the first thing that happens rather
-        // than a side effect of the import, while the script host applies straight. Those two
-        // cannot be forced together; the decision and the wording can, and when they were not,
-        // the script host silently drew no scene at all.
-        match film_export::scene_request(&f) {
-            Ok(out) => {
+        // #film-scene  The scene is drawn from the variant the film EMBEDS, in memory. No canvas
+        // `.mvar` is read, no temp file is written and no path is remembered, so a missing or
+        // other-build canvas cannot stop a clip from showing its scene and File > Save has
+        // nothing to overwrite. One builder, `film_export::variant_from_film`, shared with the
+        // script host's `film scene`.
+        match film_export::variant_from_film(&f) {
+            Ok(v) => {
                 self.film_status = format!(
-                    "Drawing {} objects from {:?} (canvas: {}) \u{2014} decoding the recording\u{2026}",
-                    out.objects,
-                    out.title,
-                    out.template.file_name().unwrap_or_default().to_string_lossy()
+                    "Drawing {} objects from {:?} (read-only, from the film itself) \u{2014} decoding the recording\u{2026}",
+                    v.objects.len(),
+                    v.title
                 );
-                // #film  The clip is loading its OWN scene; this is not the user opening a
-                // variant, so `import_mvar` must leave the film alone when it lands.
-                self.film_own_scene = Some(out.path.clone());
-                self.pending_open_variant = Some((out.path, 1));
+                self.film_render_scene(std::sync::Arc::new(v), 8);
                 self.film_start_index();
             }
             Err(why) => {
-                // `scene_request` has already said what the user can act on.
                 self.film_status = why;
                 self.spawn_status = self.film_status.clone();
             }
+        }
+    }
+
+    /// #film-scene  Put the film's own variant on screen. The same `render_variant_objects` a
+    /// `.mvar` open uses, minus everything that belongs to a FILE: no last-variant memory, no
+    /// recent-files entry, and `current_variant_path` / `new_variant_template` are CLEARED so a
+    /// later Save has nothing to write over (the scene replaces whatever variant was open).
+    /// A first render that places nothing (scene not warm yet) is retried a few ticks, as a file
+    /// open is.
+    fn film_render_scene(&mut self, variant: std::sync::Arc<mvar::Variant>, attempts: u8) {
+        self.variant_retry = None;
+        self.current_variant_path = None;
+        self.new_variant_template = None;
+        let placed = self.render_variant_objects(&variant, "film scene (read-only)");
+        if placed == 0 && attempts > 1 {
+            self.film_scene_retry = Some((variant, attempts - 1));
+        } else {
+            self.film_scene_retry = None;
         }
     }
 
@@ -13309,7 +13459,7 @@ impl App {
         self.spawn_status = self.film_status.clone();
     }
 
-    /// Extract the film's game variant (raw struct + readable notes).
+    /// Extract the film's game variant as a loadable `.bin` (plus readable notes).
     fn film_extract_game_variant(&mut self) {
         let Some(f) = self.film.clone() else { return };
         let stem = film_export::safe_stem(&f.header.game_variant.title, "extracted_gametype");
@@ -13318,15 +13468,21 @@ impl App {
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(std::env::temp_dir);
-        let dst = Self::film_unique_path(&dir, &stem, "reach_gv");
+        let dst = Self::film_unique_path(&dir, &stem, "bin");
         match film_export::export_game_variant(&f, &dst) {
             Ok(out) => {
-                self.film_status = format!(
-                    "Wrote {} bytes to {} (and the notes to {}). This is the raw struct, NOT a loadable .bin — see the notes.",
-                    out.bytes,
-                    out.struct_path.display(),
-                    out.notes_path.file_name().unwrap_or_default().to_string_lossy()
-                );
+                let notes = out.notes_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                self.film_status = match (&out.bin_path, &out.why_no_bin) {
+                    (Some(bin), _) => format!(
+                        "Wrote the game variant to {} ({} bytes, a loadable Reach .bin) and the notes to {notes}.",
+                        bin.display(), out.bytes
+                    ),
+                    (None, why) => format!(
+                        "Could not build a .bin ({}). Wrote the raw struct to {} and the notes to {notes} instead.",
+                        why.clone().unwrap_or_default(),
+                        out.struct_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                    ),
+                };
             }
             Err(e) => self.film_status = format!("Could not extract the gametype: {e}"),
         }
@@ -13418,15 +13574,7 @@ impl App {
             // one of those is exactly the kind of thing that panics intermittently while the
             // film under test is perfectly fine.
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                film::open(&path).map_err(|e| e.to_string()).map(|f| {
-                    film_decode::build_index_players(
-                        &f.bytes,
-                        &f.data,
-                        &f.header.map_variant,
-                        f.recorder_slot(),
-                        &f.header.players,
-                    )
-                })
+                film::open(&path).map_err(|e| e.to_string()).map(|f| film_decode::build_index_film(&f))
             }))
             .unwrap_or_else(|e| {
                 // The payload is whatever `panic!` was given: `&str` and `String` cover the
@@ -13577,15 +13725,7 @@ impl App {
         let (tx, rx) = std::sync::mpsc::channel();
         self.film_follow_rx = Some(rx);
         std::thread::spawn(move || {
-            let r = film::open(&path).map_err(|e| e.to_string()).map(|f| {
-                film_decode::build_index_players(
-                    &f.bytes,
-                    &f.data,
-                    &f.header.map_variant,
-                    f.recorder_slot(),
-                    &f.header.players,
-                )
-            });
+            let r = film::open(&path).map_err(|e| e.to_string()).map(|f| film_decode::build_index_film(&f));
             let _ = tx.send(r);
         });
     }
@@ -13717,16 +13857,7 @@ impl App {
             // #fp-arms  The CAMERA's subject, by slot -- including the owner-keyed route the
             // window's camera list uses. Asking only the body's slot binding returned None for an
             // owner group the recording never bound, and no armour was installed at all.
-            let slot = pb.subject_slot()?;
-            let a = self
-                .film
-                .as_deref()?
-                .header
-                .players
-                .iter()
-                .find(|p| p.index as u8 == slot)?
-                .appearance()?;
-            Some((slot, a.slots.to_vec()))
+            pb.subject_armour()
         });
         if let (Some((slot, app)), Some(sc)) = (fp_dress, self.scene_ctl.as_mut()) {
             self.film_fp_armour = self.film_driver.dress_first_person(sc, slot, &app, self.film_fp_armour);
@@ -13785,6 +13916,7 @@ impl App {
             self.update_actors();
             self.fprof.lap(8); // #film-perf  pose + bone palettes (+ any mesh rebuild)
         }
+        self.film_highlight_frame();
         // Drive the camera from the film in the player camera modes. Done AFTER the actors are
         // placed so a first-person pose uses this tick's position, and it writes the ordinary
         // free camera's fields, so leaving the mode just stops writing them and the user keeps
@@ -13985,6 +14117,8 @@ impl App {
             // and not a `mem::take`: taking the engine out would drop its open device and its
             // decoded samples once a frame.
             let sound = &mut self.sound;
+            let hl = &mut self.film_hl;
+            let mut hl_changed = false;
             if let Some(pb) = self.film_play.as_deref_mut() {
                 egui::SidePanel::right("film_panel")
                     .default_width(360.0)
@@ -13996,8 +14130,13 @@ impl App {
                             // section lives in `film_stats`, and the numbers were computed once
                             // when the index landed.
                             film_stats::panel_ui(ui, stats_ref, stats_open);
+                            // #film-highlight  switch, legend/filter and click-to-focus list.
+                            hl_changed = film_highlight::panel_ui(ui, hl);
                         });
                     });
+            }
+            if hl_changed {
+                self.film_hl.save();
             }
             // #film-live  put them back now the panel's borrow of `self.film_play` is over.
             self.film_follow_live = follow_live;
@@ -14044,19 +14183,37 @@ impl App {
             .as_ref()
             .map(|p| p.file_name().unwrap_or_default().to_string_lossy().into_owned())
             .unwrap_or_else(|| "Saved film".into());
-        egui::Window::new(format!("Saved film — {title}"))
+        // The card used to take whatever width its widest unwrapped line asked for and ran off the
+        // edge of the screen. Cap it to the screen, keep the whole window on screen, and let the
+        // content scroll (both ways) rather than widen the window.
+        let screen = ctx.screen_rect();
+        let max_w = (screen.width() - 32.0).max(320.0);
+        let max_h = (screen.height() - 48.0).max(240.0);
+        let short_title: String = if title.chars().count() > 40 {
+            format!("{}…", title.chars().take(39).collect::<String>())
+        } else {
+            title.clone()
+        };
+        egui::Window::new(format!("Saved film — {short_title}"))
+            .id(egui::Id::new("saved_film_card"))
             .open(&mut open)
-            .default_width(560.0)
+            .default_width(560.0f32.min(max_w))
+            .max_width(max_w)
+            .max_height(max_h)
+            .constrain(true)
             .collapsible(true)
             .show(ctx, |ui| {
-                action = film_ui::card_ui(
-                    ui,
-                    &f,
-                    &mut show_machine,
-                    label.as_deref(),
-                    &self.film_status,
-                    self.film_variant_names.as_deref(),
-                );
+                egui::ScrollArea::both().auto_shrink([true, true]).max_height(max_h - 40.0).show(ui, |ui| {
+                    ui.set_max_width(max_w - 24.0);
+                    action = film_ui::card_ui(
+                        ui,
+                        &f,
+                        &mut show_machine,
+                        label.as_deref(),
+                        &self.film_status,
+                        self.film_variant_names.as_deref(),
+                    );
+                });
             });
         self.film_show_machine = show_machine;
         match action {
@@ -15834,6 +15991,8 @@ impl App {
                         }
                     });
                 }
+                // #cannon-preview  Where a Spartan dropped into the selected man cannon lands.
+                self.cannon_preview_menu(ui);
                 // The scenario's trigger volumes (kill/safe/plain boxes). Not persisted.
                 if ui.checkbox(&mut self.show_triggers, "Trigger volumes")
                     .on_hover_text("Draw the scenario's trigger volumes as wireframe boxes: red = kill, green = safe, amber = plain. Script: triggers on|off|get.")
@@ -17199,7 +17358,6 @@ impl App {
         let tick = pb.tick.round().max(0.0) as u32;
         let bipeds: Vec<(u32, [f32; 3])> =
             pb.bipeds(self.film_driver.cap).into_iter().map(|p| (p.net_id, p.pos)).collect();
-        let players = self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]);
         // The VIEWER, exactly as the player names resolve one: whoever the Theater camera is on,
         // else the player who recorded the film.
         let (viewer_team, teams) = match self.film.as_deref() {
@@ -17209,23 +17367,142 @@ impl App {
                     .owner(&pb.index)
                     .and_then(|o| pb.index.slot_of_owner(o))
                     .or_else(|| f.recorder_slot());
+                // #film-roster  The viewer's team is their BODY's team stamp (the roster's, as of
+                // this tick), not the header's stale per-slot byte.
                 let t = v
-                    .and_then(|s| f.header.players.iter().find(|p| p.present() && p.index == s as usize))
-                    .map(|p| p.team)
+                    .and_then(|s| pb.index.team_of_slot_at(s, pb.tick.round().max(0.0) as u32))
                     .unwrap_or(reach_chud::TEAM_NONE);
                 (t, f.header.gametype.as_ref().is_some_and(|g| g.misc.teams_enabled()))
             }
             None => (reach_chud::TEAM_NONE, false),
         };
-        let team_of = |net: u32| -> u8 {
-            pb.index
-                .slot_of_entity(net)
-                .and_then(|s| players.iter().find(|q| q.present() && q.index == s as usize))
-                .map(|q| q.team)
-                .unwrap_or(reach_chud::TEAM_NONE)
-        };
+        let team_of = |net: u32| -> u8 { pb.index.team_of_entity(net).unwrap_or(reach_chud::TEAM_NONE) };
         let ws = film_objective::waypoints(table, &pb.index, tick, &bipeds, viewer_team, teams, &team_of);
         film_objective::waypoint_name_tags(&ws)
+    }
+
+    /// #film-highlight  Build this frame's highlight geometry and push it into the zone/ghost lanes.
+    ///
+    /// Everything is a pure function of the tick: the objects alive now, placed by the recording
+    /// (riders follow their parent), outlined in their category colour. A zone draws its shape; an
+    /// object with a collision/physics hull draws that hull's oriented bounds (filled when it has no
+    /// drawable model -- the placeholder); anything else a small cube. OFF draws nothing at all.
+    fn film_highlight_frame(&mut self) {
+        use film_highlight as fh;
+        if !self.film_hl.on {
+            if self.film_hl.drawn {
+                self.film_hl.drawn = false;
+                self.film_hl.rows.clear();
+                self.film_hl.labels.clear();
+                self.film_hl.follow = None;
+                self.overlays_dirty = true; // hand the lanes back to the editor overlays
+            }
+            return;
+        }
+        // click-to-focus, then click-again-to-follow (before the playback borrow below)
+        if let Some(id) = self.film_hl.click.take() {
+            if let Some(p) = self.film_hl.rows.iter().find(|r| r.net_id == id).map(|r| glam::Vec3::from(r.pos)) {
+                if self.film_hl.focused == Some(id) {
+                    if self.film_hl.follow == Some(id) {
+                        self.film_hl.follow = None;
+                    } else {
+                        self.film_hl.follow = Some(id);
+                        self.film_hl.follow_off = self.camera.pos - p;
+                    }
+                } else {
+                    self.film_hl.focused = Some(id);
+                    self.film_hl.follow = None;
+                    if let Some(pb) = self.film_play.as_deref_mut() {
+                        pb.camera = film_play::FilmCamera::Free;
+                    }
+                    self.frame_on_point(p);
+                }
+            }
+        }
+        let (Some(pb), Some(scene)) = (self.film_play.as_deref(), self.scene_ctl.as_ref()) else { return };
+        let Some(cache) = scene.cache_handle() else { return };
+        if self.film_driver.objects.is_none() {
+            self.film_hl.status = "resolving the film's objects...".into();
+            return;
+        }
+        let native = scene.native_dll();
+        let key = (pb.index.tracks.len(), self.film_driver.def_tags.len());
+        if self.film_hl.table.is_none() || self.film_hl.key != key {
+            let full = self.film_path.as_deref().and_then(|p| film_data::full_film(p).ok());
+            let megalo = full.as_ref().filter(|f| film_megalo::decls_of(f).is_some()).map(|f| film_data::series_of(f));
+            let objs = self.film_driver.objects.as_ref();
+            let Some(film) = self.film.as_deref() else { return };
+            let hulls = std::cell::RefCell::new(&mut self.film_hl.hulls);
+            let table = fh::build(film, &pb.index, &self.film_driver.def_tags, megalo.as_deref(), &|id| {
+                objs.and_then(|t| t.objects.get(&id)).map_or(false, |o| o.draw == film_objective::Draw::Objective)
+            }, &|tag, leaf| match tag {
+                Some(t) => !hulls.borrow_mut().entry(t).or_insert_with(|| fh::hull_info(native, cache, t, leaf)).has_model,
+                None => false,
+            });
+            self.film_hl.carriers = fh::variable_carriers(&pb.index).to_vec();
+            self.film_hl.table = Some(std::sync::Arc::new(table));
+            self.film_hl.key = key;
+        }
+        let table = self.film_hl.table.clone().expect("built above");
+        let tick = pb.tick.round().max(0.0) as u32;
+        let mut live = fh::live_at(&table, &self.film_hl.flt, &pb.index, &self.film_driver.track_of, tick);
+        let total = live.len();
+        let cam = self.camera.pos;
+        live.sort_by(|a, b| {
+            let d = |l: &fh::Live| (glam::Vec3::from(l.pos) - cam).length_squared();
+            d(a).partial_cmp(&d(b)).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        live.truncate(400);
+        let (mut segs, mut tris) = (Vec::new(), Vec::new());
+        let (mut rows, mut labels) = (Vec::new(), Vec::new());
+        for (n, l) in live.iter().enumerate() {
+            let it = &table.items[l.item];
+            let hull = match it.obj_tag {
+                Some(t) => *self.film_hl.hulls.entry(t).or_insert_with(|| fh::hull_info(native, cache, t, &it.tag_leaf)),
+                None => fh::HullInfo::default(),
+            };
+            fh::item_geometry(it, l, hull, &mut segs, &mut tris);
+            let placeholder = !hull.has_model && it.zone.is_none();
+            rows.push(fh::Row { net_id: it.net_id, cat: it.cat, text: fh::label_text(it), pos: l.pos, placeholder });
+            if n < 40 {
+                labels.push(fh::Label { pos: [l.pos[0], l.pos[1], l.pos[2] + 0.5], text: fh::label_text(it), colour: it.cat.colour() });
+            }
+        }
+        rows.sort_by(|a, b| (a.cat, &a.text).cmp(&(b.cat, &b.text)));
+        // follow: keep the same offset from the object
+        if let Some(id) = self.film_hl.follow {
+            if let Some(p) = rows.iter().find(|r| r.net_id == id).map(|r| glam::Vec3::from(r.pos)) {
+                self.camera.pos = p + self.film_hl.follow_off;
+                let d = (p - self.camera.pos).normalize_or_zero();
+                if d.length_squared() > 1e-6 {
+                    self.camera.yaw = d.y.atan2(d.x);
+                    self.camera.pitch = d.z.clamp(-1.0, 1.0).asin();
+                }
+            }
+        }
+        self.film_hl.status = format!("{} shown of {} matching ({} classified in the film)", live.len(), total, table.items.len());
+        self.film_hl.rows = rows;
+        self.film_hl.labels = labels;
+        self.renderer.set_ghost_lines(&self.render_state.device, &segs);
+        self.renderer.set_zone_tris(&self.render_state.device, if tris.is_empty() { None } else { Some(&tris) });
+        self.film_hl.drawn = true;
+    }
+
+    /// #film-highlight  The small screen-space labels (name, id, team) over the nearest objects.
+    fn film_highlight_labels(&self, ui: &mut egui::Ui, viewport: egui::Rect) {
+        if !self.film_hl.on || self.film_hl.labels.is_empty() {
+            return;
+        }
+        let painter = ui.painter_at(viewport);
+        for l in &self.film_hl.labels {
+            let Some((x, y)) = self.world_to_screen(glam::Vec3::from(l.pos), viewport) else { continue };
+            if !viewport.contains(egui::pos2(x, y)) {
+                continue;
+            }
+            let font = egui::FontId::monospace(11.0);
+            painter.text(egui::pos2(x + 1.0, y + 1.0), egui::Align2::CENTER_BOTTOM, &l.text, font.clone(), egui::Color32::BLACK);
+            painter.text(egui::pos2(x, y), egui::Align2::CENTER_BOTTOM, &l.text, font, film_highlight::colour32(l.colour));
+        }
     }
 
     fn film_name_tags(&mut self, ui: &mut egui::Ui, viewport: egui::Rect) {
@@ -17239,10 +17516,11 @@ impl App {
             return;
         }
         let mut tags = match pb.name_tags.is_on() {
-            true => film_ui::name_tags(
+            true => film_ui::name_tags_with(
                 pb,
                 self.film.as_deref().map(|f| f.header.players.as_slice()).unwrap_or(&[]),
                 self.film_driver.cap,
+                &self.film_driver.monitor_owner,
             ),
             false => Vec::new(),
         };
@@ -17255,8 +17533,7 @@ impl App {
                     .and_then(|o| pb.index.slot_of_owner(o))
                     .or_else(|| f.recorder_slot());
                 let t = v
-                    .and_then(|s| f.header.players.iter().find(|p| p.present() && p.index == s as usize))
-                    .map(|p| p.team)
+                    .and_then(|s| pb.index.team_of_slot_at(s, pb.tick.round().max(0.0) as u32))
                     .unwrap_or(crate::reach_chud::TEAM_NONE);
                 (v, t, f.header.gametype.as_ref().is_some_and(|g| g.misc.teams_enabled()))
             }
@@ -17335,9 +17612,13 @@ impl App {
         if !pb.spectate_card || pb.camera == film_play::FilmCamera::Free {
             return;
         }
-        let Some(slot) = pb.camera.owner(&pb.index).and_then(|o| pb.index.slot_of_owner(o)) else { return };
+        // #film-roster  The seat the camera is on AT THIS TICK, from the roster -- not the header's
+        // lobby record for a slot (stale, and absent for an owner group that is a whole team).
+        let Some(seat) = pb.subject_seat_index().map(|k| &pb.index.roster.seats[k]) else { return };
         let Some(film) = self.film.as_deref() else { return };
-        let Some(p) = film.header.players.iter().find(|q| q.present() && q.index == slot as usize) else { return };
+        let service_tag =
+            film.header.players.iter().find(|q| q.present() && q.xuid == seat.identifier).map(|q| q.service_tag.clone()).unwrap_or_default();
+        let name = seat.name.clone();
         let Some(sc) = self.scene_ctl.as_ref() else { return };
         let Some(cache) = sc.cache_handle() else { return };
         let Some(screen) = reach_chud::spectate_screen(sc.native_dll(), cache) else { return };
@@ -17346,7 +17627,7 @@ impl App {
             &ui.painter_at(viewport),
             viewport,
             &screen,
-            reach_chud::SpectateText { name: &p.gamertag, service_tag: &p.service_tag },
+            reach_chud::SpectateText { name: &name, service_tag: &service_tag },
             cache,
             &|t| sc.decode_bitmap_keep_alpha_public(t),
             // #row-colour  The spectated player's own colour, resolved exactly the way a
@@ -17354,7 +17635,7 @@ impl App {
             // the same player.
             reach_widget::ui_globals_for(sc.native_dll(), cache).and_then(|g| {
                 let rows = film_ui::scoreboard_rows(&self.film_roster, self.film_stats.as_deref());
-                let row = rows.iter().find(|r| r.name == p.gamertag)?;
+                let row = rows.iter().find(|r| r.name == name)?;
                 film_ui::bitmap_tint(&g, row)
             }),
         );
@@ -18327,6 +18608,7 @@ impl App {
         // saturate to white against a bright Forge piece.
         let mut ghost: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
         self.push_quant_ghost(&mut ghost);
+        self.push_man_cannon_preview(&mut ghost);
         self.renderer.set_ghost_lines(&self.render_state.device, &ghost);
         self.renderer.set_xray_lines(&self.render_state.device, &xray);
         self.renderer.set_zone_tris(&self.render_state.device, if ztris.is_empty() { None } else { Some(&ztris) });
@@ -19431,6 +19713,9 @@ impl eframe::App for App {
         // overlay lanes with the collision / blocker walks -- so poll a cheap signature of the
         // selection's poses and only mark the lanes dirty when the ghost would actually move.
         if self.quant_ghost.on && self.quant_ghost_poll() {
+            self.overlays_dirty = true;
+        }
+        if self.cannon_preview_poll(ctx) {
             self.overlays_dirty = true;
         }
         if self.overlays_dirty {
@@ -20577,6 +20862,7 @@ impl eframe::App for App {
                     // #quant-error  What the SAVE will cost this pose: the per-axis position
                     // delta, the rotation delta split into roll/pitch/yaw, and the snap action.
                     self.quant_error_rows(ui, datum);
+                    self.cannon_preview_rows(ui, datum);
                 }
                 if !self.mvar_meta.contains_key(&datum) {
                     // An object with no editable record (a scenario piece the viewer renders but
@@ -20875,6 +21161,9 @@ impl eframe::App for App {
                     if sim_particles {
                         let pm = scene.build_particle_meshes(self.camera.pos, fwd, right, up, time, self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue);
                         self.renderer.set_particle_meshes(pm);
+                        // #projectile-sim  The projectiles' light volumes (plasma streaks, tracers).
+                        let bm = scene.build_film_beam_meshes(time, self.renderer.mesh_renderer(), &self.render_state.device, &self.render_state.queue);
+                        self.renderer.set_beam_meshes(bm);
                     }
                     // Placed lens flares (efsc street-light glares, object attachment flares).
                     if want_flares {
@@ -20886,6 +21175,7 @@ impl eframe::App for App {
                 // Particles switched off entirely: drop the last batch so the final simulated
                 // frame cannot sit frozen in mid-air. (Assigning an empty Vec is free.)
                 self.renderer.set_particle_meshes(Vec::new());
+                self.renderer.set_beam_meshes(Vec::new()); // #projectile-sim
             }
             self.frame_prof_lap(2);
             self.fprof.lap(13);
@@ -20976,6 +21266,7 @@ impl eframe::App for App {
             // Blender-style floating tool buttons overlaid on the viewport (top-left), drawn in
             // THIS panel's layer and clamped to the viewport rect (see floating_toolbar).
             self.film_name_tags(ui, response.rect);
+            self.film_highlight_labels(ui, response.rect);
             // #reach-hud  Under the name tags and the card, over the render: the authored
             // first-person HUD, the weapon's reticule and the respawn countdown.
             self.film_first_person_hud(ui, response.rect);
@@ -21057,6 +21348,9 @@ impl eframe::App for App {
                         self.box_select_start = None;
                     }
                 }
+            }
+            if self.play.is_none() {
+                self.paint_man_cannon_labels(ui, response.rect);
             }
         });
 
@@ -21427,6 +21721,7 @@ impl App {
             return "not in test mode".into();
         };
         pm.leave(&mut self.actor_scene);
+        pm.projectiles.release(&mut self.actor_scene); // #projectile-sim
         self.play_sound.stop(&mut self.sound);
         // #play  THE CAMERA STAYS WHERE THE PLAYER WAS. `update_play` has already written the
         // play camera into `self.camera` this frame, so leaving it alone IS the fix -- the user
@@ -21567,11 +21862,19 @@ impl App {
             // `rounds per shot`, which the old "one per pull" assumption could not). A refused
             // shot still cost nothing, and a dry pull starts the reload the way the engine does.
             let ammo = self.play_hud.ammo.as_ref().map(|a| (a.loaded, self.play_hud.reloading.is_some(), a.reserve.unwrap_or(0) > 0));
+            // #projectile-sim  The scene clock the particle lane runs on (`time` in the render path),
+            // so a shot's trail and burst are born on the same clock they are drawn with.
+            let now = ctx.input(|i| i.time) as f32;
             for ev in pm.advance_fire(dt, fire_held, ammo) {
                 match ev {
-                    play_fire::FireEvent::Shot { projectiles, .. } => {
+                    play_fire::FireEvent::Shot { barrel, projectiles, .. } => {
                         if self.play_hud.before_fire() {
                             pm.fire(scene, dmg.as_deref_mut(), &projectiles);
+                            // #projectile-sim  And put the round in the air: from the gun's own
+                            // muzzle marker, flown and drawn by `play_projectile`.
+                            let sids = pm.projectiles.muzzle_info(native, cache, pm.weapon_tag, barrel).1;
+                            let muzzle = play_projectile::muzzle_world(sc, &self.actor_scene, &pm.fp, &sids);
+                            pm.launch_projectiles(scene, native, cache, barrel, &projectiles, muzzle, now);
                         }
                     }
                     play_fire::FireEvent::EmptyClick { .. } => self.play_hud.note_dry_pull(),
@@ -21581,13 +21884,23 @@ impl App {
                     play_fire::FireEvent::Overheated | play_fire::FireEvent::Cooled => {}
                 }
             }
+            // #vehicle-weapons  Seated in a gunner seat the trigger works the VEHICLE's weapon.
+            for ev in pm.advance_vehicle_fire(dt, fire_held, native, cache) {
+                if let play_fire::FireEvent::Shot { barrel, projectiles, .. } = ev {
+                    pm.launch_vehicle_projectiles(scene, native, cache, barrel, &projectiles, now);
+                }
+            }
             if let Some(wf) = pm.weapon_fire.as_ref() {
                 if let Some(m) = wf.def.barrels.first().and_then(|b| b.magazine) {
                     self.play_hud.adopt_rounds(wf.loaded[m], pm.shots);
                 }
             }
             pm.action_key_label = use_label;
+            // #fp-reload  The arms play the weapon's own reload clips for as long as the HUD reloads.
+            pm.fp_reload = self.play_hud.reloading.map(|age| (age, self.play_hud.reload_empty, self.play_hud.reload_missing));
             pm.tick(&input, dt, native, cache, scene, &objects, &mut self.actor_scene);
+            // #projectile-sim  Fly every projectile in the air, at the engine's 60 Hz.
+            pm.projectiles.advance(dt, now, &play_projectile::SceneWorld(scene));
             // #seat-entry  Entering and leaving a seat, AFTER the tick so the offer the key acts
             // on is this frame's. The vehicle's own prompt named this key, so pressing it when
             // nothing is offered is a no-op with a reason rather than a silent nothing.

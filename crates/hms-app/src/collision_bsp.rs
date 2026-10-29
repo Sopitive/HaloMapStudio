@@ -536,6 +536,18 @@ impl InstanceCollision {
     }
 }
 
+/// The instance's local-to-world transform: the render mesh's matrix (rotation + position, unit
+/// columns) AFTER the instance's UNIFORM SCALE, which the native keeps in the raw geometry
+/// (`ZhRawGeom::uniform_scale`) and applies to the local vertices before the matrix. PROVEN on
+/// forge_halo: the scale runs 0.54 .. 4.4 (def 27's rocks are 3.7-4.4x their prototype, def 124's
+/// are 0.54x), and a collision placed with the matrix alone was 1/s of the rock it belongs to --
+/// the island rocks the player walked through, and invisible walls where the scale is below 1.
+pub fn instance_matrix(native: &NativeDll, h: hms_native::BspHandle, mesh: u32, m: &hms_native::ZhBspMesh) -> glam::Mat4 {
+    let s = native.bsp_raw_geometry(h, mesh).map_or(1.0, |r| r.uniform_scale);
+    let s = if s.is_finite() && s > 1e-4 { s } else { 1.0 };
+    glam::Mat4::from_cols_array(&m.matrix) * glam::Mat4::from_scale(Vec3::splat(s))
+}
+
 /// The instanced geometry of one `sbsp` as collision triangles in WORLD space.
 #[derive(Clone, Debug, Default)]
 pub struct InstanceTris {
@@ -572,7 +584,7 @@ pub fn instance_tris(native: &NativeDll, cache: CacheHandle, sbsp: u32) -> Optio
         match def.and_then(|d| local.get(d)).and_then(|l| l.as_ref()) {
             Some(l) => {
                 if placed.insert(m.instance_ordinal) {
-                    let mat = glam::Mat4::from_cols_array(&m.matrix);
+                    let mat = instance_matrix(native, h, i, &m);
                     out.instances += 1;
                     out.placed.extend(l.iter().map(|t| t.map(|p| mat.transform_point3(p))));
                 }
@@ -837,13 +849,14 @@ mod tests {
     /// instance's render bounds (grown by 5 percent and 0.1 wu). Placing the collision with the
     /// transposed matrix, or with the wrong definition, fails this for most rotated instances.
     ///
-    /// SABOTAGE: `Mat4::from_cols_array(..).transpose()` -> red.
+    /// SABOTAGE: `Mat4::from_cols_array(..).transpose()` -> red; and `instance_matrix` returning the
+    /// matrix without the uniform scale -> the size assertion goes red (the island-rocks bug).
     #[test]
     #[ignore = "opens the native library; run alone with --ignored"]
     fn instance_collision_sits_inside_the_instance_render_bounds() {
         let Some((_g, native, cache)) = open() else { return };
         let native = &*native;
-        let (mut total, mut inside, mut rotated_inside, mut rotated) = (0, 0, 0, 0);
+        let (mut total, mut inside, mut rotated_inside, mut rotated, mut sized_ok) = (0, 0, 0, 0, 0);
         for &t in &native.tags_by_group(cache, "sbsp") {
             let ic = InstanceCollision::for_sbsp(native, cache, t).unwrap();
             let local: Vec<Option<Vec<Vec3>>> = ic.defs.iter().map(|d| d.collision.as_ref().map(|c| c.solid_triangles().into_iter().flat_map(|(t, _)| t).collect())).collect();
@@ -858,7 +871,7 @@ mod tests {
                 }
                 let Some(a) = native.instance_atlas_submap(cache, t, m.instance_ordinal) else { continue };
                 let Some(Some(pts)) = local.get(a.mesh_index as usize) else { continue };
-                let mat = glam::Mat4::from_cols_array(&m.matrix);
+                let mat = instance_matrix(native, h, i, &m);
                 let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
                 for p in pts {
                     let w = mat.transform_point3(*p);
@@ -880,6 +893,11 @@ mod tests {
                 let c = (mn + mx) * 0.5;
                 let ok = (c.cmpge(rmn - grow) & c.cmple(rmx + grow)).all();
                 let is_rotated = (mat.x_axis.y.abs() + mat.x_axis.z.abs()) > 0.2;
+                // THE SCALE: the collision is as big as the rock it belongs to. Placed without the
+                // instance's uniform scale it was 1/3.7 of def 27's rocks (and 1.9x def 124's).
+                let (cs, rs) = (mx - mn, rmx - rmn);
+                let sized = (cs / rs).cmpge(Vec3::splat(0.6)).all() && (cs / rs).cmple(Vec3::splat(1.1)).all();
+                sized_ok += sized as usize;
                 total += 1;
                 inside += ok as usize;
                 rotated += is_rotated as usize;
@@ -900,6 +918,8 @@ mod tests {
         }
         println!("{total} placed instances, {inside} inside their render bounds; of {rotated} rotated ones {rotated_inside}");
         assert!(total >= 1000 && rotated >= 100, "liveness: {total} instances, {rotated} rotated");
+        println!("{sized_ok} of {total} have a collision box within 0.6..1.1 of the render box on every axis");
+        assert!(sized_ok * 100 >= total * 90, "only {sized_ok} of {total} instances have collision as big as their render mesh");
         assert!(inside * 100 >= total * 97, "only {inside} of {total} instances sit inside their render bounds");
         assert!(rotated_inside * 100 >= rotated * 95, "rotated instances: {rotated_inside} of {rotated}");
     }

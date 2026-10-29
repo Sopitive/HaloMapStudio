@@ -703,7 +703,7 @@ pub fn build_timeline(pb: &Playback, tags: &CameraTags) -> CameraTimeline {
     let mut per: std::collections::HashMap<u32, Vec<ModeSegment>> = Default::default();
 
     // --- rides -> the vehicle camera -------------------------------------------------------
-    for ride in crate::film_anim::accepted_rides(idx) {
+    for ride in crate::film_anim::accepted_rides_cached(idx) {
         let seat = seat_index_of_ride(idx, &ride);
         let (third, from_tags) = tags.seat_is_third_person(ride.vehicle_net_id, seat);
         if !third {

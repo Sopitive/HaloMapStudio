@@ -147,6 +147,9 @@ pub struct Inputs {
     pub abs_throttle: f32,
     /// The driver's seat is occupied (by the player, in test mode).
     pub occupied: bool,
+    /// #vehicle-weapons  1 while the fire button is held on a weapon (`primary_trigger_down`,
+    /// `primary_firing`: the inputs a horn's and a chain gun's spin loop are scaled by), else 0.
+    pub trigger: f32,
 }
 
 impl Inputs {
@@ -155,7 +158,7 @@ impl Inputs {
     /// [`shift_ramp`].
     pub fn jeep(omega_over_max: f32, idle_ticks: u8, abs_throttle: f32) -> Inputs {
         let v = omega_over_max * shift_ramp(idle_ticks);
-        Inputs { engine_power: v, engine_rpm: v, abs_throttle, occupied: true }
+        Inputs { engine_power: v, engine_rpm: v, abs_throttle, occupied: true, trigger: 0.0 }
     }
 
     /// **STAND-IN, not the engine's** (UNRESOLVED): the `engine_power` of every family that is
@@ -165,7 +168,7 @@ impl Inputs {
     /// with that target, unsmoothed, and `boost = 0`.
     pub fn stand_in(speed_fraction: f32, abs_throttle: f32) -> Inputs {
         let target = (0.5 * speed_fraction.clamp(0.0, 1.0) + 0.5) * (0.7 * abs_throttle.clamp(0.0, 1.0) + 0.3);
-        Inputs { engine_power: target, engine_rpm: target, abs_throttle, occupied: true }
+        Inputs { engine_power: target, engine_rpm: target, abs_throttle, occupied: true, trigger: 0.0 }
     }
 }
 
@@ -209,6 +212,7 @@ fn value_of(fns: &[ObjFn], name: &str, inp: &Inputs, depth: u8, unresolved: &mut
         "driver_seat_occupied" | "driver_seat_power" => f32::from(inp.occupied),
         // Boost is not wired in test mode, so its sounds stay silent: a stated 0, not a guess.
         "boost" => 0.0,
+        "primary_trigger_down" | "primary_firing" => inp.trigger,
         other => {
             unresolved.insert(other.to_string());
             return None;
@@ -543,6 +547,8 @@ pub struct PlaySound {
     pub pickups_played: u64,
     /// Built-in function inputs a source asked for that this module does not have.
     pub unresolved: BTreeSet<String>,
+    /// #projectile-sound  The looping sounds of the projectiles in flight.
+    pub projectiles: crate::play_sound_proj::ProjectileLoops,
 }
 
 /// The gameplay events that must make a sound. Every one is counted when it HAPPENS
@@ -614,6 +620,7 @@ impl PlaySound {
         }
         self.scenery = Scenery::default();
         eng.stop_all();
+        self.projectiles = Default::default(); // #projectile-sound (the engine just stopped its voices)
         self.last_shots = None;
     }
 
@@ -623,6 +630,7 @@ impl PlaySound {
         let key = (cache.0, map_path.to_path_buf());
         if self.key.as_ref() != Some(&key) {
             self.vehicles.clear();
+            self.projectiles = Default::default(); // #projectile-sound
             self.marker_cache.clear();
             self.bipeds.clear();
             self.ground = None;

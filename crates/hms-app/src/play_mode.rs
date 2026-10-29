@@ -183,14 +183,39 @@ pub struct PlayWorld {
     /// parked elsewhere, a prop that has been knocked off its saved pose): their placement hull
     /// is an invisible block at the old spot, so they are left out of the gather.
     skip: Vec<u32>,
+    /// #bump  Bodies that are NOT where their placement is (a parked vehicle, a prop that has been
+    /// knocked about) at the pose they have NOW. They are left out of the gather above by `skip`
+    /// (the placement hull is an invisible block at the old spot) -- and then they were left out
+    /// of the biped's world altogether, so the player walked straight through a vehicle the moment
+    /// it was touched. Re-posed every frame by [`PlayWorld::set_movers`].
+    movers: Vec<Mover>,
+}
+
+/// One displaced body's hull at its current pose.
+struct Mover {
+    datum: u32,
+    /// `pos`, `fwd`, `up` of the pose the hull was built at.
+    key: [f32; 9],
+    tris: Vec<[Vec3; 3]>,
+    shells: Vec<Arc<crate::physics_settle::Shell>>,
+    mn: Vec3,
+    mx: Vec3,
 }
 
 impl StaticWorld for PlayWorld {
     fn gather(&self, mn: Vec3, mx: Vec3, out: &mut Vec<[Vec3; 3]>) {
         StaticWorld::gather(self.tris.as_slice(), mn, mx, out);
+        for m in &self.movers {
+            if m.mn.cmple(mx).all() && m.mx.cmpge(mn).all() {
+                out.extend(m.tris.iter().filter(|t| crate::physics_settle::tri_overlaps(t, mn, mx)).copied());
+            }
+        }
     }
     fn solid_shells(&self, mn: Vec3, mx: Vec3, out: &mut Vec<Arc<crate::physics_settle::Shell>>) {
         out.extend(self.shells.iter().filter(|s| (0..3).all(|k| s.mn[k] <= mx[k] && s.mx[k] >= mn[k])).cloned());
+        for m in &self.movers {
+            out.extend(m.shells.iter().filter(|s| (0..3).all(|k| s.mn[k] <= mx[k] && s.mx[k] >= mn[k])).cloned());
+        }
     }
 }
 
@@ -205,7 +230,47 @@ impl PlayWorld {
         }
     }
 
+    /// #bump  Set the displaced bodies the player must still collide with, each at its CURRENT pose
+    /// (`o.pos` / `fwd` / `up`). A body whose pose has not moved keeps the hull it already has; one
+    /// that left the list is dropped. Bodies the collision filter says a biped passes through
+    /// (spawn points, volumes) are not obstacles here either.
+    pub fn set_movers(&mut self, bodies: &[ObjectInfo], scene: &dyn ObjectScene, native: &NativeDll, cache: CacheHandle) {
+        let mut old = std::mem::take(&mut self.movers);
+        for o in bodies {
+            let solid = match self.collide.get(&o.primary_tag) {
+                Some(v) => *v,
+                None => {
+                    let v = crate::reach_collision::collides_with_biped(native, cache, o.primary_tag);
+                    self.collide.insert(o.primary_tag, v);
+                    v
+                }
+            };
+            if !solid {
+                continue;
+            }
+            let key = [o.pos[0], o.pos[1], o.pos[2], o.fwd[0], o.fwd[1], o.fwd[2], o.up[0], o.up[1], o.up[2]];
+            if let Some(i) = old.iter().position(|m| m.datum == o.datum && m.key.iter().zip(&key).all(|(a, b)| (a - b).abs() < 1e-4)) {
+                self.movers.push(old.swap_remove(i));
+                continue;
+            }
+            let flat: Vec<Vec3> = scene.physics_world_tris(o).into_iter().flatten().collect();
+            let tris: Vec<[Vec3; 3]> = flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect();
+            let shells: Vec<_> = scene.physics_world_shells(o).into_iter().map(|t| Arc::new(crate::physics_settle::Shell::new(t))).collect();
+            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in &flat {
+                mn = mn.min(*p);
+                mx = mx.max(*p);
+            }
+            self.movers.push(Mover { datum: o.datum, key, tris, shells, mn, mx });
+        }
+    }
+
     /// Is the cached neighbourhood still the right one for a player at `pos`?
+    /// Print-only (the bump trace): the triangles the player collides with, as last gathered.
+    pub fn soup(&self) -> &[[Vec3; 3]] {
+        &self.tris
+    }
+
     pub fn covers(&self, pos: Vec3) -> bool {
         self.valid && (pos - self.centre).length() <= WORLD_REGATHER
     }
@@ -369,6 +434,20 @@ pub struct EntryCamera {
     pub fov_y: f32,
 }
 
+/// #vehicle-weapons  A gunner seat's weapon and its firing machine.
+pub struct VehicleFire {
+    /// `(vehi tag, seat)` it was built for.
+    pub key: (u32, usize),
+    pub weapon: u32,
+    /// The unit that carries the weapon (the hull, or a seatless child turret).
+    pub owner: u32,
+    pub marker: String,
+    max: Vec<i32>,
+    pub wf: crate::play_fire::WeaponFire,
+    /// The fire button was held on the last call.
+    pub held: bool,
+}
+
 /// A live test-mode session.
 pub struct PlayMode {
     pub phys: PlayerPhysics,
@@ -445,6 +524,14 @@ pub struct PlayMode {
     /// #weapon-fire  The held weapon's firing machine -- the engine's per-tick trigger / barrel /
     /// magazine state machines ([`crate::play_fire`]). `None` for empty hands.
     pub weapon_fire: Option<crate::play_fire::WeaponFire>,
+    /// #vehicle-weapons  The weapon the seat I am in works, with its firing machine (None: not in
+    /// a gunner seat, or the vehicle has nothing to fire). Rebuilt when the seat changes.
+    pub vehicle_fire: Option<VehicleFire>,
+    /// #projectile-sim  Every projectile this session has launched, in flight (flight law,
+    /// collision and drawing: [`crate::play_projectile`]).
+    pub projectiles: crate::play_projectile::Field,
+    /// #vehicle-fx  The ridden / parked vehicles' head- and brake lights and attached effects.
+    pub vehicle_fx: crate::play_vehicle_fx::FxState,
     /// Where the player was first placed. **Used ONLY by the out-of-world failsafe** — this is
     /// not the rejected "put the camera back where you pressed Play" state, which was deleted; it
     /// is a recovery anchor, read every frame the body is below the map.
@@ -503,6 +590,9 @@ pub struct PlayMode {
     aim_asked: Option<String>,
     aim_use: Option<String>,
     pub fp_clip: String,
+    /// #fp-reload  A reload in progress, as the HUD runs it: `(seconds in, magazine was empty, rounds
+    /// to load)`. Set by the window each frame; the arms play the weapon's own reload clips for it.
+    pub fp_reload: Option<(f32, bool, u32)>,
     /// As [`asked`](Self::asked), for the first-person rig.
     fp_asked: Option<String>,
     /// #fp-legs  As [`asked`](Self::asked), for the first-person LEGS — the clip name last
@@ -538,6 +628,13 @@ pub struct PlayMode {
     /// #play-world  Every other physics object, simulated (`play_world`). Public so the app can
     /// hand it the Forge placement bytes when test mode starts.
     pub props: crate::play_world::PropSession,
+    /// #bump-trace  The always-on, print-only trace (`bump_trace.log`).
+    bump_trace: crate::bump_trace::BumpTrace,
+    /// Test hook for the gates' saboteur: skip the parked vehicles' hull collision. False in the app.
+    pub parked_hull_off: bool,
+    /// #man-cannon  The map's phantom volumes (man cannons, grav lifts) and the 60 Hz tick clock they run on.
+    launch: crate::play_launch::Launchers,
+    launch_clock: f32,
     /// #ride-park  Vehicles the player has driven and got out of. **They stay where they were
     /// left**: a ridden vehicle is drawn by test mode itself (its placement is hidden), so
     /// removing the actors on exit would put the editor's placement back at its ORIGINAL spot --
@@ -778,6 +875,8 @@ impl PlayMode {
             riding_variant_sid: 0,
             vehicle_actors: Vec::new(),
             props: Default::default(),
+            launch: Default::default(),
+            launch_clock: 0.0,
             parked: Vec::new(),
             grip_ref: [None, None],
             cam_prev: None,
@@ -811,6 +910,7 @@ impl PlayMode {
             aim_asked: None,
             aim_use: None,
             fp_clip: String::new(),
+            fp_reload: None,
             fp_asked: None,
             fp_legs_asked: None,
             notes,
@@ -819,6 +919,11 @@ impl PlayMode {
             body_clip_state: Default::default(),
             frames: 0,
             weapon_fire: None,
+            vehicle_fire: None,
+            projectiles: crate::play_projectile::Field::new(),
+            bump_trace: crate::bump_trace::BumpTrace::default(),
+            parked_hull_off: false,
+            vehicle_fx: Default::default(),
         };
         // --- the body -----------------------------------------------------------------------
         let id = actors.add_object(native, cache, biped_tag, feet, yaw.to_degrees())?;
@@ -1103,6 +1208,143 @@ impl PlayMode {
         });
     }
 
+    /// #projectile-sim  Launch the projectiles of one fire event (`FireEvent::Shot`), the other
+    /// half of [`PlayMode::fire`]: `fire` resolves the aim ray for the damage seam, this puts a
+    /// real `proj` in the air for each entry of `spreads` (one aim per projectile the barrel
+    /// fires; the `proj` itself may split into `conical spread` pellets).
+    ///
+    /// `muzzle` is the gun's `primary_trigger` in the world (None: the eye). The projectile leaves
+    /// the muzzle and flies at the point the crosshair ray strikes -- so what is hit is what was
+    /// aimed at -- or parallel to the aim when the ray strikes nothing.
+    ///
+    /// Returns the caption line, or None when this barrel launches nothing (melee / beam-less).
+    pub fn launch_projectiles(
+        &mut self,
+        scene: &dyn ObjectScene,
+        native: &NativeDll,
+        cache: CacheHandle,
+        barrel: usize,
+        spreads: &[crate::play_fire::Spread],
+        muzzle: Option<crate::play_projectile::Muzzle>,
+        now: f32,
+    ) -> Option<String> {
+        let proj = self.weapon_fire.as_ref()?.def.barrels.get(barrel)?.projectile?;
+        self.launch_from(scene, native, cache, self.weapon_tag, proj, barrel, spreads, muzzle, now)
+    }
+
+    /// The body of [`PlayMode::launch_projectiles`] for any weapon `weapon` whose barrel fires `proj`.
+    fn launch_from(
+        &mut self,
+        scene: &dyn ObjectScene,
+        native: &NativeDll,
+        cache: CacheHandle,
+        weapon: u32,
+        proj: u32,
+        barrel: usize,
+        spreads: &[crate::play_fire::Spread],
+        muzzle: Option<crate::play_projectile::Muzzle>,
+        now: f32,
+    ) -> Option<String> {
+        let law = self.projectiles.law(native, cache, proj)?;
+        let eye = self.st.eye(&self.phys);
+        let aim = look_dir(self.st.yaw, self.st.pitch);
+        let origin = muzzle.map_or(eye, |m| m.at);
+        // The muzzle flash: the barrel's own firing effect, on the gun it comes out of.
+        let fx = self.projectiles.muzzle_info(native, cache, weapon, barrel).0;
+        if let (Some(m), Some(fx)) = (muzzle, fx) {
+            self.projectiles.flash(fx, m.mode, m.gun, now);
+        }
+        let tracer = self.projectiles.next_tracer(native, cache, weapon, barrel);
+        let dirs: Vec<Vec3> = if spreads.is_empty() { vec![aim] } else { spreads.iter().map(|s| crate::play_fire::spread_dir(aim, s)).collect() };
+        let launches: Vec<crate::play_projectile::Launch> = dirs
+            .into_iter()
+            .map(|d| {
+                let target = scene.raycast_solid(eye, d, crate::play_projectile::CONVERGE_RANGE).map(|t| eye + d * t);
+                // Toward the struck point -- unless that point is behind the muzzle (a wall closer than
+                // the gun is long), where the aim itself is the only honest direction.
+                let dir = target
+                    .map(|t| (t - origin).normalize_or_zero())
+                    .filter(|v| v.dot(d) > 0.5)
+                    .unwrap_or(d);
+                crate::play_projectile::Launch { origin, dir, tracer }
+            })
+            .collect();
+        self.projectiles.launch(&law, &launches, now);
+        Some(format!("{} ({})", law.fx.name, self.projectiles.caption()))
+    }
+
+    /// #vehicle-weapons  Keep `vehicle_fire` matching the seat I am SEATED in: built when I settle
+    /// into a gunner seat, dropped the moment I leave it or am not seated (boarding and exiting
+    /// fire nothing).
+    pub fn sync_vehicle_fire(&mut self, native: &NativeDll, cache: CacheHandle) {
+        let want = self
+            .riding
+            .as_ref()
+            .filter(|r| r.phase == crate::play_vehicle::RidePhase::Seated)
+            .map(|r| (r.vehi_tag, r.placement_tag, r.seat));
+        let Some((vehi, placement, seat)) = want else {
+            self.vehicle_fire = None;
+            return;
+        };
+        if self.vehicle_fire.as_ref().map_or(false, |v| v.key == (vehi, seat)) {
+            return;
+        }
+        self.vehicle_fire = None;
+        let Some(sw) = crate::reach_vehicle_weapons::weapon_for_seat(native, cache, vehi, placement, seat) else { return };
+        let Some(def) = crate::reach_weapon::WeaponDef::read(native, cache, sw.weapon) else { return };
+        let max: Vec<i32> = (0..crate::play_hud::MAGAZINE_MAX as usize)
+            .map(|i| {
+                crate::play_hud::Magazine::read(native, cache, sw.weapon, i)
+                    .map_or(0, |m| m.rounds_loaded_maximum.clamp(0, crate::play_hud::ROUNDS_LOADED_MASK))
+            })
+            .collect();
+        let wf = crate::play_fire::WeaponFire::new(std::sync::Arc::new(def), max.clone());
+        self.vehicle_fire = Some(VehicleFire { key: (vehi, seat), weapon: sw.weapon, owner: sw.owner, marker: sw.marker, max, wf, held: false });
+    }
+
+    /// #vehicle-weapons  Run the seat's weapon for `dt` with the fire button in state `held`. A
+    /// vehicle weapon never runs dry (its magazines are refilled every call: nothing in test mode
+    /// feeds a vehicle's ammunition), so only `Shot`s come out. Nothing happens unless `sync_vehicle_fire`
+    /// found a weapon for the seat I am seated in.
+    pub fn advance_vehicle_fire(&mut self, dt: f32, held: bool, native: &NativeDll, cache: CacheHandle) -> Vec<crate::play_fire::FireEvent> {
+        self.sync_vehicle_fire(native, cache);
+        let crouched = self.st.crouched;
+        let Some(vf) = self.vehicle_fire.as_mut() else { return Vec::new() };
+        vf.held = held;
+        let evs = vf.wf.advance(
+            dt,
+            &crate::play_fire::FireInput { held, alt_held: false, usable: true, reloading: false, has_reserve: true, crouched, melee: false },
+        );
+        for (i, &m) in vf.max.iter().enumerate() {
+            vf.wf.sync_loaded(i, m);
+        }
+        evs
+    }
+
+    /// #vehicle-weapons  Put the seat weapon's round in the air along the crosshair, from the rider's
+    /// eye (the vehicle's own muzzle marker is not resolved: UNRESOLVED stand-in).
+    pub fn launch_vehicle_projectiles(
+        &mut self,
+        scene: &dyn ObjectScene,
+        native: &NativeDll,
+        cache: CacheHandle,
+        barrel: usize,
+        spreads: &[crate::play_fire::Spread],
+        now: f32,
+    ) -> Option<String> {
+        let (weapon, proj) = {
+            let vf = self.vehicle_fire.as_ref()?;
+            (vf.weapon, vf.wf.def.barrels.get(barrel)?.projectile?)
+        };
+        self.launch_from(scene, native, cache, weapon, proj, barrel, spreads, None, now)
+    }
+
+    /// #vehicle-weapons  What the sound sees of the seat's weapon: its tag and the trigger (1 while the
+    /// button is held), for the horn / chain-gun spin loops.
+    pub fn vehicle_weapon_sound(&self) -> Option<(u32, f32)> {
+        self.vehicle_fire.as_ref().map(|v| (v.weapon, if v.held { 1.0 } else { 0.0 }))
+    }
+
     /// #weapon-fire  Build the firing machine for the weapon now in hand (called whenever
     /// `weapon_tag` changes). Every magazine starts full, which is also what the HUD's `Ammo`
     /// does for a freshly drawn weapon.
@@ -1304,6 +1546,27 @@ impl PlayMode {
             offered: self.offer.as_ref().map(|o| o.vehi_tag),
         };
         crate::play_sound::drive(ps, eng, host, &player, &mut self.vehicles);
+        // #projectile-sound  The looping sounds of every projectile in flight, aimed at where it is
+        // NOW, so they follow the shot and stop the frame it ends.
+        if eng.begin_frame(host.native, host.cache, host.map_path) {
+            eng.cat_hint = 4;
+            let shots: Vec<crate::play_sound_proj::Shot> = self
+                .projectiles
+                .live
+                .iter()
+                .filter(|p| p.ended.is_none())
+                .map(|p| crate::play_sound_proj::Shot { id: p.id, proj: p.law.proj, pos: p.pos, trigger: 0.0 })
+                .chain(self.vehicle_weapon_sound().map(|(weapon, trigger)| crate::play_sound_proj::Shot {
+                    // a stable id of its own, far from the projectile counter
+                    id: 0x8000_0000 | (weapon & 0xFFFF),
+                    proj: weapon,
+                    pos: self.st.eye(&self.phys),
+                    trigger,
+                }))
+                .collect();
+            ps.projectiles.update(eng, host.native, host.cache, &shots, host.listener, host.dt);
+            eng.cat_hint = 0;
+        }
     }
 
     /// #seat-entry  Datums whose PLACEMENT must not be drawn this frame.
@@ -1334,6 +1597,36 @@ impl PlayMode {
             }
         }
         std::borrow::Cow::Owned(v)
+    }
+
+    /// #bump  The bodies the biped must still collide with although their placement hull is skipped:
+    /// the parked vehicles and the props that have left their saved pose, each as an object at the
+    /// pose it has now, near enough to be reached this frame.
+    fn mover_bodies(&self, objects: &[ObjectInfo]) -> Vec<ObjectInfo> {
+        let riding = self.riding.as_ref().map(|r| r.hidden_datum);
+        let mut out = Vec::new();
+        for d in self.hidden_datums() {
+            if Some(d) == riding {
+                continue;
+            }
+            let Some(base) = objects.iter().find(|o| o.datum == d) else { continue };
+            let pose = self
+                .parked
+                .iter()
+                .find(|p| p.ride.hidden_datum == d)
+                .map(|p| (p.ride.drive.pos, p.ride.drive.basis()))
+                .or_else(|| self.props.world().and_then(|w| w.body_pose(d)));
+            let Some((pos, rot)) = pose else { continue };
+            if (pos - self.st.pos).length() > WORLD_BOX + 12.0 {
+                continue;
+            }
+            let mut o = *base;
+            o.pos = pos.to_array();
+            o.fwd = (rot * Vec3::X).to_array();
+            o.up = (rot * Vec3::Z).to_array();
+            out.push(o);
+        }
+        out
     }
 
     /// #pickup  Pick up the weapon the current offer names.
@@ -1653,6 +1946,56 @@ impl PlayMode {
         notes.extend(crate::play_vehicle::drive_actors(vehicles, native, cache, r, &pieces, ids, actors));
     }
 
+    /// #man-cannon  The map's phantom volumes (man cannons, grav lifts: `play_launch`), run at the
+    /// engine's 60 Hz tick on whatever is inside one. The result is a velocity CHANGE handed to the
+    /// owner of that body's motion -- the character controller (`st.vel`), the drive law
+    /// (`drive.vel`) or the rigid-body world -- before it steps, which is what
+    /// `object_apply_acceleration` does in the engine; nothing here moves a body.
+    fn run_phantoms(&mut self, dt: f32, native: &NativeDll, cache: CacheHandle, scene: &dyn ObjectScene, objects: &[ObjectInfo]) {
+        use crate::play_launch::{Body, ObjType, TICK_SECONDS};
+        const MAX_TICKS_PER_FRAME: u32 = 3;
+        self.launch_clock += dt.clamp(0.0, 0.1);
+        let ticks = ((self.launch_clock / TICK_SECONDS) as u32).min(MAX_TICKS_PER_FRAME);
+        self.launch_clock = (self.launch_clock - ticks as f32 * TICK_SECONDS).clamp(0.0, TICK_SECONDS);
+        if ticks == 0 {
+            return;
+        }
+        self.launch.refresh(native, cache, objects);
+        if self.launch.is_empty() {
+            self.st.in_phantom = false;
+            return;
+        }
+        let g = crate::reach_physics::WORLD_GRAVITY;
+        for _ in 0..ticks {
+            self.launch.begin_tick();
+            if self.riding.is_none() {
+                // shared with the editor's man-cannon trajectory preview (`man_cannon_preview`)
+                self.launch.tick_player(&mut self.st, &self.phys, g);
+            } else {
+                self.st.in_phantom = false;
+            }
+            // a vehicle nobody drives that the rigid-body world does not own is stepped by the
+            // drive law like the ridden one, so it takes the change the same way
+            let mut rides: Vec<&mut crate::play_vehicle::Riding> = Vec::new();
+            if let Some(r) = self.riding.as_mut() {
+                rides.push(r);
+            }
+            for p in self.parked.iter_mut().filter(|p| !self.props.owns_vehicle(p.ride.hidden_datum)) {
+                rides.push(&mut p.ride);
+            }
+            for r in rides {
+                let datum = r.hidden_datum;
+                let Some(local) = self.launch.hull_aabb(datum, || {
+                    objects.iter().find(|o| o.datum == datum).and_then(|o| scene.physics_body(o)).map(|b| b.aabb())
+                }) else { continue };
+                let aabb = crate::play_launch::box_in_world(local, r.drive.pos, r.drive.basis());
+                let body = Body { kind: ObjType::Vehicle, player: false, dead: false, grounded: false, aabb, centre: (aabb.0 + aabb.1) * 0.5, velocity: r.drive.vel };
+                r.drive.vel += self.launch.tick_body(datum as u64, &body, g).0;
+            }
+            self.props.launch_props(native, cache, scene, objects, &mut self.launch);
+        }
+    }
+
     /// #seat-entry  One frame of a RIDE: drive the vehicle from the stick, put the body on the
     /// seat marker, and solve the seat camera.
     ///
@@ -1814,6 +2157,7 @@ impl PlayMode {
             Some(r) => crate::play_vehicle::duplicate_report(r, objects, self.vehicle_actors.len()),
             None => String::new(),
         };
+        self.run_phantoms(dt, native, cache, scene, objects);
         // #seat-entry  THE BYPASS. A seated body's transform is the VEHICLE's transform times
         // the seat marker, so the character controller is taken out of the loop entirely rather
         // than taught about vehicles — one writer on the body's position, which is the rule this
@@ -1821,11 +2165,11 @@ impl PlayMode {
         // is honest: no capsule swept, no contacts, no ground plane.
         self.seat_shot = None;
         if self.riding.is_some() {
-            let before = self.riding.as_ref().map(|r| r.drive.pos);
+            let before = self.riding.as_ref().map(|r| r.drive);
             let left = self.drive_and_seat(input, dt, native, cache, scene);
             // #vehicle-hull  The driven hull against the static world, after its own law moved it.
             if let (Some(prev), Some(r)) = (before, self.riding.as_mut()) {
-                self.props.collide_driven(prev, r, native, cache, scene, objects);
+                self.props.collide_driven(&prev, dt, r, native, cache, scene, objects);
             }
             self.last_step = StepOut::default();
             // #ride-phase  The exit clip has run its authored length: NOW the rider leaves.
@@ -1855,6 +2199,9 @@ impl PlayMode {
                 if k == 0 {
                     let hidden = self.hidden_datums();
                     self.world.set_skip(hidden);
+                    // #bump  ...but a body that is not at its placement is still THERE: at its pose now
+                    let movers = self.mover_bodies(objects);
+                    self.world.set_movers(&movers, scene, native, cache);
                 }
                 if !self.world.covers(self.st.pos) {
                     self.world.regather(self.st.pos, scene, objects, native, cache);
@@ -1939,7 +2286,15 @@ impl PlayMode {
                 continue;
             }
             let hold = crate::reach_vehicle::DriveInput { want_yaw: p.ride.drive.yaw, brake: true, ..Default::default() };
+            let prev = p.ride.drive;
             crate::play_vehicle::step(&mut self.vehicles, native, cache, &mut p.ride, hold, dt, scene);
+            // #parked-hull  The drive law has only a ground ray under each wheel: it knows no wall. A vehicle that moves here (a
+            // wheeled one a driver left, a launched or pushed one) goes through the same hull collision the DRIVEN one gets, so it
+            // can never pass a Forge wall or floor. One at rest costs nothing: its hull is not gathered.
+            let moving = (p.ride.drive.pos - prev.pos).length() > 1.0e-4 || p.ride.drive.vel.length() > 0.02 || prev.vel.length() > 0.02;
+            if moving && !self.parked_hull_off {
+                self.props.collide_driven(&prev, dt, &mut p.ride, native, cache, scene, objects);
+            }
         }
         // #play-world  Every other physics object. The player's capsule (on foot) or the driven
         // hull pushes; the rest of the world is simulated at the engine's 60 Hz tick.
@@ -1966,6 +2321,17 @@ impl PlayMode {
             self.sync_vehicle_bodies(native, cache, objects);
         }
         self.sync_vehicle_actors(native, cache, actors);
+        {
+            // #bump-trace  Print-only; reads, never writes.
+            let events = self.props.take_events();
+            let parked: Vec<(u32, Vec3)> = self.parked.iter().map(|p| (p.ride.hidden_datum, p.ride.drive.pos)).collect();
+            let riding = self.riding.as_ref().map(|r| r.hidden_datum);
+            let player = (self.st.pos, self.phys.radius, self.phys.capsule_height(self.st.crouched));
+            self.bump_trace.observe(crate::bump_trace::Cx { props: &self.props, objects, scene, native, cache, soup: self.world.soup(), parked: &parked, riding, actors: &*actors, player, events });
+        }
+        // #vehicle-fx  After the drive step, so this tick's brake / throttle / power are the ones lit.
+        let parked: Vec<&crate::play_vehicle::Riding> = self.parked.iter().map(|p| &p.ride).collect();
+        self.vehicle_fx.step(dt, input, self.riding.as_ref(), &parked, &mut self.vehicles, native, cache);
         if let Some((age, len)) = self.melee.as_mut() {
             *age += dt;
             if *age >= *len {
@@ -2669,13 +3035,27 @@ impl PlayMode {
         // --- the first-person rig --------------------------------------------------------
         if !self.fp.is_empty() {
             let eye = self.st.eye(&self.phys);
-            let (bases, oneshot, overlays) = crate::film_play::ActorDriver::fp_clips(
+            let (mut bases, mut oneshot, mut overlays) = crate::film_play::ActorDriver::fp_clips(
                 self.melee.map(|(age, _)| (age * 60.0) as u32),
                 self.fired.map(|age| (age * 60.0) as u32),
                 state.stance == crate::film_anim::Stance::Sprint,
                 !self.st.grounded,
                 state.gait != crate::film_anim::Gait::Idle,
             );
+            // #fp-reload  The HUD's reload owns the arms for as long as the weapon's own reload clips
+            // run, unless a swing is in progress (it cancels the reload).
+            if let (Some((age, empty, missing)), None) = (self.fp_reload, self.melee) {
+                let g = self.fp.first().and_then(|&id| actors.get(id)).and_then(|a| a.def.graph.clone());
+                if let Some(g) = g {
+                    let frames_of = |n: &str| g.anims.iter().find(|a| a.name == n).map(|a| a.frame_count.max(0) as u32);
+                    let seq = crate::film_play::ActorDriver::fp_reload_sequence(&frames_of, empty, missing);
+                    if let Some((name, t)) = crate::film_play::ActorDriver::fp_reload_at(&seq, (age * 60.0) as u32) {
+                        bases = vec![name];
+                        oneshot = Some(t);
+                        overlays.clear();
+                    }
+                }
+            }
             // #ride-camera  The arms belong to the first-person eye: gone while seated and while
             // the camera is still on its way back from a chase shot.
             let show = self.view == PlayView::FirstPerson && self.riding.is_none() && !self.camera_detached();
@@ -3491,6 +3871,361 @@ mod map_gates {
                     a.fp_attach = Some(grip);
                 }
             }
+        }
+    }
+
+    /// #fp-wave  print-only: how much of the first-person viewmodel's motion is NUMERICS?
+    ///
+    /// Stage 1 (matrices): the viewmodel is baked at `anchor` and drawn through the palette
+    /// `anchor^-1 * world_now`, so its world position goes through two big translations. This
+    /// runs that exact f32 composition for a few worlds and distances from the anchor and
+    /// compares the PROJECTED PIXEL (1920x1080, the rig's own 0.88 FOV scale) with an f64 reference.
+    /// Stage 2 (animation): second differences of the arms' posed nodes along the idle clip.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn probe_first_person_wave() {
+        use glam::{DMat4, DVec3, DVec4, Mat4};
+        use super::scale_probes::posed_world_points;
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let mut actors = ActorScene::default();
+        let Some((pm, _scene)) = start(native, cache, &mut actors, Species::Spartan) else { return };
+        let arms = pm.fp[0];
+        let _ = actors.set_anim(native, cache, arms, Some("first_person:idle"));
+        if let Some(a) = actors.get_mut(arms) {
+            a.playing = false;
+            a.frame = 0.0;
+            a.pos = Vec3::ZERO;
+            a.yaw = 0.0;
+            a.pitch = 0.0;
+            a.world_override = None;
+        }
+        actors.update_poses_headless(0.0);
+        let q: Vec<Vec3> = posed_world_points(actors.get(arms).unwrap(), native, cache).expect("arms mesh");
+        let extent = q.iter().fold(Vec3::ZERO, |m, p| m.max(p.abs()));
+        println!("arms mesh: {} vertices, extent {extent:?}", q.len());
+        let (w, h) = (1920.0f64, 1080.0f64);
+        let fov_scale = crate::film_play::first_person_fov_scale();
+        let fovy = 49.097f32.to_radians() * fov_scale;
+        let near = 0.05f32;
+        let far = 50_000.0f32;
+        let aspect = (w / h) as f32;
+        // The eye's frame, both precisions.
+        let frame = |eye: Vec3, yaw: f32, pitch: f32| -> (Mat4, DMat4) {
+            let cam = hms_render::Camera { pos: eye, yaw, pitch, fov_y: fovy, near, far };
+            let vp32 = cam.view_proj(aspect);
+            let (sy, cy) = (yaw as f64).sin_cos();
+            let (sp, cp) = (pitch as f64).sin_cos();
+            let fwd = DVec3::new(cp * cy, cp * sy, sp).normalize();
+            let e = eye.as_dvec3();
+            let view = DMat4::look_at_rh(e, e + fwd, DVec3::Z);
+            let proj = DMat4::perspective_rh(fovy as f64, aspect as f64, near as f64, far as f64);
+            (vp32, proj * view)
+        };
+        let px = |v: DVec4| -> (f64, f64) { ((v.x / v.w) * w * 0.5, (v.y / v.w) * h * 0.5) };
+        let world_of = |eye: Vec3, yaw: f32, pitch: f32| -> Mat4 { crate::reach_actor::actor_world(eye, yaw.to_degrees(), pitch.to_degrees(), 0.0) };
+        println!("stage 1: pixel error of the viewmodel (f32 anchored pipeline vs f64), 1080p");
+        println!("   anchor (eye at mount)       eye now (offset)         mean px   max px   rms px");
+        for anchor_eye in [Vec3::new(0.0, 0.0, 2.0), Vec3::new(200.0, 200.0, 20.0), Vec3::new(-300.0, 450.0, 60.0)] {
+            for off in [0.0f32, 5.0, 50.0, 300.0] {
+                let eye_now = anchor_eye + Vec3::new(off, off * 0.5, 0.0);
+                let (yaw, pitch) = (0.64f32, -0.17f32);
+                let anchor = world_of(anchor_eye, yaw, pitch);
+                let world_now = world_of(eye_now, yaw, pitch);
+                let delta = crate::reach_actor::fold_delta(anchor, world_now);
+                let (vp32, vp64) = frame(eye_now, yaw, pitch);
+                let wn64 = DMat4::from_cols_array(&world_now.to_cols_array().map(|x| x as f64));
+                let (mut sum, mut mx, mut sq, mut n) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+                for p in &q {
+                    let g = anchor * (delta * p.extend(1.0));
+                    let c32 = vp32 * g;
+                    let r = vp64 * (wn64 * p.as_dvec3().extend(1.0));
+                    if r.w < 0.3 {
+                        continue; // behind or beside the lens: not a pixel anyone sees
+                    }
+                    let a = px(DVec4::new(c32.x as f64, c32.y as f64, c32.z as f64, c32.w as f64));
+                    let b = px(r);
+                    let e = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+                    sum += e;
+                    mx = mx.max(e);
+                    sq += e * e;
+                    n += 1;
+                }
+                println!(
+                    "   ({:>7.1},{:>7.1},{:>5.1})  +{off:>5.0}   {:>8.4} {:>8.4} {:>8.4}  ({n} verts)",
+                    anchor_eye.x, anchor_eye.y, anchor_eye.z, sum / n.max(1) as f64, mx, (sq / n.max(1) as f64).sqrt()
+                );
+            }
+        }
+        // Frame-to-frame jitter while walking: the eye advances 0.05 wu/frame, the pose is fixed.
+        println!("stage 1b: jitter of the viewmodel's projected position while the eye walks 0.05 wu/frame");
+        for anchor_eye in [Vec3::new(0.0, 0.0, 2.0), Vec3::new(200.0, 200.0, 20.0)] {
+            let (yaw, pitch) = (0.64f32, -0.17f32);
+            let anchor = world_of(anchor_eye, yaw, pitch);
+            let mut errs: Vec<(f64, f64)> = Vec::new();
+            for k in 0..240 {
+                let eye_now = anchor_eye + Vec3::new(0.05 * k as f32, 0.0, 0.0);
+                let world_now = world_of(eye_now, yaw, pitch);
+                let delta = crate::reach_actor::fold_delta(anchor, world_now);
+                let (vp32, vp64) = frame(eye_now, yaw, pitch);
+                let wn64 = DMat4::from_cols_array(&world_now.to_cols_array().map(|x| x as f64));
+                let p = q[q.len() / 2];
+                let c32 = vp32 * (anchor * (delta * p.extend(1.0)));
+                let r = vp64 * (wn64 * p.as_dvec3().extend(1.0));
+                let a = px(DVec4::new(c32.x as f64, c32.y as f64, c32.z as f64, c32.w as f64));
+                let b = px(r);
+                errs.push((a.0 - b.0, a.1 - b.1));
+            }
+            let d: Vec<f64> = errs.windows(2).map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt()).collect();
+            let rms = (d.iter().map(|x| x * x).sum::<f64>() / d.len() as f64).sqrt();
+            let mx = d.iter().cloned().fold(0.0, f64::max);
+            println!("   anchor ({:>6.1},{:>6.1},{:>5.1}): frame-to-frame error change rms {rms:.4} px, max {mx:.4} px", anchor_eye.x, anchor_eye.y, anchor_eye.z);
+        }
+        // Stage 2: smoothness of the idle clip's pose.
+        println!("stage 2: second difference of arms node poses along first_person:idle (step 0.1 frame)");
+        let n = actors.get(arms).unwrap().frame_count();
+        let nodes = actors.get(arms).unwrap().def.model.node_names.len();
+        let mut samples: Vec<Vec<(Vec3, glam::Quat)>> = Vec::new();
+        let steps = ((n - 1.0) * 10.0) as usize;
+        for k in 0..=steps {
+            if let Some(a) = actors.get_mut(arms) {
+                a.frame = (k as f32 * 0.1).min(n - 0.001);
+            }
+            actors.update_poses_headless(0.0);
+            let a = actors.get(arms).unwrap();
+            samples.push((0..nodes).map(|i| { let (_, r, t) = a.pose.model[i].to_scale_rotation_translation(); (t, r) }).collect());
+        }
+        let mut worst: Vec<(f32, usize, usize)> = Vec::new();
+        for i in 0..nodes {
+            for k in 1..samples.len() - 1 {
+                let (t0, t1, t2) = (samples[k - 1][i].0, samples[k][i].0, samples[k + 1][i].0);
+                let acc = (t0 - 2.0 * t1 + t2).length();
+                worst.push((acc, i, k));
+            }
+        }
+        worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        let med = worst[worst.len() / 2].0;
+        println!("   {} nodes x {} steps; median |d2| {med:.6} wu; top outliers:", nodes, samples.len());
+        for (acc, i, k) in worst.iter().take(6) {
+            println!("     node {i:>3} '{}' step {k} (frame {:.1})  |d2| {acc:.6} wu  ({:.0}x median)", actors.get(arms).unwrap().def.model.node_names[*i], *k as f32 * 0.1, acc / med.max(1e-9));
+        }
+        // integer-frame vs between-frame behaviour
+        let (mut at_int, mut at_cnt, mut other, mut o_cnt) = (0.0f64, 0usize, 0.0f64, 0usize);
+        for i in 0..nodes {
+            for k in 1..samples.len() - 1 {
+                let acc = (samples[k - 1][i].0 - 2.0 * samples[k][i].0 + samples[k + 1][i].0).length() as f64;
+                if k % 10 == 0 { at_int += acc; at_cnt += 1 } else { other += acc; o_cnt += 1 }
+            }
+        }
+        println!("   mean |d2| at integer frames {:.6} vs between {:.6} wu", at_int / at_cnt.max(1) as f64, other / o_cnt.max(1) as f64);
+    }
+
+    /// **#fp-reload  THE GATE for "the first-person reload animations are not played properly".**
+    /// For each weapon family, through `PlayMode::tick` (the production pose path): while the HUD
+    /// reloads, the arms play the clip THE WEAPON'S OWN GRAPH names for it -- never the idle they
+    /// used to -- for as long as the authored clips last, then go back to idle; and the HUD's reload
+    /// clock is exactly that long. Plasma weapons (no reload clip) and melee weapons stay on idle.
+    /// Also: the pose differs between the start and the middle (the clip reaches the arms).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn every_weapon_family_plays_its_own_reload_clips_for_their_authored_length() {
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let mut actors = ActorScene::default();
+        let Some((mut pm, scene)) = start(native, cache, &mut actors, Species::Spartan) else { return };
+        let rows: Vec<(String, u32, u32)> = crate::play_phys::PlayerPhysics::player_representations(native, cache)
+            .into_iter()
+            .map(|r| (String::new(), r.hands, r.body))
+            .collect();
+        let elite_of = |t: u32| crate::film_anim::is_elite(&native.tag_name(cache, t).unwrap_or_default());
+        let weaps = native.tags_by_group(cache, "weap");
+        let find = |leaf: &str| weaps.iter().copied().find(|&t| native.tag_name(cache, t).is_some_and(|n| n.rsplit('\\').next() == Some(leaf)));
+        // (leaf, expected first clip while reloading with an EMPTY magazine, or None = no reload clip)
+        let families: [(&str, Option<&str>); 9] = [
+            ("assault_rifle", Some("first_person:reload_empty")),
+            ("magnum", Some("first_person:reload_empty")),
+            ("sniper_rifle", Some("first_person:reload_empty")),
+            ("rocket_launcher", Some("first_person:reload_empty")),
+            ("needler", Some("first_person:reload_empty")),
+            ("grenade_launcher", Some("first_person:reload_empty")),
+            ("shotgun", Some("first_person:reload_enter")),
+            ("plasma_rifle", None),
+            ("energy_sword", None),
+        ];
+        let mut played = 0usize;
+        for (leaf, want) in families {
+            let Some(w) = find(leaf) else { println!("   {leaf}: not in this cache"); continue };
+            let _ = pm.give_weapon(native, cache, Some(w), &mut actors, &rows, &elite_of);
+            let arms = pm.fp[0];
+            let frames = crate::play_hud::reload_clip_frames(native, cache, w);
+            let seq = crate::film_play::ActorDriver::fp_reload_sequence(&|n| frames.get(n).copied(), true, 4);
+            let total = crate::film_play::ActorDriver::fp_reload_ticks(&seq);
+            assert_eq!(want.is_some(), !seq.is_empty(), "{leaf}: a reload sequence exists exactly for the weapons that author one ({frames:?})");
+            // the HUD's clock is the sequence's length
+            if want.is_some() {
+                let mut hud = crate::play_hud::PlayHud::default();
+                hud.set_weapon(native, cache, w, 0);
+                if let Some(a) = hud.ammo.as_mut() {
+                    a.loaded = 0;
+                    a.reserve = Some(100);
+                }
+                if hud.ammo.is_some() {
+                    assert!(hud.start_reload(), "{leaf}: an empty magazine with reserve reloads");
+                    let hud_ticks = (hud.reload_duration * 60.0).round() as u32;
+                    let want_ticks = crate::film_play::ActorDriver::fp_reload_ticks(&crate::film_play::ActorDriver::fp_reload_sequence(
+                        &|n| frames.get(n).copied(),
+                        true,
+                        hud.reload_missing,
+                    ));
+                    assert_eq!(hud_ticks, want_ticks, "{leaf}: the HUD's reload clock must be the clips' length");
+                }
+            }
+            let mut pose_at = |age_s: f32, pm: &mut PlayMode, actors: &mut ActorScene| -> (String, f32, Vec<glam::Mat4>) {
+                pm.fp_reload = Some((age_s, true, 4));
+                pm.tick(&hold(0.0, false), 1.0 / 60.0, native, cache, &scene, &[], actors);
+                // a clip change cross-fades on WALL time; let it finish so the pose is the clip's own
+                actors.update_poses_headless(0.5);
+                let a = actors.get(arms).unwrap();
+                (a.anim_name.clone(), a.frame, a.pose.model.clone())
+            };
+            let (n0, f0, m0) = pose_at(0.05, &mut pm, &mut actors);
+            let (nm, fm, mm) = pose_at(total as f32 / 120.0, &mut pm, &mut actors);
+            let (ne, _, _) = pose_at(total as f32 / 60.0 + 0.5, &mut pm, &mut actors);
+            println!("   {leaf}: sequence {seq:?} ({total} ticks): t0 '{n0}' f{f0:.1} | middle '{nm}' f{fm:.1} | after '{ne}'");
+            match want {
+                Some(first) => {
+                    played += 1;
+                    assert_eq!(n0, first, "{leaf}: the reload must start on the weapon's own '{first}'");
+                    assert!(nm.contains("reload"), "{leaf}: halfway through a reload the arms play a reload clip, not '{nm}'");
+                    assert!(fm > f0, "{leaf}: the clip advances ({f0} -> {fm})");
+                    assert!(!ne.contains("reload"), "{leaf}: after the authored length the arms are back on idle, not '{ne}'");
+                    let moved: f32 = m0.iter().zip(mm.iter()).map(|(a, b)| (a.w_axis - b.w_axis).truncate().length() + (a.x_axis - b.x_axis).truncate().length()).sum();
+                    assert!(moved > 0.05, "{leaf}: the pose did not change between the start and the middle of the reload ({moved})");
+                }
+                None => assert!(!n0.contains("reload") && !nm.contains("reload"), "{leaf}: authors no reload; the arms must not play one ('{n0}','{nm}')"),
+            }
+            pm.fp_reload = None;
+        }
+        assert!(played >= 5, "liveness: only {played} reload families were exercised");
+    }
+
+    /// **#fp-wave  THE GATE for "the first-person model looks wavy, like a floating-point error".**
+    /// The rig is drawn CAMERA-RELATIVE: its matrices are relative to the eye and the vertex
+    /// shader adds the eye back for shading only. This runs the production CPU half on the real
+    /// arms (`Actor::gpu_world`, `fp_bake_frame`, `palette_delta`, `update_poses_headless`) at eyes
+    /// 0-450 wu from the origin, composes exactly what the vertex shader composes
+    /// (`bake * delta * posed`, projected through the rig's relative view-projection), and compares
+    /// every vertex's pixel with an f64 reference while the eye WALKS 0.05 wu a frame.
+    ///
+    /// Bar: RMS < 0.1 px at every eye, frame-to-frame jitter at 450 wu no worse than 2x the origin
+    /// baseline, and the world position the shader reconstructs for LIGHTING (`rel + origin`)
+    /// within 1e-3 wu of the old world-space path. Saboteur: make `Actor::gpu_world` return
+    /// `world()` again (or give the rig a world-space bake) and every number goes red.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_first_person_rig_is_drawn_camera_relative_and_does_not_wobble_far_from_the_origin() {
+        use glam::{DMat4, DVec3};
+        use super::scale_probes::posed_world_points;
+        let Some((_g, native, cache)) = open() else { return };
+        let native = &*native;
+        let mut actors = ActorScene::default();
+        let Some((pm, _scene)) = start(native, cache, &mut actors, Species::Spartan) else { return };
+        let arms = pm.fp[0];
+        let _ = actors.set_anim(native, cache, arms, Some("first_person:idle"));
+        {
+            let a = actors.get_mut(arms).unwrap();
+            a.playing = false;
+            a.frame = 0.0;
+            a.pos = Vec3::ZERO;
+            a.yaw = 0.0;
+            a.pitch = 0.0;
+            a.world_override = None;
+        }
+        actors.update_poses_headless(0.0);
+        let q: Vec<Vec3> = posed_world_points(actors.get(arms).unwrap(), native, cache).expect("arms mesh");
+        let (w, h) = (1920.0f64, 1080.0f64);
+        let fovy = 49.097f32.to_radians() * crate::film_play::first_person_fov_scale();
+        let aspect = (w / h) as f32;
+        let (yaw, pitch) = (0.64f32, -0.17f32);
+        let mut baseline_jitter = 0.0f64;
+        let mut results: Vec<(Vec3, f64, f64, f64)> = Vec::new();
+        for eye0 in [Vec3::new(0.0, 0.0, 2.0), Vec3::new(200.0, 200.0, 20.0), Vec3::new(-300.0, 450.0, 60.0), Vec3::new(120.0, -380.0, 90.0)] {
+            let anchor = crate::reach_actor::actor_world(eye0, yaw.to_degrees(), pitch.to_degrees(), 0.0);
+            actors.get_mut(arms).unwrap().fp_bake = crate::reach_actor::fp_bake_frame(anchor);
+            let mut prev: Vec<(f64, f64)> = Vec::new();
+            let (mut sq, mut n_sq, mut jit_sq, mut n_j) = (0.0f64, 0usize, 0.0f64, 0usize);
+            let mut worst_light = 0.0f32;
+            for k in 0..120 {
+                let eye = eye0 + Vec3::new(0.05 * k as f32, 0.02 * k as f32, 0.0);
+                // exactly what the window does each frame: the origin IS the camera, set first
+                actors.set_fp_origin(eye);
+                {
+                    let a = actors.get_mut(arms).unwrap();
+                    a.pos = eye;
+                    a.yaw = yaw.to_degrees();
+                    a.pitch = pitch.to_degrees();
+                }
+                actors.update_poses_headless(0.0);
+                let a = actors.get(arms).unwrap();
+                let (bake, delta) = (a.fp_bake, a.palette_delta());
+                // the renderer's rig camera: eye at (camera - origin) = 0
+                let cam = hms_render::Camera { pos: eye - eye, yaw, pitch, fov_y: fovy, near: 0.05, far: 50_000.0 };
+                let vp32 = cam.view_proj(aspect);
+                let (sy, cy) = (yaw as f64).sin_cos();
+                let (sp, cp) = (pitch as f64).sin_cos();
+                let fwd = DVec3::new(cp * cy, cp * sy, sp).normalize();
+                let e = eye.as_dvec3();
+                let vp64 = DMat4::perspective_rh(fovy as f64, aspect as f64, 0.05, 50_000.0) * DMat4::look_at_rh(e, e + fwd, DVec3::Z);
+                let w64 = DMat4::from_cols_array(&crate::reach_actor::actor_world(eye, yaw.to_degrees(), pitch.to_degrees(), 0.0).to_cols_array().map(f64::from));
+                let mut errs = Vec::with_capacity(q.len());
+                for p in &q {
+                    let rel = bake * (delta * p.extend(1.0)); // the vertex shader's `world`
+                    let r = vp64 * (w64 * p.as_dvec3().extend(1.0));
+                    if r.w < 0.06 {
+                        errs.push((0.0, 0.0));
+                        continue;
+                    }
+                    let c = vp32 * rel;
+                    let (ex, ey) = (((c.x / c.w) as f64 - r.x / r.w) * w * 0.5, ((c.y / c.w) as f64 - r.y / r.w) * h * 0.5);
+                    sq += ex * ex + ey * ey;
+                    n_sq += 1;
+                    errs.push((ex, ey));
+                    // the position the shader reconstructs for lighting / shadow / fog
+                    let abs = rel.truncate() + eye;
+                    let old = (w64 * p.as_dvec3().extend(1.0)).truncate().as_vec3();
+                    worst_light = worst_light.max((abs - old).length());
+                }
+                if !prev.is_empty() {
+                    for (a, b) in prev.iter().zip(errs.iter()) {
+                        jit_sq += (b.0 - a.0).powi(2) + (b.1 - a.1).powi(2);
+                        n_j += 1;
+                    }
+                }
+                prev = errs;
+            }
+            let rms = (sq / n_sq.max(1) as f64).sqrt();
+            let jit = (jit_sq / n_j.max(1) as f64).sqrt();
+            println!("   eye {eye0:?}: {} vertex-frames in view, per-vertex RMS error {rms:.4} px, frame-to-frame jitter {jit:.4} px, lighting-position error {worst_light:.2e} wu", n_sq);
+            assert!(n_sq > 1000, "liveness: only {n_sq} vertex-frames were in view");
+            if eye0 == Vec3::new(0.0, 0.0, 2.0) {
+                baseline_jitter = jit;
+            }
+            assert!(rms < 0.1, "eye {eye0:?}: the viewmodel is {rms:.3} px off the f64 reference");
+            assert!(worst_light < 1e-3, "eye {eye0:?}: the reconstructed world position is {worst_light} wu off");
+            results.push((eye0, rms, jit, worst_light as f64));
+        }
+        for (e, _, jit, _) in &results {
+            assert!(*jit <= baseline_jitter * 2.0 + 0.01, "eye {e:?}: jitter {jit:.4} px vs origin baseline {baseline_jitter:.4}");
+        }
+        // the gun: camera-relative too, and the same place as the world path
+        let gun = pm.fp.get(1).copied();
+        if let Some(gid) = gun {
+            let g = actors.get(gid).unwrap();
+            let rel = g.gpu_world().w_axis.truncate();
+            let abs = g.world().w_axis.truncate();
+            let eye = actors.fp_origin;
+            assert!(rel.length() < 5.0, "the gun's drawn placement is {rel:?}: not camera-relative");
+            assert!((rel + eye - abs).length() < 1e-3, "the gun's relative placement disagrees with its world one");
         }
     }
 
@@ -5136,11 +5871,16 @@ pub(crate) mod ride_harness {
         /// blocks) instead of the flat floor: the same `PlayMode::tick`, the world is the only
         /// difference.
         pub fn tick_in(&mut self, input: &MoveInput, scene: &dyn ObjectScene) {
+            self.tick_in_dt(input, DT, scene);
+        }
+
+        /// [`Ride::tick_in`] at a display frame time of `dt` (the window passes its real frame time).
+        pub fn tick_in_dt(&mut self, input: &MoveInput, dt: f32, scene: &dyn ObjectScene) {
             self.look_yaw = input.yaw;
             self.look_pitch = input.pitch;
-            self.pm.tick(input, DT, &self.native, self.cache, scene, &self.objects, &mut self.actors);
-            self.actors.update_poses_headless(DT);
-            self.time += DT;
+            self.pm.tick(input, dt, &self.native, self.cache, scene, &self.objects, &mut self.actors);
+            self.actors.update_poses_headless(dt);
+            self.time += dt;
         }
 
         /// A vehicle of `suffix` placed at `pos` facing `yaw` (the extra objects ride along in the
@@ -7178,6 +7918,80 @@ mod scale_probes {
         }
     }
 
+    /// #vehicle-fit  The seat's AUTHORED camera marker against the drawn rider's head, for every
+    /// hull seat that names a camera marker: the seat camera is authored where a seated unit's eye
+    /// is, so a rider drawn too small sits with his head below it. Print-only.
+    #[test]
+    #[ignore = "print-only probe; run alone with --ignored"]
+    fn probe_seat_camera_marker_against_the_seated_head() {
+        let Some((_g, native, cache)) = open() else { return };
+        let names: Vec<String> = native.tags_by_group(cache, "vehi").into_iter().filter_map(|t| native.tag_name(cache, t)).collect();
+        for species in [Species::Spartan, Species::Elite] {
+            for name in &names {
+                for seat in 0..8usize {
+                    let Some(mut r) = Ride::with_vehicle_as(native.clone(), cache, name, species) else { break };
+                    let tag = r.objects[0].primary_tag;
+                    let (n, c) = (r.native.clone(), r.cache);
+                    let (cam, mk, label) = {
+                        let Some(e) = r.pm.vehicles.entry(&n, c, tag) else { break };
+                        let Some(s) = e.seats.seats.get(seat) else { break };
+                        let cm = (!s.camera.marker.is_empty()).then(|| e.marker_frames(&n, c, &s.camera.marker).first().copied()).flatten();
+                        let sm = e.marker_frames(&n, c, &s.marker_name).first().copied();
+                        (cm, sm, format!("{} cam '{}' tp={}", s.label, s.camera.marker, s.third_person()))
+                    };
+                    if r.force_seat(tag, seat).is_err() {
+                        continue;
+                    }
+                    let look = r.input();
+                    r.run(2.0, &look);
+                    let Some(rd) = r.pm.riding.as_ref() else { continue };
+                    if rd.vehi_tag != rd.placement_tag {
+                        continue;
+                    }
+                    let body = r.actors.get(r.pm.body.unwrap()).unwrap();
+                    let veh = r.actors.get(r.pm.vehicle_actors[0]).unwrap();
+                    let vinv = veh.world().inverse();
+                    let bw = body.world();
+                    let node = |nm: &str| body.def.model.node_names.iter().position(|x| x == nm).map(|i| vinv.transform_point3(bw.transform_point3(body.pose.model[i].w_axis.truncate())));
+                    let (Some(cam), Some(mk)) = (cam, mk) else { continue };
+                    println!(
+                        "{species:?} {name} seat {seat} {label}: camera marker {:.3?} seat marker {:.3?} pelvis {:.3?} head {:.3?}  => camera-head {:.3?}",
+                        cam.w_axis.truncate(), mk.w_axis.truncate(), node("b_pelvis"), node("b_head"),
+                        node("b_head").map(|h| cam.w_axis.truncate() - h)
+                    );
+                }
+            }
+        }
+    }
+
+    /// #vehicle-fit  What the CHASE camera makes of a seated rider: the eye's distance to the rider's
+    /// head and the fraction of the frame height the rider fills, at the authored 78 and the owner's
+    /// 97.5 degrees horizontal. Print-only.
+    #[test]
+    #[ignore = "print-only probe; run alone with --ignored"]
+    fn probe_chase_camera_rider_screen_fraction() {
+        let Some((_g, native, cache)) = open() else { return };
+        for suffix in ["mongoose\\mongoose", "warthog\\warthog", "ghost\\ghost", "scorpion\\scorpion", "banshee\\banshee"] {
+            let Some(mut r) = Ride::with_vehicle_as(native.clone(), cache, suffix, Species::Spartan) else { continue };
+            let tag = r.objects[0].primary_tag;
+            if r.force_seat(tag, 0).is_err() {
+                continue;
+            }
+            let look = r.input();
+            r.run(3.0, &look);
+            let (n, c) = (r.native.clone(), r.cache);
+            let mut riding = r.pm.riding.clone().unwrap();
+            let Some(shot) = crate::play_vehicle::seat_shot(&mut r.pm.vehicles, &n, c, &mut riding, &tests::Floor, 1.0 / 60.0) else { continue };
+            let body = r.actors.get(r.pm.body.unwrap()).unwrap();
+            let pts = posed_world_points(body, &n, c).unwrap();
+            let (lo, hi) = pts.iter().fold((f32::MAX, f32::MIN), |a, p| (a.0.min(p.z), a.1.max(p.z)));
+            let mid = pts.iter().fold(Vec3::ZERO, |a, p| a + *p) / pts.len() as f32;
+            let dist = (shot.pose.eye - mid).length();
+            let frac = |deg: f32| (hi - lo) / (2.0 * dist * (crate::film_play::reach_vertical_fov_for(deg) * 0.5).tan());
+            println!("{suffix}: third_person {} eye {:.3?} distance to rider {:.3} rider height {:.3} fills {:.3} of frame at 78, {:.3} at 97.5", shot.third_person, shot.pose.eye, dist, hi - lo, frac(78.0), frac(97.5));
+        }
+    }
+
     /// The authored `bounding radius` (obje +0x0C, +offset) against the measured render-model
     /// box of EVERY biped and vehicle: a unit and a vehicle are authored in the same world units,
     /// so if the biped were drawn at the wrong scale its ratio would stand apart from the vehicles'.
@@ -8015,5 +8829,137 @@ mod exit_gates {
         let mut shells = Vec::new();
         w.solid_shells(Vec3::splat(-5.0), Vec3::splat(5.0), &mut shells);
         assert!(shells.is_empty(), "a hidden placement still offers its shells");
+    }
+}
+
+/// #parked-hull  A vehicle nobody drives that the prop world does not own (a wheeled one a driver left: `claim_vehicle` refuses it)
+/// is stepped by the drive law, which knows only a ground ray under each wheel. It gets the DRIVEN vehicle's hull collision now.
+#[cfg(test)]
+mod parked_hull_gates {
+    use super::ride_harness::*;
+    use super::*;
+    use crate::play_ledge_gates::{ground_at, level_seeds, spread, MapScene};
+    use crate::scene::SceneController;
+
+    /// What one shove did.
+    struct Shove {
+        /// farthest the origin got along the push axis, relative to the wall's mid plane (negative = still on this side)
+        past_mid: f32,
+        /// lowest the origin got relative to the ground
+        lowest: f32,
+        /// how far it travelled along the push axis
+        travelled: f32,
+        wall: bool,
+    }
+
+    /// A parked wheeled `vehicle` on flat ground, `gap` wu from a real Coliseum wall piece (or from nothing), given `v` along the thin axis
+    /// of the wall (plus `up` upward, as a launch phantom adds), run for `secs` at frame time `dt` with the driver long gone.
+    #[allow(clippy::too_many_arguments)]
+    fn shove(hull_on: bool, vehicle: &str, wall_name: Option<&str>, gap: f32, v: f32, up: f32, dt: f32, secs: f32) -> Option<Shove> {
+        let (_g, native, cache) = crate::reach_actor::tests::open_reach_for("forge_halo")?;
+        let mut sc = SceneController::new_shared(native.clone());
+        sc.attach_cache(cache);
+        sc.load_collision_for_test();
+        let seeds = spread(level_seeds(&native, cache), 4000);
+        let level = MapScene::new(&sc, Vec::new());
+        let spot = seeds.iter().find(|s| (-3..=3).all(|i| (-3..=3).all(|j| ground_at(&level, s.x + i as f32 * 3.0, s.y + j as f32 * 3.0, s.z).is_some_and(|z| (z - s.z).abs() < 0.1))))?;
+        let ground = ground_at(&level, spot.x, spot.y, spot.z).unwrap_or(spot.z);
+        let centre = Vec3::new(spot.x, spot.y, ground);
+        let mk = |datum: u32, tag: u32, pos: Vec3| ObjectInfo { datum, type_sig: 0, sig0: 0, sig1: 0, pos: pos.to_array(), health: 1.0, shield: 1.0, mode_tag: 0, fwd: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], attached: [0; 8], primary_tag: tag, variant_name_sid: 0 };
+        // the wall: its thin horizontal axis is the push axis; its near face is `gap` ahead of the vehicle's start
+        let mut extras: Vec<ObjectInfo> = Vec::new();
+        let mut mid = f32::MAX;
+        let start = centre;
+        if let Some(name) = wall_name {
+            let tag = ["bloc", "scen", "mach", "ctrl"].iter().flat_map(|g| native.tags_by_group(cache, g)).find(|t| native.tag_name(cache, *t).is_some_and(|n| n.ends_with(name)))?;
+            let mut w = mk(0x5151, tag, Vec3::ZERO);
+            let t0 = sc.physics_world_tris(&w);
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in t0.iter().flatten() {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            // identity orientation; push along +x if the wall is thinner in x than in y, else the piece is turned 90 degrees
+            if hi.x - lo.x > hi.y - lo.y {
+                w.fwd = [0.0, 1.0, 0.0];
+            }
+            let t1 = sc.physics_world_tris(&w);
+            let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for p in t1.iter().flatten() {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            let shift = Vec3::new(start.x + gap - lo.x, start.y - (lo.y + hi.y) * 0.5, ground - lo.z);
+            w.pos = shift.to_array();
+            mid = start.x + gap + (hi.x - lo.x) * 0.5;
+            extras.push(w);
+        }
+        let mut r = Ride::with_vehicle_placed(native.clone(), cache, vehicle, start + Vec3::Z * 0.6, 0.0, &extras)?;
+        let scene = MapScene::new(&sc, r.objects.clone());
+        let vdatum = r.objects[0].datum;
+        let idle = MoveInput::default();
+        r.pm.st = crate::play_ctl::PlayerState::standing_at(start - Vec3::new(40.0, 0.0, 0.0), 0.0);
+        r.pm.parked_hull_off = !hull_on;
+        // the first frame builds the prop world; then the driver "has left": the world no longer owns the vehicle, and the ride path does
+        r.tick_in(&idle, &scene);
+        r.pm.props.release_vehicle(vdatum);
+        let o = r.objects[0];
+        let (nat, ch) = (r.native.clone(), r.cache);
+        let mut ride = crate::play_world::bare_riding(&mut r.pm.vehicles, &nat, ch, &o)?;
+        ride.drive.pos = start + Vec3::Z * 0.6;
+        r.pm.parked.push(Parked { ride, variant_sid: 0, actors: Vec::new(), baked: start });
+        assert!(!r.pm.props.owns_vehicle(vdatum), "the vehicle must be on the ride path alone");
+        // let it settle on its wheels
+        for _ in 0..180 {
+            r.tick_in(&idle, &scene);
+        }
+        let rest = r.pm.parked[0].ride.drive.pos;
+        r.pm.parked[0].ride.drive.vel += Vec3::new(v, 0.0, up);
+        let n = (secs / dt).ceil() as usize;
+        let (mut far, mut low) = (f32::MIN, f32::MAX);
+        for _ in 0..n {
+            r.tick_in_dt(&idle, dt, &scene);
+            let p = r.pm.parked[0].ride.drive.pos;
+            far = far.max(p.x);
+            low = low.min(p.z - rest.z);
+        }
+        Some(Shove { past_mid: far - mid, lowest: low, travelled: far - rest.x, wall: wall_name.is_some() })
+    }
+
+    /// **A parked wheeled vehicle never passes a Coliseum wall.** After its driver has left (so the prop world does not own it), a Warthog and a
+    /// Mongoose are shoved into the real `ff_arena_wall` and `ff_arena_window` at 6, 12 and 20 wu/s, at 144, 60 and 30 frames a second, once flat and once
+    /// as a launch phantom adds velocity (forward and up); none ends on the far side of the wall's mid plane or below the floor. Liveness: with
+    /// no wall the same shove carries it more than 2 wu. The gate can fail: with the hull collision off (`parked_hull_off`, the pre-fix
+    /// behaviour) the same shoves go through.
+    ///
+    /// SABOTAGE: skip the `collide_driven` call for parked vehicles in `PlayMode::tick` -> red (the second half of this gate is that sabotage).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored --nocapture"]
+    fn a_parked_wheeled_vehicle_never_passes_a_coliseum_wall() {
+        let mut bad: Vec<String> = Vec::new();
+        let mut runs = 0;
+        for vehicle in ["warthog\\warthog", "mongoose\\mongoose"] {
+            // liveness: it moves when nothing is behind it
+            let Some(free) = shove(true, vehicle, None, 0.0, 6.0, 0.0, 1.0 / 60.0, 3.0) else { return };
+            assert!(free.travelled > 2.0 && !free.wall, "{vehicle}: a shove of 6 wu/s with nothing ahead moved it only {:.2} wu", free.travelled);
+            for wall in ["ff_arena_wall", "ff_arena_window"] {
+                for v in [6.0f32, 12.0, 20.0] {
+                    for dt in [1.0 / 144.0, 1.0 / 60.0, 1.0 / 30.0] {
+                        for up in [0.0f32, 4.0] {
+                            let s = shove(true, vehicle, Some(wall), 3.0, v, up, dt, 5.0).expect("scene");
+                            runs += 1;
+                            if s.past_mid >= 0.0 || s.lowest < -0.6 {
+                                bad.push(format!("{vehicle} into {wall} at {v} wu/s (+{up} up), {:.0} Hz: reached {:+.2} past the wall's mid plane, lowest {:+.2}", 1.0 / dt, s.past_mid, s.lowest));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(runs >= 60);
+        assert!(bad.is_empty(), "{} of {runs} shoves got through:\n{}", bad.len(), bad.join("\n"));
+        // the gate can fail: without the hull collision a fast shove goes through
+        let off = shove(false, "warthog\\warthog", Some("ff_arena_wall"), 3.0, 20.0, 0.0, 1.0 / 60.0, 5.0).expect("scene");
+        assert!(off.past_mid >= 0.0, "liveness of the gate: with no hull collision the shove should pass the wall, got {:+.2}", off.past_mid);
     }
 }

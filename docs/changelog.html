@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.6.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -27,6 +27,7 @@
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -40,7 +41,54 @@
 <h1>Changelog</h1>
 <p class="lead">Release notes are published alongside each build on <a href="https://github.com/Sopitive/HaloMapStudio/releases">GitHub Releases</a>. This page summarises them.</p>
 
-<h2>v1.6.0 — 2026-10-21 <span class="tag">current</span></h2>
+<h2>v1.7.0 — 2026-10-29 <span class="tag">current</span></h2>
+<p><strong>Theater grows up: it now shows the objects a gametype's script cares about, draws a clip's Forge scene straight from the film, and can export the game variant as a real .bin file. Test mode gets loose objects and vehicles that collide properly, working vehicle weapons, and projectiles and explosions that finally draw and sound right. Real-time lighting is better in narrow spots and next to lamps.</strong></p>
+<p class="note"><strong>Test mode and Theater remain labelled EXPERIMENTAL.</strong> Vehicle weapons fire from the rider's eye rather than the gun's muzzle, and secondary weapons (bombs, missiles) have no key yet. The extracted game variant file has not been loaded in the MCC window itself.</p>
+
+<h3>Added</h3>
+<ul>
+  <li><strong>Theater: Highlight script objects.</strong> A new side-panel option (off by default, remembered) outlines the objects a gametype's script is responsible for, in a colour per category: objectives, zones and hill markers, markers attached to players, script-spawned and labelled Forge objects, and objects a script variable points at. It labels the nearest ones, lists them with category and name filters, and moves the camera to one when you click it (click again to follow it). Objects with no visible model, such as invisible cubes and doors that only draw an effect, get a see-through placeholder of their real size. Scripting: new <code>film highlight</code> verb. Box zones now read their width and length the same way the editor does.</li>
+  <li><strong>Theater: extracting a game variant now gives you a real .bin.</strong> <code>film extract gametype</code> (and the extract button) writes a Halo: Reach game variant file named from the gametype's title, in the format the game itself saves, instead of an unloadable raw dump. Megalo scripts, scripted options, string tables, loadouts, traits, Forge labels, HUD widgets and Firefight variants are all included. It was checked against hundreds of real gametypes, and 21 of 42 test films produce a file identical to the saved gametype of the same title and author. It has not been loaded in the MCC window itself, so please report any file the game refuses. A small notes .txt is written beside it; a variant that cannot fit in a .bin (a string table that is too large) is written as a .reach_gv file instead, with the reason in the notes.</li>
+  <li><strong>Test mode: vehicle weapons work.</strong> In a vehicle's gunner or driver seat the fire button now fires the vehicle's own weapon: Ghost and Banshee cannons, Warthog and Mongoose horns, turrets, and the guns on the Wraith, Scorpion, Falcon and Revenant. The horn and chain-gun spin sounds play while the button is held. Rounds leave from the rider's eye for now, not the gun's muzzle.</li>
+  <li><strong>Test mode: projectiles keep their proper orientation in flight</strong> (launched along the aim, then following their velocity where the projectile's tag says so), and projectiles with a looping sound (rockets, needles, grenades, flak, mortars and others) play it from the projectile as it flies and stop it the moment it ends.</li>
+  <li><strong>Test mode and Theater: explosions and impacts now draw.</strong> They appear at the contact point, facing the surface. The particle systems of every explosion effect were being skipped, so a rocket hit used to draw nothing.</li>
+  <li><strong>Real-time lighting: a fine probe grid follows the camera on big maps.</strong> Narrow shadows, pits and nooks now keep their darkness instead of being filled with sky light from the coarse map-wide grid, which still takes over in the distance. The per-frame cost is unchanged.</li>
+  <li><strong>Real-time lighting: the map's baked lamps are drawn per pixel again</strong> (the nearest eight, hidden behind walls), so interiors that looked too dark next to a lamp come up toward the baked lighting. Near a lamp, Boneyard and Settlement went from about 0.6x and 0.8x of the baked brightness to about 0.9x and 1.0x. A lamp behind a thin wall can still leak a little.</li>
+</ul>
+
+<h3>Fixed</h3>
+<ul>
+  <li><strong>Theater: a clip's Forge scene no longer needs a saved map variant.</strong> It is drawn directly from the Forge objects the clip itself carries, so it can no longer fail with a palette-CRC or canvas mismatch. It is a read-only view: nothing is saved and no file is written. <em>Extract map variant</em> still writes a real .mvar from a same-build variant, now tries every saved variant for the map, and lists the ones it tried if none fits.</li>
+  <li><strong>Theater: opening a clip no longer freezes the window.</strong> The statistics census and ride detection moved off the interface thread.</li>
+  <li><strong>Theater: markers attached to players now travel with them.</strong> The race clip's hill-marker respawn zones used to slide in straight lines between the few positions the recording states (up to about 40 wu off); they now follow the player or Mongoose they ride, within 0.83 wu. Their attachment offsets were also read 33 times too large, and a marker that only ever rides something is no longer treated as a static Forge piece.</li>
+  <li><strong>Theater: players who start inside a vehicle (a race start) are seated from the first frame.</strong> Their position used to arrive up to 4.5 seconds late, leaving the Mongooses empty. Four more rider links in the test films are recovered too.</li>
+  <li><strong>Theater: vehicle wheels and steering animate.</strong> Recorded Warthogs and Mongooses turn their wheels by the distance they roll and steer by the turning the recording implies, the same as in test mode. Scrubbing and seeking agree.</li>
+  <li><strong>Theater: Forge monitors get a name tag.</strong> A recording states no player for a monitor, so the name is worked out from which seat's body hands over to it. When the recording cannot say, the tag reads "Monitor" instead of a guessed gamertag.</li>
+  <li><strong>Theater: the saved-film details card no longer runs off the screen.</strong> It is capped to the window, kept on screen, and scrolls instead of widening for its longest line; a long file name is shortened in its title.</li>
+  <li><strong>First person: the weapon model no longer shimmers or looks wavy far from the map origin.</strong> Its jitter at a distance of 200 wu dropped from about 2 pixels to effectively zero.</li>
+  <li><strong>First person: reload animations play.</strong> A reload plays the weapon's own reload clip(s) for their authored length (the shotgun loads one shell per clip), in test mode from the HUD's reload and in Theater from the recorded reload event. The HUD's reload clock is the same length.</li>
+  <li><strong>Real-time lighting: a surface whose whole probe cell sat inside geometry rendered pure black.</strong> It now takes the light of the probes it faces and can see, and a pocket they cannot see stays dark.</li>
+  <li><strong>Real-time lighting: sun shadows are cleaner at the edges of the far cascades.</strong> Thin occluders are no longer missed and sloped surfaces no longer show edge artefacts.</li>
+</ul>
+
+<h3>Test mode (experimental)</h3>
+<ul>
+  <li><strong>Loose props, dropped weapons and anything you push now use the game's own physics solver</strong> (contact handling, continuous collision against the level, and putting resting bodies to sleep) instead of the earlier home-made one. Vehicles keep the old solver and the two push each other both ways. A weapon leaning on a wall, or lying a hand's width into a Forge piece, still comes out on top. Props now rest about 1.6 cm above the surface they lie on, as in the game, and a stack of three crates can creep sideways a little before it settles.</li>
+  <li><strong>Fixed: vehicles nobody is driving no longer pass through Forge walls and floors.</strong> A Warthog or Mongoose you got out of, or one thrown by a man cannon or grav lift, now collides like the vehicle you drive. Tested on the Coliseum wall and window pieces at several speeds and frame rates.</li>
+  <li><strong>Fixed: weapons, the soccer ball and undriven vehicles no longer fall through Forge pieces set to Phased,</strong> which includes every wall, platform and brace of the Coliseum. Phased pieces are solid to loose objects now, as they are to you.</li>
+  <li><strong>Fixed: an object with no physics body, zero mass or no shapes</strong> was left out of the physics world, so a loose prop fell through something you could stand on. It is now solid ground to props.</li>
+  <li><strong>Fixed: a tumbling body could be thrown back harder than it fell</strong> (a banshee flap dropped from 1.5 wu rose at 7 wu/s); impacts are now limited to the energy the body had.</li>
+  <li><strong>Fixed: when many bodies landed on the same tick, later impacts were skipped and tiny bodies fell through the floor.</strong> Every impact of the tick is handled now.</li>
+  <li><strong>Fixed: a compound body (a bench, a table) could sink through the floor.</strong> Its contact points are now kept per part.</li>
+  <li><strong>New diagnostic: <code>bump_trace.log</code></strong> is written next to <code>prop_fall.log</code> (at most 200 lines a session) and records which part of the physics owns each object you bump, to help track down odd collisions.</li>
+</ul>
+
+<h3>Performance</h3>
+<ul>
+  <li><strong>Test mode: 292 loose bodies falling and landing at once cost about 1.1 ms a tick</strong> on average (4 ms worst) with the new physics world.</li>
+</ul>
+
+<h2>v1.6.0 — 2026-10-21</h2>
 <p><strong>Halo 3 Forge editing that saves what Halo 3 stores, whole-build scaling, a character controller and vehicle physics taken from the engine, and a much lighter footprint next to the game.</strong> The properties panel on a Halo 3 map now edits Halo 3's own fields and writes them back; <kbd>S</kbd> scales a whole selection about its centre; test mode walks and drives on the engine's own laws; and Halo Map Studio stops running flat out when you are using something else.</p>
 <p class="note"><strong>Test mode and Theater remain labelled EXPERIMENTAL.</strong> Vehicle physics are still being matched to the engine, and ledge and edge behaviour is still under investigation. The tank and hover vehicles are not ported to the new physics yet. Theater sound levels are still being tuned, and Theater does not yet draw everything a clip recorded.</p>
 
@@ -233,7 +281,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.6.0 source (2026-10-21). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

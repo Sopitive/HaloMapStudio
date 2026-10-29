@@ -304,45 +304,98 @@ pub fn resolve_head_anchors(
     moved
 }
 
-/// A label for every body drawn at this moment.
+/// A label for every PLAYER body drawn at this moment.
 ///
-/// Named where the recording supports it and the ENTITY ID otherwise — never a guess. A clip can
-/// hold far more players than its header names (the header is who was present when it was
-/// written), so most tags on some clips are ids, and that is a property of the recording.
+/// **Who a body is comes from the roster** (`film_roster`): the player updates the recording itself
+/// carries say who held every slot and when, and a body's armour and team stamp pick the seat that
+/// was playing when it spawned. So a name is the name that player had THEN -- a slot re-used by a
+/// different person, a player who left and one who rejoined in another slot, and the lobby names the
+/// header stored before the match started all resolve to the right person.
+///
+/// A body that carries no appearance block is the gametype's or the AI's, not a player's; it has no
+/// gamertag to show and gets no tag. A player's body the roster cannot settle is labelled for what
+/// it is -- the candidates, or an unlisted player -- and drawn as an inference, never as a name.
 pub fn name_tags(
     pb: &crate::film_play::Playback,
     players: &[crate::film::FilmPlayer],
     cap: usize,
 ) -> Vec<NameTag> {
+    name_tags_with(pb, players, cap, &Default::default())
+}
+
+/// [`name_tags`] plus the Forge monitors: a monitor has no appearance block, so the roster calls
+/// it `NotAPlayer`; `monitors` (from `ActorDriver::monitor_owner`) says whose it most likely is.
+/// A monitor is always drawn as an INFERENCE, never as a stated gamertag.
+pub fn name_tags_with(
+    pb: &crate::film_play::Playback,
+    _players: &[crate::film::FilmPlayer],
+    cap: usize,
+    monitors: &std::collections::HashMap<u32, crate::film_roster::MonitorOwner>,
+) -> Vec<NameTag> {
+    use crate::film_roster::{Identity, MonitorOwner};
     pb.bipeds(cap)
         .into_iter()
-        .map(|p| {
-            let slot = pb.index.slot_of_entity(p.net_id);
-            let player = slot.and_then(|s| players.iter().find(|q| q.present() && q.index == s as usize));
-            let named = player.map_or(false, |q| !q.gamertag.is_empty());
-            // #xfilm  A body this film's own roster cannot name may still be named from ANOTHER
-            // recording, by its armour: a player's appearance is a near-unique fingerprint (171
-            // roster entries across the corpus reduce to 88 distinct appearances with one
-            // collision). That is an INFERENCE, not something this recording states, so it is
-            // carried separately and drawn differently -- a wrong gamertag is worse than none.
-            let inferred = (!named).then(|| pb.index.inferred_name(p.net_id)).flatten();
-            NameTag {
-                text: match (player.filter(|q| !q.gamertag.is_empty()), inferred) {
-                    (Some(q), _) => q.gamertag.clone(),
-                    (None, Some((tag, _))) => tag.to_string(),
-                    (None, None) => format!("{:#010x}", p.net_id),
+        .filter_map(|p| {
+            let id = pb.index.identity_of(p.net_id);
+            let (text, named, inferred_from, slot, seat_team) = match id {
+                Identity::NotAPlayer => match monitors.get(&p.net_id) {
+                    Some(MonitorOwner::Seat(i)) => {
+                        let seat = &pb.index.roster.seats[*i];
+                        (
+                            seat.name.clone(),
+                            false,
+                            Some("a Forge monitor states no player; this seat's own body hands over to it".to_string()),
+                            Some(seat.slot),
+                            seat.data_team,
+                        )
+                    }
+                    Some(MonitorOwner::Unknown) => {
+                        ("Monitor".to_string(), false, Some("a Forge monitor; the recording does not say whose".to_string()), None, -1)
+                    }
+                    None => return None,
                 },
-                inferred_from: inferred.map(|(_, src)| src.to_string()),
+                // The team stamp names this slot but the seat's armour says otherwise (or states
+                // none): the recording does not settle it, so it is drawn as an inference.
+                Identity::Player { seat, basis: crate::film_roster::Basis::SlotStamp } => (
+                    seat.name.clone(),
+                    false,
+                    Some("the team stamp names this slot; the armour does not confirm it".to_string()),
+                    Some(seat.slot),
+                    seat.data_team,
+                ),
+                Identity::Player { seat, .. } => (seat.name.clone(), true, None, Some(seat.slot), seat.data_team),
+                // #xfilm  A player's body this film's own roster cannot place may still be named
+                // from ANOTHER recording, by its armour. An INFERENCE, carried separately and
+                // drawn differently -- a wrong gamertag is worse than none.
+                Identity::Candidates(seats) => match pb.index.inferred_name(p.net_id) {
+                    Some((tag, src)) => (tag.to_string(), false, Some(src.to_string()), None, -1),
+                    None => {
+                        let mut names: Vec<&str> = seats.iter().map(|s| s.name.as_str()).collect();
+                        names.dedup();
+                        (names.join(" / "), false, Some("players wearing identical armour".to_string()), None, -1)
+                    }
+                },
+                Identity::Unknown => match pb.index.inferred_name(p.net_id) {
+                    Some((tag, src)) => (tag.to_string(), false, Some(src.to_string()), None, -1),
+                    None => ("unlisted player".to_string(), false, Some("no player update names this body".to_string()), None, -1),
+                },
+            };
+            // The body's own team: the stamp is the object's team, which is what the engine's
+            // colour rule compares. The seat's stated team is the fallback.
+            let team = pb.index.team_of_entity(p.net_id).or((seat_team >= 0).then_some(seat_team as u8)).unwrap_or(0xFF);
+            Some(NameTag {
+                text,
+                inferred_from,
                 pos: [p.pos[0], p.pos[1], p.pos[2] + NAME_TAG_UP_WU],
                 named,
-                team: player.map(|q| q.team).unwrap_or(0xFF),
+                team,
                 net_id: p.net_id,
                 feet: p.pos,
                 on_marker: false,
                 slot,
                 color_index: 2,
                 show_icon: false,
-            }
+            })
         })
         .collect()
 }
@@ -1868,112 +1921,119 @@ pub struct RosterRow {
     pub body_unmatched: bool,
 }
 
-/// The watchable cast of a film: one row per player who actually had a body, plus any header
-/// player who never did.
+/// The watchable cast of a film: one row per PERSON who played, plus a row for each group of
+/// bodies that belong to no player (the gametype's monitors, the AI).
 ///
-/// **Not the film header's roster.** The header records who was present when it was WRITTEN, so a
-/// clip can store three gamertags while fourteen players had a body on the map. Building the list
-/// from the header made eleven of those fourteen unwatchable, which is the wrong trade: aiming a
-/// camera at a body needs no gamertag, only an entity id, and the recording always has one.
+/// **Not the film header's roster, and not one row per team.** The header records who was in the
+/// LOBBY when it was written, and on a team film the first tick removes and re-adds nearly all of
+/// them; the player updates in the recording itself say who really played, and when. A person is
+/// one row for the whole clip even when they left and came back in another slot or changed
+/// armour, because the roster keys them on their player identifier. Their camera follows
+/// whichever slot they hold at the moment (`FirstPerson(slot)`).
 pub fn roster_lines(
     f: &Film,
     pb: &crate::film_play::Playback,
     biped_of: &std::collections::HashMap<u32, String>,
 ) -> Vec<RosterRow> {
+    use crate::film_roster::Verdict;
     // #scoreboard-color  Whether this recording was a TEAM game, from the embedded game
     // variant's own `teams enabled` bit -- which is what the engine's `game_engine_has_teams()`
     // tests. A clip with no variant at all (a pure Forge recording) is not a team game.
     let teams = f.header.gametype.as_ref().map_or(false, |gv| gv.misc.teams_enabled());
+    let idx = &pb.index;
+    let roster = &idx.roster;
+    let first_body = idx.first_player_tick().unwrap_or(0);
     let mut out: Vec<RosterRow> = Vec::new();
-    let mut claimed: std::collections::HashSet<u8> = Default::default();
-    for owner in pb.index.owner_groups() {
-        let slot = pb.index.slot_of_owner(owner);
-        if let Some(s) = slot {
-            claimed.insert(s);
+    // People, in the order the roster first saw them.
+    let mut order: Vec<u64> = Vec::new();
+    for s in &roster.seats {
+        if !order.contains(&s.identifier) {
+            order.push(s.identifier);
         }
-        let player =
-            slot.and_then(|s| f.header.players.iter().find(|p| p.present() && p.index == s as usize));
-        let first = pb
-            .index
+    }
+    for id in order {
+        let seats: Vec<usize> = (0..roster.seats.len()).filter(|&i| roster.seats[i].identifier == id).collect();
+        let bodies: Vec<&crate::film_decode::EntityTrack> = idx
             .tracks
             .iter()
-            .filter(|t| t.entity_type == 11 && t.owner_raw == Some(owner))
-            .min_by_key(|t| t.first_tick);
-        let named = player.map_or(false, |p| !p.gamertag.is_empty());
-        // #camera-rows  A group with no player slot is NOT a nameless player by default. The
-        // recording says what each body was spawned from, and over this corpus the bodies that
-        // never bind to a slot include FORGE MONITORS -- a monitor is a biped with an owner
-        // stamp and no configuration slot, so it reaches exactly this branch. A row that is one
-        // of those should say what it is, not show a bare entity id as though a gamertag had
-        // gone missing. `biped_of` is `net id -> bipd tag path`, resolved by the driver from the
-        // creation messages; empty when nobody has resolved it yet.
+            .filter(|t| t.entity_type == 11)
+            .filter(|t| matches!(idx.body_verdicts.get(&t.net_id), Some(Verdict::Named(i, _)) if seats.contains(i)))
+            .collect();
+        // A lobby seat removed before the first body ever existed was never part of the match.
+        let in_match = seats.iter().any(|&i| !roster.seats[i].from_header || roster.seats[i].until_tick.map_or(true, |u| u > first_body));
+        if bodies.is_empty() && !in_match {
+            continue;
+        }
+        let Some(&last) = seats.last() else { continue };
+        let seat = &roster.seats[last];
+        let hdr = f.header.players.iter().find(|p| p.present() && p.xuid == id);
+        let look = seats.iter().rev().find_map(|&i| roster.seats[i].look);
+        let appearance = look.map(|l| crate::film::PlayerAppearance {
+            slots: std::array::from_fn(|i| l.slots[i] as u8),
+            color_primary: l.colors[0] as u8,
+            color_secondary: l.colors[1] as u8,
+            f48: l.flags,
+            f4b: l.colors[2] as u8,
+            model_choice: l.model_choice,
+        });
+        // The team the recording stamps on this person's bodies; the seat's stated team is the
+        // fallback for someone who never spawned.
+        let team = bodies
+            .iter()
+            .filter_map(|t| idx.team_of_entity(t.net_id))
+            .next()
+            .or_else(|| seats.iter().rev().map(|&i| roster.seats[i].data_team).find(|t| *t >= 0).map(|t| t as u8))
+            .unwrap_or(0xFF);
+        out.push(RosterRow {
+            owner: None,
+            slot: Some(seat.slot),
+            label: if seat.name.is_empty() { format!("slot {}", seat.slot) } else { seat.name.clone() },
+            named: !seat.name.is_empty(),
+            service_tag: hdr.map(|p| p.service_tag.clone()).unwrap_or_default(),
+            team,
+            armour: appearance.map(|a| a.summary()).unwrap_or_default(),
+            armour_color: appearance.map(|a| a.color_primary),
+            emblem: hdr.and_then(|p| p.emblem()),
+            teams_enabled: teams,
+            body_kind: String::new(),
+            lives: bodies.len(),
+            first_tick: bodies.iter().map(|t| t.first_tick).min(),
+            body_unmatched: false,
+        });
+    }
+    // Bodies that belong to no person: the gametype's and the AI's (a Forge monitor is a biped
+    // with an owner stamp and no player), and any player's body the roster could not place. They
+    // stay watchable, by owner group, labelled for what the recording says they are.
+    let mut groups: std::collections::BTreeMap<u8, Vec<&crate::film_decode::EntityTrack>> = Default::default();
+    for t in idx.tracks.iter().filter(|t| t.entity_type == 11) {
+        if matches!(idx.body_verdicts.get(&t.net_id), Some(Verdict::Named(..))) {
+            continue;
+        }
+        if let Some(o) = t.owner_raw {
+            groups.entry(o).or_default().push(t);
+        }
+    }
+    for (owner, ts) in groups {
+        let first = ts.iter().min_by_key(|t| t.first_tick).copied();
         let kind = first
             .and_then(|t| biped_of.get(&t.net_id))
             .map(|p| p.rsplit('\\').next().unwrap_or(p.as_str()).to_string())
             .unwrap_or_default();
         out.push(RosterRow {
             owner: Some(owner),
-            slot,
-            label: match player.filter(|p| !p.gamertag.is_empty()) {
-                Some(p) => p.gamertag.clone(),
-                // No name for this body. Say what the recording DOES know about it: the thing it
-                // was spawned from, plus the entity id that makes it watchable. The id stays in
-                // the label because it is the only handle that distinguishes two monitors.
-                None => unnamed_camera_label(&kind, first.map(|t| t.net_id), owner),
-            },
-            named,
-            service_tag: player.map(|p| p.service_tag.clone()).unwrap_or_default(),
-            // #team-colour  In a team game the owner group IS the team (the stamp is the object's
-            // team), which is what the engine feeds the row; the header's per-player `team` is
-            // as stale as its roster, so it is only the fallback.
-            team: f
-                .header
-                .gametype
-                .as_ref()
-                .and_then(|gv| gv.team_of_owner(owner))
-                .or_else(|| player.map(|p| p.team))
-                .unwrap_or(0xFF),
-            armour: player.and_then(|p| p.appearance()).map(|a| a.summary()).unwrap_or_default(),
-            armour_color: player.and_then(|p| p.appearance()).map(|a| a.color_primary),
-            emblem: player.and_then(|p| p.emblem()),
+            slot: None,
+            label: unnamed_camera_label(&kind, first.map(|t| t.net_id), owner),
+            named: false,
+            service_tag: String::new(),
+            team: f.header.gametype.as_ref().and_then(|gv| gv.team_of_owner(owner)).unwrap_or(0xFF),
+            armour: String::new(),
+            armour_color: None,
+            emblem: None,
             teams_enabled: teams,
             body_kind: kind,
-            lives: pb.index.owner_lives(owner),
+            lives: ts.len(),
             first_tick: first.map(|t| t.first_tick),
             body_unmatched: false,
-        });
-    }
-    // A header player with no owner group. Two quite different reasons, and the row must not
-    // conflate them: either they genuinely never had a body, or they did and HMS could not tell
-    // WHICH of the unnamed bodies was theirs.
-    let unmatched_bodies = out.iter().filter(|r| !r.named).count();
-    for p in f.present_players() {
-        if claimed.contains(&(p.index as u8)) {
-            continue;
-        }
-        let own = pb.index.bodies_of_slot(p.index as u8);
-        out.push(RosterRow {
-            owner: None,
-            slot: Some(p.index as u8),
-            label: if p.gamertag.is_empty() { format!("slot {}", p.index) } else { p.gamertag.clone() },
-            named: !p.gamertag.is_empty(),
-            service_tag: p.service_tag.clone(),
-            team: p.team,
-            armour: p.appearance().map(|a| a.summary()).unwrap_or_default(),
-            armour_color: p.appearance().map(|a| a.color_primary),
-            emblem: p.emblem(),
-            teams_enabled: teams,
-            body_kind: String::new(),
-            // This row has no owner GROUP, but that does not mean it has no bodies: a slot can
-            // be named at the BODY level by elimination, and then its lives sit in whichever
-            // unnamed group those bodies belong to. Hardcoding 0 said "this player never
-            // played" about somebody who did -- on the test film, slot 15 read `lives=0` while
-            // six of their own bodies were listed under a separate unnamed row. `bodies_of_slot`
-            // answers per body, so it reaches an elimination-named slot without letting the
-            // unnamed group claim the name.
-            lives: own.len(),
-            first_tick: own.first().map(|t| t.first_tick),
-            body_unmatched: unmatched_bodies > 0 && own.is_empty(),
         });
     }
     out.sort_by_key(|r| (!r.named, r.first_tick.unwrap_or(u32::MAX), r.label.clone()));
@@ -2017,67 +2077,68 @@ pub fn unnamed_camera_label(body_kind: &str, _net_id: Option<u32>, owner: u8) ->
     format!("{kind} {owner}")
 }
 
-/// A plain statement of who is in the clip versus who can be NAMED — worded so a reader can tell
-/// a property of the recording from a failure of this program.
+/// A plain statement of who is in the clip versus who can be NAMED -- worded so a reader can tell a
+/// property of the recording from a failure of this program.
 ///
-/// It is the former, and for TWO separate reasons that must not be run together.
-///
-/// **The body's own field cannot name everybody.** A body says whose it is through the engine's
-/// `object +0x3E`, a SIGNED byte with -1 meaning "nobody", replicated as `value + 1` in four
-/// bits (`write_bits(*(char*)(obj+0x3E)+1, 4)` against `read_bits(4)-1`). So wire 0 carries TWO
-/// meanings and nothing in the field distinguishes them: it is the `-1` sentinel, "attributed to
-/// nobody", and it is also slot 15, whose `index + 1` OVERFLOWS four bits to 0. Where the header
-/// occupies slot 15 and wires 1..15 account for every other slot, the leftover group is recovered
-/// as that player (`FilmIndex::bind_stamp_zero_by_truncation`); where it does not, wire 0 really
-/// does mean nobody. In neither case is there a wrap for slots past 15. Nothing else in the file
-/// attributes a body: the runtime
-/// player-to-unit mapping is written (`Player_SetUnit`, `player_datum +0x28` and back to
-/// `object +0x1CC`) but never replicated, and `s_player_action`, the one channel that carries
-/// per-player object references, has zero blocks across 39 films and 400,000-plus ticks.
-///
-/// **And the header does not hold every name.** A clip measured here stores three gamertags
-/// while thirteen slots carry per-tick records and fourteen players had a body. Scanning that
-/// film's whole 60 MB — every byte, at all eight bit alignments past the header, because a string
-/// inside a bit-packed payload would not be byte-aligned — finds exactly those three gamertags,
-/// all within the first 4 KB. Anyone who joined after the header was written has no record in it
-/// to be named from.
+/// **Names come from the recording's own player updates.** Every join, leave, swap and armour change
+/// is a record in the stream (`film_roster`), and each player body states its armour and team, so a
+/// body is tied to the person who was playing in it when it spawned. The film header only stores
+/// who was in the lobby when it was written, which on a team film is nearly nobody who played.
 pub fn roster_coverage(pb: &crate::film_play::Playback, header_players: usize) -> String {
-    let bodies = pb.index.owner_group_count();
-    // Ask BOTH routes, because `slot_of_owner` answers `None` for wire 0 by design and the
-    // display does not: `owner_group_is_named` also tries each of the group's bipeds through
-    // `slot_of_entity`, which is what actually feeds a nameplate. Counting only the first route
-    // used to report "15 of 16 can be NAMED" while the sixteenth player's gamertag was being
-    // drawn over their head.
-    let named =
-        pb.index.owner_groups().iter().filter(|&&o| pb.index.owner_group_is_named(o)).count();
-    let mut s = format!("{bodies} player(s) had a body in this clip, and all {bodies} can be watched. ");
-    if named >= bodies {
-        s.push_str("Every one of them is named by the recording.");
-        return s;
+    use crate::film_roster::Verdict;
+    let idx = &pb.index;
+    let (mut player_bodies, mut named, mut candidates, mut unknown, mut people) =
+        (0usize, 0usize, 0usize, 0usize, std::collections::BTreeSet::new());
+    let mut non_player = 0usize;
+    for t in idx.tracks.iter().filter(|t| t.entity_type == 11) {
+        match idx.body_verdicts.get(&t.net_id) {
+            Some(Verdict::Named(i, _)) => {
+                player_bodies += 1;
+                named += 1;
+                people.insert(idx.roster.seats[*i].identifier);
+            }
+            Some(Verdict::Ambiguous(_)) => {
+                player_bodies += 1;
+                candidates += 1;
+            }
+            Some(Verdict::Unmatched) => {
+                player_bodies += 1;
+                unknown += 1;
+            }
+            _ => non_player += 1,
+        }
     }
-    // #xfilm  Say that cross-film naming depends on the user's OTHER recordings, because the
-    // same clip naming differently on a different machine reads as a bug otherwise.
-    s.push_str(
-        "Some bodies are named from ANOTHER of your recordings, by matching their armour, and \
-         those names are drawn dimmer and in [brackets] because this recording does not state \
-         them. That means the same clip names more players on a machine with more films on it, \
-         and only the ones this film's own header holds if it is the only one. ",
+    let mut s = format!(
+        "{} player(s) had a body in this clip, and all of them can be watched. The film header stored {header_players} \
+         gamertag(s) \u{2014} who was in the lobby when it was written \u{2014} while the recording's own player updates \
+         ({} of them) list everyone who joined, left or changed. ",
+        people.len(),
+        idx.roster.updates
     );
-    s.push_str(&format!(
-        "{named} of them can be NAMED. The field a body carries to say whose it is holds \
-         `index + 1` in FOUR BITS, so slots 0 to 14 take wire values 1 to 15 and slot 15 \
-         OVERFLOWS to 0 \u{2014} the same value the engine uses for \u{201c}nobody\u{201d}. Where \
-         this header occupies slot 15 and every other slot is accounted for, those bodies are \
-         RECOVERED as that player; where it does not, 0 means nobody and is left unnamed on \
-         purpose rather than guessed. Nothing else in the file attributes them: the \
-         runtime player-to-unit link is never replicated, and the one channel that carries \
-         per-player object references is absent from films entirely. Separately, this header \
-         stored {header_players} gamertag(s), which is who was present when it was written, so \
-         anyone who joined later has no record here to name them from either. The rest are \
-         listed by what the recording says they ARE \u{2014} the biped and their owner group \
-         \u{2014} and a body stamped \u{201c}nobody\u{201d} is left unnamed on purpose rather \
-         than guessed at."
-    ));
+    if player_bodies == 0 {
+        s.push_str("No player body appears in this clip.");
+    } else if named == player_bodies {
+        s.push_str(&format!("Every one of the {player_bodies} player bodies is named by the recording."));
+    } else {
+        s.push_str(&format!("{named} of {player_bodies} player bodies are named by the recording"));
+        if candidates > 0 {
+            s.push_str(&format!(
+                "; {candidates} could be either of several players who wore identical armour at that moment and are labelled with all of them"
+            ));
+        }
+        if unknown > 0 {
+            s.push_str(&format!(
+                "; {unknown} belong to nobody the player updates list (a name from another of your recordings is shown in [brackets] where the armour matches one)"
+            ));
+        }
+        s.push('.');
+    }
+    if non_player > 0 {
+        s.push_str(&format!(
+            " {non_player} other bod{} belong to no player (the gametype's or the AI's) and carry no name.",
+            if non_player == 1 { "y" } else { "ies" }
+        ));
+    }
     s
 }
 
@@ -2362,6 +2423,31 @@ pub fn side_panel_ui(
                         // than on the header slot, which most do not.
                         ui.horizontal(|ui| {
                             match row.owner {
+                                // #film-roster  A PERSON: the camera follows whichever slot they
+                                // hold, through the bindings the roster made.
+                                None if row.slot.is_some() && row.lives > 0 => {
+                                    let s = row.slot.unwrap_or(0);
+                                    let fp = pb.camera == crate::film_play::FilmCamera::FirstPerson(s);
+                                    let fl = pb.camera == crate::film_play::FilmCamera::Follow(s);
+                                    if ui.selectable_label(fp, "1st").on_hover_text("Through this player's eyes").clicked() {
+                                        pb.camera = if fp {
+                                            crate::film_play::FilmCamera::Free
+                                        } else {
+                                            crate::film_play::FilmCamera::FirstPerson(s)
+                                        };
+                                    }
+                                    if ui
+                                        .selectable_label(fl, "follow")
+                                        .on_hover_text("Behind and above this player's body; drag in the viewport to orbit")
+                                        .clicked()
+                                    {
+                                        pb.camera = if fl {
+                                            crate::film_play::FilmCamera::Free
+                                        } else {
+                                            crate::film_play::FilmCamera::Follow(s)
+                                        };
+                                    }
+                                }
                                 Some(o) => {
                                     let has_body_now = owners_with_body.contains(&o);
                                     let fp = pb.camera == crate::film_play::FilmCamera::FirstPersonOwner(o);
@@ -3552,13 +3638,14 @@ mod scoreboard_tests {
     }
 
 
-    /// A named player who HAS bodies must never be listed with no lives.
+    /// A person who HAS bodies must never be listed with no lives, and the rows must account for
+    /// every body the roster named.
     ///
-    /// The camera list is built per owner GROUP, and a slot can be named at the BODY level by
-    /// elimination while having no group of its own. Those rows used to hardcode `lives: 0,
-    /// first_tick: None`, which says "this player never played" about somebody who did -- on the
-    /// 7:11 test clip, slot 15 read `lives=0` while their own body sat in a separate unnamed row.
-    /// Over the real corpus; skips, with a note, on a machine with no recordings.
+    /// The cast is one row per PERSON (the roster keys them on their player identifier), not per
+    /// owner group and not per header slot: a slot can change hands, and on a team film an owner
+    /// group is a whole team. So the invariant is per person: count each person's named bodies
+    /// from the verdicts, and check the rows say the same. Over the real corpus; skips, with a
+    /// note, on a machine with no recordings.
     #[test]
     fn a_named_player_with_bodies_is_never_listed_with_no_lives() {
         let films = crate::film::spec_corpus();
@@ -3567,104 +3654,37 @@ mod scoreboard_tests {
             return;
         }
         let empty = std::collections::HashMap::new();
-        let (mut rows_seen, mut checked, mut groupless) = (0usize, 0usize, 0usize);
-        let mut first_tick_mismatch = 0usize;
+        let (mut rows_seen, mut people_checked) = (0usize, 0usize);
         for path in films.iter() {
             let Ok(f) = crate::film::open(path) else { continue };
-            // The SAME entry point both hosts use. `build_index_for` skips the header player
-            // records, and without them no slot is ever named by elimination -- which is exactly
-            // the branch this gate is about, so using it made the gate check nothing.
-            let idx = crate::film_decode::build_index_players(
-                &f.bytes,
-                &f.data,
-                &f.header.map_variant,
-                f.recorder_slot(),
-                &f.header.players,
-            );
-            let pb = crate::film_play::Playback::new(idx);
-            for r in roster_lines(&f, &pb, &empty) {
-                rows_seen += 1;
-                let Some(slot) = r.slot.filter(|_| r.named) else { continue };
-                let bodies = pb.index.bodies_of_slot(slot);
-                if bodies.is_empty() {
-                    // Genuinely no body for this slot: 0 lives is the truth, and it must not be
-                    // dressed up as something else either.
-                    assert_eq!(r.lives, 0, "{:?} slot {slot}: lives without bodies", path.file_name());
-                    continue;
+            let idx = crate::film_decode::build_index_film(&f);
+            let mut want: std::collections::BTreeMap<u64, usize> = Default::default();
+            for t in idx.tracks.iter().filter(|t| t.entity_type == 11) {
+                if let Some(seat) = idx.seat_of_entity(t.net_id) {
+                    *want.entry(seat.identifier).or_default() += 1;
                 }
-                checked += 1;
-                // The branch this gate exists for: a slot named at the BODY level with no owner
-                // GROUP of its own. Counted so the gate cannot pass by never reaching it.
-                if r.owner.is_none() {
-                    groupless += 1;
-                }
-                assert!(
-                    r.lives > 0,
-                    "{:?} slot {slot} ({}) has {} bodies but is listed with no lives",
-                    path.file_name(),
-                    r.label,
-                    bodies.len()
-                );
-                // The row must not claim to START AFTER its own earliest body.
-                //
-                // This used to demand exact equality with `bodies[0].first_tick`, and that became
-                // wrong rather than violated: a slot is now bound by several routes (the owner
-                // stamp, and the body's ARMOUR matched against other recordings), and the roster
-                // follows all of them while this gate collects bodies by one. So the roster
-                // legitimately knows about an earlier body than the gate can see — measured, a row
-                // starting at tick 2 whose first visible body is at tick 10. Equality would be
-                // asserting that this gate's view is complete, which it is not.
-                //
-                // Nor does the opposite direction hold: measured across the corpus the roster's
-                // first tick runs BOTH earlier than this gate's earliest body (2 vs 10) and much
-                // later (49162 vs 2), because the two views are built from different route sets
-                // while the armour route is still landing. So the two are COUNTED and reported
-                // rather than asserted against each other — an assertion whose premise is false
-                // is worse than none, and silently deleting the check would be worse still.
-                //
-                // THIS IS A LOOSE END, not a finished check: once the binding routes settle, this
-                // should become an equality again against a body set gathered the same way the
-                // roster gathers it.
-                if let (Some(rt), Some(b)) = (r.first_tick, bodies.first().map(|b| b.first_tick)) {
-                    if rt != b {
-                        first_tick_mismatch += 1;
-                    }
-                }
-                // A row with bodies of its own is not an unmatched body.
-                assert!(!r.body_unmatched, "{:?} slot {slot}: has bodies and is still flagged unmatched", path.file_name());
             }
+            let pb = crate::film_play::Playback::new(idx);
+            let rows = roster_lines(&f, &pb, &empty);
+            rows_seen += rows.len();
+            let mut with_bodies: Vec<usize> =
+                rows.iter().filter(|r| r.owner.is_none() && r.slot.is_some() && r.lives > 0).map(|r| r.lives).collect();
+            let mut expected: Vec<usize> = want.values().copied().collect();
+            with_bodies.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(
+                with_bodies,
+                expected,
+                "{:?}: the cast does not list every person who had bodies, with the right count",
+                path.file_name()
+            );
+            for r in rows.iter().filter(|r| r.owner.is_none() && r.slot.is_some() && r.lives == 0) {
+                assert!(r.first_tick.is_none(), "{:?}: {} has no lives but a first tick", path.file_name(), r.label);
+            }
+            people_checked += expected.len();
         }
-        eprintln!(
-            "film_ui: {rows_seen} camera rows over {} films; {checked} named slots had bodies, \
-             {groupless} of them with no owner group",
-            films.len()
-        );
+        eprintln!("film_ui: {rows_seen} camera rows over {} films; {people_checked} people with bodies listed", films.len());
         assert!(rows_seen > 0, "no camera rows at all — this gate checked nothing");
-        if first_tick_mismatch > 0 {
-            eprintln!(
-                "film_ui: {first_tick_mismatch} row(s) whose first tick differs from their earliest \
-                 body as this gate gathers them — the roster follows binding routes this gate does \
-                 not, so the two are reported rather than asserted equal (see the note above)"
-            );
-        }
-        // The REAL invariant, and it is checked above on all 67 named slots that have bodies:
-        // a row with bodies of its own carries that body's first tick and is not flagged
-        // unmatched.
-        //
-        // This used to additionally demand `groupless > 0` — that the corpus still CONTAIN a slot
-        // named at body level with no owner group — so the gate could prove it had exercised that
-        // branch. That count is now ZERO, and not because anything regressed: the owner stamp's
-        // wire 0 is both the "nobody" sentinel and slot 15's overflowed `index + 1`, and
-        // `FilmIndex::bind_stamp_zero_by_truncation` now recovers those bodies, so every named
-        // slot with bodies has a group. Demanding the old shape would make a decode improvement
-        // look like a failure, so the branch is REPORTED when it is empty rather than asserted.
-        if groupless == 0 {
-            eprintln!(
-                "film_ui: no slot is named at body level without an owner group — the stamp-0 \
-                 recovery now gives every named slot a group, so that branch is not exercised \
-                 by this corpus"
-            );
-        }
     }
 
     /// **THE SCORE GATE.** The scoreboard must show the score the recording had AT the tick being
@@ -3758,20 +3778,14 @@ mod scoreboard_tests {
         );
     }
 
-    /// The coverage sentence must give the REAL reason a body is unnamed.
+    /// The coverage sentence must say what is TRUE of this recording, in its numbers.
     ///
     /// It used to say the unnamed players "joined afterwards, so their names were never written
-    /// to the file at all", which is not what the recording does. The body's owner field holds
-    /// `index + 1` in FOUR BITS with 0 meaning "nobody" -- a property of the format, not of when
-    /// anyone joined. Late joining is a separate, additional reason, and the two must not be
-    /// conflated.
-    ///
-    /// The consequence has since been narrowed: `15 + 1` OVERFLOWS to 0, so slot 15 shares the
-    /// "nobody" wire value rather than being unreachable, and where the header occupies slot 15
-    /// and every other slot is accounted for those bodies are RECOVERED as that player
-    /// (`FilmIndex::bind_stamp_zero_by_truncation`). So the sentence must no longer claim a
-    /// fifteen-player ceiling on who can be named -- that would contradict the nameplates
-    /// actually being drawn -- and this gate now asks for the overflow and the recovery instead.
+    /// to the file at all", then blamed a four-bit owner field. Neither is the reason now: bodies
+    /// are tied to people through the recording's own player updates, and what the sentence has to
+    /// get right is how many gamertags the header stored (the lobby), how many player updates the
+    /// stream carried, and how many player bodies could not be named. Each of those is checked
+    /// against the index it describes.
     #[test]
     fn the_coverage_sentence_gives_the_real_reason() {
         let films = crate::film::spec_corpus();
@@ -3779,46 +3793,35 @@ mod scoreboard_tests {
             eprintln!("film_ui: no real recordings on this machine -- coverage wording not checked");
             return;
         }
-        let mut checked = 0usize;
+        let (mut checked, mut partial) = (0usize, 0usize);
         for path in films.iter() {
             let Ok(f) = crate::film::open(path) else { continue };
-            // The SAME entry point both hosts use. `build_index_for` skips the header player
-            // records, and without them no slot is ever named by elimination -- which is exactly
-            // the branch this gate is about, so using it made the gate check nothing.
-            let idx = crate::film_decode::build_index_players(
-                &f.bytes,
-                &f.data,
-                &f.header.map_variant,
-                f.recorder_slot(),
-                &f.header.players,
-            );
+            let idx = crate::film_decode::build_index_film(&f);
             let pb = crate::film_play::Playback::new(idx);
-            let s = roster_coverage(&pb, f.present_players().count());
-            if s.contains("Every one of them is named") {
-                continue;
-            }
+            let header = f.present_players().count();
+            let s = roster_coverage(&pb, header);
             checked += 1;
+            for retired in ["never written to the file at all", "FOUR BITS", "OVERFLOWS", "cannot name more than fifteen"] {
+                assert!(!s.contains(retired), "a retired explanation is back ({retired:?}): {s}");
+            }
+            assert!(s.contains(&format!("stored {header} gamertag(s)")), "the header count is wrong: {s}");
             assert!(
-                !s.contains("never written to the file at all"),
-                "the retired explanation is back: {s}"
+                s.contains(&format!("player updates ({} of them)", pb.index.roster.updates)),
+                "the player-update count is wrong: {s}"
             );
-            assert!(s.contains("FOUR BITS"), "the four-bit limit is the real reason and is not stated: {s}");
-            // The four-bit field is still the reason, but the CONSEQUENCE changed: slot 15's
-            // `index + 1` overflows to 0 rather than being unreachable, and where the header
-            // accounts for every other slot those bodies are recovered as that player. The old
-            // wording ("cannot name more than fifteen players") now contradicts the behaviour, so
-            // the gate asks for the current rule instead.
-            assert!(s.contains("OVERFLOWS"), "the slot-15 overflow is not stated: {s}");
-            assert!(s.contains("RECOVERED"), "the recovery is not stated: {s}");
-            assert!(
-                !s.contains("cannot name more than fifteen"),
-                "the retired fifteen-player ceiling is back, and it is no longer true: {s}"
-            );
-            // Late joining is still mentioned, but as a SEPARATE reason.
-            assert!(s.contains("joined later"), "late joining dropped entirely: {s}");
-            assert!(s.contains("Separately"), "the two reasons are run together: {s}");
+            let players = pb.index.body_verdicts.values().filter(|v| !matches!(v, crate::film_roster::Verdict::NotAPlayer)).count();
+            let named = pb.index.body_verdicts.values().filter(|v| matches!(v, crate::film_roster::Verdict::Named(..))).count();
+            if players == 0 {
+                assert!(s.contains("No player body appears"), "{s}");
+            } else if named == players {
+                assert!(s.contains(&format!("Every one of the {players} player bodies is named")), "{s}");
+            } else {
+                partial += 1;
+                assert!(s.contains(&format!("{named} of {players} player bodies are named")), "{s}");
+            }
         }
-        eprintln!("film_ui: coverage wording checked on {checked} film(s) with unnamed bodies");
+        eprintln!("film_ui: coverage wording checked on {checked} film(s), {partial} with unnamed bodies");
+        assert!(checked > 0);
     }
 
     /// #camera-rows  A body the recording never named must not be labelled as a bare object id.

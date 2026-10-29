@@ -3056,6 +3056,15 @@ pub struct Actor {
     /// Set when the MESHES (not the pose) must be rebuilt: a new actor, a changed weapon, or a
     /// placement that drifted too far from `anchor` for the fold-in to keep lighting honest.
     pub meshes_dirty: bool,
+    /// #fp-wave  The world position the first-person rig is drawn RELATIVE to (the renderer's
+    /// `set_first_person_origin`); only read for `first_person` actors. Set by `ActorScene`.
+    pub fp_origin: Vec3,
+    /// #fp-wave  The camera-relative frame a first-person mesh was baked at: the rotation of `anchor`
+    /// with no translation. It is the per-instance matrix the GPU draws the mesh with.
+    pub fp_bake: Mat4,
+    /// #fp-wave  A first-person weapon's placement relative to `fp_origin`: its parent's relative
+    /// placement times the hand node, composed without ever forming a world coordinate.
+    pub gpu_override: Option<Mat4>,
 }
 
 /// #armour-fx One `effe` ATTACHMENT a posed actor is playing, resolved once per mesh rebuild.
@@ -3169,6 +3178,23 @@ pub fn actor_mesh_frame(anchor: Mat4) -> (Vec3, Vec3, Vec3) {
     (anchor.w_axis.truncate(), anchor.x_axis.truncate(), anchor.z_axis.truncate())
 }
 
+/// #fp-wave  `anchor^-1 * world`, the placement delta every palette folds in, computed in f64.
+///
+/// **Why f64.** A mesh is baked at `anchor` (the actor's placement at the last rebuild) and then
+/// followed by a per-frame palette of `anchor^-1 * world`. For a world model that is a rare
+/// correction; for the FIRST-PERSON rig it is the whole transform, every frame, because the rig is
+/// glued to the eye and the eye is wherever the player is: 100-450 wu from the origin on a Forge
+/// map. A general f32 inverse of a matrix whose translation is 200 has a translation error of about
+/// 1e-4 wu, and the viewmodel is 0.3-0.6 wu from the lens: MEASURED (`play_mode::map_gates::
+/// probe_first_person_wave`) as 2.1 px RMS and up to 7 px of frame-to-frame jitter at 1080p while
+/// walking, against 0.03 px at the origin. The user's "sort of wavy, like a floating point error" is
+/// that. One f64 inverse-and-multiply, rounded once on the way out, takes it to rounding only.
+pub fn fold_delta(anchor: Mat4, world: Mat4) -> Mat4 {
+    let d = |m: Mat4| glam::DMat4::from_cols_array(&m.to_cols_array().map(f64::from));
+    let m = d(anchor).inverse() * d(world);
+    Mat4::from_cols_array(&m.to_cols_array().map(|x| x as f32))
+}
+
 /// #float-weapon  Where a HELD WEAPON's mesh actually ends up on screen, written out in full.
 ///
 /// Three transforms compose, and they come from three different places, which is why this is a
@@ -3185,7 +3211,7 @@ pub fn actor_mesh_frame(anchor: Mat4) -> (Vec3, Vec3, Vec3) {
 /// `bake` taken from anywhere else and the weapon is displaced by `bake.translation -
 /// anchor.translation`, drawn hanging in mid-air away from the hand that holds it.
 pub fn held_weapon_drawn(bake: Mat4, anchor: Mat4, world_now: Mat4, attach: Mat4) -> Mat4 {
-    bake * anchor.inverse() * world_now * attach
+    bake * fold_delta(anchor, world_now) * attach
 }
 
 /// #float-weapon  The frame `actor_mesh_frame` describes, rebuilt as a matrix — i.e. what
@@ -3198,7 +3224,55 @@ pub fn bake_frame(origin: Vec3, fwd: Vec3, up: Vec3) -> Mat4 {
     Mat4::from_cols(f.extend(0.0), right.extend(0.0), u.extend(0.0), origin.extend(1.0))
 }
 
+/// #fp-wave  The frame a first-person mesh is DRAWN with: the rotation of `anchor` (the placement it was
+/// built at), with no translation. Used by the build and by the gates.
+pub fn fp_bake_frame(anchor: Mat4) -> Mat4 {
+    let (_, f, u) = actor_mesh_frame(anchor);
+    bake_frame(Vec3::ZERO, f, u)
+}
+
+/// #fp-wave  Give every mesh of a freshly built first-person actor the camera-relative instance
+/// matrix `m` (a rotation-only frame) in place of the world-space one it was built with.
+fn rebase_lanes(l: &mut crate::objscene::RebuiltLanes, m: Mat4, queue: &wgpu::Queue) {
+    for lane in [&mut l.opaque, &mut l.cutout, &mut l.holo, &mut l.holo_solid, &mut l.blend] {
+        for g in lane.iter_mut() {
+            g.set_instance_models(queue, &[m]);
+        }
+    }
+}
+
+/// #fp-wave  `world` with its translation re-expressed relative to `origin`, subtracted in f64.
+/// For a rig mounted on the eye the result is ~0, so nothing large ever reaches the GPU.
+pub fn rel_world(world: Mat4, origin: Vec3) -> Mat4 {
+    let mut m = world;
+    let t = world.w_axis.truncate().as_dvec3() - origin.as_dvec3();
+    m.w_axis = t.as_vec3().extend(1.0);
+    m
+}
+
 impl Actor {
+    /// #fp-wave  The placement the GPU draws this actor with. A first-person actor is drawn
+    /// CAMERA-RELATIVE ([`rel_world`]); everything else is placed in the world as before.
+    pub fn gpu_world(&self) -> Mat4 {
+        if !self.first_person {
+            return self.world();
+        }
+        match (self.fp_attach, self.gpu_override) {
+            (Some(_), Some(m)) => m,
+            _ => rel_world(self.world(), self.fp_origin),
+        }
+    }
+
+    /// #fp-wave  The placement delta every palette entry is multiplied by, for whichever frame this
+    /// actor's meshes were drawn in: camera-relative for the first-person rig, world otherwise.
+    pub fn palette_delta(&self) -> Mat4 {
+        if self.first_person {
+            fold_delta(self.fp_bake, self.gpu_world())
+        } else {
+            fold_delta(self.anchor, self.world())
+        }
+    }
+
     /// The actor's world matrix (placement only; the pose is in the palette).
     ///
     /// `Rz(yaw) * Ry(-pitch)` sends model +X to `(cos p cos y, cos p sin y, sin p)`, which is
@@ -3401,7 +3475,9 @@ impl Actor {
         let skel = &self.def.model.skel;
         // The palette folds the placement DELTA in so the meshes (built at `anchor`) follow the
         // actor without a rebuild: world = anchor * (anchor^-1 * world) * posed * inverse_bind.
-        let delta = self.anchor.inverse() * self.world();
+        // #fp-wave  A first-person actor was re-based to a rotation-only frame (`fp_bake`) and is
+        // placed camera-relative, so the delta is small by construction.
+        let delta = self.palette_delta();
         if let Some(p) = &self.palette {
             let inv = &self.def.inverse_bind;
             let mats: Vec<Mat4> = (0..skel.len()).map(|i| delta * self.pose.model[i] * inv[i]).collect();
@@ -3692,6 +3768,8 @@ impl Actor {
 #[derive(Default)]
 pub struct ActorScene {
     pub actors: Vec<Actor>,
+    /// #fp-wave  See [`Actor::fp_origin`]; handed to every actor before they pose or upload.
+    pub fp_origin: Vec3,
     defs: HashMap<u32, Arc<ActorDef>>,
     /// #fp Definitions built from a bare render model, keyed `(render model, graph)` — the same
     /// first-person arms model has one per weapon, because the graph that poses it is the
@@ -3875,6 +3953,9 @@ impl ActorScene {
             fx: Vec::new(),
             fx_seed: 0,
             first_person: false,
+            fp_origin: Vec3::ZERO,
+            fp_bake: Mat4::IDENTITY,
+            gpu_override: None,
             meshes_dirty: true,
         });
         self.rebuild = true;
@@ -3964,6 +4045,9 @@ impl ActorScene {
             fx: Vec::new(),
             fx_seed: 0,
             first_person: false,
+            fp_origin: Vec3::ZERO,
+            fp_bake: Mat4::IDENTITY,
+            gpu_override: None,
             meshes_dirty: true,
         });
         self.rebuild = true;
@@ -4161,9 +4245,19 @@ impl ActorScene {
         Ok(name)
     }
 
+    /// #fp-wave  Where the first-person rig is drawn relative to -- the eye. The window passes the SAME
+    /// value to the renderer (`set_first_person_origin`); the two must agree or the rig is displaced.
+    pub fn set_fp_origin(&mut self, origin: Vec3) {
+        self.fp_origin = origin;
+        for a in self.actors.iter_mut() {
+            a.fp_origin = origin;
+        }
+    }
+
     /// Advance every playing actor and refresh every pose + palette. One call per frame.
     pub fn update(&mut self, dt: f32, queue: &wgpu::Queue) {
         for a in self.actors.iter_mut() {
+            a.fp_origin = self.fp_origin;
             a.advance(dt);
             a.refresh_pose(queue);
         }
@@ -4171,10 +4265,11 @@ impl ActorScene {
         // first-person weapon is parented to a hand inside the animation graph the two models
         // share, so its placement is not known until the arms have been posed -- which is why
         // this is a second pass rather than an ordering rule inside the first.
-        for (i, w) in self.fp_attach_links() {
+        for (i, w, rel) in self.fp_attach_links() {
             if self.actors[i].world_override != Some(w) {
                 self.actors[i].world_override = Some(w);
             }
+            self.actors[i].gpu_override = rel;
             self.actors[i].refresh_pose(queue);
         }
     }
@@ -4187,11 +4282,13 @@ impl ActorScene {
     /// `refresh_pose` for exactly this reason), so this is the production pass minus the upload.
     pub(crate) fn update_poses_headless(&mut self, dt: f32) {
         for a in self.actors.iter_mut() {
+            a.fp_origin = self.fp_origin;
             a.advance(dt);
             a.compute_pose();
         }
-        for (i, w) in self.fp_attach_links() {
+        for (i, w, rel) in self.fp_attach_links() {
             self.actors[i].world_override = Some(w);
+            self.actors[i].gpu_override = rel;
             self.actors[i].compute_pose();
         }
     }
@@ -4201,7 +4298,7 @@ impl ActorScene {
     /// ONE implementation, so the GPU pass and the headless one cannot disagree about where a
     /// first-person weapon goes -- the shape of defect this project has already had twice (a
     /// cached phase that drifted from the walk that fed it, a load status with two writers).
-    fn fp_attach_links(&self) -> Vec<(usize, Mat4)> {
+    fn fp_attach_links(&self) -> Vec<(usize, Mat4, Option<Mat4>)> {
         let links: Vec<(usize, u32, usize)> = self
             .actors
             .iter()
@@ -4215,7 +4312,10 @@ impl ActorScene {
                 continue;
             }
             let Some(local) = self.actors[pi].pose.model.get(node).copied() else { continue };
-            out.push((i, self.actors[pi].world() * local));
+            // #fp-wave  The relative twin: the parent's camera-relative placement times the hand node,
+            // so the gun's drawn position never passes through a 200-wu f32 coordinate.
+            let rel = self.actors[pi].first_person.then(|| self.actors[pi].gpu_world() * local);
+            out.push((i, self.actors[pi].world() * local, rel));
         }
         out
     }
@@ -4563,7 +4663,9 @@ pub fn build_actor_meshes(
     }
     actors.builds += 1;
     actors.actors_built = actors.actors.len();
+    let fp_origin = actors.fp_origin;
     for a in actors.actors.iter_mut() {
+        a.fp_origin = fp_origin;
         if a.palette.is_none() { a.palette = Some(mesh.new_skin_palette(device)); }
         // Resolve the model variant once. Without it the render model draws every region's every
         // permutation, which is the "wearing all the armour at once" look.
@@ -4597,7 +4699,14 @@ pub fn build_actor_meshes(
             a.def.obj_tag, a.variant_sid, origin, bfwd, bup,
             a.skin, a.damage, a.palette.as_ref(), mesh, device, queue,
         ) {
-            Ok((l, bmn, bmx)) => {
+            Ok((mut l, bmn, bmx)) => {
+                // #fp-wave  Lighting was sampled where the rig really is (above); the matrix the GPU
+                // draws it with is the ROTATION of that frame with no translation, because the rig is
+                // placed camera-relative (see `Actor::gpu_world`).
+                if a.first_person {
+                    a.fp_bake = fp_bake_frame(a.anchor);
+                    rebase_lanes(&mut l, a.fp_bake, queue);
+                }
                 if std::env::var("HMS_ACTOR_BUILD").is_ok() {
                     let d = bmx - bmn;
                     eprintln!("ACTORBUILD #{} '{}' obj={:#x} variant={:#x} -> {} opaque {} cutout {} holo {} holo_solid {} blend  bbox {:.3} x {:.3} x {:.3} wu",
@@ -4665,7 +4774,10 @@ pub fn build_actor_meshes(
                 w.obj_tag, wvar, origin, bfwd, bup,
                 None, 0, a.weapon_palette.as_ref(), mesh, device, queue,
             ) {
-                Ok((l, wmn, wmx)) => {
+                Ok((mut l, wmn, wmx)) => {
+                    if a.first_person {
+                        rebase_lanes(&mut l, a.fp_bake, queue);
+                    }
                     // #float-weapon  Record the frame this mesh was really baked at, so a
                     // displacement is a number `actor list` prints rather than something to
                     // notice on screen.
@@ -5625,6 +5737,29 @@ pub(crate) mod tests {
         assert!(checked >= 40, "only {checked} (graph, arms) pairs checked");
     }
 
+    /// #fp-reload  print-only: every first-person clip of every weapon that has to do with
+    /// reloading, venting or readying, with its tag-authored type and length.
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_first_person_reload_clips() {
+        let Some((_g, native, cache)) = open_reach("forge_halo") else { return };
+        for t in native.tags_by_group(cache, "weap") {
+            let name = native.tag_name(cache, t).unwrap_or_default();
+            let leaf = name.rsplit('\\').next().unwrap_or(&name).to_string();
+            let (Some(_), Some(j)) = first_person_weapon(native.as_ref(), cache, t, 0) else { continue };
+            let Some(g) = AnimGraph::read(&native, cache, j) else { continue };
+            let mut v: Vec<String> = Vec::new();
+            for a in &g.anims {
+                let n = a.name.to_ascii_lowercase();
+                if n.contains("reload") || n.contains("vent") || n.contains("overheat") || n.contains("chamber") || n.contains("ready") || n.contains("throw") || n.contains("put_away") {
+                    v.push(format!("{} [{:?} {}f]", a.name.trim_start_matches("first_person:"), a.anim_type, a.frame_count));
+                }
+            }
+            let hud = crate::play_hud::reload_seconds(&native, cache, t).map(|(s, c)| format!("{s:.2}s '{c}'"));
+            eprintln!("FPR {leaf:<32} hud reload {:?} | {}", hud, v.join(", "));
+        }
+    }
+
     /// #fp-gun  The WEAPON side of the same node map. A Reach weapon's `first person model` is
     /// its ordinary render model, and the first-person graph lists that model's own nodes beside
     /// the arms' -- so the gun is drawn on the same rig, posed by the same clip, and needs no
@@ -6281,6 +6416,53 @@ pub(crate) mod tests {
         // the split would be decorative (slot 8 = 6, slot 9 = 3).
         let fx = |v: &[(u32, u32)]| v.iter().find(|(r, _)| name(*r) == "armor_fx").map(|(_, p)| name(*p));
         assert_ne!(fx(&sp), fx(&el), "the Spartan and Elite armour effects must not be the same pick");
+    }
+
+    /// **#fp-wave  THE GATE for the placement half of "the first-person model looks wavy".**
+    /// The viewmodel's whole transform is the palette's `anchor^-1 * world` (the eye is 100-450 wu from
+    /// the origin on a Forge map). Walking, the WORLD position the GPU composes, `anchor * (delta *
+    /// p)`, must match the exact f64 `world * p` to within the f32 rounding of the final addition:
+    /// measured `fold_delta` (f64) 1.0-1.4x the 1-ulp floor, the old f32 `anchor.inverse() * world`
+    /// 3-5x it. Saboteur: put the f32 inverse back in `fold_delta`.
+    ///
+    /// This is ONE stage of the chain. The rest of the measured wobble (the part this does not
+    /// remove) is the f32 world coordinate itself, which only a camera-relative lane removes; the
+    /// numbers are in the changelog.
+    #[test]
+    fn the_first_person_placement_does_not_jitter_far_from_the_origin() {
+        let (yaw, pitch) = (0.64f32, -0.17f32);
+        let mut pts: Vec<Vec3> = Vec::new();
+        for ix in 0..5 {
+            for iy in 0..5 {
+                for iz in 0..5 {
+                    pts.push(Vec3::new(0.3 + 0.075 * ix as f32, -0.15 + 0.075 * iy as f32, -0.15 + 0.075 * iz as f32));
+                }
+            }
+        }
+        let mut worst_ratio = 0.0f64;
+        for anchor_eye in [Vec3::new(200.0, 200.0, 20.0), Vec3::new(-300.0, 450.0, 60.0), Vec3::new(120.0, -380.0, 90.0)] {
+            let anchor = actor_world(anchor_eye, yaw.to_degrees(), pitch.to_degrees(), 0.0);
+            let mut worst = 0.0f64;
+            let mut floor = 0.0f64;
+            for k in 0..240 {
+                let eye = anchor_eye + Vec3::new(0.05 * k as f32, 0.02 * k as f32, 0.0);
+                let world = actor_world(eye, yaw.to_degrees(), pitch.to_degrees(), 0.0);
+                let delta = fold_delta(anchor, world);
+                let w64 = glam::DMat4::from_cols_array(&world.to_cols_array().map(f64::from));
+                for p in &pts {
+                    let got = (anchor * (delta * p.extend(1.0))).truncate().as_dvec3();
+                    let want = (w64 * p.as_dvec3().extend(1.0)).truncate();
+                    worst = worst.max((got - want).length());
+                    // the floor: one f32 rounding of the exact answer
+                    let r = want.as_vec3().as_dvec3();
+                    floor = floor.max((r - want).length());
+                }
+            }
+            let ratio = worst / floor.max(1e-12);
+            println!("   anchor {anchor_eye:?}: placement error {worst:.2e} wu = {ratio:.1}x the one-rounding floor {floor:.2e}");
+            worst_ratio = worst_ratio.max(ratio);
+        }
+        assert!(worst_ratio < 3.0, "the folded viewmodel placement is {worst_ratio:.1}x off the one-rounding floor");
     }
 
     /// #float-weapon THE GATE for "the gun is in the hand, not hanging in the air beside it".

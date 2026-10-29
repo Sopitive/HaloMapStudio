@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Film data — Halo Map Studio</title>
+<meta name="description" content="Extract data from Halo: Reach saved films and in-progress recordings: objects, Forge labels and zones, who was inside what and when, Megalo variables, events, seats and score, as CSV or JSON from scripts, or streamed live with --film-follow.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html" class="cur" aria-current="page">Film data</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Film data -->
+<!-- desc: Extract data from Halo: Reach saved films and in-progress recordings: objects, Forge labels and zones, who was inside what and when, Megalo variables, events, seats and score, as CSV or JSON from scripts, or streamed live with --film-follow. -->
+<h1>Film data</h1>
+<p class="lead">A Halo: Reach saved film is a recording of the game&rsquo;s network traffic, and Halo Map Studio can read nearly everything in it as <strong>data</strong>: every object and where it was, the Forge labels and zones of the map the match was played on, who stood inside what and when, the gametype&rsquo;s Megalo variables, kills and other events, who held which seat, and the score. This page is the guide to getting that data out &mdash; as CSV or JSON from the script system, or streamed as it happens from a match that is still being recorded &mdash; for whatever you want to build: stats overlays, timers, objective trackers, kill feeds, dashboards.</p>
+
+<div class="note"><strong>Reach only.</strong> Films from other titles are not read. Playback, cameras and the in-app statistics panel are on the <a href="theater.html">Theater</a> page; this page is only about extracting data.</div>
+
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#model">What a recording contains</a></li>
+<li><a href="#notin">What is not in a recording</a></li>
+<li><a href="#start">Getting started</a></li>
+<li><a href="#conventions">Time, ids, CSV and JSON</a></li>
+<li><a href="#verbs">Verb reference</a>
+  <ul>
+  <li><a href="#v-objects"><code>film objects</code></a></li>
+  <li><a href="#v-object"><code>film object</code></a></li>
+  <li><a href="#v-inside"><code>film inside</code> and <code>film near</code></a></li>
+  <li><a href="#v-events"><code>film events</code></a></li>
+  <li><a href="#v-seats"><code>film seats</code></a></li>
+  <li><a href="#v-score"><code>film score</code></a></li>
+  <li><a href="#v-megalo"><code>film megalo</code></a></li>
+  <li><a href="#v-variant"><code>film variant</code></a></li>
+  <li><a href="#v-dump"><code>film dump</code></a></li>
+  </ul></li>
+<li><a href="#cookbook">Cookbook</a></li>
+<li><a href="#follow">The live follower: <code>--film-follow</code></a></li>
+<li><a href="#limits">Limits and gotchas</a></li>
+</ul></div>
+
+<p class="small">Every example output on this page is <strong>illustrative</strong>: names, ids and numbers are made up to show the shape of the data, not taken from a real match. Column lists, flags and event types are exactly what the program produces.</p>
+
+<h2 id="model">What a recording contains</h2>
+<p>The film is a time line of <strong>ticks</strong> (60 per second, from 0 at the start of the recording). Everything below is addressed by tick; every verb prints both <code>tick</code> and <code>seconds</code>.</p>
+<div class="tablewrap"><table>
+<tr><th>Kind of data</th><th>What you get</th><th>Verb</th></tr>
+<tr><td><strong>Roster and seats</strong></td><td>Who held each of the 16 player slots and when: joins, leaves, swaps, team changes, with the player&rsquo;s name and identifier. A slot can be held by different people over a match, so everything keyed by slot should be read through the seats.</td><td><a href="#v-seats"><code>film seats</code></a></td></tr>
+<tr><td><strong>Entity tracks (objects)</strong></td><td>Every object the game replicated: bipeds, vehicles, weapons, items, generic objects, devices. For each: its type, the tick it was created and (if it was) destroyed, its position and orientation whenever they were sent, the object it is attached to (<code>parent</code>), and &mdash; for player bodies &mdash; which player owns it.</td><td><a href="#v-objects"><code>film objects</code></a>, <a href="#v-object"><code>film object</code></a></td></tr>
+<tr><td><strong>Replicated multiplayer properties</strong></td><td>Per object: a flag word, a team, and a <strong>boundary shape</strong> (sphere, cylinder or box) with its size. This is how zones (flag bases, hills, goal areas, kill volumes) are described in the stream.</td><td>the <code>mp_*</code> columns of <code>film objects</code>; <a href="#v-inside"><code>film inside</code></a></td></tr>
+<tr><td><strong>Forge label and spawn data</strong></td><td>The label text, spawn sequence, respawn time, team, colour and placement flags of the Forge object an entity came from. These are <em>not</em> in the stream; they come from the map variant the film embeds in full, and HMS joins each entity to its placement by position (see <a href="#limits">limits</a>).</td><td>the <code>label</code> and <code>placement_*</code>/<code>placed_*</code> columns</td></tr>
+<tr><td><strong>Events and incidents</strong></td><td>The game&rsquo;s 72-type event channel on the tick line: kills and medals (<code>incident</code>), weapon fire, reloads, pickups, vehicle entry and exit, melee, grenade throws, and so on.</td><td><a href="#v-events"><code>film events</code></a></td></tr>
+<tr><td><strong>Scoreboard</strong></td><td>The change log of each player&rsquo;s and each team&rsquo;s round score, total score and rounds won.</td><td><a href="#v-score"><code>film score</code></a></td></tr>
+<tr><td><strong>Megalo variables</strong></td><td>For a scripted gametype: the global, player and team variables the game replicated, as time series, plus the round clock and game state. Declarations (which variables exist and how they are replicated) are read from the embedded gametype.</td><td><a href="#v-megalo"><code>film megalo</code></a></td></tr>
+<tr><td><strong>Gametype settings</strong></td><td>Title, author, engine type, team/round/respawn settings, and the Megalo declaration summary.</td><td><a href="#v-variant"><code>film variant</code></a></td></tr>
+</table></div>
+<p>The <strong>Megalo variables</strong> a recording carries are those the engine sends over the network: variables whose network priority is <em>low</em> or <em>high</em> (<code>player.number[n]</code>, <code>player.timer[n]</code>, <code>team.object[n]</code>, <code>global.number[n]</code>, &hellip;), plus the round clock, the current round and the game-finished flag. Each is a series of changes: a value holds until the next change. Player variables are keyed by player <em>slot</em>; the output also names whoever held that slot at that moment. Timers are reported as seconds left (with the engine&rsquo;s rate code and an at-edge flag). Object variables (a team&rsquo;s flag, say) hold object references that match an entity in the recording.</p>
+
+<h2 id="notin">What is not in a recording</h2>
+<ul>
+  <li><strong>Megalo variables with network priority <em>none</em> or <em>local</em></strong> are never sent. If the script never put a value in a replicated variable, no film has it.</li>
+  <li><strong>Per-object Megalo variables</strong> (<code>object.number[n]</code> etc.). The engine has no replication codec for them that HMS could find. They are listed as <em>declared</em> by <code>film megalo decls</code> but never have values.</li>
+  <li><strong>Variable names.</strong> A gametype stores no names; a variable is only <code>scope.kind[n]</code>. What <code>player.number[2]</code> means is up to the script.</li>
+  <li><strong>A variable&rsquo;s value before its first update.</strong> A film starting mid-match carries a variable only from the moment it changes.</li>
+  <li><strong>Forge label, spawn sequence, respawn time and colour for objects the gametype spawned at runtime.</strong> They have no placement in the variant, so they have no label.</li>
+  <li><strong>The match&rsquo;s kill feed.</strong> The kill and medal feed is personal in Reach: the recording names the kills of the player who saved the clip, not everyone&rsquo;s. Other deaths are seen as a body being destroyed, sometimes with a responsible unit; the full story is not there.</li>
+  <li><strong>Which loadout a player chose</strong> (player-side state, never transmitted) and anything that is purely a client-side effect.</li>
+  <li><strong>Positions on every tick.</strong> A body&rsquo;s position is sent on some ticks only; HMS holds the last sample until the next one. Small zones can be crossed between two samples.</li>
+  <li><strong>Tag names without a map.</strong> An object&rsquo;s definition is a network tag reference; turning it into a tag path needs a map cache (<code>--map</code> to <code>--film-follow</code>). The script verbs print an empty <code>tag</code> column.</li>
+</ul>
+
+<h2 id="start">Getting started</h2>
+<p>There are three ways to run film queries. They all read the same data and print the same columns.</p>
+<div class="tablewrap"><table>
+<tr><th>Route</th><th>Needs</th><th>Use it for</th></tr>
+<tr><td><strong>Script file or <code>--exec</code></strong> &mdash; <code>hms-app --script q.hscr</code></td><td>The app executable. The headless script host creates a graphics device first, so a GPU adapter (or the software rasteriser, see <a href="headless.html#gpu">GPU notes</a>) must be available. Nothing is drawn.</td><td>One-off extraction and batch jobs over finished films. Output goes to <strong>stderr</strong>.</td></tr>
+<tr><td><strong>Running app</strong> &mdash; script console, or the TCP command server on <code>127.0.0.1:47800</code></td><td>The GUI running (<code>HMS_CMD_PORT</code> changes the port; <code>0</code> disables the server).</td><td>Querying a film you already have open, and driving it from another program. See <a href="scripting.html#run">Ways to run a script</a> for the framing, and <a href="examples/hms_cmd.py"><code>examples/hms_cmd.py</code></a> for a ready-made client.</td></tr>
+<tr><td><strong><code>hms-app --film-follow</code></strong></td><td>Nothing else. No window, no GPU device, no audio.</td><td>A match <em>in progress</em> (a growing <code>.temp</code>), servers, SSH, background jobs. See <a href="#follow">below</a>.</td></tr>
+</table></div>
+
+<h3 id="open">Open the film, then index it</h3>
+<p>Every query is a <code>film</code> verb run after a film is open. The minimum is:</p>
+<pre><code># q.hscr
+film /path/to/match.mov
+film index
+echo @@begin
+film objects label=zone_a
+echo @@end</code></pre>
+<pre><code>hms-app --script q.hscr 2&gt;q.log
+sed -n '/^@@begin$/,/^@@end$/p' q.log | sed '1d;$d' &gt; objects.csv</code></pre>
+<ul>
+  <li><code>film &lt;path&gt;</code> opens a <code>.mov</code>, a <code>.film</code> or a <code>.temp</code> (the file MCC is writing while you play). It reads the header only and prints the film&rsquo;s metadata. The line grammar has no quoting, so a path with spaces does not work; copy the film to a simple path.</li>
+  <li><code>film index</code> decodes the recording. <strong><code>objects</code>, <code>object</code>, <code>inside</code>, <code>near</code>, <code>events</code>, <code>seats</code>, <code>score</code> and <code>dump</code> need it first.</strong> <code>film megalo</code> and <code>film variant</code> read the file themselves and work without it. In a headless script <code>film index</code> finishes before the next line runs. In the running app it starts decoding on a worker thread and returns at once; until it finishes, the data verbs answer <code>the recording is not decoded yet (film index, then wait)</code>, so retry (the example client does).</li>
+  <li>The headless log is the concatenated output of every command on stderr, with <code>film &lt;path&gt;</code> and <code>film index</code> adding their own text. Bracket a query with <code>echo</code> markers as above, or keep one query per script. Over TCP the response contains only the output of what you sent.</li>
+  <li><code>--exec</code> joins its arguments with spaces into <em>one</em> line; to give several commands, put newlines inside one quoted string, or use <code>--script</code>.</li>
+  <li>MCC&rsquo;s in-progress recording is a <code>.temp</code> in the <code>Temporary\HaloReach\autosave</code> folder of the MCC local data (<code>File &#9656; Open saved film…</code> lists every folder it found); finished films are <code>.mov</code> in <code>Movie</code> folders. See <a href="theater.html#where">Where films live</a>. A <code>.temp</code> can be queried like a film, but is a snapshot of whatever had been written when it was read.</li>
+</ul>
+
+<h2 id="conventions">Time, ids, CSV and JSON</h2>
+<div class="tablewrap"><table>
+<tr><th>Topic</th><th>Rule</th></tr>
+<tr><td>Time arguments</td><td>Seconds <code>12.5</code> (or <code>12.5s</code>), <code>mm:ss</code> <code>1:30</code>, or ticks <code>t1234</code> (<code>tick1234</code> also works). 60 ticks per second. Used by <code>from=</code>, <code>to=</code>, <code>alive=</code>, <code>at=</code>, <code>film megalo at</code>, <code>film inside</code> / <code>near</code> and <code>--since</code>. (<code>film seek</code>, the playback verb, takes plain seconds only.)</td></tr>
+<tr><td>Time ranges</td><td><code>a..b</code> with each end in any of the forms above, e.g. <code>1:00..2:30</code> or <code>t23000..t24100</code>.</td></tr>
+<tr><td>Object ids</td><td>Printed in decimal (<code>id</code>) and hex (<code>id_hex</code>, like <code>0xEB070194</code>). Accepted as either, with the <code>0x</code> prefix for hex. These are the recording&rsquo;s own entity ids; <code>subject</code>/<code>other</code> in events, object references in Megalo values, <code>parent</code> and <code>zone_id</code>/<code>occupant_id</code> all use them.</td></tr>
+<tr><td>CSV</td><td>The default: a header row, then one row per record; fields containing commas, quotes or newlines are double-quoted. Empty cells mean &ldquo;not stated&rdquo;.</td></tr>
+<tr><td>JSON</td><td>Add the word <code>json</code> to any data verb. <code>objects</code>, <code>events</code>, <code>seats</code>, <code>score</code> and <code>inside</code> give an array of objects; <code>megalo</code>, <code>variant</code>, <code>object</code> and <code>dump</code> give one object. Missing values are <code>null</code>.</td></tr>
+<tr><td>Filters</td><td><code>key=value</code> tokens with no spaces, in any order, all of which must match. An unknown key is an error that lists the valid keys. Text matches are case-insensitive.</td></tr>
+</table></div>
+
+<h2 id="verbs">Verb reference</h2>
+<p>The playback verbs (<code>film play</code>, <code>film seek</code>, <code>film camera</code>, <code>film stats</code>, <code>film extract</code>, &hellip;) are on the <a href="theater.html#scripting">Theater</a> page. These are the data verbs.</p>
+
+<h3 id="v-objects"><code>film objects [filter...] [csv|json]</code></h3>
+<p>One row per object in the recording, filtered. Without <code>at=</code>/<code>alive=</code> the position and orientation columns are the object&rsquo;s <em>first</em> recorded values (where it appeared); with a time they are the held values at that moment.</p>
+<p><strong>Filters</strong> (all must match):</p>
+<div class="tablewrap"><table>
+<tr><th>Key</th><th>Meaning</th></tr>
+<tr><td><code>type=</code></td><td>Entity type name or tag path. Without <code>*</code> it is a substring test, so <code>generic</code> also matches <code>generic_garbage</code>; with <code>*</code> it is a glob. Names: <code>biped item generic generic_garbage vehicle projectile weapon device</code> (the object kinds), plus the non-object entities <code>player megalo_team statborg</code> and a few others. A tag path matches only when a map name source is available.</td></tr>
+<tr><td><code>tag=</code></td><td>Tag path glob (needs tag names; empty in script verbs).</td></tr>
+<tr><td><code>label=</code></td><td>Forge label text: exact (case-insensitive) unless it contains <code>*</code> (glob, anchored at both ends: <code>ctf*</code>, <code>*_base</code>). <code>label=#12</code> matches the label-table index.</td></tr>
+<tr><td><code>team=</code></td><td><code>none</code>, <code>red</code>, <code>blue</code>, <code>green</code>, <code>orange</code>, <code>purple</code>, <code>gold</code> (or <code>yellow</code>), <code>brown</code>, <code>pink</code>, or a number (<code>-1</code> = none). Uses the replicated team, else the placement&rsquo;s.</td></tr>
+<tr><td><code>owner=</code> (or <code>player=</code>)</td><td>Substring of the owning player&rsquo;s name (player bodies only).</td></tr>
+<tr><td><code>slot=</code></td><td>Owning player slot, 0&ndash;15.</td></tr>
+<tr><td><code>alive=&lt;time&gt;</code></td><td>Existed at that time. Also sets the time at which positions are evaluated and printed.</td></tr>
+<tr><td><code>at=&lt;time&gt;</code></td><td>The time at which <code>near=</code>/<code>box=</code> are tested and positions are printed (default: <code>alive=</code>&rsquo;s time, else each object&rsquo;s first position).</td></tr>
+<tr><td><code>id=</code>, <code>parent=</code></td><td>One object; objects attached to a parent id.</td></tr>
+<tr><td><code>near=x,y,z,r</code></td><td>Position within radius <code>r</code> of a point, in world units.</td></tr>
+<tr><td><code>box=x0,y0,z0,x1,y1,z1</code></td><td>Position inside an axis-aligned box (corners in any order).</td></tr>
+<tr><td><code>megalo=1</code></td><td>A Megalo variable in the recording refers to this object.</td></tr>
+<tr><td><code>zone=1</code></td><td>The object has a boundary. <code>zone=0</code> for the opposite.</td></tr>
+<tr><td><code>shape=</code></td><td><code>sphere</code>, <code>cylinder</code>, <code>box</code> or <code>none</code>.</td></tr>
+</table></div>
+<p><strong>CSV columns</strong> (44, in this order):</p>
+<div class="tablewrap"><table>
+<tr><th>Group</th><th>Columns</th></tr>
+<tr><td>Identity</td><td><code>id</code>, <code>entity_type</code>, <code>type</code>, <code>tag</code>, and <code>id_hex</code> (last column)</td></tr>
+<tr><td>Lifetime</td><td><code>first_tick</code>, <code>last_tick</code> (last tick with an update), <code>destroyed_tick</code> (empty if never destroyed)</td></tr>
+<tr><td>Pose</td><td><code>x</code>, <code>y</code>, <code>z</code>, <code>fwd_x</code>, <code>fwd_y</code>, <code>fwd_z</code>, <code>up_x</code>, <code>up_y</code>, <code>up_z</code></td></tr>
+<tr><td>Links</td><td><code>parent</code> (first object it was attached to), <code>owner_slot</code>, <code>owner_name</code> (player bodies), <code>megalo_ref</code> (true/false)</td></tr>
+<tr><td>Forge placement (from the variant)</td><td><code>placement_slot</code>, <code>quota_index</code>, <code>item</code>, <code>label_idx</code>, <code>label</code>, <code>placed_team</code>, <code>spawn_seq</code>, <code>respawn_s</code>, <code>cached_type</code>, <code>placement_flags</code>, <code>join_dist</code> (distance of the position match, in world units), <code>placed_shape</code>, <code>placed_w_or_r</code>, <code>placed_length</code>, <code>placed_top</code>, <code>placed_bottom</code></td></tr>
+<tr><td>Replicated properties (from the stream)</td><td><code>mp_flags</code>, <code>mp_team</code> (&minus;1 = none), <code>mp_shape</code>, <code>mp_w_or_r</code>, <code>mp_length</code>, <code>mp_top</code>, <code>mp_bottom</code></td></tr>
+<tr><td>Zone</td><td><code>zone_source</code>: <code>replicated</code> if the stream states the boundary, <code>placement</code> if it comes from the variant, empty if the object has none</td></tr>
+</table></div>
+<p>Boundary dimensions: sphere uses <code>w_or_r</code> as the radius; cylinder uses <code>w_or_r</code> (radius), <code>top</code> and <code>bottom</code>; box uses width (<code>w_or_r</code>), <code>length</code>, <code>top</code> and <code>bottom</code>. Only objects the Forge placement can be matched to (items, generic objects, vehicles, weapons, devices) have placement columns; bodies and projectiles do not.</p>
+<p>JSON rows are nested instead: <code>id</code>, <code>id_hex</code>, <code>entity_type</code>, <code>type</code>, <code>def_wire</code>, <code>tag</code>, <code>first_tick</code>, <code>last_tick</code>, <code>destroyed_tick</code>, <code>position</code> (<code>[x,y,z]</code>), <code>parent</code>, <code>owner_slot</code>, <code>owner_name</code>, <code>megalo_ref</code>, <code>label</code>, <code>placement</code> (an object, or <code>null</code>), <code>mp</code> (an object, or <code>null</code>) and <code>zone_source</code>. <code>def_wire</code> is the network tag reference; objects of the same kind share it, so it identifies a type even when there is no map to name it.</p>
+<pre><code>film objects label=zone_* shape=sphere</code></pre>
+<pre><code># illustrative output, columns trimmed to fit (the real output has all 44)
+id,type,label,x,y,z,first_tick,destroyed_tick,mp_shape,mp_w_or_r,zone_source,id_hex
+3943104916,generic,zone_a,85.8290,149.4430,40.4000,9,,sphere,3.500,replicated,0xEB070194
+3943170453,generic,zone_b,-12.2000,60.1000,38.0000,9,,sphere,3.500,replicated,0xEB080195</code></pre>
+
+<h3 id="v-object"><code>film object &lt;id&gt; [csv|json]</code></h3>
+<p>One object&rsquo;s whole history, in tick order. Columns: <code>tick,seconds,what,detail</code>. <code>what</code> is one of:</p>
+<div class="tablewrap"><table>
+<tr><th><code>what</code></th><th><code>detail</code></th></tr>
+<tr><td><code>create</code></td><td><code>type=&lt;type&gt; def_wire=&lt;n&gt;</code></td></tr>
+<tr><td><code>position</code></td><td><code>x,y,z</code></td></tr>
+<tr><td><code>orientation</code></td><td><code>fwd=x/y/z;up=x/y/z</code></td></tr>
+<tr><td><code>mp</code></td><td><code>flags=..;team=..;shape=..;dims=w_or_r/length/top/bottom</code></td></tr>
+<tr><td><code>attach</code></td><td><code>parent=&lt;id&gt;;node=&lt;n&gt;</code>, or <code>none</code> when detached</td></tr>
+<tr><td><code>destroy</code></td><td>(empty)</td></tr>
+</table></div>
+<p>JSON: <code>{"object": {...the film objects row...}, "series": [{"tick", "seconds", "what", "detail"}, ...]}</code>. This is the verb for a <em>moving</em> object: a carried item or a vehicle has one <code>position</code> row per sample.</p>
+<pre><code>film object 3943104916
+
+# illustrative
+tick,seconds,what,detail
+9,0.150,create,type=generic def_wire=412
+9,0.150,position,"85.8290,149.4430,40.4000"
+9,0.150,mp,flags=0;team=0;shape=sphere;dims=3.500/0.000/0.000/0.000</code></pre>
+
+<h3 id="v-inside"><code>film inside</code> and <code>film near</code></h3>
+<pre><code>film inside &lt;id|filter...&gt; [time | a..b] [r=R | cyl=r,top,bot | box=w,l,top,bot] [occupants=players|vehicles|all] [csv|json]
+film near   &lt;id&gt; r=R [time | a..b] [occupants=...] [csv|json]</code></pre>
+<p>Who is inside a volume. The <strong>zone</strong> is one or more objects, chosen by id or by object filters (the same keys as <code>film objects</code>, e.g. <code>label=zone_a</code>). The volume is the object&rsquo;s own boundary, moving with the object, unless you give one: <code>r=R</code> (sphere), <code>cyl=radius,top,bottom</code> or <code>box=width,length,top,bottom</code> place that shape at the object&rsquo;s position and orientation, which is also how you test &ldquo;within R of this object&rdquo; for an object that has no boundary. <code>film near</code> is the sphere form and requires <code>r=</code>. An object with no boundary and no shape from you is skipped; if nothing matches you get an error.</p>
+<p>The <strong>time</strong> argument decides the output:</p>
+<ul>
+  <li>A single time &mdash; a snapshot: rows with <code>event</code> = <code>INSIDE</code>, one per occupant inside at that tick.</li>
+  <li>A range <code>a..b</code>, or no time at all (the whole recording) &mdash; the zone is replayed tick by tick and every change is a row: <code>ENTER</code> when an occupant becomes inside, <code>EXIT</code> when it stops. A destroyed or not-yet-created zone is empty. Narrow the range on a long film.</li>
+</ul>
+<p><strong>Occupants:</strong> <code>players</code> (the default; player bodies), <code>vehicles</code>, or <code>all</code> (bodies, vehicles, weapons, items, generic objects, devices). Columns: <code>tick,seconds,event,zone_id,zone_label,occupant_id,occupant_type,slot,name</code>. <code>slot</code> and <code>name</code> identify the player owning a body and are empty for other occupants and for a body whose player could not be named.</p>
+<p>A decimal object id is recognised as an id when it has more than six digits (real ids have ten); a short number is read as a time. Use the <code>0x</code> form or <code>id=</code> to be unambiguous.</p>
+<pre><code>film inside label=zone_a 1:00..2:00
+
+# illustrative
+tick,seconds,event,zone_id,zone_label,occupant_id,occupant_type,slot,name
+3702,61.700,ENTER,3943104916,zone_a,4013424645,biped,4,Alpha
+4006,66.767,EXIT,3943104916,zone_a,4013424645,biped,4,Alpha</code></pre>
+
+<h3 id="v-events"><code>film events [csv|json] [filter...]</code></h3>
+<p>The recording&rsquo;s event channel, in tick order. Filters: <code>type=</code> (or <code>kind=</code>, or a bare word) &mdash; a number 0&ndash;71 or a name such as <code>incident</code>; <code>player=</code> (or <code>name=</code>) &mdash; substring of either party&rsquo;s name; <code>slot=</code> &mdash; either party&rsquo;s slot; <code>from=</code>, <code>to=</code> &mdash; time range.</p>
+<p>Columns: <code>tick,seconds,kind,name,subject,other,incident,incident_name,seat,subject_slot,subject_name,other_slot,other_name</code>. <code>subject</code> and <code>other</code> are object ids (the unit acting or earning the incident, and the other party such as the victim or vehicle); the <code>*_slot</code>/<code>*_name</code> columns name the player when the object is a body that could be attributed. For <code>incident</code> events, <code>incident</code> is the numeric string id and <code>incident_name</code> its name when known. <code>seat</code> is the vehicle seat index for <code>biped_board_vehicle</code>, <code>biped_enter_vehicle</code> and <code>biped_exit_vehicle</code>, and empty otherwise.</p>
+<p>The kinds most often wanted:</p>
+<div class="tablewrap"><table>
+<tr><th>kind</th><th>name</th><th>kind</th><th>name</th></tr>
+<tr><td>14</td><td><code>incident</code> (kills, medals, flag and game incidents)</td><td>26</td><td><code>action_weapon_fire</code></td></tr>
+<tr><td>27</td><td><code>weapon_reload</code></td><td>28 / 38</td><td><code>biped_throw_initiate</code> / <code>biped_throw_release</code></td></tr>
+<tr><td>29 / 39</td><td><code>biped_melee_initiate</code> / <code>biped_melee_damage</code></td><td>22</td><td><code>biped_assassinate</code></td></tr>
+<tr><td>9</td><td><code>biped_pickup</code></td><td>32&ndash;35</td><td><code>weapon_pickup</code>, <code>weapon_put_away</code>, <code>weapon_drop</code>, <code>weapon_trade</code></td></tr>
+<tr><td>8 / 40</td><td><code>biped_board_vehicle</code> / <code>biped_enter_vehicle</code></td><td>19 / 41</td><td><code>biped_exit_vehicle</code> / <code>biped_vehicle_evict</code></td></tr>
+<tr><td>23</td><td><code>biped_equipment_activation</code></td><td>70</td><td><code>insert_saved_film_marker</code></td></tr>
+</table></div>
+<p>Incident names include <code>kill</code>, <code>death</code>, <code>suicide</code>, <code>assist</code>, <code>kill_betrayal</code>, <code>melee_kill</code>, <code>headshot_kill</code>, <code>splatter_kill</code>, <code>assassination_kill</code>, <code>finishing_move_kill</code>, <code>first_blood</code>, <code>flag_grabbed</code>, <code>flag_dropped</code>, <code>flag_scored</code>, <code>flag_reset</code>, <code>flag_recovered</code>, <code>round_over</code>, <code>game_over</code> and multikill/spree medals; an id the program has no name for prints an empty name and the number. Remember the <a href="#notin">kill-feed caveat</a>.</p>
+<pre><code>film events type=incident from=2:00 to=5:00 player=alpha
+
+# illustrative
+tick,seconds,kind,name,subject,other,incident,incident_name,seat,subject_slot,subject_name,other_slot,other_name
+7364,122.733,14,incident,4013424645,3969384472,7864320,kill,,4,Alpha,2,Bravo</code></pre>
+
+<h3 id="v-seats"><code>film seats [csv|json]</code></h3>
+<p>The time-aware roster: one row per <em>segment</em> of a player holding a slot. Columns: <code>slot,identifier,name,team,data_team,from_tick,until_tick,left_tick,from_header,joined_in_progress</code>. <code>identifier</code> is the player&rsquo;s 16-hex-digit id; <code>team</code> and <code>data_team</code> are team indices (&minus;1 = none); <code>until_tick</code> is when the segment ended (a reconfiguration, swap, removal or replacement) and <code>left_tick</code> when the player left the game; both are empty while still current. <code>from_header</code> is true for seats that come from the film header rather than a join update.</p>
+<p>Use it to map a <em>slot</em> to a <em>person</em> at a given tick: the rows for one slot are consecutive segments, and a swap or a new player in the slot ends one and starts the next.</p>
+<pre><code># illustrative
+slot,identifier,name,team,data_team,from_tick,until_tick,left_tick,from_header,joined_in_progress
+4,00A0000000000001,Alpha,0,0,0,,,true,false
+6,00A0000000000002,Bravo,1,1,0,25006,,true,false
+6,00A0000000000003,Charlie,1,1,25006,,,false,true</code></pre>
+
+<h3 id="v-score"><code>film score [csv|json]</code></h3>
+<p>The scoreboard&rsquo;s change log: a row each time a score store changes. Columns: <code>tick,seconds,statborg,is_team,owner_name,round_score,total_score,rounds_won,final</code>. <code>statborg</code> is the store&rsquo;s index: 0&ndash;15 are player slots, 16 and up are teams (index &minus; 16 = team). <code>owner_name</code> is the player holding that slot at that tick (empty for teams). Blank cells mean that field was not stated. In JSON the unset fields are <code>null</code>.</p>
+<pre><code># illustrative
+tick,seconds,statborg,is_team,owner_name,round_score,total_score,rounds_won,final
+23905,398.417,16,true,,8,,,
+31839,530.650,0,false,Alpha,12,12,0,true</code></pre>
+
+<h3 id="v-megalo"><code>film megalo ...</code></h3>
+<p>Only available for scripted (Megalo) gametypes; for any other engine type it answers that the game variant is not a Megalo script. <code>film megalo</code> reads the file itself, so it needs no <code>film index</code>.</p>
+<div class="tablewrap"><table>
+<tr><th>Form</th><th>Output</th></tr>
+<tr><td><code>film megalo</code> / <code>film megalo info</code></td><td>A text summary: trigger, action and condition counts, how many variables of each kind each scope declares and replicates, how many value changes were recorded, and the not-in-a-film list.</td></tr>
+<tr><td><code>film megalo decls [csv|json]</code></td><td>Every declared variable slot. Columns <code>scope,kind,slot,priority,replicated,initial</code>. <code>priority</code> is <code>none</code>, <code>low</code>, <code>high</code> or <code>local</code>; only <code>low</code>/<code>high</code> are replicated. Object-scope rows always show <code>replicated=false</code>.</td></tr>
+<tr><td><code>film megalo vars [filter...] [csv|json]</code></td><td>Every recorded change of every variable, time ordered. Columns <code>tick,seconds,scope,owner,owner_name,kind,slot,value,text</code>. The round clock and game state appear as rows with <code>scope=game</code>, <code>owner=0</code>, the game variable&rsquo;s name in <code>kind</code> and the value in <code>value</code>/<code>text</code>. Filters: <code>scope=</code> (<code>global player team object</code>), <code>kind=</code> (<code>number timer team player object</code>), <code>var=</code> (or <code>slot=</code>; the variable index), <code>owner=</code> (a number is a slot / team index; anything else is a name substring), <code>player=</code> (same as <code>owner=</code>), <code>from=</code>, <code>to=</code>. Any filter drops the <code>game</code> rows.</td></tr>
+<tr><td><code>film megalo at &lt;time&gt; [csv|json]</code></td><td>Every variable&rsquo;s value at one moment (columns as <code>vars</code>, <code>tick</code> = the time asked for), plus the game rows. JSON: <code>{tick, seconds, variables: [...], game: [{name, value}]}</code>.</td></tr>
+<tr><td><code>film megalo get &lt;scope&gt; &lt;owner&gt; &lt;kind&gt; &lt;slot&gt; [csv|json]</code></td><td>One variable&rsquo;s series. <code>owner</code> is the player slot, the team index, or <code>0</code> for global. Columns <code>tick,seconds,value,text</code>. JSON: <code>{scope, owner, kind, slot, points: [{tick, value, text}]}</code>. Scope also accepts <code>g p t o</code>, kind accepts <code>num n t obj</code>. An error says the variable was not declared, not replicated, or never sent.</td></tr>
+</table></div>
+<p><strong>Reading <code>value</code> and <code>text</code>:</strong> a number is the number; a timer is <em>seconds left</em> in <code>value</code>, with <code>text</code> like <code>4s rate5 edge</code> (a countdown changes once a second); a team or player variable is the team/slot index; an object variable is the object&rsquo;s id (<code>text</code> is hex like <code>0xE9C70054</code>) or <code>-1</code>/<code>null</code> when cleared. An object id from a variable can be passed straight to <code>film object</code> and shows up in <code>film objects megalo=1</code>.</p>
+<p><strong>Game variable names:</strong> <code>current_state</code>, <code>game_finished</code>, <code>current_round</code>, <code>round_condition_flags</code>, <code>round_timer_seconds</code> (the round clock, once a second), <code>sudden_death_seconds</code>, <code>grace_period_seconds</code>.</p>
+<p>The JSON of <code>film megalo vars</code> is one object: <code>declarations</code>, <code>coverage</code> (how many replication messages were decoded cleanly), <code>ticks</code>, <code>series</code> (each <code>{scope, owner, owner_name, kind, slot, points: [[tick, value], ...]}</code>), <code>game</code> and <code>not_in_film</code>. In JSON a series carries one <code>owner_name</code> (the holder when it starts); use the CSV, or <code>film seats</code>, when the slot changes hands.</p>
+<pre><code>film megalo vars scope=player kind=timer var=2 owner=alpha
+
+# illustrative
+tick,seconds,scope,owner,owner_name,kind,slot,value,text
+24966,416.100,player,4,Alpha,timer,2,5,5s rate5
+25026,417.100,player,4,Alpha,timer,2,4,4s rate5 edge</code></pre>
+
+<h3 id="v-variant"><code>film variant [json]</code> (alias <code>film gametype</code>)</h3>
+<p>The embedded game variant. Text form: title, author, engine, map id, team/round/respawn settings and a one-line Megalo summary. JSON keys: <code>title</code>, <code>description</code>, <code>author</code>, <code>engine_type</code>, <code>engine</code>, <code>map_id</code>, <code>activity</code>, <code>game_mode</code>, and, when the gametype decodes, <code>teams_enabled</code>, <code>rounds</code>, <code>round_time_limit_min</code>, <code>early_victory_wins</code>, <code>sudden_death_s</code>, <code>grace_period_s</code>, <code>lives_per_round</code>, <code>respawn_time_s</code>, <code>suicide_penalty_s</code>, <code>betrayal_penalty_s</code>, <code>species</code>, and <code>megalo</code> (the same declarations as <code>film megalo decls json</code>).</p>
+
+<h3 id="v-dump"><code>film dump [json]</code></h3>
+<p>Everything in one JSON document, for handing to another tool: <code>{"schema": "hms-film-dump/1", "ticks": N, "variant": ..., "megalo": ..., "seats": [...], "events": [...], "score": [...], "objects": [...]}</code>. <code>megalo</code> is the <code>film megalo vars json</code> object (or <code>null</code> for a non-Megalo gametype); the rest are the JSON forms of the verbs above. It does not include zone occupancy: compute that with <code>film inside</code>, or from the object tracks with your own geometry.</p>
+
+<h3 id="v-highlight"><code>film highlight [csv|json]</code></h3>
+<p>The objects the Theater <em>Highlight script objects</em> switch outlines (see <a href="theater.html#highlight">Theater</a>), one row each: <code>id,id_hex,category,name,label,team,entity_type,first_tick,destroyed_tick,shape,w_or_r,length,top,bottom</code>. Categories: objective / flag, zone / hill, attached marker, script-spawned, labelled Forge, script variable, invisible / no model. From a script the tag path is not known, so the <em>invisible</em> category only catches <code>invisible_*</code> names; the Theater panel also uses the render model.</p>
+
+<h2 id="cookbook">Cookbook</h2>
+<p>All of these assume the film is open and indexed (<a href="#open">above</a>). The Python helpers are in <code>docs/examples</code>: <a href="examples/hms_cmd.py"><code>hms_cmd.py</code></a> (queries a running app), <a href="examples/zone_time.py"><code>zone_time.py</code></a> and <a href="examples/follow_zones.py"><code>follow_zones.py</code></a>.</p>
+
+<h3 id="r-labels">Find all objects with a Forge label and their positions</h3>
+<pre><code>film objects label=zone_a                 # where each appeared
+film objects label=zone_a alive=3:00      # where each was at 3:00 (and only those existing then)
+film objects label=ctf* type=generic json # a glob, as JSON
+film objects label=#12                    # by label-table index
+film object 3943104916                    # one object's full history, if it moves</code></pre>
+<p>The <code>label</code> column is empty for anything the gametype spawned at runtime. Use <code>join_dist</code> to check the position match: it should be a few hundredths of a world unit.</p>
+
+<h3 id="r-zones">Who is inside zone Y over time (ENTER / EXIT)</h3>
+<pre><code>film inside label=zone_y                      # the whole recording
+film inside label=zone_y 5:00..6:00          # one window
+film inside label=zone_y t23905               # who is inside at one tick
+film inside label=zone_y occupants=vehicles
+film inside label=marker r=10 0..3:00        # a 10-unit sphere round an object with no boundary</code></pre>
+
+<h3 id="r-time">Time a player spends in or between zones</h3>
+<p>Get the ENTER/EXIT rows as CSV and pair them. The helper <a href="examples/zone_time.py"><code>zone_time.py</code></a> does the pairing, totals the time inside each zone per player, and prints the gap from leaving one zone to entering the next:</p>
+<pre><code>python3 -I hms_cmd.py match.mov "film inside label=zone_*" | python3 -I zone_time.py
+# illustrative
+Alpha: zone_a -&gt; zone_b in 5.00s
+Alpha spent 5.00s inside zone_a
+Alpha spent 5.50s inside zone_b</code></pre>
+<p>Because positions are held between samples, a zone entry is detected on the tick the next position sample arrives, so times carry that granularity (see <a href="#limits">limits</a>).</p>
+
+<h3 id="r-megalo">Track a Megalo variable for one player across slot changes</h3>
+<p>Run <code>film index</code> first, then filter by <em>name</em>, not slot: the name is resolved through the seats at each point&rsquo;s tick, so the series follows the person even if they changed slot or someone else later took the slot.</p>
+<pre><code>film megalo decls                                  # what exists, and what is replicated
+film megalo vars scope=player kind=number var=0 owner=alpha
+film seats                                         # to see when the slot changed hands
+film megalo vars scope=player owner=4              # by slot instead: whoever held slot 4</code></pre>
+<p>A variable&rsquo;s meaning is decided by the gametype&rsquo;s script, not by the film. Find it from the gametype itself, or by correlating the series with something you can see (a score change at the same tick, a position).</p>
+
+<h3 id="r-objective">Follow an objective through a Megalo object variable</h3>
+<pre><code>film megalo get team 1 object 1          # the object ids team.object[1] pointed at, over time
+film object 4013686891                   # where that object was, in tick order
+film objects megalo=1                    # every object a variable ever referred to</code></pre>
+
+<h3 id="r-events">List kills, deaths and incidents in a time range</h3>
+<pre><code>film events type=incident from=2:00 to=5:00
+film events type=incident slot=4 json
+film events type=weapon_reload player=alpha from=t6000 to=t7200
+film events 14 from=t0 to=t3600           # a bare word or number is the type</code></pre>
+
+<h3 id="r-json">Export everything as JSON for another tool</h3>
+<pre><code>python3 -I hms_cmd.py match.mov "film dump json" &gt; match.json
+jq '.score[] | select(.final == true)' match.json
+jq '[.objects[] | select(.label != null) | {id, label, position}]' match.json</code></pre>
+
+<h3 id="r-live">Watch several labelled objects live</h3>
+<p>Use the follower (below): <code>--watch-label</code> is repeatable, so one process reports every enter and exit for all of them.</p>
+<pre><code>hms-app --film-follow match.temp --watch-label zone_a --watch-label zone_b --watch-radius 6 \
+        2&gt;follow.log | python3 -I follow_zones.py</code></pre>
+
+<h2 id="follow">The live follower: <code>--film-follow</code></h2>
+<p>Reads a finished film, or a <code>.temp</code> the game is <em>still writing</em>, and prints what happens in it as a stream of events, one JSON object per line. It never opens a window, a GPU device or audio &mdash; the flag is handled before any of those exist &mdash; so it runs over SSH, as a service, or with no display. It is a separate mode from the script verbs: it keeps its own running state and reports <em>changes</em>, where the verbs answer questions about a finished recording.</p>
+<pre><code>hms-app --film-follow &lt;film.temp|film.mov&gt; [--emit json-lines|csv] [--poll-ms 1000] [--since T]
+        [--watch-label NAME]... [--watch-id ID]... [--watch-radius R]
+        [--objects] [--filter key=value]... [--all-events] [--clock]
+        [--map cache.map] [--once] [--max-seconds N]</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Flag</th><th>Meaning</th></tr>
+<tr><td><code>&lt;path&gt;</code></td><td>The film or <code>.temp</code>. It may not exist yet: the follower prints <code>waiting: ...</code> on stderr and keeps polling.</td></tr>
+<tr><td><code>--emit</code></td><td><code>json-lines</code> (default; <code>jsonl</code> and <code>json</code> also accepted) or <code>csv</code>. CSV has the header <code>id,tick,seconds,type,data</code>; <code>data</code> is the whole event as a quoted JSON string.</td></tr>
+<tr><td><code>--poll-ms N</code></td><td>How often the file&rsquo;s size and modification time are checked (default 1000, minimum 20). The file is only re-read when one of them changed.</td></tr>
+<tr><td><code>--since T</code></td><td>Suppress events with a tick at or before <code>T</code> (seconds, <code>mm:ss</code> or <code>t1234</code>). See <a href="#f-resume">resuming</a>.</td></tr>
+<tr><td><code>--watch-label NAME</code></td><td>Watch the objects with that Forge label for occupants entering and leaving (<code>zone_enter</code> / <code>zone_exit</code>). Repeatable. Matched exactly, ignoring case; no globs here.</td></tr>
+<tr><td><code>--watch-id ID</code></td><td>The same for one object id (decimal or <code>0x</code> hex). Repeatable.</td></tr>
+<tr><td><code>--watch-radius R</code></td><td>For a watched object that has no boundary of its own, use a sphere of radius <code>R</code> around it. A watched object with neither a boundary nor <code>--watch-radius</code> reports nothing.</td></tr>
+<tr><td><code>--objects</code></td><td>Also report <code>object_spawn</code> / <code>object_delete</code> (not for projectiles).</td></tr>
+<tr><td><code>--filter key=value</code></td><td>With <code>--objects</code>: only for objects matching (the same keys as <a href="#v-objects"><code>film objects</code></a>; repeatable). It does not affect zone events.</td></tr>
+<tr><td><code>--all-events</code></td><td>Report every event-channel event as <code>event</code>, not just <code>incident</code>.</td></tr>
+<tr><td><code>--clock</code></td><td>Include the once-a-second round clock and the sudden-death and grace-period timers as <code>game</code> events (off by default; they are noisy).</td></tr>
+<tr><td><code>--map cache.map</code></td><td>Turn object definitions into tag paths for the <code>tag</code> field. The only use of a map.</td></tr>
+<tr><td><code>--once</code></td><td>Process the file as it is now and exit.</td></tr>
+<tr><td><code>--max-seconds N</code></td><td>Exit after about <code>N</code> seconds.</td></tr>
+</table></div>
+<p>Standard output carries only events. Status goes to standard error, one line per file change: <code>refresh: 12000 records (1500 new), 8 events, 11.2 ms wall, 10.9 ms cpu</code>. A bad argument prints the reason and usage and exits with code 2. If the program reading the pipe goes away, the follower exits with code 0.</p>
+
+<h3 id="f-temp">Following a recording the game is still writing</h3>
+<ul>
+  <li>The game rewrites the <code>.temp</code> roughly every <strong>15 seconds</strong>, each time the same stream with more records at the end. That is a limit on freshness no reader can beat: events appear in batches, up to about 15 seconds after they happened in the match.</li>
+  <li>The follower reads only complete records, decodes <em>only the ones it has not seen</em>, and keeps all state between refreshes, so the cost of a refresh depends on what is new.</li>
+  <li>Nothing is printed until the file holds <strong>256 records</strong> (about four seconds of play); at that point everything from the start is reported in one burst.</li>
+  <li>If the file is replaced by a different match, or becomes shorter, a <code>reset</code> event is printed and following starts over (a consumer should discard its state).</li>
+  <li>When the match ends MCC finalises the recording and renames the <code>.temp</code>. The follower does not chase the new name: it keeps polling the old path and prints nothing. Stop it, and run it once more with <code>--once</code> on the finished file if you want the tail (use <code>--since</code> to skip what you have).</li>
+  <li>If the file cannot be opened or parsed at the moment of a poll (the game is mid-write), the follower prints <code>waiting: ...</code> on stderr and tries again on the next poll; nothing is lost.</li>
+</ul>
+
+<h3 id="f-bg">Running it in the background and piping it</h3>
+<pre><code># write the stream to a file, status to a log
+hms-app --film-follow match.temp --objects --watch-label zone_a --watch-radius 6 \
+        &gt; events.jsonl 2&gt; follow.log &amp;
+
+# or pipe it straight into a consumer
+hms-app --film-follow match.temp --watch-label zone_a --watch-radius 6 2&gt;/dev/null | python3 -I consumer.py</code></pre>
+<p>The follower flushes after every batch of events, so a consumer reading line by line sees them as they are produced. On Windows, run it from a terminal and redirect or pipe the output. With no display (SSH, a service) nothing else is needed: the <code>--film-follow</code> mode does not touch the graphics stack.</p>
+
+<h3 id="f-resume">De-duplication and resuming with <code>--since</code></h3>
+<p>Every event has an <code>id</code> of the form <code>&lt;tick&gt;-&lt;n&gt;</code> (<code>n</code> counts events within a tick). The stream is <strong>deterministic</strong>: the events for the first part of a file are exactly the beginning of the events for the whole file, however the file was chunked into refreshes. So an id never repeats within a run, and a restarted follower produces the same ids for the same events. To resume after a restart, pass the tick you last handled; the follower re-decodes from the start (a cold start is about a second on a long film) and suppresses events at or before it:</p>
+<pre><code>hms-app --film-follow match.temp --since t24000 --watch-label zone_a --watch-radius 6</code></pre>
+<p>Because <code>--since</code> drops events with a tick <em>at or before</em> the value, pass the last tick <em>minus one</em> and skip ids you have already stored, if events in the final tick may not all have been written when you stopped.</p>
+
+<h3 id="f-schema">Event schema</h3>
+<p>Every event has <code>id</code>, <code>tick</code>, <code>seconds</code> and <code>type</code>. The remaining fields by type:</p>
+<div class="tablewrap"><table>
+<tr><th><code>type</code></th><th>Fields</th><th>When</th></tr>
+<tr><td><code>reset</code></td><td><code>reason</code></td><td>The file changed identity or shrank.</td></tr>
+<tr><td><code>player_join</code></td><td><code>slot</code>, <code>name</code>, <code>team</code>, <code>identifier</code>, <code>joined_in_progress</code></td><td>A player is added.</td></tr>
+<tr><td><code>player_leave</code></td><td><code>slot</code>, <code>name</code>, <code>reason</code> (<code>left_game</code> or <code>removed</code>)</td><td>A player leaves a slot.</td></tr>
+<tr><td><code>player_swap</code></td><td><code>slot</code>, <code>with_slot</code>, <code>name</code></td><td>Two slots exchange players.</td></tr>
+<tr><td><code>player_update</code></td><td><code>slot</code>, <code>name</code>, <code>team</code></td><td>A player&rsquo;s configuration changes (team, name).</td></tr>
+<tr><td><code>incident</code></td><td><code>incident</code> (name, or <code>null</code>), <code>incident_id</code>, <code>subject</code>, <code>other</code> (object ids), <code>subject_slot</code>, <code>subject_name</code>, <code>other_slot</code>, <code>other_name</code></td><td>A kill, medal or game incident. The slot and name fields are <code>null</code> when the body is not attributed to a player.</td></tr>
+<tr><td><code>event</code></td><td><code>kind</code>, <code>name</code>, <code>subject</code>, <code>other</code>, <code>subject_slot</code>, <code>subject_name</code>, <code>other_slot</code>, <code>other_name</code></td><td>Any other event-channel event; only with <code>--all-events</code>.</td></tr>
+<tr><td><code>score</code></td><td><code>statborg</code>, <code>is_team</code>, <code>slot</code> (players) or <code>team</code> (teams), <code>name</code>, <code>round_score</code>, <code>total_score</code>, <code>rounds_won</code>, <code>final</code></td><td>A score store changes. Fields not yet stated are <code>null</code>.</td></tr>
+<tr><td><code>megalo</code></td><td><code>scope</code> (<code>global</code>/<code>player</code>/<code>team</code>), <code>owner</code>, <code>owner_name</code>, <code>kind</code>, <code>slot</code>, <code>value</code>, <code>text</code></td><td>A replicated variable took a new value. The first sighting of each variable is reported too.</td></tr>
+<tr><td><code>game</code></td><td><code>name</code> (<code>current_state</code>, <code>game_finished</code>, <code>current_round</code>, <code>round_condition_flags</code>; with <code>--clock</code> also <code>round_timer_seconds</code>, <code>sudden_death_seconds</code>, <code>grace_period_seconds</code>), <code>value</code></td><td>A game-state variable changed.</td></tr>
+<tr><td><code>object_spawn</code> / <code>object_delete</code></td><td><code>id_obj</code> (the object&rsquo;s id &mdash; <code>id</code> is the event id), <code>entity_type</code>, <code>object_type</code>, <code>tag</code>, <code>label</code>, <code>position</code> (<code>[x,y,z]</code>), <code>team</code>, <code>shape</code></td><td>With <code>--objects</code> (and <code>--filter</code>). A delete is reported only for objects whose spawn was reported.</td></tr>
+<tr><td><code>zone_enter</code> / <code>zone_exit</code></td><td><code>zone_id</code>, <code>zone_label</code>, <code>occupant_id</code>, <code>occupant_type</code> (<code>biped</code> or <code>vehicle</code>), <code>slot</code>, <code>name</code></td><td>With a <code>--watch-*</code> flag. Occupants are player bodies and vehicles.</td></tr>
+</table></div>
+<pre><code>{"id":"3702-0","tick":3702,"seconds":61.7,"type":"zone_enter","zone_id":3943104916,"zone_label":"zone_a","occupant_id":4013424645,"occupant_type":"biped","slot":4,"name":"Alpha"}   (illustrative)</code></pre>
+<p>Within a tick, events come in the order roster changes, events and incidents, destroys, entity-driven events (score, Megalo, spawns), then zone changes. Watched objects are registered when they are created, so a watch started on a film that already contains the object still works (the follower decodes from the start).</p>
+
+<h3 id="f-cost">Polling and CPU cost</h3>
+<p>Measured on a 47-minute, 150 MB film: re-reading and framing the file is about 55 ms; decoding 1,500 new records (25 seconds of play) about 10 ms; a cold start over the whole film about 1.2 seconds. Memory is the follower&rsquo;s per-object state only. At the default 1 s poll the follower only looks at the file&rsquo;s metadata unless the game has rewritten it, so it idles at essentially zero CPU between the game&rsquo;s writes.</p>
+
+<h3 id="f-consumers">Generic consumers</h3>
+<p><strong>Shell:</strong> print a line whenever any watched object gets an enter or exit:</p>
+<pre><code>hms-app --film-follow match.temp --watch-label zone_a --watch-label zone_b --watch-radius 6 2&gt;/dev/null |
+  jq -r --unbuffered 'select(.type=="zone_enter" or .type=="zone_exit")
+                      | "\(.seconds)s  \(.name // .occupant_id)  \(.type)  \(.zone_label // .zone_id)"'</code></pre>
+<p><strong>Python:</strong> the same, plus the time each occupant spent inside each zone (<a href="examples/follow_zones.py"><code>examples/follow_zones.py</code></a>, run as <code>python3 -I follow_zones.py</code>):</p>
+<pre><code>import json, sys
+
+seen, since, total = set(), {}, {}
+for line in sys.stdin:
+    e = json.loads(line)
+    if e["id"] in seen:                       # de-duplicate by event id
+        continue
+    seen.add(e["id"])
+    if e["type"] == "reset":                  # a different match: forget everything
+        seen.clear(); since.clear(); total.clear()
+    elif e["type"] in ("zone_enter", "zone_exit"):
+        zone = e["zone_label"] or e["zone_id"]
+        who = e["name"] or f'{e["occupant_type"]} {e["occupant_id"]}'
+        key = (e["zone_id"], e["occupant_id"])
+        print(f'{e["seconds"]:9.2f}s  {who:<16} {e["type"][5:]:<5} {zone}', flush=True)
+        if e["type"] == "zone_enter":
+            since[key] = e["seconds"]
+        elif key in since:
+            total[(who, zone)] = total.get((who, zone), 0.0) + e["seconds"] - since.pop(key)</code></pre>
+<p>An occupant still inside when you stop has not been counted: add <code>now - since[key]</code> for the open entries at exit if you need it. The same approach works for any other event type: filter on <code>type</code>, key the state by the fields that identify what you are tracking, and de-duplicate on <code>id</code>.</p>
+
+<h2 id="limits">Limits and gotchas</h2>
+<ul>
+  <li><strong>Position sampling is sparse.</strong> A body&rsquo;s position is only sent on some ticks and HMS holds the last sample until the next. A fast player can cross a small zone between two samples and never be seen inside it; an ENTER or EXIT can lag the true crossing until the next sample. Larger zones and slower objects are reliable. Vehicles and bodies share this.</li>
+  <li><strong>Labels are matched by position.</strong> The stream does not state an entity&rsquo;s Forge label; HMS finds the variant placement within a quarter of a world unit of the entity&rsquo;s first position. Check <code>join_dist</code>. Two placements stacked at the same point are ambiguous (the nearest wins). Anything spawned by the gametype has no label.</li>
+  <li><strong>Box zones are approximate.</strong> Sphere and cylinder tests are exact. For a box, HMS treats width and length as full extents (the numbers the Forge UI shows); the engine&rsquo;s own test was not located, so the box could be half that size. Prefer sphere or cylinder zones where you can, or confirm a box against a known event (a score at a known tick).</li>
+  <li><strong>Tag names need a map.</strong> Without <code>--map</code> (follower) the <code>tag</code> field is empty; script verbs always leave it empty. <code>def_wire</code> (in JSON and in <code>film object</code>) and the placement columns identify the type instead.</li>
+  <li><strong>Per-object Megalo variables are not recorded</strong>, and neither are variables with network priority none or local. A variable you cannot find in <code>film megalo vars</code> may simply not be replicated; <code>film megalo decls</code> says which are.</li>
+  <li><strong>Slots are not people.</strong> Key player data by name through <code>film seats</code> (or the <code>*_name</code> columns), not by slot, whenever players can swap or join late.</li>
+  <li><strong>The kill feed is the recorder&rsquo;s.</strong> See <a href="#notin">what is not in a recording</a>.</li>
+  <li><strong>A film started mid-match</strong> carries a Megalo variable only from its first update; before that its value is unknown, not zero.</li>
+  <li><strong>Player bodies in an in-progress recording</strong> are bound to players by a different route than in a finished film (there is no author record yet), so on some clips fewer bodies have names until the film is finalised.</li>
+  <li><strong>Paths with spaces</strong> do not work in the script grammar (no quoting). <code>--film-follow</code> takes its path as one command-line argument, so it is fine there.</li>
+</ul>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

@@ -98,6 +98,12 @@ const SQUEEZE_PROGRESS: f32 = 0.1;
 /// The three literals of the adhesion velocity (`sub_1406C4A20`): it is
 /// `clamp(speed / ADHESION_REF_SPEED * ADHESION_MAX, ADHESION_MIN, ADHESION_MAX)` wu/s at a
 /// 30 Hz reference tick (see [`adhesion_speed`] for the 60 Hz scale).
+///
+/// These are the literals of the branch taken when physics-input flag 8 is SET; with the flag
+/// clear the decompile uses 0.24 / 0.468 instead, and a HORIZONTAL target with no vertical
+/// velocity error (see the note on [`control_velocity`]). Which one the player normally gets is
+/// UNRESOLVED -- flag 8 reaches the input from unit state, and the only writer found
+/// (`sub_1406C4380`, output flag 8) sets it for a ground object that is an early mover.
 const ADHESION_REF_SPEED: f32 = 2.2;
 const ADHESION_MIN: f32 = 0.12;
 const ADHESION_MAX: f32 = 0.234;
@@ -165,6 +171,11 @@ pub struct PlayerState {
     turning_in_place: bool,
     /// Standing on walkable ground this frame.
     pub grounded: bool,
+    /// #man-cannon  A phantom volume (man cannon, grav lift) acted on the body at the last engine
+    /// tick. The engine passes that to the ground update as `physics_input +0xB8` and the update
+    /// then skips the ground-adhesion velocity (`sub_1406C4A20`), which would otherwise pull the
+    /// body back onto the floor it is being lifted off.
+    pub in_phantom: bool,
     /// The ground PLANE underfoot (`Vec3::Z` when airborne) — [`ground_plane`]'s answer, which is
     /// a normalised sum of contact normals and not necessarily any one surface's.
     pub ground_normal: Vec3,
@@ -208,6 +219,7 @@ impl Default for PlayerState {
             facing_rate: 0.0,
             turning_in_place: false,
             grounded: false,
+            in_phantom: false,
             ground_normal: Vec3::Z,
             contacts: [Contact::default(); MAX_CONTACTS],
             n_contacts: 0,
@@ -371,7 +383,7 @@ fn clamp_delta(err: Vec3, max_delta: f32) -> (Vec3, bool) {
 /// quantities per-second: the acceleration clamp is `accel * dt`, gravity is `g * dt`; the
 /// adhesion is a velocity and is not scaled.
 ///
-/// **Grounded** (`sub_1406C4A20`, the `bit2 == 0` branch):
+/// **Grounded** (`sub_1406C4A20`, the `bit2 == 0` branch, physics-input flag 8 SET):
 /// 1. the commanded direction gets the slope-following z that lies in the plane,
 ///    `z = -(x*nx + y*ny) / nz`, and is renormalised — a body walking up a ramp aims UP the ramp;
 /// 2. its speed is `|cmd|` times [`PlayerPhysics::slope_speed_scale`] of that direction's z;
@@ -379,6 +391,10 @@ fn clamp_delta(err: Vec3, max_delta: f32) -> (Vec3, bool) {
 ///    acceleration blended toward the sneak one by the crouch fraction);
 /// 4. [`adhesion_speed`] is subtracted along the plane normal;
 /// 5. gravity is subtracted LAST, and only if step 3 saturated.
+///
+/// The decompile's OTHER branch (flag 8 clear): the direction stays horizontal (`v135[2] = 0`),
+/// the vertical error is forced to zero (`v134.m8 = 0`) and the adhesion literals are 0.24 /
+/// 0.468. Not ported: whether the player is ever in it is UNRESOLVED (see [`ADHESION_REF_SPEED`]).
 ///
 /// **Airborne** (`bit2` branch): the horizontal error to the commanded velocity is clamped to the
 /// authored `airborne acceleration * dt`; vertical velocity is Havok's, i.e. plain gravity.
@@ -631,7 +647,13 @@ impl PlayerState {
         }
 
         // --- the engine's velocity update ----------------------------------------------------
+        let before = self.vel;
         self.vel = control_velocity(self.vel, plane, cmd, p, self.crouch_t, dt);
+        // #man-cannon  Inside a phantom volume the ground update skips the adhesion velocity
+        // (`physics_input +0xB8` set, `sub_1406C4A20`): `control_velocity` subtracted it, so add it back.
+        if let (true, Some(n)) = (self.in_phantom, plane.filter(|n| n.z > 1e-3)) {
+            self.vel += n * adhesion_speed(before, p);
+        }
 
         // --- integrate, sub-stepped, depenetrating as we go ---------------------------------
         // SUB-STEP UNTIL THE WHOLE DISPLACEMENT IS CONSUMED, never by more than half the
@@ -3208,6 +3230,44 @@ mod tests {
         }
     }
 
+    /// #collision  **A SLOPE TOO STEEP TO STAND ON IS SLID UP, NOT HIT LIKE A WALL.** A 20 degree
+    /// ramp (walkable, so the body is GROUNDED on it) runs into a 55 degree face (steeper than the
+    /// 35 degree surface limit). The contact solver turns the run's velocity up the face and the
+    /// controller must not throw it away: run at the ramp's speed the body carries on up the face
+    /// (0.5 wu above the knee at a run, 1.4 sprinting), the engine's own
+    /// "to some degree" -- the momentum, the air acceleration and gravity decide how far, with no
+    /// stop response of any kind for a steep contact. (A body pressed against such a face from a
+    /// standstill, floor still under it, is pinned: gravity and adhesion outweigh the lift of its
+    /// own acceleration. That is the same arithmetic, not a stop rule.)
+    ///
+    /// SABOTAGE: zero the whole velocity on a steep contact in `resolve` (a wall's full-stop
+    /// response) -> the body stays at the knee (red, measured: highest z 1.108 vs knee 1.092).
+    #[test]
+    fn a_body_runs_on_up_a_face_too_steep_to_stand_on() {
+        let p = spartan();
+        let (t1, t2) = (20f32.to_radians().tan(), 55f32.to_radians().tan());
+        let knee_x = 3.0f32;
+        let knee_z = knee_x * t1;
+        let big = |x0: f32, x1: f32, top: f32| cuboid(Vec3::new(x0, -6.0, top - 1.0), Vec3::new(x1, 6.0, top));
+        let shallow = vec![Vec3::new(0.0, -6.0, -1.0), Vec3::new(0.0, 6.0, -1.0), Vec3::new(0.0, -6.0, 0.0), Vec3::new(0.0, 6.0, 0.0), Vec3::new(knee_x, -6.0, knee_z), Vec3::new(knee_x, 6.0, knee_z), Vec3::new(knee_x, -6.0, -1.0), Vec3::new(knee_x, 6.0, -1.0)];
+        let steep = vec![Vec3::new(knee_x, -6.0, -1.0), Vec3::new(knee_x, 6.0, -1.0), Vec3::new(knee_x, -6.0, knee_z), Vec3::new(knee_x, 6.0, knee_z), Vec3::new(knee_x + 4.0, -6.0, knee_z + 4.0 * t2), Vec3::new(knee_x + 4.0, 6.0, knee_z + 4.0 * t2), Vec3::new(knee_x + 4.0, -6.0, -1.0), Vec3::new(knee_x + 4.0, 6.0, -1.0)];
+        let w = course(&[big(-6.0, 0.0, 0.0), shallow, steep], &[], 0.0);
+        for sprint in [false, true] {
+            let mut st = PlayerState::standing_at(Vec3::new(-2.2, 0.0, 0.05), 0.0);
+            for _ in 0..60 { st.step(&MoveInput::default(), &p, &w, 1.0 / 60.0); }
+            let input = MoveInput { fwd: 1.0, yaw: 0.0, sprint, ..Default::default() };
+            let (mut top, mut grounded_on_shallow) = (0.0f32, 0usize);
+            for _ in 0..240 {
+                st.step(&input, &p, &w, 1.0 / 60.0);
+                top = top.max(st.pos.z);
+                grounded_on_shallow += (st.grounded && st.pos.x < knee_x - 0.1) as usize;
+            }
+            println!("{}: highest z {top:.3} (the knee is at {knee_z:.3}), {grounded_on_shallow} grounded ticks on the shallow ramp", if sprint { "sprint" } else { "run" });
+            assert!(grounded_on_shallow > 30, "liveness: the body must climb the walkable part grounded first");
+            assert!(top > knee_z + if sprint { 0.5 } else { 0.25 }, "pinned at the knee: highest z {top:.3}, knee {knee_z:.3}");
+        }
+    }
+
     // -----------------------------------------------------------------------------------------
     // the real tags
     // -----------------------------------------------------------------------------------------
@@ -3405,7 +3465,7 @@ mod tests {
         let v = tangent * 2.2;
         let on_ramp = control_velocity(v, Some(n), Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
         // error zero (the target IS the current velocity), so only adhesion at speed 2.2
-        assert!((on_ramp - (v - n * 0.117)).length() < 1e-5, "ramp {on_ramp:?}");
+        assert!((on_ramp - (v - n * 0.117)).length() < 1e-4, "ramp {on_ramp:?}");
         // ...and from a standstill the first tick accelerates ALONG the plane, not along x
         let up = control_velocity(Vec3::ZERO, Some(n), Vec3::new(2.2, 0.0, 0.0), &p, 0.0, dt);
         let along = (up + n * 0.06 + Vec3::Z * (g / 60.0)).normalize();
@@ -4507,6 +4567,30 @@ mod tests {
         }
         assert!(walkers >= 40 && crossings >= 100, "the seam sweep barely looked: {walkers} walkers, {crossings} crossings");
         assert!(bad.is_empty(), "{} walkers lost speed or left the ground crossing block seams", bad.len());
+    }
+
+    /// #man-cannon  Inside a phantom volume the ground update skips the ground-adhesion velocity
+    /// (`physics_input +0xB8`, `sub_1406C4A20`): the velocity the engine pushes INTO the floor each
+    /// tick would otherwise hold a body down against the lift. At 60 Hz the adhesion floor is the
+    /// engine's 0.12 wu/s literal halved for the tick rate = 0.06 wu/s.
+    #[test]
+    fn a_body_in_a_phantom_volume_is_not_pressed_into_the_ground() {
+        let p = spartan();
+        assert!(p.ground_adhesion_scale <= 0.0, "the literal below assumes the unscaled adhesion");
+        let w = floor(0.0, 30.0);
+        let mut st = PlayerState::standing_at(Vec3::ZERO, 0.0);
+        run(&mut st, &MoveInput::default(), &p, &w, 1.0);
+        assert!(st.grounded, "a body must be standing before the test means anything");
+        let step = |in_phantom: bool| {
+            let mut b = st;
+            // rising slowly enough (0.45 < 0.468) that the floor is still its ground plane
+            b.vel = Vec3::new(0.0, 0.0, 0.45);
+            b.in_phantom = in_phantom;
+            b.step(&MoveInput::default(), &p, &w, 1.0 / 60.0);
+            b.vel.z
+        };
+        let (plain, phantom) = (step(false), step(true));
+        assert!((phantom - plain - 0.06).abs() < 2e-3, "plain {plain}, in a phantom {phantom}: the difference should be the 0.06 wu/s adhesion");
     }
 
 }

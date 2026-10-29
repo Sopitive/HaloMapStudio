@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.6.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -27,6 +27,7 @@
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -107,7 +108,7 @@
 <h2 id="gi">Real-time probe GI and the path-traced bake</h2>
 <p>Both are optional alternatives to the map's baked lightmaps, mainly useful to preview lighting for objects or to see a map under a different sun.</p>
 <ul>
-  <li><strong>Real-time lighting (probe GI)</strong> keeps a grid of light probes updated on the GPU every frame (a DDGI-style probe grid with visibility). When on you get a <em>GI gain</em> slider (0.25–4, default 1.3), <em>sun yaw / pitch / intensity</em> sliders seeded from the map with <em>reset sun to map</em>, and — if <em>Lights</em> is shown — a <em>move light</em> picker that lets you drag any of the 24 nearest map lights (or move one to the camera). The info line reports the probe count, spacing and update rate. Outdoors it matches the shipped bake closely; interiors are darker than the bake.</li>
+  <li><strong>Real-time lighting (probe GI)</strong> keeps a grid of light probes updated on the GPU every frame (a DDGI-style probe grid with visibility). When on you get a <em>GI gain</em> slider (0.25–4, default 1.3), <em>sun yaw / pitch / intensity</em> sliders seeded from the map with <em>reset sun to map</em>, and — if <em>Lights</em> is shown — a <em>move light</em> picker that lets you drag any of the 24 nearest map lights (or move one to the camera). The info line reports the probe count, spacing and update rate. Outdoors it matches the shipped bake closely. A finer probe grid follows the camera on big maps (so narrow shadows and pits stay dark) and the map's baked lamps are drawn per pixel; interiors come up close to the bake near lamps but can still be a little darker.</li>
   <li><strong>Path-traced lighting</strong> ignores the map's lightmaps and bakes a GPU path-traced global illumination of the level (a few seconds, progress bar shown). <em>bake quality</em> offers <code>direct_only</code>, <code>draft</code>, <code>low</code>, <code>medium</code>, <code>high</code> and <code>super_slow</code> (increasing samples and bounces). Untick to return to the stock lighting.</li>
 </ul>
 
@@ -122,11 +123,11 @@
   <li><strong>Sun and shadows</strong> — the sun direction comes from the map; the sun shadow map covers objects only, since the level's own sun shadowing is already baked into the lightmap, exactly as in the game.</li>
   <li><strong>Fog</strong> — atmospheric fog uses the engine's scattering model and the map's fog parameters.</li>
 </ul>
-<p>Much of this has been checked pixel-for-pixel against frames captured from the game with the same camera. Known remaining differences (v1.6.0): some indoor mid-tones render darker than the game (the engine's wide bloom "pedestal" is only partially reproduced), instanced geometry lit by per-vertex lighting can read too dark on some maps, a few water hues and the Forge World tide pools are slightly off, and a handful of exotic shader templates fall back to a neutral material. None of this affects what is written to a variant — rendering is for viewing only.</p>
+<p>Much of this has been checked pixel-for-pixel against frames captured from the game with the same camera. Known remaining differences (v1.7.0): some indoor mid-tones render darker than the game (the engine's wide bloom "pedestal" is only partially reproduced), instanced geometry lit by per-vertex lighting can read too dark on some maps, a few water hues and the Forge World tide pools are slightly off, and a handful of exotic shader templates fall back to a neutral material. None of this affects what is written to a variant — rendering is for viewing only.</p>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.6.0 source (2026-10-21). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

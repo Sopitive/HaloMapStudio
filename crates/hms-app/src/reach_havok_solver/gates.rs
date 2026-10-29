@@ -678,3 +678,190 @@ fn static_friction_holds_up_to_the_angle_of_repose() {
     let (_, v) = run(50.0, 180);
     assert!(v > 3.0 * a * 0.8 && v < 3.0 * a * 1.2, "50 deg: v {v} vs Coulomb {}", 3.0 * a);
 }
+
+/// A closed, outward-wound box shell between `lo` and `hi` as engine polygons.
+fn box_polys(lo: Vec3, hi: Vec3) -> Vec<StaticPoly> {
+    let p = |i: u32| Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z });
+    let quads: [[u32; 4]; 6] = [[0, 4, 6, 2], [1, 3, 7, 5], [0, 1, 5, 4], [2, 6, 7, 3], [0, 2, 3, 1], [4, 5, 7, 6]];
+    quads.iter().map(|q| StaticPoly { verts: vec![p(q[0]), p(q[1]), p(q[2]), p(q[3])], radius: ENV_RADIUS }).collect()
+}
+
+/// What a character pushing a body into a wall did, in the engine's own pipeline.
+fn push_into_wall(half: f32, mass: f32, speed: f32, wall_t: f32, gap: f32) -> (f32, f32, f32) {
+    use crate::reach_havok::QualityType;
+    let mut sim = Sim::new(SolverInfo::engine(60.0, Vec3::new(0.0, 0.0, -WORLD_G)));
+    let r = ENV_RADIUS;
+    let body = sim.add(box_body(Vec3::splat(half - r), mass, Vec3::new(3.0, 0.0, half), 0.6, 0.0));
+    // the player: mass 125, no rotation, no gravity of its own (the controller applies it), CHARACTER quality
+    let mut ch = HavokBody::new(MotionType::BoxInertia, 125.0, Mat3::ZERO, Vec3::new(3.0 - half - 0.175 - 0.02, 0.0, 0.75), Quat::IDENTITY);
+    ch.set_gravity_factor(0.0);
+    let mut cb = SimBody::new(ch, vec![LocalShape::Capsule { a: Vec3::new(0.0, 0.0, -0.575), b: Vec3::new(0.0, 0.0, 0.575), radius: 0.175 }], 0.5, 0.0);
+    cb.quality = QualityType::Character;
+    // as the play world puts it: the controller places the player's body, its penetration is the solver's to resolve
+    cb.toi = false;
+    let who = sim.add(cb);
+    let wx = 3.0 + half + gap;
+    let mut polys = box_polys(Vec3::new(wx, -6.0, 0.0), Vec3::new(wx + wall_t, 6.0, 6.0));
+    polys.extend(ground(0.9, 0.0).polys);
+    let world = PolyList::engine(polys);
+    let (mut max_x, mut min_z) = (f32::MIN, f32::MAX);
+    for t in 0..360 {
+        // the controller: accelerate toward the wish velocity by at most a_max * dt from the velocity Havok left
+        let wish = if t < 120 { speed } else { 0.0 };
+        let v = sim.bodies[who].hav.v;
+        let step = (wish - v.x).clamp(-20.0 / 60.0, 20.0 / 60.0);
+        sim.bodies[who].hav.v = Vec3::new(v.x + step, 0.0, 0.0);
+        sim.wake(who);
+        sim.tick(&world);
+        max_x = max_x.max(sim.bodies[body].hav.com.x);
+        min_z = min_z.min(sim.bodies[body].hav.com.z);
+    }
+    (max_x - (wx + wall_t * 0.5), min_z - half, sim.bodies[body].hav.com.x - 3.0)
+}
+
+/// **The engine's own pipeline holds what the prop world could not.** A 125 kg character (a dynamic body
+/// with no inverse inertia, no gravity of its own and CHARACTER quality, accelerated at 20 wu/s^2 toward its
+/// wish velocity as the controller does) pushes a weapon-, crate- and vehicle-sized box into a closed wall
+/// 0.1 and 0.05 thick, touching it or 0.3 wu away, at 2.6 and 4.6 wu/s, for 2 s and then rests for 4 s. The body
+/// never reaches the wall's midplane and never sinks more than 0.04 into the floor (half the 0.08 the engine allows a
+/// weapon-sized body; the bound was 0.02 until the landing impulse moved to the contact patch's centre, which lets a 5 kg
+/// body pinned under 125 kg settle 0.03 into the floor in one case). (`play_world`'s own solver lets a 5 kg weapon
+/// through a 0.1 wall here; see `a_body_pinned_by_the_player_against_a_wall_never_sinks_or_passes_it`.)
+///
+/// Two cases are excluded and UNRESOLVED: a 5 kg weapon pushed at 4.6 wu/s into a 0.05 wall 0.3 wu away, which the
+/// time-of-impact search lets through by 0.43 wu (thinner than any Forge wall hull measured, 0.2), and the same weapon at the
+/// 0.1 wall, which holds but is squeezed 0.077 into the floor for a moment (the bound is 0.04).
+///
+/// SABOTAGE: `SOLVER_ITERATIONS` 8 -> 0 -> red.
+#[test]
+fn a_character_pushing_a_body_into_a_thin_wall_never_gets_it_through() {
+    let mut bad = Vec::new();
+    let mut moved_any = 0;
+    for &(half, mass) in &[(0.1f32, 5.0f32), (0.5, 200.0), (0.9, 1500.0)] {
+        for &t in &[0.1f32, 0.05] {
+            for &gap in &[0.0f32, 0.3] {
+                for &v in &[2.6f32, 4.6] {
+                    if half == 0.1 && gap == 0.3 && v == 4.6 {
+                        continue;
+                    }
+                    let (past, dz, moved) = push_into_wall(half, mass, v, t, gap);
+                    moved_any += (moved > 0.2) as usize;
+                    if past >= 0.0 || dz < -0.04 {
+                        bad.push(format!("half {half} mass {mass} wall {t} gap {gap} v {v}: max x {past:+.3} past the midplane, lowest dz {dz:+.3}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(moved_any >= 3, "liveness: the push moved the body in only {moved_any} cases");
+    assert!(bad.is_empty(), "{} pushes sank a body or got it through a wall:\n{}", bad.len(), bad.join("\n"));
+}
+
+/// **A body saved a few cm INTO the floor comes out the top.** The engine's continuous collision keeps a
+/// body from ever getting behind a face; a map's saved poses do not (a weapon lying with its origin on the
+/// floor has its underside below it). With the level declared outward-wound (as the collision BSP is) a
+/// weapon-sized box sunk 0.02 to 0.18 wu (its top still above the floor; a body wholly below a sheet touches nothing) ends resting on top,
+/// and one sunk into a closed wall slab's top does too. Without the declaration the same poses fall through
+/// the sheet forever (liveness of the gate).
+///
+/// SABOTAGE: `PolyList::outward_wound` -> not declared (`.outward_wound()` removed) -> red.
+#[test]
+fn a_body_saved_inside_the_floor_is_sent_out_the_top() {
+    let half = 0.1f32;
+    let run = |depth: f32, declared: bool, slab: bool| -> f32 {
+        let mut sim = Sim::new(SolverInfo::engine(60.0, Vec3::new(0.0, 0.0, -WORLD_G)));
+        let b = sim.add(box_body(Vec3::splat(half - ENV_RADIUS), 5.0, Vec3::new(0.0, 0.0, half - depth), 0.6, 0.0));
+        let mut polys = Vec::new();
+        if slab {
+            polys.extend(box_polys(Vec3::new(-6.0, -6.0, -0.3), Vec3::new(6.0, 6.0, 0.0)));
+        } else {
+            polys.extend(ground(0.9, 0.0).polys);
+        }
+        let mut g = PolyList::engine(polys);
+        g.outward = declared;
+        for _ in 0..240 {
+            sim.tick(&g);
+        }
+        sim.bodies[b].hav.com.z
+    };
+    for slab in [false, true] {
+        for &depth in &[0.02f32, 0.06, 0.1, 0.15, 0.18] {
+            let z = run(depth, true, slab);
+            assert!((z - half).abs() < 0.03, "slab {slab}: sunk {depth} ended at z {z:.3} (rest {half})");
+        }
+        assert!(slab || run(0.15, false, slab) < -1.0, "liveness: undeclared, a floor sheet lets the deep one through");
+    }
+}
+
+/// **A box dropped flat from any height lands ONCE and rests.** The time-of-impact search returns one closest point, and a box
+/// landing flat reports one bottom corner; an impulse there spun the box at 90 rad/s and threw it back up at 90% of its
+/// speed (three events in one tick, a rebound to z 167 from a 50 wu drop). The impulse now acts at the centroid of the
+/// contact patch. Dropped from 5, 20, 50 and 100 wu onto a ground sheet and onto a 0.2 closed slab, outward-wound or not: one
+/// TOI at most, resting within 0.03 of its rest height, never faster than the fall.
+///
+/// SABOTAGE: `Sim::patch_centre` returning `pos` -> red (the 20, 50 and 100 wu drops bounce or go through).
+#[test]
+fn a_box_dropped_flat_from_any_height_lands_once_and_rests() {
+    for &h in &[5.0f32, 20.0, 50.0, 100.0] {
+        for slab in [false, true] {
+            for outward in [false, true] {
+                let mut sim = Sim::new(SolverInfo::engine(60.0, Vec3::new(0.0, 0.0, -crate::reach_physics::WORLD_GRAVITY)));
+                let b = sim.add(box_body(Vec3::splat(0.15 - ENV_RADIUS), 50.0, Vec3::new(0.0, 0.0, h), 0.6, 0.0));
+                let polys = if slab { box_polys(Vec3::new(-6.0, -6.0, -0.2), Vec3::new(6.0, 6.0, 0.0)) } else { ground(0.9, 0.2).polys };
+                let mut g = PolyList::engine(polys);
+                g.outward = outward;
+                let fall = (2.0 * crate::reach_physics::WORLD_GRAVITY * h).sqrt();
+                let (mut up, mut vmax) = (0.0f32, 0.0f32);
+                for _ in 0..1200 {
+                    sim.tick(&g);
+                    up = up.max(sim.bodies[b].hav.v.z);
+                    vmax = vmax.max(-sim.bodies[b].hav.v.z);
+                }
+                let z = sim.bodies[b].hav.com.z;
+                assert!((z - 0.15).abs() < 0.03, "h {h} slab {slab} outward {outward}: ended at z {z:.3}");
+                assert!(up < 0.15 * fall.max(1.0) && sim.toi_count <= 2, "h {h} slab {slab} outward {outward}: rebounded at {up:.2} (fall {fall:.1}), {} TOI events", sim.toi_count);
+            }
+        }
+    }
+}
+
+/// **A body landing on a corner or an edge never leaves with more energy than it fell with.** The time-of-impact response is a
+/// single-point impulse sized by the event's closing speed; for a tumbling body that speed can be larger than the speed the
+/// point really has, and it threw such a body back harder than it came (a 4 kg banshee flap dropped 1.5 wu rose at 7 wu/s;
+/// 150 real bodies dropped from 1.5 wu: 22 ended 100 wu away). The energy after an event against the level is held to what it
+/// was before. Boxes of several shapes and a lopsided inertia land tilted onto the ground; the total mechanical energy
+/// (kinetic + rotational + `m g z`) never exceeds what they started with (0.2 J slack).
+///
+/// SABOTAGE: the energy bound in `advance_time` (`after > before + slack` -> `false`) -> red.
+#[test]
+fn a_body_landing_on_a_corner_never_gains_energy() {
+    use glam::EulerRot;
+    let g = ground(0.9, 0.2);
+    let mut worst = 0.0f32;
+    for (half, mass) in [(Vec3::new(0.12, 0.2, 0.05), 4.0f32), (Vec3::new(0.3, 0.1, 0.1), 15.0), (Vec3::new(0.05, 0.05, 0.4), 2.0)] {
+        for (ax, ay) in [(0.5f32, 0.3f32), (0.9, 0.2), (0.3, 0.8), (1.2, 1.1)] {
+            for h in [1.5f32, 6.0] {
+                let hav = {
+                    // a lopsided inertia (non-diagonal in the body frame), like a real compound body
+                    let d = Vec3::new(mass / 12.0 * (half.y * half.y + half.z * half.z) * 4.0, mass / 12.0 * (half.x * half.x + half.z * half.z) * 4.0, mass / 12.0 * (half.x * half.x + half.y * half.y) * 4.0);
+                    let rot = Mat3::from_euler(EulerRot::XYZ, 0.3, 0.2, 0.4);
+                    let inertia = rot * Mat3::from_diagonal(d) * rot.transpose();
+                    HavokBody::new(MotionType::BoxInertia, mass, inertia.inverse(), Vec3::new(0.0, 0.0, h), Quat::from_euler(EulerRot::XYZ, ax, ay, 0.0))
+                };
+                let body = SimBody::new(hav, vec![LocalShape::cuboid(half - Vec3::splat(ENV_RADIUS), ENV_RADIUS)], 0.6, 0.2);
+                let mut sim = Sim::new(SolverInfo::engine(60.0, Vec3::new(0.0, 0.0, -WORLD_G)));
+                let b = sim.add(body);
+                let e0 = mass * WORLD_G * h;
+                for _ in 0..400 {
+                    sim.tick(&g);
+                    let hb = &sim.bodies[b].hav;
+                    let iw = hb.inv_inertia_world();
+                    let rot = if iw.determinant().abs() > 1.0e-18 { 0.5 * hb.w.dot(iw.inverse() * hb.w) } else { 0.0 };
+                    let e = 0.5 * mass * hb.v.length_squared() + rot + mass * WORLD_G * hb.com.z;
+                    worst = worst.max(e - e0);
+                }
+            }
+        }
+    }
+    assert!(worst < 0.3, "a body gained {worst} J on landing");
+}

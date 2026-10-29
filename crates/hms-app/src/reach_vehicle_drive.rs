@@ -2944,6 +2944,29 @@ mod jeep_gates {
         assert!((facing_error(Vec3::Z, -Vec3::X, 3.0) + (std::f32::consts::PI - 3.0)).abs() < 1e-5);
     }
 
+    /// **In the reverse gear the wheels turn the opposite way to the facing error** (`sub_140E62270`
+    /// negates the shaped angle when engine byte +0x13, "gear == 0", is set), so a reversing car
+    /// follows the aim.  Same facing error, forward gear vs reverse gear: opposite lock.
+    #[test]
+    fn the_reverse_gear_inverts_the_steering() {
+        let d = fixture();
+        let st = settle_flat(&d);
+        let mut fwd = st;
+        fwd.engine.gear = 1;
+        let mut rev = st;
+        rev.engine.gear = 0;
+        let go = |s: DriveState| {
+            let mut s = s;
+            // one tick, no throttle: the gear cannot change before the steering reads it
+            s = d.step(s, DriveInput { want_yaw: st.yaw + 0.4, ..Default::default() }, 1.0 / 60.0, &flat);
+            s.steer_angle
+        };
+        let (a, b) = (go(fwd), go(rev));
+        println!("forward gear lock {a:+.5}, reverse gear lock {b:+.5}");
+        assert!(a > 1e-4, "liveness: the forward gear must steer left toward a left facing: {a}");
+        assert!(b < -1e-4 && (a + b).abs() < 1e-4, "reverse must mirror it: {a} vs {b}");
+    }
+
     // -----------------------------------------------------------------------------------------
     // INDEPENDENCE OF THE FRAME RATE
     // -----------------------------------------------------------------------------------------
@@ -4231,5 +4254,60 @@ mod jeep_gates {
                 assert!(ratio > 0.6 && ratio < 1.1, "{name} {deg} deg: takeoff vz is x{ratio:.2} of v*tan(ramp)");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "print-only"]
+    fn probe_every_jeep_drives() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        for tag in native.tags_by_group(cache, "vehi") {
+            let name = native.tag_name(cache, tag).unwrap_or_default();
+            let mut index = crate::play_vehicle::VehicleIndex::default();
+            let Some(entry) = index.entry(&native, cache, tag) else { continue };
+            let Some(p) = &entry.phys else { continue };
+            if !matches!(p.family, crate::reach_vehicle::Family::Jeep { .. }) { continue }
+            match &entry.drive {
+                Err(e) => println!("{name}: NO DRIVE MODEL: {e}"),
+                Ok(d) => {
+                    let wl = d.wheel_law.is_some();
+                    let body = d.wheel_law.as_ref().is_some_and(|w| w.body.is_some());
+                    println!("{name}: drive Ok, wheel_law {wl}, body {body}, rigid {}, wheels resolved {}/{}, seats {}", d.rigid(), p.wheel_positions.len(), p.havok.friction_points.len(), entry.seats.seats.len());
+                    if d.rigid() {
+                        let r = d.wheel_law.as_ref().unwrap().wheels[0].radius;
+                        let st0 = DriveState { pos: Vec3::new(0.0, 0.0, r + 0.02), ..Default::default() };
+                        let st = run(d, st0, DriveInput::default(), 3.0, 60.0, &flat, |_, _| {});
+                        let end = run(d, st, DriveInput { throttle: 1.0, ..Default::default() }, 8.0, 60.0, &flat, |_, _| {});
+                        println!("    8 s full throttle: x {:.2} speed {:.2} gear {} aav {:.2}", end.pos.x, end.vel.length(), end.engine.gear, end.engine.angular_velocity);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The ONI van and the semi cab author `max speed reference = 0` on their driver
+    /// seats; that value only scales the kinematic fallback, so it must not stop the
+    /// rigid wheel law from building.  Headless real-tick drive from rest: they must
+    /// move under throttle and end near the drivetrain ceiling (heavy: ~25 s).
+    #[test]
+    fn the_van_and_the_semi_cab_drive() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let mut seen = 0;
+        for tag in native.tags_by_group(cache, "vehi") {
+            let name = native.tag_name(cache, tag).unwrap_or_default();
+            if !(name.ends_with("oni_van") || name.ends_with("truck_cab_large")) { continue }
+            let mut index = crate::play_vehicle::VehicleIndex::default();
+            let entry = index.entry(&native, cache, tag).expect("entry");
+            let d = entry.drive.as_ref().unwrap_or_else(|e| panic!("{name} has no drive model: {e}"));
+            assert!(d.rigid(), "{name} not on the rigid wheel law");
+            let r = d.wheel_law.as_ref().unwrap().wheels[0].radius;
+            let st0 = DriveState { pos: Vec3::new(0.0, 0.0, r + 0.02), ..Default::default() };
+            let st = run(d, st0, DriveInput::default(), 3.0, 60.0, &flat, |_, _| {});
+            let mut peak = 0.0f32;
+            run(d, st, DriveInput { throttle: 1.0, ..Default::default() }, 25.0, 60.0, &flat, |_, s| peak = peak.max(s.vel.x));
+            let ceiling = d.max_forward_speed;
+            assert!(peak > 0.85 * ceiling && peak < 1.1 * ceiling, "{name}: peak {peak} vs ceiling {ceiling}");
+            seen += 1;
+        }
+        assert!(seen == 0 || seen == 2, "expected both trucks, saw {seen}");
     }
 }

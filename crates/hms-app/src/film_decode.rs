@@ -745,6 +745,10 @@ pub struct EntityState {
     /// no parent is how an attachment is cleared, which this reports as `None` -- the caller sees
     /// the difference through the dirty mask.
     pub attach: Option<BaseAttachment>,
+    /// #film-objects  Base field 11, the object's MULTIPLAYER PROPERTIES (`multiplayer-properties`
+    /// in the tool build: 15 flag bits, a 4-bit team designator, then the boundary shape and its
+    /// quantised dimensions). Present only when the message carried and fully read field 11.
+    pub mp: Option<crate::film_objects::MpProps>,
 }
 
 /// The shared creation reader `sub_1803D5A8C`, used by types 11, 12, 13, 14, 15, 17 and 18.
@@ -795,7 +799,7 @@ fn creation(r: &mut BitReader, entity_type: u8, p: &DecodeParams) -> Result<(), 
 ///
 /// Position is field 0 and orientation is field 2, so both are reached before the first gap
 /// (field 11, whose leaf helper is unresolved).
-fn base_dirty_walk(r: &mut BitReader, p: &DecodeParams, st: &mut EntityState) -> Result<(), DecodeStop> {
+pub(crate) fn base_dirty_walk(r: &mut BitReader, p: &DecodeParams, st: &mut EntityState) -> Result<(), DecodeStop> {
     // The iterator carries a GATE LIST (`sub_18043442C`); the base walk's is `{2, 8}` (read off
     // `0x180A49258`). Before the presence bit of a gated field the stream carries one extra gate
     // bit, and a 0 there LATCHES the iterator: every later field is skipped with no bits read at
@@ -883,11 +887,7 @@ fn base_dirty_walk(r: &mut BitReader, p: &DecodeParams, st: &mut EntityState) ->
             }
             // 15 + 4 + `sub_1804EC888`, the same damage-state tail the biped's weapon-slot
             // field 0x19 uses. Costed only so field 12 can be reached.
-            11 => {
-                r.bits(15)?;
-                r.bits(4)?;
-                damage_state(r)?;
-            }
+            11 => st.mp = Some(crate::film_objects::read_mp(r)?),
             // #film-attach  THE OBJECT-TO-OBJECT ATTACHMENT RECORD.
             12 => st.attach = base_attachment(r, p)?,
             _ => {
@@ -975,8 +975,10 @@ fn base_attachment(r: &mut BitReader, p: &DecodeParams) -> Result<Option<BaseAtt
         let lo = r.bits(11)?;
         let node = r.bits(8)? as u8;
         r.flag()?;
-        // The engine passes `second_flag ? 0 : 2` as the range-table index.
-        let mode: u8 = if r.flag()? { 0 } else { 2 };
+        // #film-hill-markers  The engine passes `second_flag != 0 ? 2 : 0` as the range-table index
+        // (`sub_1803D7E58`: `sub_1803C6CE4(.., -(v26 != 0) & 2, 16)`). This used to be read the
+        // other way round, which scaled every offset by 33.3 (a clean 1.0 wu came out as 33.33).
+        let mode: u8 = if r.flag()? { 2 } else { 0 };
         let [mlo, mhi] = ATTACH_OFFSET_RANGE[mode as usize];
         let mut offset = [0.0f32; 3];
         for o in offset.iter_mut() {
@@ -1215,7 +1217,7 @@ pub fn creation_owner_slot(payload: &[u8]) -> Option<u8> {
 /// `flag ? -1 : ReadBits(7)`, so the block is 108 bits when every one of them is absent and 192
 /// when every one is present -- an 84-bit swing, and the reason a fixed offset for anything that
 /// follows it cannot work.
-fn creation_appearance(r: &mut BitReader) -> Result<BipedAppearance, DecodeStop> {
+pub(crate) fn creation_appearance(r: &mut BitReader) -> Result<BipedAppearance, DecodeStop> {
     let mut a = BipedAppearance::default();
     a.flags = (r.flag()? as u8) | ((r.flag()? as u8) << 1); // +0x00
     for c in a.colors.iter_mut() {
@@ -1346,6 +1348,9 @@ pub struct BipedCreation {
     /// [`CREATION_OWNER_BIT`] tried to be. It MOVES -- `creation_walk_probe` prints the
     /// distribution per film.
     pub bits_before_owner: usize,
+    /// #race-riders  The bit offset where the creation body ENDS -- the creation message's dirty
+    /// block (position, attachment, ...) starts here. 0 when the walk could not reach the end.
+    pub end_bit: usize,
 }
 
 /// Walk a biped's creation payload. `eqip_bits` is the width of a `TagReference('eqip')` in this
@@ -1374,6 +1379,7 @@ pub fn creation_biped(payload: &[u8], p: &DecodeParams, eqip_bits: u32) -> Optio
     c.bits_before_owner = r.pos();
     c.owner = r.bits(5).ok()? as i8 - 1;
     let Ok(eqip) = r.bits(eqip_bits) else { return Some(c) };
+    c.end_bit = 0;
     c.eqip_raw = eqip as u32;
     if c.eqip_raw != 0 {
         // the same `compressed_vector3` shape base field 0 uses: one flag, then three axes
@@ -1395,9 +1401,56 @@ pub fn creation_biped(payload: &[u8], p: &DecodeParams, eqip_bits: u32) -> Optio
             Err(_) => return Some(c),
         }
     }
+    c.end_bit = r.pos();
     c.tail_closed = r.remaining() < 8;
     c.leftover_bits = r.remaining();
     Some(c)
+}
+
+/// #race-riders  A biped creation's own DIRTY BLOCK, walked from where the creation body ends.
+///
+/// `creation_biped` stops after the `'eqip'` tail, and the dirty block (position, attachment...)
+/// follows it in the same payload. Returns the walk's state when it rebuilt the message's own
+/// low 20 mask bits exactly -- the stream states the mask twice, so that equality is the oracle.
+pub fn creation_dirty_state(payload: &[u8], mask: u64, p: &DecodeParams, eqip_bits: u32) -> Option<EntityState> {
+    let c = creation_biped(payload, p, eqip_bits)?;
+    if c.end_bit == 0 {
+        return None;
+    }
+    let mut r = BitReader::new(payload);
+    r.skip(c.end_bit).ok()?;
+    let mut st = EntityState::default();
+    base_dirty_walk(&mut r, p, &mut st).ok()?;
+    // The oracle only has to cover what is USED: fields 0..=12 (position, attachment). A creation
+    // that also states a later field this reader cannot cost (the walk stops there) has still read
+    // field 12 correctly, because the walk is in field order -- and 5 of the corpus's 37 parent-
+    // stating creations were dropped by demanding the whole mask.
+    let reached_12 = st.stopped_at_unknown_field.map_or(true, |f| f > 12);
+    (reached_12 && st.rebuilt_mask & 0x1FFF == mask & 0x1FFF).then_some(st)
+}
+
+/// [`creation_dirty_state`] with the film-wide width first and every other width as a fallback, so a
+/// film whose solve landed on the wrong width cannot silently lose a rider.
+pub fn creation_dirty_state_any(payload: &[u8], mask: u64, p: &DecodeParams, preferred: Option<u32>) -> Option<EntityState> {
+    preferred
+        .into_iter()
+        .chain(1..=12u32)
+        .find_map(|w| creation_dirty_state(payload, mask, p, w))
+}
+
+/// #race-riders  The `'eqip'` width that makes the dirty block after a biped creation rebuild its
+/// own mask. [`solve_eqip_bits`] scores widths on "the payload closes", which a creation WITH a
+/// dirty block never does, so it lands on whatever width zero-reads fit; this one scores the
+/// walk that follows. Returns `(width, creations rebuilt)`.
+pub fn solve_creation_dirty_width(creations: &[(&[u8], u64)], p: &DecodeParams) -> (u32, usize) {
+    let mut best = (0u32, 0usize);
+    for bits in 1..=12u32 {
+        let ok = creations.iter().take(32).filter(|(pl, m)| creation_dirty_state(pl, *m, p, bits).is_some()).count();
+        if ok > best.1 {
+            best = (bits, ok);
+        }
+    }
+    best
 }
 
 /// The `'eqip'` reference width for a film, solved from its own biped creations.
@@ -1966,6 +2019,12 @@ impl EntityTrack {
             })
             .sum()
     }
+    /// #film-hill-markers  Did this entity ever state a PARENT (ride something)? A rider stops
+    /// replicating a position of its own, so `moves()` alone calls a marker glued to a player
+    /// "never moved".
+    pub fn rides(&self) -> bool {
+        self.attachments.iter().any(|(_, a)| a.is_some())
+    }
     pub fn moves(&self) -> bool {
         match self.moves_cached {
             Some(m) => m,
@@ -2145,9 +2204,25 @@ pub fn basis_mat3(fwd: [f32; 3], up: [f32; 3]) -> glam::Mat3 {
     glam::Mat3::from_cols(l.cross(u).normalize(), l, u)
 }
 
+/// #film-open-perf  Whole-film results that are pure functions of the decoded tracks and cost
+/// hundreds of milliseconds to seconds -- the ride detector (run by the vehicle table, the camera
+/// timeline and the stats, which used to run it three times on the UI thread) and the stats' gait
+/// census. Folded ONCE, on the decode worker, by [`FilmIndex::attach_derived`]; consumers read it
+/// through [`FilmIndex::derived_valid`], which refuses it if the tracks have since changed shape.
+#[derive(Clone, Debug, Default)]
+pub struct Derived {
+    /// `(tracks, total position keys)` the results were folded from.
+    pub key: (usize, usize),
+    pub rides: Vec<crate::film_anim::Ride>,
+    /// Per owner group.
+    pub gait: std::collections::HashMap<u8, crate::film_stats::GaitCensus>,
+}
+
 /// A whole film decoded into entity tracks: what HMS needs to scrub a timeline.
 #[derive(Clone, Debug, Default)]
 pub struct FilmIndex {
+    /// See [`Derived`]. `None` until the decode worker has folded it.
+    pub derived: Option<std::sync::Arc<Derived>>,
     pub params: DecodeParams,
     pub frame: PositionFrame,
     /// Ticks in the film (== records).
@@ -2272,6 +2347,23 @@ pub struct FilmIndex {
     /// Kind-1 commands seen, and how many the event decoder accepted. A film where these differ
     /// is one whose events should not be trusted.
     pub event_commands: usize,
+    /// #film-roster  Every PLAYER UPDATE the recording carried (list A, command kind 9: add,
+    /// remove, swap, left-game, configuration), in tick order. See `crate::film_roster`.
+    pub player_updates: Vec<(u32, crate::film_roster::PlayerUpdate)>,
+    /// #film-objects  Per entity, every CHANGE of its replicated multiplayer properties (base
+    /// field 11): team designator, flag bits, boundary shape and dimensions.
+    pub mp_props: std::collections::HashMap<u32, Vec<(u32, crate::film_objects::MpProps)>>,
+    /// #film-roster  The time-aware roster: the header's players, then those updates applied the
+    /// way the engine applies them. Filled by `build_index_players`.
+    pub roster: crate::film_roster::Roster,
+    /// #film-roster  Whether the game has teams, from the film's game variant -- `None` when the
+    /// caller did not say. Decides whether a body's team stamp is a team or (free-for-all) a slot.
+    pub teams_enabled: Option<bool>,
+    /// #film-roster  The roster's verdict on every biped: whose it is, or why nobody's. Read it
+    /// through [`FilmIndex::identity_of`].
+    pub body_verdicts: std::collections::HashMap<u32, crate::film_roster::Verdict>,
+    /// #film-roster  The team stamp (`team`, 0-based) of every PLAYER biped that carries one.
+    pub body_teams: std::collections::HashMap<u32, u8>,
     pub elapsed: std::time::Duration,
 }
 
@@ -2353,6 +2445,10 @@ pub enum BindOrigin {
     /// EXACTLY ONE present header slot's is that player's. Needs no owner field at all. See
     /// [`FilmIndex::bind_by_appearance`].
     Appearance,
+    /// #film-roster  **THE ROSTER.** The player updates the recording itself carries say who held
+    /// every slot and when, and the body's armour and team stamp pick the seat. See
+    /// [`crate::film_roster::Roster::attribute`].
+    Roster,
 }
 
 impl BindOrigin {
@@ -2365,6 +2461,9 @@ impl BindOrigin {
             }
             BindOrigin::SpeciesElimination => {
                 "elimination: the only header slot left unclaimed, and its species"
+            }
+            BindOrigin::Roster => {
+                "the roster: who held the slot when this body spawned, by armour and team"
             }
         }
     }
@@ -2427,7 +2526,7 @@ impl PlayerBinding {
         // (one free slot of that species, one class, no two bodies alive at once). Scoring it by
         // `margin` -- which is zero, because there is no runner-up angle to subtract -- would
         // throw away every name it produces.
-        if matches!(self.origin, BindOrigin::SpeciesElimination) {
+        if matches!(self.origin, BindOrigin::SpeciesElimination | BindOrigin::Roster) {
             return true;
         }
         let limit = if self.from_facing { 0.45 } else { 1.0 };
@@ -3344,6 +3443,27 @@ pub(crate) fn owner_to_slot(&self, owner: u8) -> Option<u8> {
     /// players while 13 slots carry per-tick records and 14 owner groups had a body on the map.
     /// Following a body needs no gamertag — an entity id is enough to aim a camera — so the UI
     /// builds its rows from here.
+    fn derived_key(&self) -> (usize, usize) {
+        (self.tracks.len(), self.tracks.iter().map(|t| t.positions.len()).sum())
+    }
+
+    /// #film-open-perf  Fold [`Derived`] (call from the decode worker, never a frame path).
+    pub fn attach_derived(&mut self) {
+        let rides = crate::film_anim::accepted_rides(self);
+        let mut gait = std::collections::HashMap::new();
+        for owner in self.owner_groups() {
+            let bodies: Vec<&EntityTrack> =
+                self.tracks.iter().filter(|t| t.entity_type == 11 && t.owner_raw == Some(owner)).collect();
+            gait.insert(owner, crate::film_stats::gait_census(self, &rides, &bodies));
+        }
+        self.derived = Some(std::sync::Arc::new(Derived { key: self.derived_key(), rides, gait }));
+    }
+
+    /// The folded results, only while they still describe these tracks.
+    pub fn derived_valid(&self) -> Option<&Derived> {
+        self.derived.as_deref().filter(|d| d.key == self.derived_key())
+    }
+
     pub fn owner_groups(&self) -> Vec<u8> {
         let mut v: Vec<u8> = self
             .tracks
@@ -3721,6 +3841,37 @@ pub fn build_index_players(
     recorder_slot: Option<u8>,
     players: &[crate::film::FilmPlayer],
 ) -> FilmIndex {
+    build_index_players_teams(bytes, data, variant, recorder_slot, players, None)
+}
+
+/// [`build_index_players`] for a film in hand: also passes the game variant's `teams enabled`,
+/// which is what lets a free-for-all body's team stamp be read as a SLOT. Prefer this one.
+pub fn build_index_film(f: &crate::film::Film) -> FilmIndex {
+    let mut idx = build_index_film_core(f);
+    idx.attach_derived();
+    idx
+}
+
+fn build_index_film_core(f: &crate::film::Film) -> FilmIndex {
+    build_index_players_teams(
+        &f.bytes,
+        &f.data,
+        &f.header.map_variant,
+        f.recorder_slot(),
+        &f.header.players,
+        f.header.gametype.as_ref().map(|g| g.misc.teams_enabled()),
+    )
+}
+
+/// As [`build_index_players`], with the game variant's `teams enabled` (`None` = not known).
+pub fn build_index_players_teams(
+    bytes: &[u8],
+    data: &crate::film::FilmData,
+    variant: &crate::film::EmbeddedMapVariant,
+    recorder_slot: Option<u8>,
+    players: &[crate::film::FilmPlayer],
+    teams: Option<bool>,
+) -> FilmIndex {
     let mut idx = build_index_full(
         bytes,
         data,
@@ -3729,12 +3880,50 @@ pub fn build_index_players(
         occupied_slot_mask(players),
         elite_slot_mask(players),
     );
-    // #appearance  The armour route, applied last so it only fills gaps the stamp left.
-    idx.appearance_named = idx.bind_by_appearance(players);
-    // #appearance  And the CROSS-FILM fallback, for the bodies this film's own roster cannot
+    // #film-roster  WHO WAS PLAYING, AND WHEN, comes from the recording's own player updates;
+    // the header only seeds it. This replaces the header-slot routes below the roster: a header
+    // names the LOBBY, and on the corpus's team films the first tick removes and re-adds nearly
+    // every player in it. The armour route is subsumed (the roster compares the same bits against
+    // the players who were actually playing), so `bind_by_appearance` no longer runs.
+    idx.attach_roster(players, teams);
+    idx.appearance_named = idx
+        .body_verdicts
+        .values()
+        .filter(|v| matches!(v, crate::film_roster::Verdict::Named(_, crate::film_roster::Basis::Armour | crate::film_roster::Basis::ArmourAndTeam)))
+        .count();
+    // #appearance  The CROSS-FILM fallback, for the bodies this film's own roster cannot
     // name. Two things keep it cheap: it only runs when a clip still HAS unnamed player bodies
     // (so a clip the stamp handles pays nothing), and the corpus key is built once per process
     // (`AppearanceKey::shared`) rather than per call.
+    let unnamed = idx
+        .tracks
+        .iter()
+        .filter(|t| t.entity_type == 11 && t.look.is_some() && idx.slot_of_entity(t.net_id).is_none())
+        .count();
+    if unnamed > 0 {
+        let key = AppearanceKey::shared();
+        if !key.is_empty() {
+            idx.bind_by_appearance_across_films(key);
+        }
+    }
+    idx
+}
+
+/// The index as it was BEFORE the roster: the owner stamp, the armour route against the HEADER's
+/// players, and the cross-film fallback. Kept for the gates that grade those older routes, and
+/// as the baseline the roster is measured against. Not used by the app.
+#[cfg(test)]
+pub(crate) fn build_index_header_only(f: &crate::film::Film) -> FilmIndex {
+    let players = &f.header.players;
+    let mut idx = build_index_full(
+        &f.bytes,
+        &f.data,
+        &f.header.map_variant,
+        f.recorder_slot(),
+        occupied_slot_mask(players),
+        elite_slot_mask(players),
+    );
+    idx.appearance_named = idx.bind_by_appearance(players);
     let unnamed = idx
         .tracks
         .iter()
@@ -3825,6 +4014,7 @@ pub fn build_index_full(
     // Each biped's CREATION payload, by track index, kept so the owner stamp can be walked once
     // the film's `'eqip'` width is known. See `creation_biped` / `solve_eqip_bits`.
     let mut biped_creations: std::collections::HashMap<usize, Vec<u8>> = Default::default();
+    let mut biped_creation_ticks: std::collections::HashMap<usize, (u32, u64)> = Default::default();
     // The four weapon-slot references and the selected slot index, carried across a body's
     // messages: the stream states each separately and only when it CHANGES.
     let mut weapon_state: std::collections::HashMap<u32, ([Option<u32>; 4], i8)> = Default::default();
@@ -3847,6 +4037,13 @@ pub fn build_index_full(
                 idx.player_objects.resize(16, Vec::new());
             }
             idx.player_objects[(act.slot & 15) as usize].push((tick, *act));
+        }
+        // #film-roster  List A kind 9 is the engine's PLAYER UPDATE (`ExecuteVariantCommandOnce`
+        // case 9 -> `RosterEntry_ProcessCommand`): who joined, left, swapped or changed armour.
+        for c in t.commands.iter().take(t.commands_a).filter(|c| c.kind == 9) {
+            if let Some(u) = crate::film_roster::decode_player_update(&c.payload) {
+                idx.player_updates.push((tick, u));
+            }
         }
         // #film-action  The EVENT channel. List A is a different namespace, so only list B's
         // entries are folded; `commands_a` is the split.
@@ -3901,6 +4098,7 @@ pub fn build_index_full(
                     idx.tracks.len() - 1
                 });
                 biped_creations.entry(slot).or_insert_with(|| e.payload.clone());
+                biped_creation_ticks.entry(slot).or_insert((tick, e.dirty_mask));
             }
             let Some(st) = decode_entity_payload(e, &params) else { continue };
             let slot = *by_id.entry(e.net_id).or_insert_with(|| {
@@ -3938,6 +4136,13 @@ pub fn build_index_full(
                 let last = tr.attachments.last().map(|(_, a)| *a);
                 if last != Some(st.attach) {
                     tr.attachments.push((tick, st.attach));
+                }
+            }
+            // #film-objects  Base field 11 (multiplayer properties), recorded on CHANGE.
+            if let Some(m) = st.mp {
+                let v = idx.mp_props.entry(e.net_id).or_default();
+                if v.last().map(|(_, l)| *l) != Some(m) {
+                    v.push((tick, m));
                 }
             }
             if let Some(q) = st.facing_yaw_q {
@@ -4024,6 +4229,15 @@ pub fn build_index_full(
         let (eqip, closed) = solve_eqip_bits(&pls, &params);
         idx.eqip_bits = eqip;
         idx.creations_closed = closed;
+        let with_dirty: Vec<(&[u8], u64)> = biped_creations
+            .iter()
+            .filter_map(|(ti, pl)| Some((pl.as_slice(), biped_creation_ticks.get(ti)?.1)))
+            .filter(|(_, m)| m & 0x1000 != 0)
+            .collect();
+        let dirty_width = match solve_creation_dirty_width(&with_dirty, &params) {
+            (w, n) if n > 0 => Some(w),
+            _ => None,
+        };
         for (ti, pl) in &biped_creations {
             // Reaching the owner field is the condition; closing the payload is not. See
             // `creation_biped`.
@@ -4031,6 +4245,36 @@ pub fn build_index_full(
             idx.tracks[*ti].owner_raw = Some((c.owner + 1) as u8);
             idx.tracks[*ti].appearance = c.appearance;
             idx.tracks[*ti].look = c.look;
+            // #race-riders  The creation message carries its own dirty block, and a body that
+            // SPAWNS in a vehicle (a race start) states its parent there and never again until
+            // it gets out. No type-11 arm in `creation()` meant that block was never read, so
+            // those riders had no ride for their whole first stretch.
+            if let Some(&(t0, mask)) = biped_creation_ticks.get(ti) {
+                if let Some(st) = (mask & 0x1000 != 0).then(|| creation_dirty_state_any(pl, mask, &params, dirty_width)).flatten() {
+                    // #race-riders  A rider spawned INSIDE a vehicle reports no position of its own
+                    // until long after the spawn (measured on the race clip: the first report
+                    // comes 15 to 270 ticks late, and then it is within 0.02 wu of the vehicle),
+                    // so until then the body had no place and was not drawn -- an empty Mongoose
+                    // at the start of every race. Its place IS its parent's: seed the track with
+                    // the parent's position at the spawn. ONLY for a body that states a parent, so
+                    // nothing that rides nothing (every Castle Wars body) gains a point.
+                    let seed = st.attach.and_then(|att| {
+                        let par = idx.tracks.iter().find(|x| x.net_id == att.parent)?;
+                        par.sample(t0).or_else(|| par.positions.first().map(|p| p.1))
+                    });
+                    let tr = &mut idx.tracks[*ti];
+                    if let Some(att) = st.attach {
+                        if tr.attachments.first().map_or(true, |(t, _)| *t > t0) {
+                            tr.attachments.insert(0, (t0, Some(att)));
+                        }
+                    }
+                    if let Some(p) = seed {
+                        if tr.positions.first().map_or(true, |(t, _)| *t > t0) {
+                            tr.positions.insert(0, (t0, p));
+                        }
+                    }
+                }
+            }
         }
     }
     // Identify every non-Forge entity by the Forge spawn point it appeared on. Skipped for type
@@ -7293,8 +7537,10 @@ mod tests {
                 continue;
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let idx =
-                build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+            // #film-roster  Graded on the HEADER-ONLY index. This gate is about the owner-stamp
+            // groups and elimination; the app's index names bodies through the roster, whose own
+            // gates are in `film_roster::real_film_gates`.
+            let idx = build_index_header_only(&f);
             checked += 1;
             let mut film_peak: (i32, u8, usize, Vec<BindOrigin>) = (0, 0, 0, Vec::new());
             for slot in 0..16u8 {
@@ -7530,9 +7776,9 @@ mod tests {
                 continue;
             }
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            let idx = build_index_players(
-                &f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players,
-            );
+            // #film-roster  Graded on the HEADER-ONLY index: this is a gate on the owner-stamp
+            // read and on elimination, and the app's index now names bodies through the roster.
+            let idx = build_index_header_only(&f);
             checked += 1;
             let stamped: std::collections::HashSet<u8> = idx
                 .bindings
@@ -9236,13 +9482,10 @@ mod appearance_gates {
             if f.data.records.len() < 500 {
                 continue;
             }
-            let idx = build_index_players(
-                &f.bytes,
-                &f.data,
-                &f.header.map_variant,
-                f.recorder_slot(),
-                &f.header.players,
-            );
+            // #film-roster  Graded on the HEADER-ONLY index: this is a cross-check between the
+            // owner stamp and the armour route as they were, and the app's index now names
+            // bodies through the roster instead.
+            let idx = build_index_header_only(&f);
             let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             // Every slot the STAMP route confidently gave a body.
             let by_stamp: std::collections::HashMap<u32, u8> = idx

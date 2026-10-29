@@ -743,30 +743,83 @@ pub fn closest_point_on_triangle(p: Vec3, a: Vec3, b: Vec3, c: Vec3) -> (Vec3, b
     (a + ab * v + ac * w, true)
 }
 
-/// A world-space sphere (centre, radius) against one triangle.
-fn sphere_tri_contact(c: Vec3, r: f32, tri: &[Vec3; 3], mat: &ShapeMaterial, soft: Option<f32>, out: &mut Vec<Contact>) {
-    let (q, _) = closest_point_on_triangle(c, tri[0], tri[1], tri[2]);
-    let delta = c - q;
-    let d = delta.length();
-    if d >= r { return; }
-    let n = if d > 1e-6 {
-        delta / d
-    } else {
+/// A world-space sphere (centre, radius) against every triangle of a soup.
+///
+/// With `one_sided` (the soup is wound OUTWARD: the engine's collision BSP, the object hull shells) a
+/// centre that has got BEHIND the face it projects into is pushed back out the FRONT of that face
+/// instead of on through it -- unless the sphere also touches the front of a face looking the
+/// OPPOSITE way, which means it is outside a thin slab or wall and the face it is "behind" is that
+/// solid's far side. See [`shape_contacts_sided`].
+fn sphere_vs_tris(c: Vec3, r: f32, tris: &[[Vec3; 3]], mat: &ShapeMaterial, soft: Option<f32>, one_sided: bool, out: &mut Vec<Contact>) {
+    let mut fronts: Vec<Vec3> = Vec::new();
+    let mut deferred: Vec<(usize, Vec3, Contact, Option<Contact>)> = Vec::new();
+    for tri in tris {
+        let (q, face) = closest_point_on_triangle(c, tri[0], tri[1], tri[2]);
+        let delta = c - q;
+        let d = delta.length();
         let tn = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
-        if tn == Vec3::ZERO { return; }
-        tn
-    };
-    out.push(Contact { p: q, n, depth: r - d, mu: mat.friction, e: mat.restitution, soft });
+        let old = (d < r).then(|| {
+            let n = if d > 1e-6 { delta / d } else { tn };
+            Contact { p: q, n, depth: r - d, mu: mat.friction, e: mat.restitution, soft }
+        }).filter(|c| c.n != Vec3::ZERO);
+        let s_out = tn.dot(delta);
+        if one_sided && face && tn != Vec3::ZERO && s_out < 0.0 && -s_out < 4.0 * r {
+            deferred.push((0, tn, Contact { p: q, n: tn, depth: r - s_out, mu: mat.friction, e: mat.restitution, soft }, old));
+            continue;
+        }
+        if let Some(ct) = old {
+            if one_sided && s_out >= 0.0 {
+                fronts.push(tn);
+            }
+            out.push(ct);
+        }
+    }
+    resolve_deferred(deferred, &fronts, out);
+}
+
+/// Settle the contacts of vertices that were BEHIND a face. A vertex inside a closed shell is behind
+/// EVERY face of it, and each would push it out its own way; only the NEAREST exit is real (the far
+/// faces are the other side of the solid), so per vertex only the shallowest allowed face pushes. A face
+/// the body also touches the front of an OPPOSED face of (a thin slab or wall it is outside of) keeps
+/// the centre-side contact it always made.
+fn resolve_deferred(deferred: Vec<(usize, Vec3, Contact, Option<Contact>)>, fronts: &[Vec3], out: &mut Vec<Contact>) {
+    let mut best: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for (k, (v, tn, new, _)) in deferred.iter().enumerate() {
+        if fronts.iter().any(|f| f.dot(*tn) < -0.5) {
+            continue;
+        }
+        let e = best.entry(*v).or_insert(k);
+        if new.depth < deferred[*e].2.depth {
+            *e = k;
+        }
+    }
+    for (k, (v, tn, new, old)) in deferred.into_iter().enumerate() {
+        if fronts.iter().any(|f| f.dot(tn) < -0.5) {
+            out.extend(old);
+        } else if best.get(&v) == Some(&k) {
+            out.push(new);
+        }
+    }
 }
 
 /// Contacts of one shape (posed by `rot`/`pos` = body->world, body space points) against `tris`.
+/// A triangle's side is the one on the BODY's centre (the soup is not trusted to be wound).
 pub(crate) fn shape_contacts(shape: &ConvexShape, rot: Mat3, pos: Vec3, inv_rot: Mat3, tris: &[[Vec3; 3]], out: &mut Vec<Contact>) {
+    shape_contacts_sided(shape, rot, pos, inv_rot, tris, false, out)
+}
+
+/// [`shape_contacts`] for a soup whose triangles are wound OUTWARD (the engine's collision BSP and
+/// the object hull shells): with `one_sided` a triangle only ever pushes toward its FRONT side. A
+/// body that has ended up behind a face -- a weapon lying on a floor, placed a few centimetres into
+/// it by the saved pose -- is pushed back OUT through it, not on down through it because its centre
+/// is behind the plane (#bump-class: "it just falls through the floor").
+pub(crate) fn shape_contacts_sided(shape: &ConvexShape, rot: Mat3, pos: Vec3, inv_rot: Mat3, tris: &[[Vec3; 3]], one_sided: bool, out: &mut Vec<Contact>) {
     let mat = &shape.mat;
     match &shape.geom {
         ShapeGeom::Sphere { c, r } => {
             let cw = pos + rot * *c;
             let soft = shape.support.then_some(*r * SUPPORT_TRAVEL);
-            for t in tris { sphere_tri_contact(cw, *r, t, mat, soft, out); }
+            sphere_vs_tris(cw, *r, tris, mat, soft, one_sided, out);
         }
         ShapeGeom::Capsule { a, b, r } => {
             // five spheres along the axis (the segment-triangle pair is not solved exactly)
@@ -774,7 +827,7 @@ pub(crate) fn shape_contacts(shape: &ConvexShape, rot: Mat3, pos: Vec3, inv_rot:
             let bw = pos + rot * *b;
             for k in 0..5 {
                 let cw = aw.lerp(bw, k as f32 / 4.0);
-                for t in tris { sphere_tri_contact(cw, *r, t, mat, None, out); }
+                sphere_vs_tris(cw, *r, tris, mat, None, one_sided, out);
             }
         }
         ShapeGeom::Hull { pts, planes, r } => {
@@ -783,10 +836,12 @@ pub(crate) fn shape_contacts(shape: &ConvexShape, rot: Mat3, pos: Vec3, inv_rot:
             let ext = (lmx - lmn).max_element().max(1e-3);
             // (a) hull vertices vs triangles
             let world: Vec<Vec3> = pts.iter().map(|p| pos + rot * *p).collect();
+            let mut fronts: Vec<Vec3> = Vec::new();
+            let mut deferred: Vec<(usize, Vec3, Contact, Option<Contact>)> = Vec::new();
             for t in tris {
                 let tn = (t[1] - t[0]).cross(t[2] - t[0]).normalize_or_zero();
                 if tn == Vec3::ZERO { continue; }
-                for pw in &world {
+                for (vi, pw) in world.iter().enumerate() {
                     let (q, face) = closest_point_on_triangle(*pw, t[0], t[1], t[2]);
                     let delta = *pw - q;
                     // the triangle normal on the body's side
@@ -794,9 +849,24 @@ pub(crate) fn shape_contacts(shape: &ConvexShape, rot: Mat3, pos: Vec3, inv_rot:
                     if face {
                         let s = n_face.dot(delta); // signed distance above the face
                         let depth = *r - s;
+                        let old = (depth > 0.0 && depth < ext).then(|| Contact { p: q, n: n_face, depth, mu: mat.friction, e: mat.restitution, soft: None });
                         // a vertex deeper than the hull itself is a triangle we came from
                         // elsewhere (a wall behind the piece): not a contact
-                        if depth > 0.0 && depth < ext { out.push(Contact { p: q, n: n_face, depth, mu: mat.friction, e: mat.restitution, soft: None }); }
+                        let s_out = tn.dot(delta);
+                        if one_sided && s_out < 0.0 {
+                            // BEHIND an outward-wound face: out the front, unless settled below
+                            let d2 = *r - s_out;
+                            if d2 > 0.0 && d2 < ext {
+                                deferred.push((vi, tn, Contact { p: q, n: tn, depth: d2, mu: mat.friction, e: mat.restitution, soft: None }, old));
+                                continue;
+                            }
+                        }
+                        if let Some(ct) = old {
+                            if one_sided && s_out >= 0.0 {
+                                fronts.push(tn);
+                            }
+                            out.push(ct);
+                        }
                     } else {
                         let d = delta.length();
                         if d < 1e-6 { continue; }
@@ -821,6 +891,7 @@ pub(crate) fn shape_contacts(shape: &ConvexShape, rot: Mat3, pos: Vec3, inv_rot:
                     }
                 }
             }
+            resolve_deferred(deferred, &fronts, out);
             // (b) triangle vertices inside the (radius-padded) hull
             for t in tris {
                 for v in t {

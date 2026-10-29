@@ -222,6 +222,10 @@ fn reduce(points: &mut Vec<RawContact>, max: usize) {
 /// is below `tolerance`; normals point from `b` into `a`. Returns false when no axis lets them
 /// touch (separated by more than `tolerance` after padding).
 pub fn collide(a: &Poly, b: &Poly, tolerance: f32, max_points: usize, out: &mut Vec<RawContact>) -> bool {
+    // a polytope with no usable face (every loop degenerate or non-finite) has nothing to touch
+    if a.faces.is_empty() || b.faces.is_empty() {
+        return false;
+    }
     let pad = a.radius + b.radius;
     let margin = tolerance + pad;
     // face axes: separation = the other body's lowest point above the face plane

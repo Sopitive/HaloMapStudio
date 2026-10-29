@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.6.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -27,6 +27,7 @@
 <li><a href="scripting.html" class="cur" aria-current="page">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -52,6 +53,7 @@
 <li><a href="#camera">Camera</a></li>
 <li><a href="#play">play &mdash; test mode</a></li>
 <li><a href="#query">Queries</a></li>
+<li><a href="#film">Film data (saved films)</a></li>
 <li><a href="#maps">Maps, variants, screenshots, saving</a></li>
 <li><a href="#variant">variant — the file's global fields</a></li>
 <li><a href="#loops">Loops</a></li>
@@ -315,6 +317,17 @@ captures are complete either way.</p>
 <tr><td><code>echo &lt;text&gt;</code></td><td>Prints the text (useful as a marker in batch logs).</td></tr>
 </table></div>
 
+<h2 id="film">Film data (saved films)</h2>
+<p>The <code>film</code> verb family opens a Halo: Reach saved film (<code>.mov</code>, <code>.film</code>, or an in-progress <code>.temp</code>) and reads it. Besides playback (<a href="theater.html#scripting">Theater</a>), it extracts the recording&rsquo;s data as CSV or JSON, and it works in every entry point above &mdash; the script console, <code>--script</code> / <code>--exec</code>, and the TCP command server:</p>
+<pre><code>film /path/to/match.mov
+film index
+film objects label=zone_a                  # objects with a Forge label, and where they are
+film inside label=zone_a 1:00..2:00        # who entered / left a zone, with times
+film events type=incident from=2:00        # kills and medals
+film megalo vars scope=player kind=number  # Megalo variable time series
+film seats | film score | film variant | film dump json</code></pre>
+<p>Verbs: <code>objects</code>, <code>object</code>, <code>inside</code>, <code>near</code>, <code>events</code>, <code>seats</code>, <code>score</code>, <code>variant</code>, <code>megalo</code> (<code>decls</code>, <code>vars</code>, <code>at</code>, <code>get</code>), <code>dump</code>. Times are seconds (<code>12.5</code>), <code>mm:ss</code> or ticks (<code>t1234</code>). The full reference, the columns of every verb, cookbook recipes and the headless live follower (<code>hms-app --film-follow</code>) are on the <a href="film-data.html">Film data</a> page. Headless, the output of every command goes to stderr like the rest of the log.</p>
+
 <h2 id="maps">Maps, variants, screenshots, saving</h2>
 <div class="tablewrap"><table>
 <tr><th>Command</th><th>Effect</th></tr>
@@ -434,7 +447,7 @@ screenshot forge_ground.png 1280x720</code></pre>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.6.0 source (2026-10-21). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

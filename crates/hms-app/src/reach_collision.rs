@@ -280,8 +280,20 @@ pub fn mp_type_is_region(kind: u8) -> bool {
 /// everything under the player's own 125 kg — see this module's note on mass. A filter cannot fix
 /// that; pushable bodies can.
 pub fn collides_with_biped(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> bool {
-    if shape_filters(native, cache, obj_tag).is_empty() {
+    let shapes = shape_filters(native, cache, obj_tag);
+    // A phantom shape is a trigger volume and never a body: with only those there is nothing to hit.
+    let bodies: Vec<&ShapeFilter> = shapes.iter().filter(|s| s.phantom.is_none()).collect();
+    if bodies.is_empty() {
         return false;
+    }
+    // The engine's group rule (`hcfd`): a shape with an AUTHORED group collides with a biped exactly
+    // when that group's mask has the biped's bit. `Environment Only` (2) is mask 0x3 -- it meets only
+    // the environment groups -- which is why a Forge shield door never stops a biped, a vehicle or a
+    // prop. A shape with no override (0xFF) takes its rigid body's default and stays solid here.
+    if let Some(f) = matg_filter(native, cache) {
+        if !bodies.iter().any(|s| s.group == NO_GROUP_OVERRIDE || f.collides(s.group as usize, GROUP_BIPED).unwrap_or(true)) {
+            return false;
+        }
     }
     match multiplayer_object(native, cache, obj_tag) {
         Some(mp) => !mp_type_is_region(mp.kind),
@@ -289,6 +301,16 @@ pub fn collides_with_biped(native: &NativeDll, cache: CacheHandle, obj_tag: u32)
         // are in this case and they are vehicle parts and props.
         None => true,
     }
+}
+
+/// The shape-group enum value of a biped (`phmo` shape `collision group`: 0xB `Biped`).
+pub const GROUP_BIPED: usize = 0x0B;
+/// `collision group` 0xFF: "No Override" -- the shape takes the rigid body's / model's default.
+pub const NO_GROUP_OVERRIDE: u8 = 0xFF;
+
+/// The globals' `hcfd`, read through the first `matg`.
+pub fn matg_filter(native: &NativeDll, cache: CacheHandle) -> Option<CollisionFilter> {
+    CollisionFilter::read(native, cache, *native.tags_by_group(cache, "matg").first()?)
 }
 
 #[cfg(test)]

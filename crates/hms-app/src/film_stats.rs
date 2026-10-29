@@ -931,6 +931,85 @@ pub const KILL_FEED_COVERAGE: &str = "THE KILL FEED COVERS ONLY THE RECORDER. A 
 // the computation
 // ---------------------------------------------------------------------------------------------
 
+/// #film-open-perf  One owner group's gait census: how its bodies' position keys classify.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GaitCensus {
+    pub top_speed_wu_s: f32,
+    pub top_foot_speed_wu_s: f32,
+    pub sprinting_ticks: u32,
+    pub airborne_ticks: u32,
+    pub stationary_ticks: u32,
+    pub running_ticks: u32,
+    pub walking_ticks: u32,
+    pub seated_ticks: u32,
+    /// Ticks classified at all (the rest of a body's life is `unclassified`).
+    pub classified: u32,
+}
+
+/// The gait census of `bodies` (one owner group's bodies), walked over their own POSITION KEYS.
+/// The classifier is `film_anim::derive`, the same one the drawn body uses.
+pub fn gait_census(idx: &FilmIndex, rides: &[crate::film_anim::Ride], bodies: &[&EntityTrack]) -> GaitCensus {
+    let mut st = GaitCensus::default();
+        // The gait census, walked over the body's own POSITION KEYS rather than over every
+        // tick. Two things come out of that choice:
+        //
+        //  * it is honest — a tick is classified only when the recording bracketed it with two
+        //    positions less than [`MAX_KEY_GAP`] apart, so a ten-second gap in replication is
+        //    counted as `unclassified` instead of being read as ten seconds of standing still
+        //    (which is what the per-tick version did: 99% "stationary" on a body with 2%
+        //    position coverage);
+        //  * it is cheap — O(keys) instead of O(ticks), which took a 47-minute 1,689-body clip
+        //    from 647 ms to well under a tenth of that.
+        //
+        // The classifier itself is `film_anim::derive`, the same one the drawn body uses, so the
+        // numbers here and the picture on screen can never disagree.
+        for b in bodies.iter().copied() {
+            use crate::film_anim::{Gait, Provenance, Stance};
+            let mut classified = 0u32;
+            let moving = crate::film_anim::MovingMap::build(b);
+            for w in b.positions.windows(2) {
+                let (t0, t1) = (w[0].0, w[1].0);
+                if t1 <= t0 || t1 - t0 > MAX_KEY_GAP {
+                    continue;
+                }
+                let span = t1 - t0;
+                let seat = rides
+                    .iter()
+                    .find(|r| r.biped_net_id == b.net_id && r.covers(t0))
+                    .map(|r| crate::film_anim::Seat {
+                        vehicle_net_id: r.vehicle_net_id,
+                        mode: String::new(),
+                        vehicle: String::new(),
+                    });
+                if seat.is_some() {
+                    st.seated_ticks += span;
+                    classified += span;
+                    continue;
+                }
+                let d = crate::film_anim::derive_mapped(b, t0, None, &moving);
+                if d.provenance != Provenance::Derived {
+                    continue; // no decoded facing at this tick: nothing to classify
+                }
+                classified += span;
+                st.top_speed_wu_s = st.top_speed_wu_s.max(d.ground_speed);
+                if d.ground_speed <= FOOT_SPEED_MAX {
+                    st.top_foot_speed_wu_s = st.top_foot_speed_wu_s.max(d.ground_speed);
+                }
+                match d.stance {
+                    Stance::Sprint => st.sprinting_ticks += span,
+                    Stance::Flight => st.airborne_ticks += span,
+                    _ => match d.gait {
+                        Gait::Idle | Gait::TurnLeft | Gait::TurnRight => st.stationary_ticks += span,
+                        Gait::WalkFront | Gait::BackSlow => st.walking_ticks += span,
+                        _ => st.running_ticks += span,
+                    },
+                }
+            }
+            st.classified += classified;
+        }
+    st
+}
+
 /// Statistics from an already-decoded film. Pure: no renderer, no scene, no frame.
 ///
 /// `names` is only consulted for vehicle and weapon TAG NAMES; pass [`NoNames`] and every row is
@@ -960,7 +1039,7 @@ pub fn compute(film: &crate::film::Film, idx: &FilmIndex, names: &dyn NameSource
     // ---- the rides, which need no map at all -------------------------------------------------
     // `accepted_rides` keys on matched HORIZONTAL displacement, so it is a property of the
     // stream; only the vehicle's NAME needs the map's sandbox palette.
-    let rides = crate::film_anim::accepted_rides(idx);
+    let rides = crate::film_anim::accepted_rides_cached(idx);
     let vehicle_name: std::collections::HashMap<u32, String> = idx
         .tracks
         .iter()
@@ -1134,49 +1213,23 @@ pub fn compute(film: &crate::film::Film, idx: &FilmIndex, names: &dyn NameSource
         //
         // The classifier itself is `film_anim::derive`, the same one the drawn body uses, so the
         // numbers here and the picture on screen can never disagree.
-        for b in &bodies {
-            use crate::film_anim::{Gait, Provenance, Stance};
-            let mut classified = 0u32;
-            for w in b.positions.windows(2) {
-                let (t0, t1) = (w[0].0, w[1].0);
-                if t1 <= t0 || t1 - t0 > MAX_KEY_GAP {
-                    continue;
-                }
-                let span = t1 - t0;
-                let seat = rides
-                    .iter()
-                    .find(|r| r.biped_net_id == b.net_id && r.covers(t0))
-                    .map(|r| crate::film_anim::Seat {
-                        vehicle_net_id: r.vehicle_net_id,
-                        mode: String::new(),
-                        vehicle: String::new(),
-                    });
-                if seat.is_some() {
-                    st.seated_ticks += span;
-                    classified += span;
-                    continue;
-                }
-                let d = crate::film_anim::derive(b, t0, None);
-                if d.provenance != Provenance::Derived {
-                    continue; // no decoded facing at this tick: nothing to classify
-                }
-                classified += span;
-                st.top_speed_wu_s = st.top_speed_wu_s.max(d.ground_speed);
-                if d.ground_speed <= FOOT_SPEED_MAX {
-                    st.top_foot_speed_wu_s = st.top_foot_speed_wu_s.max(d.ground_speed);
-                }
-                match d.stance {
-                    Stance::Sprint => st.sprinting_ticks += span,
-                    Stance::Flight => st.airborne_ticks += span,
-                    _ => match d.gait {
-                        Gait::Idle | Gait::TurnLeft | Gait::TurnRight => st.stationary_ticks += span,
-                        Gait::WalkFront | Gait::BackSlow => st.walking_ticks += span,
-                        _ => st.running_ticks += span,
-                    },
-                }
-            }
-            st.gait_ticks += classified;
-        }
+        // #film-open-perf  The census is the one expensive part of this function (a `derive` per
+        // position key of every body), and it needs no names, so the open path folds it ONCE on
+        // the decode worker (`FilmIndex::derived`) and this reads it back. Without that (the CLI,
+        // a hand-built index) it is folded here, by the same function.
+        let g = match idx.derived_valid().and_then(|d| d.gait.get(&owner)) {
+            Some(g) => *g,
+            None => gait_census(idx, &rides, &bodies),
+        };
+        st.top_speed_wu_s = g.top_speed_wu_s;
+        st.top_foot_speed_wu_s = g.top_foot_speed_wu_s;
+        st.sprinting_ticks = g.sprinting_ticks;
+        st.airborne_ticks = g.airborne_ticks;
+        st.stationary_ticks = g.stationary_ticks;
+        st.running_ticks = g.running_ticks;
+        st.walking_ticks = g.walking_ticks;
+        st.seated_ticks = g.seated_ticks;
+        st.gait_ticks += g.classified;
         st.unclassified_ticks = st.body_ticks.saturating_sub(st.gait_ticks);
 
         // Rides, and the weapons the recording named.
@@ -1223,11 +1276,13 @@ pub fn compute(film: &crate::film::Film, idx: &FilmIndex, names: &dyn NameSource
             slot,
             gamertag: (!is_team)
                 .then(|| {
-                    film.header
-                        .players
-                        .iter()
-                        .find(|p| p.present() && p.index == slot as usize)
-                        .map(|p| p.gamertag.clone())
+                    // #film-roster  Whoever held the slot at the end of the film; the header's
+                    // lobby name only when the roster has nobody there.
+                    idx.seat_in_slot(slot, u32::MAX)
+                        .map(|s| s.name.clone())
+                        .or_else(|| {
+                            film.header.players.iter().find(|p| p.present() && p.index == slot as usize).map(|p| p.gamertag.clone())
+                        })
                         .filter(|g| !g.is_empty())
                 })
                 .flatten(),
@@ -1257,6 +1312,11 @@ pub fn compute(film: &crate::film::Film, idx: &FilmIndex, names: &dyn NameSource
     let name_of = |net: Option<u32>| -> (Option<u8>, Option<String>) {
         let Some(net) = net else { return (None, None) };
         let Some(tr) = idx.tracks.iter().find(|t| t.net_id == net) else { return (None, None) };
+        // #film-roster  The roster's seat for this body first: the name that player had when the
+        // body spawned, which the header's lobby names are not.
+        if let Some(seat) = idx.seat_of_entity(net) {
+            return (Some(seat.slot), Some(seat.name.clone()).filter(|g| !g.is_empty()));
+        }
         let slot = idx
             .slot_of_entity(net)
             .or_else(|| tr.owner_raw.and_then(|o| idx.slot_of_owner(o)));
@@ -1434,7 +1494,7 @@ pub fn from_path(path: &std::path::Path) -> Result<FilmStats, String> {
 /// As [`from_path`], with a name source for the vehicle and weapon tag names.
 pub fn from_path_with(path: &std::path::Path, names: &dyn NameSource) -> Result<FilmStats, String> {
     let f = crate::film::open(path).map_err(|e| e.to_string())?;
-    let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+    let idx = crate::film_decode::build_index_film(&f);
     Ok(compute(&f, &idx, names))
 }
 

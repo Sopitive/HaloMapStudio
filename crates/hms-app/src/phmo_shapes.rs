@@ -743,6 +743,86 @@ pub fn vehicle_support_points(friction: &[u8], friction_elem: usize, antigrav: &
 
 fn u32_at(d: &[u8], o: usize) -> u32 { d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])) }
 
+/// `phmo` meta offset of the `phantoms` block and its element size (`physics_model_phantom`,
+/// `sizeof(s_physics_model_phantom)` 0x58). Each element wraps ONE shape: type u16 @0x20, index
+/// i16 @0x22 (Assembly's `ReachMCC/phmo.xml`, confirmed on the shipped man cannons: a wrapper
+/// names polyhedron 3 and that polyhedron's own `phantom` byte @0x1E is the wrapper's index).
+pub const OFF_PHANTOMS: usize = 0x190;
+pub const PHANTOM_ELEM: usize = 0x58;
+
+/// #man-cannon  A phantom volume: the shape a rigid body's shape list names with a type-6 entry,
+/// in MODEL space, with the `material` byte of the primitive it wraps (the engine picks the
+/// phantom TYPE through `materials[material].phantom type`, `sub_1404415D0`).
+#[derive(Clone, Debug)]
+pub struct PhantomVolume {
+    pub shape: ConvexShape,
+    pub material: u8,
+}
+
+/// Every phantom volume of a `phmo`. `phantoms` is the raw `phantoms` block ([`OFF_PHANTOMS`]).
+/// A wrapper that names anything but a convex primitive is skipped.
+pub fn phantom_volumes(b: &PhmoBlocks, l: &PhmoLayout, nodes: &[Mat4], phantoms: &[u8]) -> Vec<PhantomVolume> {
+    let npoly = b.polyhedra.len() / l.poly_elem.max(1);
+    let mut poly_fv_start = Vec::with_capacity(npoly);
+    let mut cursor = 0usize;
+    for i in 0..npoly {
+        poly_fv_start.push(cursor);
+        cursor += i32_at(&b.polyhedra, i * l.poly_elem + 0x78).max(0) as usize;
+    }
+    let mut w = Walker { b, l, poly_fv_start, counts: ShapeCounts::default() };
+    // (shape type, index) of every type-6 entry reachable from a rigid body, with the node matrix
+    // of the body that reaches it
+    fn reach(b: &PhmoBlocks, ty: u16, ix: i16, depth: usize, out: &mut Vec<i16>) {
+        if ix < 0 || depth > MAX_DEPTH { return; }
+        match ty {
+            6 => out.push(ix),
+            SHAPE_LIST => {
+                let i = ix as usize;
+                if elem(&b.lists, i, LIST_ELEM).is_none() { return; }
+                let start: usize = (0..i).map(|k| i32_at(&b.lists, k * LIST_ELEM + 0x38).max(0) as usize).sum();
+                let cnt = i32_at(&b.lists, i * LIST_ELEM + 0x38).max(0) as usize;
+                let nls = b.list_shapes.len() / LIST_SHAPE_ELEM;
+                for k in start..(start + cnt).min(nls) {
+                    reach(b, u16_at(&b.list_shapes, k * LIST_SHAPE_ELEM), i16_at(&b.list_shapes, k * LIST_SHAPE_ELEM + 2), depth + 1, out);
+                }
+            }
+            SHAPE_MOPP => {
+                if let Some(e) = elem(&b.mopps, ix as usize, MOPP_ELEM) {
+                    reach(b, u16_at(e, 0x58), i16_at(e, 0x5A), depth + 1, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let nrb = (b.rigid_bodies.len() / l.rb_elem).min(MAX_RIGID_BODIES);
+    for i in 0..nrb {
+        let e = &b.rigid_bodies[i * l.rb_elem..(i + 1) * l.rb_elem];
+        let m = node_matrix(nodes, i16_at(e, 0));
+        let mut found = Vec::new();
+        reach(b, u16_at(e, l.rb_shape_type), i16_at(e, l.rb_shape_index), 0, &mut found);
+        for p in found {
+            let Some(wrap) = elem(phantoms, p as usize, PHANTOM_ELEM) else { continue };
+            let (ty, ix) = (u16_at(wrap, 0x20), i16_at(wrap, 0x22));
+            // the wrapped primitive's own header: material byte @4
+            let (block, size) = match ty {
+                SHAPE_SPHERE => (&b.spheres, SPHERE_ELEM),
+                SHAPE_PILL => (&b.pills, PILL_ELEM),
+                SHAPE_BOX => (&b.boxes, BOX_ELEM),
+                SHAPE_POLYHEDRON => (&b.polyhedra, l.poly_elem),
+                _ => continue,
+            };
+            let Some(prim) = elem(block, ix.max(0) as usize, size) else { continue };
+            let mut shapes = Vec::new();
+            w.emit(ty, ix, &m, 0, &mut shapes);
+            for shape in shapes {
+                out.push(PhantomVolume { shape, material: u8_at(prim, 4) });
+            }
+        }
+    }
+    out
+}
+
 /// One line for the status bar: "phmo: 1 rigid body (1 polyhedron), mass 3.2".
 pub fn describe(defs: &[RigidBodyDef], counts: &ShapeCounts) -> String {
     let n = defs.len();

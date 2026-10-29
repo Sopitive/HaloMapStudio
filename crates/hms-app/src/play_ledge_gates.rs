@@ -4,7 +4,7 @@
 //! Reported: *"a vehicle teleports backward when it is about to drive off the edge of basically
 //! anything"*. The gates here drive through [`Ride::tick_in`], i.e. the real `PlayMode::tick` the
 //! window calls every frame -- `drive_and_seat` -> `play_vehicle::step` (the memoised wheel ray, the
-//! `DriveModel` sub-steps) -> `PropSession::collide_driven` (the 6 wu hull gather, `sweep_hull`) ->
+//! `DriveModel` sub-steps) -> `PropSession::collide_driven` (the 6 wu hull gather, the engine's Havok pipeline in `play_driven`) ->
 //! `props.tick` -- against a REAL `SceneController` (the map's engine collision soup, the same
 //! `raycast_solid_excluding` the wheels cast) plus real placed Forge blocks. Nothing between the
 //! input and the ride's position is re-implemented here.
@@ -25,7 +25,7 @@ use hms_ipc::ObjectInfo;
 
 use crate::objscene::ObjectScene;
 use crate::play_ctl::MoveInput;
-use crate::play_mode::ride_harness::{Ride, DT};
+use crate::play_mode::ride_harness::Ride;
 use crate::scene::SceneController;
 
 /// Backward motion (wu in one 60 Hz tick) that is not a collision response a human could see: a
@@ -41,12 +41,15 @@ pub struct MapScene<'a> {
     pub blocks: Vec<ObjectInfo>,
     /// World physics triangles per block datum, posed once.
     pub tris: HashMap<u32, Vec<[Vec3; 3]>>,
+    /// The scale the pick-table box is shrunk by about its centre (1 = exact): the app's boxes come
+    /// from the render mesh, and a gate can make them wrong on purpose.
+    pub pick_scale: f32,
 }
 
 impl<'a> MapScene<'a> {
     pub fn new(sc: &'a SceneController, blocks: Vec<ObjectInfo>) -> Self {
         let tris = blocks.iter().map(|o| (o.datum, sc.physics_world_tris(o))).collect();
-        MapScene { sc, blocks, tris }
+        MapScene { sc, blocks, tris, pick_scale: 1.0 }
     }
 }
 
@@ -65,7 +68,17 @@ impl ObjectScene for MapScene<'_> {
     fn set_object_scales(&mut self, _s: HashMap<u32, f32>) {}
     fn set_object_casters(&mut self, _c: std::collections::HashSet<u32>) {}
     fn pick(&self, _o: Vec3, _d: Vec3) -> Option<u32> { None }
-    fn aabb_of(&self, _d: u32) -> Option<([f32; 3], [f32; 3])> { None }
+    fn aabb_of(&self, d: u32) -> Option<([f32; 3], [f32; 3])> {
+        // the placed objects' physics bounds (the app answers from its pick table; no GPU here)
+        let t = self.tris.get(&d).filter(|t| !t.is_empty())?;
+        let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+        for p in t.iter().flatten() {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let (c, h) = ((lo + hi) * 0.5, (hi - lo) * 0.5 * self.pick_scale);
+        Some(((c - h).to_array(), (c + h).to_array()))
+    }
     fn object_obb(&self, _d: u32) -> Option<crate::construct::Obb> { None }
     fn selection_wireframe(&self, _d: u32) -> Option<Vec<[f32; 3]>> { None }
     fn translate_pick(&mut self, _d: u32, _v: Vec3) {}
@@ -124,7 +137,7 @@ pub struct Drive {
 }
 
 /// Ground height under (x, y) as the wheels see it: the production ray, 15 wu from `z0 + 3`.
-fn ground_at(scene: &dyn ObjectScene, x: f32, y: f32, z0: f32) -> Option<f32> {
+pub(crate) fn ground_at(scene: &dyn ObjectScene, x: f32, y: f32, z0: f32) -> Option<f32> {
     scene.raycast_solid_excluding(Vec3::new(x, y, z0 + 3.0), -Vec3::Z, 15.0, &[]).map(|d| z0 + 3.0 - d)
 }
 
@@ -171,6 +184,7 @@ pub fn drive_ledge(
     ledge: Ledge,
     speed: f32,
     held: bool,
+    frame: f32,
 ) -> Option<Drive> {
     let (sxy, z0, yaw, edge_dist, drop) = ledge;
     let start = Vec3::new(sxy.x, sxy.y, z0 + 0.6);
@@ -187,12 +201,12 @@ pub fn drive_ledge(
     r.pm.riding.as_mut()?.drive.vel = dir * speed;
     let go = MoveInput { fwd: if held { 1.0 } else { 0.0 }, yaw, ..Default::default() };
     let mut out = Drive::default();
-    for k in 0..(9.0 / DT) as usize {
+    for k in 0..(9.0 / frame) as usize {
         let (p0, v0) = {
             let d = &r.pm.riding.as_ref()?.drive;
             (d.pos, d.vel)
         };
-        r.tick_in(&go, scene);
+        r.tick_in_dt(&go, frame, scene);
         let (p1, v1) = {
             let d = &r.pm.riding.as_ref()?.drive;
             (d.pos, d.vel)
@@ -215,7 +229,7 @@ pub fn drive_ledge(
             out.worst_back = out.worst_back.min(along);
             flag("moved against its velocity by", along, &mut out);
         }
-        let allowed = v0.length().max(v1.length()) * DT + JUMP_TOL;
+        let allowed = v0.length().max(v1.length()) * frame + JUMP_TOL;
         if step.length() > allowed {
             out.jumps += 1;
             out.worst_jump = out.worst_jump.max(step.length() - allowed);
@@ -234,7 +248,7 @@ pub fn drive_ledge(
 }
 
 /// Real flat spots of the level: centres of big up-facing collision triangles.
-fn level_seeds(native: &hms_native::NativeDll, cache: hms_native::CacheHandle) -> Vec<Vec3> {
+pub(crate) fn level_seeds(native: &hms_native::NativeDll, cache: hms_native::CacheHandle) -> Vec<Vec3> {
     let mut seeds = Vec::new();
     for &t in &native.tags_by_group(cache, "sbsp") {
         if let Some(b) = crate::collision_bsp::CollisionBsp::for_sbsp(native, cache, t) {
@@ -250,7 +264,7 @@ fn level_seeds(native: &hms_native::NativeDll, cache: hms_native::CacheHandle) -
 }
 
 /// Deterministic shuffle so the ledges are spread over the map instead of the first BSP's corner.
-fn spread(mut v: Vec<Vec3>, n: usize) -> Vec<Vec3> {
+pub(crate) fn spread(mut v: Vec<Vec3>, n: usize) -> Vec<Vec3> {
     let mut seed = 0x1234_ABCDu32;
     let mut rnd = || {
         seed ^= seed << 13;
@@ -266,22 +280,17 @@ fn spread(mut v: Vec<Vec3>, n: usize) -> Vec<Vec3> {
     v
 }
 
-/// Real Forge blocks big enough to drive onto (a flat top of at least 6 x 6 wu, 0.5 wu or more
-/// above the ground), placed on flat ground. Returns the objects.
-fn place_blocks(sc: &SceneController, native: &hms_native::NativeDll, cache: hms_native::CacheHandle, spots: &[Vec3], want: usize) -> Vec<ObjectInfo> {
+/// Real Forge platforms: an `n` x `n` grid of one `ff_plat_*` block (matched by the END of its tag
+/// path), stood on flat ground at each spot -- the way a Forge map is actually built, seams and all.
+/// A spot is skipped when the ground under the grid is not level to 15 cm.
+pub(crate) fn place_platforms(sc: &SceneController, native: &hms_native::NativeDll, cache: hms_native::CacheHandle, spots: &[Vec3], kinds: &[&str], n: i32) -> Vec<ObjectInfo> {
     let mut out: Vec<ObjectInfo> = Vec::new();
     let mut spot = spots.iter();
-    for &tag in native.tags_by_group(cache, "bloc").iter() {
-        if out.len() >= want {
-            break;
-        }
-        let name = native.tag_name(cache, tag).unwrap_or_default();
-        if !name.contains("levels\\forge\\ff_") {
-            continue;
-        }
-        let Some(at) = spot.next() else { break };
-        let mk = |pos: Vec3| ObjectInfo {
-            datum: 0x7000 + out.len() as u32,
+    let probe_scene = MapScene::new(sc, Vec::new());
+    for kind in kinds {
+        let Some(tag) = native.tags_by_group(cache, "bloc").into_iter().find(|t| native.tag_name(cache, *t).is_some_and(|nm| nm.ends_with(kind))) else { continue };
+        let mk = |datum: u32, pos: Vec3| ObjectInfo {
+            datum,
             type_sig: 0,
             sig0: 0,
             sig1: 0,
@@ -295,8 +304,7 @@ fn place_blocks(sc: &SceneController, native: &hms_native::NativeDll, cache: hms
             primary_tag: tag,
             variant_name_sid: 0,
         };
-        let probe = mk(*at);
-        let tris = sc.physics_world_tris(&probe);
+        let tris = sc.physics_world_tris(&mk(0, Vec3::ZERO));
         if tris.is_empty() {
             continue;
         }
@@ -305,19 +313,29 @@ fn place_blocks(sc: &SceneController, native: &hms_native::NativeDll, cache: hms
             lo = lo.min(*p);
             hi = hi.max(*p);
         }
-        // a flat top at least 6 x 6 wu and 0.5 wu high
-        if hi.x - lo.x < 6.0 || hi.y - lo.y < 6.0 || hi.z - lo.z < 0.5 {
-            continue;
+        let (size, mid) = (hi - lo, (lo + hi) * 0.5);
+        // two grids per kind
+        for _ in 0..2 {
+            let Some(at) = spot.find(|at| {
+                (0..n).all(|i| (0..n).all(|j| {
+                    let (x, y) = (at.x + (i as f32 - 0.5 * (n - 1) as f32) * size.x, at.y + (j as f32 - 0.5 * (n - 1) as f32) * size.y);
+                    ground_at(&probe_scene, x, y, at.z).is_some_and(|z| (z - at.z).abs() < 0.15)
+                }))
+            }) else { break };
+            for i in 0..n {
+                for j in 0..n {
+                    let c = Vec3::new(at.x + (i as f32 - 0.5 * (n - 1) as f32) * size.x, at.y + (j as f32 - 0.5 * (n - 1) as f32) * size.y, at.z);
+                    // centre the block's footprint on `c`, lowest point on the ground
+                    out.push(mk(0x7000 + out.len() as u32, c - Vec3::new(mid.x, mid.y, lo.z)));
+                }
+            }
         }
-        // stand it on the ground at the spot: lowest point on the floor
-        eprintln!("block {name}: {:.1} x {:.1} x {:.1}", hi.x - lo.x, hi.y - lo.y, hi.z - lo.z);
-        out.push(mk(*at + Vec3::Z * (at.z - lo.z)));
     }
     out
 }
 
 /// One map's whole gate. `stem` only names the map in the report.
-pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], min_ledges: usize, min_block_ledges: usize) {
+pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], frames: &[f32], min_ledges: usize, min_block_ledges: usize) {
     let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for(stem) else {
         eprintln!("ledge gates SKIPPED: no {stem} cache");
         return;
@@ -325,12 +343,12 @@ pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], min_ledges: usize,
     let mut sc = SceneController::new_shared(native.clone());
     sc.attach_cache(cache);
     sc.load_collision_for_test();
-    let seeds = spread(level_seeds(&native, cache), 400);
+    let seeds = spread(level_seeds(&native, cache), 4000);
 
     let level = MapScene::new(&sc, Vec::new());
-    let level_ledges = find_ledges(&level, &seeds, 1.0, 9.0, 6.0, 14);
+    let level_ledges = find_ledges(&level, &seeds, 1.0, 9.0, 6.0, 16);
     // blocks: place on the flattest seeds, find their edges from seeds ON the block tops
-    let blocks = place_blocks(&sc, &native, cache, &seeds[..seeds.len().min(60)], 6);
+    let blocks = place_platforms(&sc, &native, cache, &seeds, &["ff_plat_4x4_short", "ff_plat_4x4", "ff_plat_4x4_tall", "ff_plat_5x5_flat"], 4);
     let with_blocks = MapScene::new(&sc, blocks.clone());
     let mut tops = Vec::new();
     for o in &blocks {
@@ -341,7 +359,7 @@ pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], min_ledges: usize,
             }
         }
     }
-    let block_ledges = find_ledges(&with_blocks, &tops, 0.4, 6.0, 4.0, 14);
+    let block_ledges = find_ledges(&with_blocks, &tops, 0.15, 7.0, 5.0, 16);
     eprintln!("{stem}: {} level ledges, {} blocks placed, {} block-top ledges", level_ledges.len(), blocks.len(), block_ledges.len());
 
     let (mut runs, mut reached, mut backward, mut jumps, mut incomplete) = (0usize, 0usize, 0usize, 0usize, 0usize);
@@ -351,8 +369,8 @@ pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], min_ledges: usize,
         for v in vehicles {
             for &l in ledges.iter() {
                 for &speed in speeds {
-                    for held in [false, true] {
-                        let Some(d) = drive_ledge(&native, cache, scene, objs, v, l, speed, held) else { continue };
+                    for (held, &frame) in [false, true].into_iter().flat_map(|h| frames.iter().map(move |f| (h, f))) {
+                        let Some(d) = drive_ledge(&native, cache, scene, objs, v, l, speed, held, frame) else { continue };
                         runs += 1;
                         reached += d.reached as usize;
                         backward += d.backward;
@@ -362,7 +380,7 @@ pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], min_ledges: usize,
                         incomplete += inc as usize;
                         if (d.backward > 0 || d.jumps > 0 || inc) && shown < 12 {
                             shown += 1;
-                            eprintln!("LEDGE[{label}] {v} yaw {:.2} drop {:.1} speed {speed} held {held}: backward {} (worst {:.3}) jumps {} reached {} dropped {}", l.2, l.4, d.backward, d.worst_back, d.jumps, d.reached, d.dropped);
+                            eprintln!("LEDGE[{label}] {v} yaw {:.2} drop {:.1} speed {speed} held {held} frame {frame:.4}: backward {} (worst {:.3}) jumps {} reached {} dropped {}", l.2, l.4, d.backward, d.worst_back, d.jumps, d.reached, d.dropped);
                             for line in &d.report {
                                 eprintln!("     {line}");
                             }
@@ -390,20 +408,5 @@ pub fn run_map(stem: &str, vehicles: &[&str], speeds: &[f32], min_ledges: usize,
 #[test]
 #[ignore = "opens the native library; run alone with --ignored --nocapture"]
 fn driving_off_edges_in_forge_world_never_moves_backward_or_jumps() {
-    run_map("forge_halo", &["mongoose", "warthog"], &[4.0, 9.0], 8, 4);
-}
-
-#[test]
-#[ignore = "TRACE probe"]
-fn probe_triangles_at_the_site() {
-    let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
-    let mut sc = SceneController::new_shared(native.clone());
-    sc.attach_cache(cache);
-    sc.load_collision_for_test();
-    let mut t = Vec::new();
-    sc.static_tris_in_aabb(Vec3::new(67.5, 205.5, 42.0), Vec3::new(71.5, 209.0, 47.0), &mut t);
-    for tr in &t {
-        let n = (tr[1] - tr[0]).cross(tr[2] - tr[0]);
-        eprintln!("TRI n ({:.2},{:.2},{:.2}) area {:.2} {:?}", n.normalize().x, n.normalize().y, n.normalize().z, 0.5 * n.length(), tr.map(|p| (p * 100.0).round() / 100.0));
-    }
+    run_map("forge_halo", &["mongoose", "warthog"], &[4.0, 9.0], &[1.0 / 60.0, 1.0 / 30.0, 1.0 / 144.0], 8, 4);
 }

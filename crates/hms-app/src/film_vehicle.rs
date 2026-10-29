@@ -398,6 +398,101 @@ pub fn placement_at(tr: &crate::film_decode::EntityTrack, t: f32) -> Option<(Vec
 }
 
 // ---------------------------------------------------------------------------------------------
+// 4b. #film-wheels  wheel travel and steering, DERIVED from the recorded motion
+// ---------------------------------------------------------------------------------------------
+
+/// A recording states no wheel angle, so Theater derives the two quantities the vehicle's own
+/// animation overlays are indexed by (`reach_vehicle_anim::DrivenState`) from the hull's motion:
+/// the signed distance rolled, and the steering.
+///
+/// **A pure function of the tick.** The distance is a CUMULATIVE table built once from the
+/// track, looked up and interpolated at the fractional clock; nothing accumulates per frame, so
+/// a seek, a rewind and a replay of the same moment pose the same wheel.
+#[derive(Clone, Debug, Default)]
+pub struct Odometer {
+    ticks: Vec<u32>,
+    cum: Vec<f32>,
+}
+
+/// A segment that covers more than this many world units per second is a teleport (a respawn),
+/// not driving, and rolls nothing.
+const TELEPORT_WU_PER_S: f32 = 80.0;
+
+impl Odometer {
+    /// `cum[i]` = signed distance along the hull's flat forward from the first position to
+    /// position `i`. Reversing subtracts, so the wheels turn backwards.
+    pub fn build(tr: &crate::film_decode::EntityTrack) -> Odometer {
+        let mut o = Odometer::default();
+        let mut acc = 0.0f32;
+        for (i, &(t, p)) in tr.positions.iter().enumerate() {
+            if i > 0 {
+                let (t0, p0) = tr.positions[i - 1];
+                let dt = (t.saturating_sub(t0)) as f32 / 60.0;
+                let d = Vec3::from(p) - Vec3::from(p0);
+                if dt > 0.0 && d.length() / dt <= TELEPORT_WU_PER_S {
+                    let mid = (t0 as f32 + t as f32) * 0.5;
+                    if let Some((f, _)) = orientation_at(tr, mid) {
+                        let fwd = Vec3::new(f[0], f[1], 0.0).normalize_or_zero();
+                        acc += Vec3::new(d.x, d.y, 0.0).dot(fwd);
+                    }
+                }
+            }
+            o.ticks.push(t);
+            o.cum.push(acc);
+        }
+        o
+    }
+
+    /// The odometer at a fractional tick.
+    pub fn at(&self, t: f32) -> f32 {
+        let i = self.ticks.partition_point(|&k| (k as f32) <= t);
+        if i == 0 {
+            return 0.0;
+        }
+        let (t0, c0) = (self.ticks[i - 1], self.cum[i - 1]);
+        match (self.ticks.get(i), self.cum.get(i)) {
+            (Some(&t1), Some(&c1)) if t1 > t0 => c0 + (c1 - c0) * ((t - t0 as f32) / (t1 - t0) as f32).clamp(0.0, 1.0),
+            _ => c0,
+        }
+    }
+}
+
+/// #film-wheels  The steering fraction (`-1` full right .. `+1` full left) a recorded motion
+/// implies, by inverting the drive model's own steered-wheel law `omega = v * tan(delta) / L`
+/// ([`crate::reach_vehicle::TurnLaw::Bicycle`]): `delta = atan(omega * L / v)`, then divided by the
+/// authored maximum turn on that side exactly as play mode does
+/// ([`crate::play_vehicle::steer_fraction`]).
+///
+/// `v` and `omega` are taken over +-6 ticks (0.1 s) so a sparse stream does not make the wheel
+/// flicker. A vehicle that is not moving along its forward steers nothing.
+pub fn steer_fraction_at(tr: &crate::film_decode::EntityTrack, t: f32, wheelbase: f32, max_left: f32, max_right: f32) -> f32 {
+    const W: f32 = 6.0;
+    let (a, b) = ((t - W).max(0.0), t + W);
+    let (Some(p0), Some(p1)) = (position_at(tr, a), position_at(tr, b)) else { return 0.0 };
+    let (Some((f0, _)), Some((f1, _)), Some((fm, _))) = (orientation_at(tr, a), orientation_at(tr, b), orientation_at(tr, t)) else {
+        return 0.0;
+    };
+    let dt = (b - a) / 60.0;
+    if dt <= 0.0 {
+        return 0.0;
+    }
+    let fm = Vec3::new(fm[0], fm[1], 0.0).normalize_or_zero();
+    let v = Vec3::new(p1.x - p0.x, p1.y - p0.y, 0.0).dot(fm) / dt;
+    if v.abs() < 0.3 || v.abs() > TELEPORT_WU_PER_S {
+        return 0.0;
+    }
+    let yaw = |f: [f32; 3]| f[1].atan2(f[0]);
+    let d = (yaw(f1) - yaw(f0) + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    let omega = d / dt;
+    let delta = (omega * wheelbase / v).atan();
+    let lim = if delta >= 0.0 { max_left.abs() } else { max_right.abs() };
+    if lim <= 1e-4 {
+        return 0.0;
+    }
+    (delta / lim).clamp(-1.0, 1.0)
+}
+
+// ---------------------------------------------------------------------------------------------
 // 5. #film-vehid  identifying a vehicle by the definition it STATES
 // ---------------------------------------------------------------------------------------------
 

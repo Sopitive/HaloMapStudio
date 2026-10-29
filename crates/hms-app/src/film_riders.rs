@@ -1005,4 +1005,579 @@ mod e2e {
         assert!(seated_n >= 40, "liveness: only {seated_n} samples were drawn in a seat");
         assert!(unplaceable * 4 <= seated_n, "too many unplaceable rides: {unplaceable} of {}", seated_n + unplaceable);
     }
+
+    /// **#film-child-follow  THE GATE for "the Warthog's turret slides around".** Through the
+    /// production `ActorDriver::sync` on real recordings: while a child vehicle (the turret) is
+    /// parented to a drawn Warthog, its drawn matrix expressed in the hull's frame is the SAME at
+    /// every sub-tick sample of a stretch where the hull is really driving. Independent
+    /// interpolation of the two tracks (the old lane) drifts by decimetres.
+    #[test]
+    #[ignore = "opens a Reach cache and reads the saved-film corpus"]
+    fn a_parented_turret_keeps_its_place_on_a_driving_hull() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else {
+            eprintln!("SKIPPED: forge_halo is not available");
+            return;
+        };
+        let (mut windows, mut worst, mut worst_at) = (0usize, 0.0f32, String::new());
+        for p in crate::film::find_finished_films() {
+            if windows >= 6 {
+                break;
+            }
+            if !p.file_name().map_or(false, |n| n.to_string_lossy().contains("forge_hal")) {
+                continue;
+            }
+            let Ok(f) = crate::film::open(&p) else { continue };
+            let idx = crate::film_decode::build_index(&f.bytes, &f.data, &f.header.map_variant);
+            // (child, parent, from, to) stretches where the hull moves >= 6 wu in 60 ticks
+            let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+            for c in idx.tracks.iter().filter(|t| t.entity_type == VEHICLE_TYPE) {
+                for (k, (t0, a)) in c.attachments.iter().enumerate() {
+                    let Some(a) = a else { continue };
+                    let t1 = c.attachments.get(k + 1).map_or(c.last_tick, |x| x.0);
+                    let Some(h) = idx.tracks.iter().find(|t| t.net_id == a.parent && t.entity_type == VEHICLE_TYPE) else { continue };
+                    let mut t = *t0 + 30;
+                    while t + 60 < t1 {
+                        if let (Some(p0), Some(p1)) = (h.sample(t), h.sample(t + 60)) {
+                            if Vec3::from(p0).distance(Vec3::from(p1)) >= 6.0 {
+                                spans.push((c.net_id, a.parent, t));
+                                break;
+                            }
+                        }
+                        t += 30;
+                    }
+                }
+            }
+            if spans.is_empty() {
+                continue;
+            }
+            let name = p.file_name().unwrap().to_string_lossy().chars().take(34).collect::<String>();
+            let mut rig = Rig::new(&o, idx);
+            for (child, hull, t0) in spans.into_iter().take(3) {
+                let mut rels: Vec<Mat4> = Vec::new();
+                for k in 0..=60 * 4 {
+                    rig.pb.seek_tick(t0 as f32 + k as f32 * 0.25);
+                    rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                    let (Some(&ca), Some(&ha)) = (rig.driver.vehicle_actor.get(&child), rig.driver.vehicle_actor.get(&hull)) else { break };
+                    let (Some(cw), Some(hw)) = (
+                        rig.actors.get(ca).and_then(|a| a.world_override),
+                        rig.actors.get(ha).and_then(|a| a.world_override),
+                    ) else { break };
+                    rels.push(hw.inverse() * cw);
+                }
+                if rels.len() < 200 {
+                    eprintln!("{name}: child {child:#x} not drawn over the stretch ({} samples)", rels.len());
+                    continue;
+                }
+                windows += 1;
+                let r0 = rels[0];
+                let d = rels
+                    .iter()
+                    .map(|r| (r.w_axis - r0.w_axis).truncate().length().max((r.x_axis - r0.x_axis).truncate().length()).max((r.z_axis - r0.z_axis).truncate().length()))
+                    .fold(0.0f32, f32::max);
+                if d > worst {
+                    worst = d;
+                    worst_at = format!("{name} child {child:#x} tick {t0}");
+                }
+            }
+        }
+        eprintln!("turret-on-hull windows {windows}: worst drift in the hull frame {worst:.5} ({worst_at})");
+        assert!(windows >= 3, "liveness: only {windows} driving stretches had a drawn turret");
+        assert!(worst < 2e-3, "the turret slides on its hull by {worst:.4} wu ({worst_at})");
+    }
+
+    /// **#race-riders  THE GATE for "Mongooses drive around by themselves, nobody is in them".**
+    /// A race clip (`HT Ignition v2.1`, a downloaded saved film in `~/Downloads/Reach(1).mov`)
+    /// starts with 16 players SPAWNED INSIDE their Mongooses: each biped's parent link is in its
+    /// own CREATION message, a block the decoder used to skip (no type-11 arm in `creation()`), so
+    /// 14 of 24 Mongooses had no recorded driver and the 16 players stood at their spawn point.
+    ///
+    /// Through the production `ActorDriver::sync`, at every 60th tick of every recorded ride:
+    /// the rider is drawn in the vehicle's seat frame (a whole matrix, within 3 wu of the hull's
+    /// recorded placement) playing a Mongoose seat clip. Counted: recorded vehicle-ticks vs
+    /// rendered ones, and how many of the recorded ones are creation-borne (what the old build
+    /// lost). Liveness: the clip has Mongoose drivers, and creation-borne ones.
+    #[test]
+    #[ignore = "opens a Reach cache and reads a downloaded race clip"]
+    fn every_recorded_mongoose_driver_in_the_race_clip_is_drawn_in_the_seat() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads").join("Reach(1).mov");
+        let Ok(f) = crate::film::open(&p) else {
+            eprintln!("SKIPPED: the race clip is not on this machine");
+            return;
+        };
+        let Some(o) = open_forge() else {
+            eprintln!("SKIPPED: forge_halo is not available");
+            return;
+        };
+        let idx = crate::film_decode::build_index_film(&f);
+        let rides = accepted_rides(&idx);
+        let firsts: std::collections::HashMap<u32, u32> = idx.tracks.iter().map(|t| (t.net_id, t.first_tick)).collect();
+        let first_of = |net: u32| firsts.get(&net).copied().unwrap_or(0);
+        let mut rig = Rig::new(&o, idx);
+        // THE APP'S OWN CAP (`ActorDriver::default().cap`), not the rig's 512: a gate that raises it
+        // hides every body the real window drops.
+        rig.driver.cap = ActorDriver::default().cap;
+        let (mut recorded, mut rendered, mut born, mut born_rendered, mut worst) = (0usize, 0usize, 0usize, 0usize, 0.0f32);
+        let (mut mongoose_rides, mut bad_clip) = (0usize, 0usize);
+        let mut misses: Vec<String> = Vec::new();
+        let mut dead_occupants = 0usize;
+        let mut pre_position = 0usize;
+        // INDEPENDENT GROUND TRUTH for the creation-borne rides: a rider's own first REPORTED
+        // position (not the seed, which sits at the creation tick) lies within 1 wu of the
+        // vehicle the ride names. Nothing of the parent link is used to decide this.
+        let (mut corroborated, mut uncorroborated) = (0usize, 0usize);
+        for r in rides.iter().filter(|r| r.seat.is_some() && r.from_tick <= first_of(r.biped_net_id) + 8) {
+            let tr = rig.pb.index.tracks.iter().find(|x| x.net_id == r.biped_net_id);
+            let veh = rig.pb.index.tracks.iter().find(|x| x.net_id == r.vehicle_net_id);
+            let first = tr.and_then(|t| t.positions.iter().find(|(k, _)| *k > t.first_tick).copied());
+            match (first, veh) {
+                (Some((k, bp)), Some(v)) if crate::film_vehicle::position_at(v, k as f32).is_some_and(|vp| Vec3::from(bp).distance(vp) < 1.0) => corroborated += 1,
+                _ => uncorroborated += 1,
+            }
+        }
+        let mut ticks: Vec<u32> = rides.iter().flat_map(|r| (r.from_tick + 4..r.to_tick.saturating_sub(4)).step_by(60)).collect();
+        // The first 400 ticks densely: the riders' own first position reports arrive 15 to 270
+        // ticks after the spawn, and that is the window the sparse 60-tick sweep walked straight over.
+        ticks.extend((41..400).step_by(3));
+        ticks.sort_unstable();
+        ticks.dedup();
+        for t in ticks {
+            rig.pb.seek_tick(t as f32);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            for r in rides.iter().filter(|r| r.seat.is_some() && r.from_tick + 1 <= t && t + 4 < r.to_tick) {
+                let Some(v) = rig.pb.index.tracks.iter().find(|x| x.net_id == r.vehicle_net_id) else { continue };
+                let Some(hull) = crate::film_vehicle::position_at(v, t as f32) else { continue };
+                if !rig.driver.vehicles.as_ref().and_then(|vt| vt.vehicles.get(&r.vehicle_net_id)).is_some_and(|x| x.name.contains("mongoose")) {
+                    continue;
+                }
+                // A rider who has DIED lies where he fell (the death clip owns the body); that is
+                // the engine's ragdoll business, not a seat. Counted, not asserted on.
+                let dead = rig.driver.body_actor.get(&r.biped_net_id).and_then(|&id| rig.actors.get(id)).is_some_and(|a| a.anim_name.contains("dead"));
+                if dead {
+                    dead_occupants += 1;
+                    continue;
+                }
+                recorded += 1;
+                let creation_borne = r.from_tick <= first_of(r.biped_net_id) + 8;
+                born += creation_borne as usize;
+                let drawn = rig.driver.body_actor.get(&r.biped_net_id).and_then(|&id| rig.actors.get(id)).map(|a| (a.world_override, a.anim_name.clone()));
+                if drawn.as_ref().map_or(true, |d| d.0.is_none()) && misses.len() < 12 {
+                    misses.push(format!("t{t} biped {:#x} veh {:#x} ride {}..{} NOT DRAWN IN SEAT ({:?})", r.biped_net_id, r.vehicle_net_id, r.from_tick, r.to_tick, drawn.as_ref().map(|d| d.1.clone())));
+                }
+                if let Some((Some(m), anim)) = drawn {
+                    let d = m.w_axis.truncate().distance(hull);
+                    worst = worst.max(d);
+                    if d >= 3.0 && misses.len() < 12 {
+                        misses.push(format!("t{t} biped {:#x} veh {:#x} ride {}..{} d {d:.1} anim {anim}", r.biped_net_id, r.vehicle_net_id, r.from_tick, r.to_tick));
+                    }
+                    if d < 3.0 {
+                        rendered += 1;
+                        born_rendered += creation_borne as usize;
+                        if !anim.contains("mongoose") {
+                            bad_clip += 1;
+                        }
+                    }
+                }
+            }
+        }
+        mongoose_rides += rides.iter().filter(|r| r.seat.is_some()).count();
+        eprintln!(
+            "race clip: {mongoose_rides} stated rides; sampled vehicle-ticks with a recorded Mongoose occupant {recorded} (creation-borne {born}); \
+             rendered in the seat {rendered} (creation-borne {born_rendered}); dead riders excluded {dead_occupants}; before first position (excluded) {pre_position}; worst seat-to-hull {worst:.2} wu; not a mongoose clip {bad_clip}"
+        );
+        for m in &misses {
+            eprintln!("miss: {m}");
+        }
+        eprintln!("independent truth: {corroborated} creation-borne rides corroborated by the rider's own first position, {uncorroborated} not");
+        assert!(corroborated >= 14, "liveness: only {corroborated} creation-borne rides are corroborated by the riders' own positions");
+        assert!(mongoose_rides >= 20 && born >= 100, "liveness: {mongoose_rides} rides / {born} creation-borne Mongoose samples");
+        assert_eq!(rendered, recorded, "{} recorded Mongoose driver samples are not drawn in the seat", recorded - rendered);
+        assert_eq!(bad_clip, 0, "{bad_clip} drivers are not posed with a Mongoose seat clip");
+    }
+
+    /// **#film-wheels  THE GATE for "vehicle wheels don't turn in Theater".** On the race clip's
+    /// Mongooses, through the production `ActorDriver::sync`, then the pose the draw path skins
+    /// from (`Actor::pose.model`, which `skin_palette` turns into the bone palette):
+    ///
+    /// * parked at the start (odometer 0): the rear wheel node is unrotated and the steering node
+    ///   is centred;
+    /// * over a driving stretch, the rear wheel's rotation angle follows the DISTANCE rolled / the
+    ///   authored radius, sample by sample (wrapped; the clip is four 90-degree keys, so 0.2 rad);
+    /// * the steering node swings with the recorded turning and rests when it is straight;
+    /// * seeking away and back to a tick poses the identical wheel.
+    #[test]
+    #[ignore = "opens a Reach cache and reads a downloaded race clip"]
+    fn the_race_clips_mongoose_wheels_turn_with_the_distance_they_roll() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let p = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads").join("Reach(1).mov");
+        let Ok(f) = crate::film::open(&p) else {
+            eprintln!("SKIPPED: the race clip is not on this machine");
+            return;
+        };
+        let Some(o) = open_forge() else {
+            eprintln!("SKIPPED: forge_halo is not available");
+            return;
+        };
+        let idx = crate::film_decode::build_index_film(&f);
+        let mut rig = Rig::new(&o, idx);
+        // The angle one node has turned from its bind orientation, radians, 0..pi.
+        let node_angle = |rig: &Rig, net: u32, node: &str| -> Option<f32> {
+            let a = rig.actors.get(*rig.driver.vehicle_actor.get(&net)?)?;
+            let i = a.def.model.node_names.iter().position(|n| n == node)?;
+            let (_, rb, _) = a.def.model.skel.bind_model()[i].to_scale_rotation_translation();
+            let (_, rp, _) = a.pose.model[i].to_scale_rotation_translation();
+            Some((rb.inverse() * rp).normalize().w.abs().clamp(0.0, 1.0).acos() * 2.0)
+        };
+        let wrap = |x: f32| (x + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+        let mut vi = crate::play_vehicle::VehicleIndex::default();
+        let nets: Vec<u32> = rig.pb.index.tracks.iter().filter(|t| t.entity_type == VEHICLE_TYPE).map(|t| t.net_id).collect();
+        let (mut driven, mut worst, mut worst_rest, mut steered, mut straight, mut bad_steer) = (0usize, 0.0f32, 0.0f32, 0usize, 0usize, 0usize);
+        let mut seek_checked = 0usize;
+        for net in nets {
+            let Some(tr) = rig.pb.index.tracks.iter().find(|t| t.net_id == net).cloned() else { continue };
+            let Some(ident) = rig.driver.vehicles.as_ref().and_then(|vt| vt.vehicles.get(&net)).cloned() else { continue };
+            if !ident.name.contains("mongoose") || tr.positions.len() < 2000 {
+                continue;
+            }
+            let Some(e) = vi.entry(&o.native, o.cache, ident.obj_tag) else { continue };
+            let anim = e.anim.clone();
+            use crate::reach_vehicle_anim::Role;
+            let Some((rear, radius)) = anim.overlays.iter().find_map(|ov| match &ov.role {
+                Role::Roll { radius, wheels } => wheels.iter().find(|w| w.contains("back") || w.contains("rear")).map(|w| (w.clone(), *radius)),
+                _ => None,
+            }) else {
+                continue;
+            };
+            let Some((wb, tl)) = e.drive.as_ref().ok().and_then(|d| Some((d.wheelbase?, d.turning?))) else { continue };
+            let steer_node = anim.overlays.iter().find_map(|ov| matches!(ov.role, Role::Steer { .. }).then(|| ov.nodes.first().cloned()).flatten());
+            let odo = crate::film_vehicle::Odometer::build(&tr);
+            // -- parked at the start: nothing rolled yet ------------------------------------
+            let t_rest = tr.first_tick + 3;
+            rig.pb.seek_tick(t_rest as f32);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            rig.actors.update_poses_headless(0.0);
+            if let Some(a) = node_angle(&rig, net, &rear) {
+                worst_rest = worst_rest.max(a.min(std::f32::consts::TAU - a));
+            }
+            // -- a driving stretch: >= 8 wu in 60 ticks, forward ------------------------------
+            let mut t0 = None;
+            let mut t = tr.first_tick + 600;
+            while t + 80 < tr.last_tick {
+                if odo.at((t + 60) as f32) - odo.at(t as f32) >= 8.0 {
+                    t0 = Some(t);
+                    break;
+                }
+                t += 240;
+            }
+            let Some(t0) = t0 else { continue };
+            driven += 1;
+            for k in 0..30 {
+                let ft = t0 as f32 + k as f32 * 2.0;
+                rig.pb.seek_tick(ft);
+                rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                rig.actors.update_poses_headless(0.0);
+                let Some(a) = node_angle(&rig, net, &rear) else { continue };
+                let want = wrap(odo.at(ft) / radius).abs();
+                let mut err = (a - want).abs();
+                if err > std::f32::consts::PI {
+                    err = (std::f32::consts::TAU - err).abs();
+                }
+                worst = worst.max(err);
+                if let Some(sn) = &steer_node {
+                    let s = crate::film_vehicle::steer_fraction_at(&tr, ft, wb, tl.max_left, tl.max_right);
+                    if let Some(sa) = node_angle(&rig, net, sn) {
+                        if s.abs() > 0.5 {
+                            steered += 1;
+                            bad_steer += (sa < 0.03) as usize;
+                        } else if s.abs() < 0.05 {
+                            straight += 1;
+                            bad_steer += (sa > 0.06) as usize;
+                        }
+                    }
+                }
+            }
+            // -- ticks where the recording is turning hard: the steering node must be bent ----
+            if let Some(sn) = &steer_node {
+                let mut t = tr.first_tick + 600;
+                let mut hits = 0;
+                while t + 10 < tr.last_tick && hits < 4 {
+                    let ft = t as f32;
+                    if crate::film_vehicle::steer_fraction_at(&tr, ft, wb, tl.max_left, tl.max_right).abs() > 0.5 {
+                        hits += 1;
+                        rig.pb.seek_tick(ft);
+                        rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                        rig.actors.update_poses_headless(0.0);
+                        if let Some(sa) = node_angle(&rig, net, sn) {
+                            steered += 1;
+                            bad_steer += (sa < 0.1) as usize;
+                        }
+                    }
+                    t += 20;
+                }
+            }
+            // -- a seek away and back poses the identical wheel --------------------------------
+            let probe_t = t0 as f32 + 17.0;
+            rig.pb.seek_tick(probe_t);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            rig.actors.update_poses_headless(0.0);
+            let first = node_angle(&rig, net, &rear);
+            rig.pb.seek_tick((t0 + 4000).min(tr.last_tick - 1) as f32);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            rig.pb.seek_tick(probe_t);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            rig.actors.update_poses_headless(0.0);
+            let again = node_angle(&rig, net, &rear);
+            assert_eq!(first.is_some(), again.is_some());
+            if let (Some(a), Some(b)) = (first, again) {
+                assert!((a - b).abs() < 1e-4, "{net:#x}: a seek changed the wheel angle {a} -> {b}");
+                seek_checked += 1;
+            }
+            if driven >= 6 {
+                break;
+            }
+        }
+        eprintln!("wheels: {driven} driving stretches, worst |angle - distance/radius| {worst:.3} rad, worst parked angle {worst_rest:.3}, steering samples {steered} bent / {straight} straight ({bad_steer} wrong), seek checks {seek_checked}");
+        assert!(driven >= 3 && seek_checked >= 3, "liveness: {driven} stretches / {seek_checked} seek checks");
+        assert!(worst_rest < 0.05, "a parked Mongoose's wheel is rotated by {worst_rest} rad");
+        assert!(worst < 0.2, "the wheel does not follow distance/radius: worst error {worst} rad");
+        assert!(steered >= 3 && straight >= 3, "liveness: steering saw {steered} bent / {straight} straight samples");
+        assert_eq!(bad_steer, 0, "{bad_steer} steering samples disagree with the recorded turning");
+    }
+
+    /// **#monitor-names  THE GATE for "monitor players have no names in Theater".** Over every film
+    /// of the corpus (plus the downloaded race clip) that holds a Forge monitor, through the
+    /// production name path (`name_tags_with` over the driver's `monitor_owner`, then
+    /// `resolve_head_anchors` on the drawn actor): every monitor alive at the sampled moment has a
+    /// tag, it is drawn as an INFERENCE (never `named`), it floats above the monitor's own `head`
+    /// marker, and a tag that carries a seat's name belongs to a seat that is NOT also driving a
+    /// Spartan at that moment. The race clip's two monitors are two DIFFERENT seats.
+    ///
+    /// Liveness: at least 10 monitors across films and at least 2 resolved to a seat.
+    #[test]
+    #[ignore = "opens a Reach cache and reads the saved-film corpus"]
+    fn every_forge_monitor_gets_a_name_tag_above_its_head() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else {
+            eprintln!("SKIPPED: forge_halo is not available");
+            return;
+        };
+        let mut paths = crate::film::find_finished_films();
+        paths.push(PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Downloads").join("Reach(1).mov"));
+        let (mut monitors, mut resolved, mut unknown, mut tagged, mut anchored, mut conflicts) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut race_seats: Vec<usize> = Vec::new();
+        let mut undrawn = 0usize;
+        for p in paths {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let mut rig = Rig::new(&o, idx);
+            let mons: Vec<(u32, u32, u32)> = rig
+                .pb
+                .index
+                .tracks
+                .iter()
+                .filter(|t| t.entity_type == 11 && rig.driver.biped_of.get(&t.net_id).is_some_and(|b| b.contains("monitor")))
+                .map(|t| (t.net_id, t.first_tick, t.destroyed_tick.unwrap_or(t.last_tick)))
+                .collect();
+            let is_race = p.file_name().is_some_and(|n| n == "Reach(1).mov");
+            for (net, a, b) in mons {
+                let t = (a + (b - a) / 2).max(a + 2);
+                rig.pb.seek_tick(t as f32);
+                rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                rig.actors.update_poses_headless(0.0);
+                let mut tags = crate::film_ui::name_tags_with(&rig.pb, &[], 4096, &rig.driver.monitor_owner);
+                crate::film_ui::resolve_name_colors(&mut tags, None, crate::reach_chud::TEAM_NONE, false);
+                crate::film_ui::resolve_head_anchors(&mut tags, &rig.actors, &o.native, o.cache);
+                // A monitor the recording never placed (0 or 1 position reports) is not DRAWN, so
+                // there is nothing to float a name over; it is counted, not asserted on.
+                if !rig.pb.bipeds(4096).iter().any(|x| x.net_id == net) {
+                    undrawn += 1;
+                    continue;
+                }
+                monitors += 1;
+                let Some(tag) = tags.iter().find(|x| x.net_id == net) else { continue };
+                tagged += 1;
+                assert!(!tag.named, "a monitor's name is an inference, never a stated gamertag");
+                anchored += tag.on_marker as usize;
+                match rig.driver.monitor_owner.get(&net) {
+                    Some(crate::film_roster::MonitorOwner::Seat(si)) => {
+                        resolved += 1;
+                        // not also playing a Spartan right now
+                        let busy = rig.pb.index.tracks.iter().any(|x| {
+                            x.entity_type == 11
+                                && x.net_id != net
+                                && rig.pb.index.seat_index_of_entity(x.net_id) == Some(*si)
+                                && x.first_tick + 30 <= t
+                                && t + 30 <= x.destroyed_tick.unwrap_or(x.last_tick)
+                        });
+                        conflicts += busy as usize;
+                        if is_race {
+                            race_seats.push(*si);
+                        }
+                    }
+                    _ => unknown += 1,
+                }
+            }
+        }
+        eprintln!("monitors: {monitors} drawn ({undrawn} never placed, excluded), {tagged} tagged ({anchored} on the head marker), {resolved} resolved to a seat, {unknown} labelled Monitor, {conflicts} conflicts; race clip seats {race_seats:?}");
+        assert!(monitors >= 10 && resolved >= 2, "liveness: {monitors} monitors / {resolved} resolved");
+        assert_eq!(tagged, monitors, "{} monitors have no name tag", monitors - tagged);
+        assert_eq!(anchored, tagged, "{} monitor tags are not on the head marker", tagged - anchored);
+        assert_eq!(conflicts, 0, "{conflicts} monitor tags name a seat that is playing a Spartan at that moment");
+        assert!(race_seats.len() == 2 && race_seats[0] != race_seats[1], "the race clip's two monitors must be two different seats: {race_seats:?}");
+    }
+
+    /// #race-truth  print-only: an INDEPENDENT ground truth for who rides which vehicle, from the
+    /// bodies' own reported positions (no parent link, no occupant field).
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_race_independent_truth() {
+        let p = PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov");
+        let f = crate::film::open(&p).expect("opens");
+        let idx = crate::film_decode::build_index_film(&f);
+        let rides = accepted_rides(&idx);
+        let vehicles: Vec<&crate::film_decode::EntityTrack> = idx.tracks.iter().filter(|t| t.entity_type == VEHICLE_TYPE).collect();
+        let mut near_total = 0usize;
+        let mut near_unexplained: Vec<String> = Vec::new();
+        let mut ride_far = 0usize;
+        let mut ride_samples = 0usize;
+        for b in idx.tracks.iter().filter(|t| t.entity_type == 11) {
+            for &(t, bp) in &b.positions {
+                // nearest vehicle at that tick
+                let mut best: Option<(f32, u32)> = None;
+                for v in &vehicles {
+                    if !v.alive_at(t) {
+                        continue;
+                    }
+                    if let Some(vp) = crate::film_vehicle::position_at(v, t as f32) {
+                        let d = Vec3::from(bp).distance(vp);
+                        if best.map_or(true, |x| d < x.0) {
+                            best = Some((d, v.net_id));
+                        }
+                    }
+                }
+                let riding = rides.iter().find(|r| r.biped_net_id == b.net_id && r.from_tick <= t && t <= r.to_tick);
+                if let Some(r) = riding {
+                    ride_samples += 1;
+                    let vp = vehicles.iter().find(|v| v.net_id == r.vehicle_net_id).and_then(|v| crate::film_vehicle::position_at(v, t as f32));
+                    if vp.map_or(false, |vp| Vec3::from(bp).distance(vp) > 6.0) {
+                        ride_far += 1;
+                    }
+                }
+                if let Some((d, vn)) = best {
+                    if d < 2.5 {
+                        near_total += 1;
+                        if riding.map(|r| r.vehicle_net_id) != Some(vn) && near_unexplained.len() < 40 {
+                            near_unexplained.push(format!("biped {:#x} t{t} within {d:.2} wu of vehicle {vn:#x}; decoder ride: {:?}", b.net_id, riding.map(|r| (r.vehicle_net_id, r.from_tick, r.to_tick))));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("truth: {near_total} body position reports lie within 2.5 wu of a Mongoose; {} of them are NOT in the decoder's ride for that vehicle", near_unexplained.len());
+        for l in &near_unexplained {
+            eprintln!("   {l}");
+        }
+        eprintln!("rides: {ride_samples} reported positions during decoder rides, {ride_far} of them > 6 wu from the ride's vehicle");
+        // first reported position vs nearest vehicle for each biped
+        for b in idx.tracks.iter().filter(|t| t.entity_type == 11) {
+            let Some(&(t, bp)) = b.positions.first() else { continue };
+            let mut ranked: Vec<(f32, u32)> = vehicles.iter().filter(|v| v.alive_at(t)).filter_map(|v| Some((Vec3::from(bp).distance(crate::film_vehicle::position_at(v, t as f32)?), v.net_id))).collect();
+            ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let r = rides.iter().find(|r| r.biped_net_id == b.net_id && r.from_tick <= t + 10);
+            eprintln!("first {:#x} life {}..{} firstpos@{t}: nearest {:?} | decoder ride at spawn {:?}", b.net_id, b.first_tick, b.last_tick, ranked.iter().take(2).map(|(d, n)| format!("{n:#x}@{d:.2}")).collect::<Vec<_>>(), r.map(|r| (r.vehicle_net_id, r.from_tick, r.to_tick)));
+        }
+    }
+
+    /// #race-truth  print-only: which of the race clip's vehicles does the FORGE SCENE also draw?
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_race_forge_copies() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let p = PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov");
+        let f = crate::film::open(&p).expect("opens");
+        let idx = crate::film_decode::build_index_film(&f);
+        let rig = Rig::new(&o, idx);
+        let vt = rig.driver.vehicles.as_ref().unwrap();
+        let idx = &rig.pb.index;
+        eprintln!("variant objects {} | vehicles identified {} (by definition {}, with a forge copy {})", idx.variant_objects.len(), vt.vehicles.len(), rig.driver.veh_by_def.added, rig.driver.veh_by_def.with_forge_copy);
+        for v in idx.tracks.iter().filter(|t| t.entity_type == VEHICLE_TYPE) {
+            let Some(id) = vt.vehicles.get(&v.net_id) else { continue };
+            let t0 = v.first_tick + 4;
+            let p0 = crate::film_vehicle::position_at(v, t0 as f32);
+            let away = |t: u32| crate::film_vehicle::position_at(v, t as f32).map(|p| Vec3::from(id.spawn_pos).distance(p));
+            eprintln!(
+                "veh {:#x} life {}..{} forge copy at spawn {:?} (err {:.2}) | start {:?} | distance from that spawn at +60/+600/+6000 ticks: {:?} {:?} {:?}",
+                v.net_id, v.first_tick, v.last_tick,
+                id.spawn_pos.iter().map(|x| if x.is_finite() { format!("{x:.1}") } else { "none".into() }).collect::<Vec<_>>(),
+                id.spawn_error, p0.map(|p| format!("({:.1},{:.1},{:.1})", p.x, p.y, p.z)),
+                away(t0 + 60).map(|d| d as i32), away(t0 + 600).map(|d| d as i32), away(t0 + 6000).map(|d| d as i32)
+            );
+        }
+    }
+
+    /// #race-truth  print-only, whole corpus + Downloads: biped creations that state a parent
+    /// (mask bit 12) versus the ones the decoder actually recovered one for.
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_creation_parents_corpus() {
+        let mut paths = crate::film::find_finished_films();
+        let dl = PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads");
+        for n in ["Reach(1).mov", "Reach.mov", "asq_mglo-1_ca_forge__A5992DE3_6938D76B.mov"] {
+            paths.push(dl.join(n));
+        }
+        let (mut films, mut with12, mut recovered, mut vehicle_films) = (0usize, 0usize, 0usize, 0usize);
+        for p in paths {
+            let Ok(f) = crate::film::open(&p) else { eprintln!("cannot open {}", p.file_name().unwrap().to_string_lossy()); continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let mut base_tick: Option<u32> = None;
+            let (mut n12, mut shapes) = (0usize, std::collections::BTreeMap::<u64, usize>::new());
+            let mut nets = Vec::new();
+            for (i, rec) in f.data.records.iter().enumerate() {
+                let Ok(t) = crate::film_decode::decode_record(rec.body(&f.bytes), &idx.params) else { continue };
+                let _ = *base_tick.get_or_insert(t.tick.wrapping_sub(i as u32));
+                for e in &t.entities {
+                    if e.entity_type == 11 && !e.is_update {
+                        *shapes.entry(e.dirty_mask & 0xFFFFF).or_default() += 1;
+                        if e.dirty_mask & 0x1000 != 0 {
+                            n12 += 1;
+                            nets.push(e.net_id);
+                        }
+                    }
+                }
+            }
+            for n in &nets {
+                let ok = idx.tracks.iter().find(|t| t.net_id == *n).is_some_and(|t| t.attachments.first().is_some_and(|a| a.0 <= t.first_tick + 1 && a.1.is_some()));
+                if !ok {
+                    let mut base_tick: Option<u32> = None;
+                    for (i, rec) in f.data.records.iter().enumerate() {
+                        let Ok(t) = crate::film_decode::decode_record(rec.body(&f.bytes), &idx.params) else { continue };
+                        let _ = *base_tick.get_or_insert(t.tick.wrapping_sub(i as u32));
+                        for e in t.entities.iter().filter(|e| e.net_id == *n && !e.is_update) {
+                            let pls = [(e.payload.as_slice(), e.dirty_mask)];
+                            let (w, c) = crate::film_decode::solve_creation_dirty_width(&pls, &idx.params);
+                            eprintln!("   MISSED creation {n:#x} mask {:#x} payload {} bits; own best width {w} ({c} rebuilt); film width solve {:?}", e.dirty_mask, e.payload.len() * 8, crate::film_decode::creation_biped(&e.payload, &idx.params, 7).map(|c| (c.owner, c.end_bit)));
+                        }
+                    }
+                }
+            }
+            let got = nets.iter().filter(|n| idx.tracks.iter().find(|t| t.net_id == **n).is_some_and(|t| t.attachments.first().is_some_and(|a| a.0 <= t.first_tick + 1 && a.1.is_some()))).count();
+            let veh = idx.tracks.iter().filter(|t| t.entity_type == VEHICLE_TYPE).count();
+            films += 1;
+            with12 += n12;
+            recovered += got;
+            vehicle_films += (veh > 0) as usize;
+            if n12 != got || n12 > 0 {
+                eprintln!("film {} | vehicles {veh} | biped creations stating a parent {n12}, recovered {got} | creation shapes {:?}", p.file_name().unwrap().to_string_lossy(), shapes.iter().map(|(m, c)| format!("{m:#x}x{c}")).collect::<Vec<_>>());
+            }
+        }
+        eprintln!("corpus: {films} films ({vehicle_films} with vehicles); {with12} biped creations state a parent, {recovered} recovered");
+    }
 }

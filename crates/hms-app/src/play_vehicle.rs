@@ -1583,93 +1583,113 @@ pub fn drive_actors(
     // and it is a visible-and-reportable approximation rather than a silent one.
     apply_appearance(actors, ids, &riding.appearance);
     for (&id, p) in ids.iter().zip(pieces.iter()) {
-        // Each piece has its OWN graph: a Warthog's body and its chaingun are two objects with
-        // two graphs, and the turret's `any:idle` is not the hog's.
-        let Some(jmad) = crate::reach_actor::resolve_jmad(native, cache, p.obj_tag) else {
-            continue;
-        };
-        if !actors.set_model_graph(native, cache, id, Some(jmad)) {
-            notes.push(format!("{:#x} would not take its own animation graph", p.obj_tag));
-            continue;
-        }
-        // The classification, cached per OBJECT tag. `VehicleIndex::entry` only answers for a
-        // `vehi`, which every piece of a vehicle is (the Warthog's turret is a `vehi` too).
-        let Some(e) = index.entry(native, cache, p.obj_tag) else { continue };
-        let anim = e.anim.clone();
-        let Some(base_index) = anim.base else { continue };
-        let base_name = anim.base_name.clone();
-        // --- the base clip, once ----------------------------------------------------------
-        let needs_base = actors.get(id).map(|a| a.anim_name != base_name).unwrap_or(false);
-        if needs_base {
-            if let Err(why) = actors.set_anim(native, cache, id, Some(&base_name)) {
-                notes.push(format!("'{base_name}' would not load: {why}"));
-            }
-        }
-        // --- its frame, and the overlays on top -------------------------------------------
-        let cells = anim.cells(&st);
-        let mut loaded: Vec<(usize, Vec<(f32, f32)>)> = Vec::new();
-        for (ai, c) in cells {
-            // THE INDEX GUARD: the name the classifier saw must be the name the actor's own
-            // graph has at that index.
-            let ok = actors
-                .get(id)
-                .and_then(|a| a.def.graph.as_ref())
-                .and_then(|g| g.anims.get(ai))
-                .zip(anim.overlays.iter().find(|o| o.anim == ai))
-                .map(|(got, want)| got.name == want.name)
-                .unwrap_or(false);
-            if !ok {
-                notes.push(format!(
-                    "overlay {ai} of {:#x} is not the clip it was classified as and was not installed",
-                    p.obj_tag
-                ));
-                continue;
-            }
-            let Some(a) = actors.get_mut(id) else { continue };
-            if a.ensure_overlay(native, cache, ai) {
-                loaded.push((ai, c));
-            } else {
-                notes.push(format!("overlay {ai} of {:#x} would not load", p.obj_tag));
-            }
-        }
-        // #vehicle-anim  A TURRET'S AIM — 18 of the 36 shipped vehicles are the `turret` type,
-        // four of them the Warthog's own gun positions, so this is the second most likely thing
-        // a player sits in.
-        //
-        // **`vehicle:aiming` is not an animation: it is an AIM GRID.** Measured across three
-        // unrelated turrets (`warthog_chaingun`, `machinegun`, `shade_flak_cannon`) it is the
-        // same ten frames every time — `b_aim_yaw` stepping 45 deg a frame right round the
-        // circle for the first eight, then `b_aim_pitch` at +90 and -90 for the last two. Those
-        // are LABELS: the clip states, in its own channels, which direction each frame means. So
-        // it goes down exactly the lane Theater drives a biped's look through
-        // (`Actor::aim_grid` -> `AimGrid::cells`), rather than being indexed as a range.
-        //
-        // `aim_grid` returns `None` for a clip that animates neither aim node, so a vehicle whose
-        // `vehicle:aiming` is not really a grid is declined by the reader rather than by a name.
-        if let Some((yaw, pitch)) = aim {
-            if let Some((ai, grid)) = actors.get_mut(id).and_then(|a| a.aim_grid(native, cache, "vehicle:aiming")) {
-                let c = grid.cells(yaw, pitch);
-                if c.is_empty() {
-                    notes.push(format!("{:#x} has an aim grid that resolved no cells for ({yaw:+.2},{pitch:+.2}) rad", p.obj_tag));
-                } else {
-                    loaded.push((ai, c));
-                }
-            }
-        }
-        if let Some(a) = actors.get_mut(id) {
-            // The clip's frame is driven here, never by `playing`: a vehicle's idle is a loop on
-            // the wall clock and `ActorScene::update` would advance it at its own rate as well,
-            // which is two writers on one frame.
-            a.playing = false;
-            let n = a.frame_count().max(1.0);
-            a.frame = (riding.drive.time * crate::film_anim::CLIP_FPS).rem_euclid(n).min(n - 0.001).max(0.0);
-            a.overlays = loaded;
-            // Unused -- the base clip and the overlays carry the whole pose.
-            a.replacement = None;
-        }
-        let _ = base_index;
+        drive_piece(index, native, cache, p.obj_tag, id, &st, aim, riding.drive.time, actors, &mut notes);
     }
     notes
+}
+
+/// #vehicle-anim  One drawn piece of a vehicle, animated: its own graph, its base clip, and the
+/// driven overlays at `st`. This is the body of [`drive_actors`]'s loop, pulled out so Theater
+/// (`#film-wheels`) poses a recorded vehicle through the SAME code as play mode instead of a
+/// second copy. `time` is the wall clock (seconds) the base loop runs on.
+pub fn drive_piece(
+    index: &mut VehicleIndex,
+    native: &NativeDll,
+    cache: CacheHandle,
+    obj_tag: u32,
+    id: u32,
+    st: &crate::reach_vehicle_anim::DrivenState,
+    aim: Option<(f32, f32)>,
+    time: f32,
+    actors: &mut crate::reach_actor::ActorScene,
+    notes: &mut Vec<String>,
+) {
+    // Each piece has its OWN graph: a Warthog's body and its chaingun are two objects with
+    // two graphs, and the turret's `any:idle` is not the hog's.
+    let Some(jmad) = crate::reach_actor::resolve_jmad(native, cache, obj_tag) else {
+        return;
+    };
+    if !actors.set_model_graph(native, cache, id, Some(jmad)) {
+        notes.push(format!("{:#x} would not take its own animation graph", obj_tag));
+        return;
+    }
+    // The classification, cached per OBJECT tag. `VehicleIndex::entry` only answers for a
+    // `vehi`, which every piece of a vehicle is (the Warthog's turret is a `vehi` too).
+    let Some(e) = index.entry(native, cache, obj_tag) else { return };
+    let anim = e.anim.clone();
+    let Some(base_index) = anim.base else { return };
+    let base_name = anim.base_name.clone();
+    // --- the base clip, once ----------------------------------------------------------
+    let needs_base = actors.get(id).map(|a| a.anim_name != base_name).unwrap_or(false);
+    if needs_base {
+        if let Err(why) = actors.set_anim(native, cache, id, Some(&base_name)) {
+            notes.push(format!("'{base_name}' would not load: {why}"));
+        }
+    }
+    // --- its frame, and the overlays on top -------------------------------------------
+    let cells = anim.cells(st);
+    let mut loaded: Vec<(usize, Vec<(f32, f32)>)> = Vec::new();
+    for (ai, c) in cells {
+        // THE INDEX GUARD: the name the classifier saw must be the name the actor's own
+        // graph has at that index.
+        let ok = actors
+            .get(id)
+            .and_then(|a| a.def.graph.as_ref())
+            .and_then(|g| g.anims.get(ai))
+            .zip(anim.overlays.iter().find(|o| o.anim == ai))
+            .map(|(got, want)| got.name == want.name)
+            .unwrap_or(false);
+        if !ok {
+            notes.push(format!(
+                "overlay {ai} of {:#x} is not the clip it was classified as and was not installed",
+                obj_tag
+            ));
+            continue;
+        }
+        let Some(a) = actors.get_mut(id) else { continue };
+        if a.ensure_overlay(native, cache, ai) {
+            loaded.push((ai, c));
+        } else {
+            notes.push(format!("overlay {ai} of {:#x} would not load", obj_tag));
+        }
+    }
+    // #vehicle-anim  A TURRET'S AIM — 18 of the 36 shipped vehicles are the `turret` type,
+    // four of them the Warthog's own gun positions, so this is the second most likely thing
+    // a player sits in.
+    //
+    // **`vehicle:aiming` is not an animation: it is an AIM GRID.** Measured across three
+    // unrelated turrets (`warthog_chaingun`, `machinegun`, `shade_flak_cannon`) it is the
+    // same ten frames every time — `b_aim_yaw` stepping 45 deg a frame right round the
+    // circle for the first eight, then `b_aim_pitch` at +90 and -90 for the last two. Those
+    // are LABELS: the clip states, in its own channels, which direction each frame means. So
+    // it goes down exactly the lane Theater drives a biped's look through
+    // (`Actor::aim_grid` -> `AimGrid::cells`), rather than being indexed as a range.
+    //
+    // `aim_grid` returns `None` for a clip that animates neither aim node, so a vehicle whose
+    // `vehicle:aiming` is not really a grid is declined by the reader rather than by a name.
+    if let Some((yaw, pitch)) = aim {
+        if let Some((ai, grid)) = actors.get_mut(id).and_then(|a| a.aim_grid(native, cache, "vehicle:aiming")) {
+            let c = grid.cells(yaw, pitch);
+            if c.is_empty() {
+                notes.push(format!("{:#x} has an aim grid that resolved no cells for ({yaw:+.2},{pitch:+.2}) rad", obj_tag));
+            } else {
+                loaded.push((ai, c));
+            }
+        }
+    }
+    if let Some(a) = actors.get_mut(id) {
+        // The clip's frame is driven here, never by `playing`: a vehicle's idle is a loop on
+        // the wall clock and `ActorScene::update` would advance it at its own rate as well,
+        // which is two writers on one frame.
+        a.playing = false;
+        let n = a.frame_count().max(1.0);
+        a.frame = (time * crate::film_anim::CLIP_FPS).rem_euclid(n).min(n - 0.001).max(0.0);
+        a.overlays = loaded;
+        // Unused -- the base clip and the overlays carry the whole pose.
+        a.replacement = None;
+    }
+    let _ = base_index;
+
 }
 
 /// #vehicle-anim  Where the rider is looking, HULL-RELATIVE and clamped by the seat's own

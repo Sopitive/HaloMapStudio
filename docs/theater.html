@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.6.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -27,6 +27,7 @@
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html" class="cur" aria-current="page">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -117,7 +118,7 @@
 <p>Every figure in the JSON carries a <strong>provenance</strong> label — <em>decoded</em> (read from the file), <em>derived</em> (computed from what was read, with the rule stated) or <em>not available</em> — so a consumer can filter on confidence without reading this page.</p>
 
 <h2 id="scripting">Scripting</h2>
-<p>The same operations are available to the <a href="scripting.html">script host</a> and the command server:</p>
+<p>The same operations are available to the <a href="scripting.html">script host</a> and the command server. Pulling data out of a recording (objects, zones, events, Megalo variables, score) has its own page, <a href="film-data.html">Film data</a>:</p>
 <pre><code>film &lt;path&gt;              open a clip
 film info | scene | index what was read: header, map variant, decoded stream
 film play | pause
@@ -126,11 +127,35 @@ film step &lt;n&gt;            n frames (negative steps back)
 film speed &lt;x&gt;           playback rate
 film camera free | follow &lt;slot&gt; | first &lt;slot&gt;
 film stats [json]        the same statistics as --film-stats
-film extract variant|gametype [dir]   write the embedded map variant / game variant out
-film folders | records   where films were found; raw record listing</code></pre>
+film extract variant|gametype [dir]   write the embedded map variant (.mvar) / game variant (.bin) out
+film folders | records   where films were found; raw record listing
+film variant | megalo | events | seats | score | objects | object | inside | near | dump
+                         the data verbs: CSV / JSON out of the recording (see Film data)</code></pre>
+<p>The data verbs (<code>variant</code>, <code>megalo</code>, <code>events</code>, <code>seats</code>, <code>score</code>, <code>objects</code>, <code>object</code>, <code>inside</code>, <code>near</code>, <code>dump</code>) print CSV with a header row, or JSON when <code>json</code> is given. Their filters, columns, time syntax and examples are on the <a href="film-data.html#verbs">Film data</a> page. Most of them need <code>film index</code> first; <code>film megalo</code> and <code>film variant</code> read the file themselves.</p>
 <p>Playback draws the film&rsquo;s own Forge scene automatically. The first <code>film index</code>, <code>film seek</code> or <code>film play</code> after a film is opened rebuilds the map the recording was made on, from the variant the film carries, and reports it next to the actor count &mdash; <code>Forge scene: 452 object(s) from "Xenon // Castle"</code>. If it cannot, it says so in the same line and why: the film was recorded on a stock map, or HMS has no saved <code>.mvar</code> for that map to use as a canvas. <code>film scene</code> forces a redraw.</p>
 <p>Opening a film with <code>film &lt;path&gt;</code> reads the header only and needs no map loaded, so <code>film info</code>, <code>film stats</code>, <code>film records</code> and <code>film extract</code> all work on a machine that has no maps installed at all.</p>
 <p><code>film extract variant</code> is worth knowing about on its own: it writes the Forge map variant embedded in the film out as a <code>.mvar</code>, so a map you only have a clip of can be opened in the editor.</p>
+<p><code>film extract gametype</code> writes the game variant the film was recorded with out as a real Halo: Reach <code>.bin</code> gametype file, named from its title, plus a small <code>.txt</code> of notes beside it. A film embeds the gametype whole as the game&rsquo;s in-memory struct; Halo Map Studio re-packs it into the file format the game saves (a BLF container around the bit-packed <code>mpvr</code> chunk) with an encoder that matches the game&rsquo;s own serialiser bit for bit on the several hundred real gametypes it was checked against, Megalo scripts, string tables and Firefight variants included. The file is rebuilt from the film&rsquo;s own variant &mdash; it is never copied from a similarly named file on disk, because MCC keeps the same lineage id on every derived save. To use it, drop it into the <code>game_variants</code> folder next to your saved gametypes. HMS has not loaded it in MCC itself; if the game refuses a file, please report it. If a variant cannot be encoded (a string table too large for a <code>.bin</code>), a raw <code>.reach_gv</code> dump of the struct is written instead and the notes say why.</p>
+
+<h2 id="megalo">Megalo variables in a recording</h2>
+<p>A film embeds the whole game variant, so it knows which Megalo variables the gametype <em>declares</em>, and it records the values the game chose to <em>send</em> (global, player and team variables with network priority low or high, plus the round clock and game state), each as a time series. Variables with priority none or local, per-object variables and variable names are not in a film. <code>film megalo</code> reads all of it; see <a href="film-data.html#v-megalo">Film data &#9656; <code>film megalo</code></a> for the forms, filters and how to read timers and object references.</p>
+
+<h2 id="objects">Objects, labels and zones in a recording</h2>
+<p>Every object is an entity in the recording, with its type, lifetime, position, parent and (for player bodies) owner; the stream also states each object&rsquo;s team and <strong>boundary shape</strong> (sphere, cylinder or box). The Forge <strong>label</strong>, spawn sequence and respawn time are not in the stream: HMS takes them from the map variant the film embeds, matching each object to its placement by position (<code>join_dist</code> reports the match distance). Positions are sparse samples held until the next one, so a fast player can cross a small zone between two samples, and box zones are approximate. <code>film objects</code>, <code>film object</code> and <code>film inside</code> / <code>film near</code> read all of this; see <a href="film-data.html#v-objects">Film data</a>.</p>
+
+<h2 id="highlight">Highlighting script objects</h2>
+<p>Open the Theater side panel and tick <strong>Highlight script objects</strong> (off by default; the choice and the category filter are remembered). Objects the gametype's script is responsible for are outlined in a colour per category, with a small label (name, id, team) over the nearest ones, and listed in the panel. Click a row to move the camera to the object; click the same row again to follow it (click once more to stop).</p>
+<div class="tablewrap"><table>
+<tr><th>Category</th><th>What the recording says</th></tr>
+<tr><td>objective / flag</td><td>the flag, ball, bomb, skull ... (the Theater object lane's objective list)</td></tr>
+<tr><td>attached marker</td><td>a generic object that rides something and is a marker: it states a zone shape or non-default properties, has no model, or a variable refers to it (the race clip's hill markers glued to players)</td></tr>
+<tr><td>zone / hill</td><td>it states a boundary shape (sphere, cylinder or box), replicated or from its Forge placement</td></tr>
+<tr><td>script-spawned</td><td>a generic object the map variant never placed, with a team, flags or a shape</td></tr>
+<tr><td>labelled Forge</td><td>a placed object with a Forge label or spawn sequence</td></tr>
+<tr><td>script variable</td><td>any other object a replicated Megalo variable refers to</td></tr>
+<tr><td>invisible / no model</td><td>none of the above, but its definition draws nothing (4 or fewer render triangles, or an <code>invisible_*</code> name)</td></tr>
+</table></div>
+<p>Bodies and projectiles are never highlighted; the entities that carry the player, team and global variables are counted in the panel but not drawn. An object with no drawable model (an <code>invisible_cube_of_derek</code>, a hill-marker zone, a door that only draws an effect) gets a translucent placeholder of its real extents: its zone shape, else the oriented bounds of its collision or physics hull, else a small cube. With the highlight off nothing is drawn for them, so the default view matches the game. <code>film highlight [csv|json]</code> lists the same objects for scripts. Not applied: a scripted object scale, which a recording does not state.</p>
 
 <h2 id="truth">What a recording actually contains</h2>
 <p>A Reach saved film is not a video. It is a recording of the game's <strong>network traffic</strong> — the same stream the other players' consoles were sent — replayed against the same map and the same gametype. That shapes what HMS can and cannot tell you, and HMS is explicit about the difference everywhere it matters:</p>
@@ -143,7 +168,7 @@ film folders | records   where films were found; raw record listing</code></pre>
 </ul>
 <p>The general rule this feature is built on: a number that was read from the file and a number that was worked out from it are different kinds of fact, and the one that was worked out always says so.</p>
 
-<p class="small">Documentation written against the v1.6.0 source (2026-10-21). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </main>
 </div>
 </body>

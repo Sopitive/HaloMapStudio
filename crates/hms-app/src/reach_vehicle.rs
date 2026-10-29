@@ -1714,12 +1714,21 @@ impl DriveModel {
                 *model,
                 None,
             ),
-            Family::Jeep { turning, .. } => {
-                let v = turn.max_speed_reference;
+            Family::Jeep { turning, limits, .. } => {
+                // #jeep-trucks  The seat's `max speed reference` is only the kinematic fallback's speed
+                // scale. The ONI van and the truck cab author none (0), and this used to refuse them
+                // outright -- "they do not drive at all" -- although the rigid-body wheel law never
+                // reads it. Fall back to the drivetrain's own ceiling (`max angular velocity x top
+                // ratio`, from the tag), and refuse only a jeep with neither.
+                let v = if turn.max_speed_reference > 0.0 {
+                    turn.max_speed_reference
+                } else {
+                    limits.map(|l| l.top_speed_ceiling).unwrap_or(0.0)
+                };
                 if !(v > 0.0) {
                     return Err(format!(
-                        "{kind} authors no forward speed and its driver seat authors no `max speed \
-                         reference` either, so there is no authored speed to drive it at"
+                        "{kind} authors no forward speed, no `max speed reference` on its driver seat and no \
+                         usable drivetrain either, so there is no authored speed to drive it at"
                     ));
                 }
                 // A wheeled vehicle authors no acceleration either. The ACCELERATION is therefore
@@ -2051,7 +2060,14 @@ impl DriveModel {
         // hull's up, is shaped by the overdampen curve and slewed into the wheel angle at `turn
         // rate`, inside [max right, max left]. The lateral stick does NOT steer.
         let facing_error = drive::facing_error(rot * glam::Vec3::Z, fwd, input.want_yaw);
-        st.steer_angle = wl.steer.slew(st.steer_angle, wl.steer.shape(facing_error), TICK_DT);
+        // #jeep-reverse-steer  `sub_140E62270`'s `a10` is engine byte +0x13 (`sub_140E601B0`: set
+        // exactly when the gear is 0, the reverse gear) and it NEGATES the shaped target angle
+        // (`sub_141405EF0(.., -v19, ..)`). In reverse the wheels therefore turn the opposite way
+        // to the facing error, which is what makes a reversing car follow the aim. PROVEN from the
+        // decompile; the byte is last tick's gear, as here (the engine update comes after).
+        let shaped = wl.steer.shape(facing_error);
+        let shaped = if st.engine.gear == 0 { -shaped } else { shaped };
+        st.steer_angle = wl.steer.slew(st.steer_angle, shaped, TICK_DT);
 
         // --- THE THROTTLE: sub_140E61950 -------------------------------------------------------
         // The sign of the forward axis times the magnitude of the WHOLE stick (capped at 1), times

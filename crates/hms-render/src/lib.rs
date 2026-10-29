@@ -373,6 +373,9 @@ pub struct SceneRenderer {
     /// The factor above, as the app measured it off the engine. 1.0 = draw the rig through the
     /// world camera (what HMS did before).
     fp_fov_scale: f32,
+    /// #fp-wave  World position the first-person rig's matrices are RELATIVE to (the eye). See
+    /// [`SceneRenderer::set_first_person_origin`].
+    fp_origin: Vec3,
     /// Real-time probe GI state (compute update + the probe buffers bound at camera 10-12).
     rtgi: rtgi::RtGi,
     // vMF diffuse LUT (group0 binding 7/8) — kept so the resize rebuild can re-bind it.
@@ -441,6 +444,7 @@ pub struct SceneRenderer {
     fp_blend_meshes: Vec<GpuMesh>,
     dynamic_cutout_meshes: Vec<GpuMesh>, // cutout objects (tree canopies) → alpha-test pass
     dynamic_holo_meshes: Vec<GpuMesh>, // holo/objective objects (hill markers, globe) → additive pass
+    beam_meshes: Vec<GpuMesh>, // #projectile-sim per-frame light-volume ribbons of flying projectiles → additive pass
     dynamic_holo_solid_meshes: Vec<GpuMesh>, // object markers (spawns/hill/kill-safe shells) → alpha-blended holo (always-readable shape)
     dynamic_blend_meshes: Vec<GpuMesh>, // transparent OBJECT parts (forge glass windows) → alpha-blend pass
     particle_meshes: Vec<GpuMesh>, // per-frame effect particle batches (per-mesh blend routing)
@@ -761,6 +765,14 @@ impl SceneRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 12,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
+                    count: None,
+                },
+                // binding 15 = the real-time GI's ray-traced sun shadow cascades (rtgi.rs `update_sun`; read by
+                // `gi_sun_vis` in the mesh / terrain shaders)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 15,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None },
                     count: None,
@@ -1247,6 +1259,7 @@ impl SceneRenderer {
                 wgpu::BindGroupEntry { binding: 10, resource: rtgi.probes_buf().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: rtgi.params_buf().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: rtgi.vis_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: rtgi.sun_buf().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&dps_lut_view) },
                 wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&h4_cascade_view) },
             ],
@@ -1295,6 +1308,7 @@ impl SceneRenderer {
                         wgpu::BindGroupEntry { binding: 10, resource: rtgi.probes_buf().as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 11, resource: rtgi.params_buf().as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 12, resource: rtgi.vis_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: rtgi.sun_buf().as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&dps_lut_view) },
                         wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&h4_cascade_view) },
                     ],
@@ -1904,6 +1918,7 @@ impl SceneRenderer {
             fp_camera_buf,
             fp_camera_bg,
             fp_fov_scale: 1.0,
+            fp_origin: Vec3::ZERO,
             rtgi,
             vmf_lut_view,
             vmf_lut_samp,
@@ -1937,6 +1952,7 @@ impl SceneRenderer {
             fp_blend_meshes: Vec::new(),
             dynamic_cutout_meshes: Vec::new(),
             dynamic_holo_meshes: Vec::new(),
+            beam_meshes: Vec::new(),
             dynamic_holo_solid_meshes: Vec::new(),
             dynamic_blend_meshes: Vec::new(),
             particle_meshes: Vec::new(),
@@ -2334,6 +2350,7 @@ impl SceneRenderer {
                 wgpu::BindGroupEntry { binding: 10, resource: self.rtgi.probes_buf().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 11, resource: self.rtgi.params_buf().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 12, resource: self.rtgi.vis_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.rtgi.sun_buf().as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 13, resource: wgpu::BindingResource::TextureView(&self.dps_lut_view) },
                 wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::TextureView(&self.h4_cascade_view) },
             ],
@@ -2360,6 +2377,12 @@ impl SceneRenderer {
         ([p.sun_dir[0], p.sun_dir[1], p.sun_dir[2]], [p.sun_color[0], p.sun_color[1], p.sun_color[2]])
     }
     pub fn rtgi_kick(&self) { self.rtgi.kick(); }
+    /// Centre the fine inner probe grid on a camera position now (the frame loop does this every frame).
+    pub fn rtgi_focus(&self, p: [f32; 3]) -> usize { self.rtgi.focus(p) }
+    /// Trace every stale sun-shadow cascade around `cam` now (headless runs; the interactive path does one per frame).
+    pub fn rtgi_update_sun_now(&self, device: &wgpu::Device, queue: &wgpu::Queue, cam: [f32; 3]) { self.rtgi.update_sun_now(device, queue, cam); }
+    /// The shading shaders' own sun visibility (sqrt of the visible fraction) at (position, normal) points.
+    pub fn rtgi_sample_sun_vis(&self, device: &wgpu::Device, queue: &wgpu::Queue, pts: &[([f32; 3], [f32; 3])], objects: bool) -> Vec<f32> { self.rtgi.sample_sun_vis(device, queue, pts, objects) }
     /// Every probe record plus the grid (origin, spacing, dims) — a blocking readback for measurement
     /// (`HMS_RTGI_COMPARE`) and the lightmap baker's engine-record export; never called per frame.
     pub fn rtgi_probes(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> (Vec<rtgi::ProbeRecord>, [f32; 3], f32, [u32; 3]) {
@@ -2924,6 +2947,7 @@ impl SceneRenderer {
             || !self.blend_meshes.is_empty()
             || !self.dynamic_blend_meshes.is_empty()
             || !self.dynamic_holo_meshes.is_empty()
+            || !self.beam_meshes.is_empty()
             // #sword-blade SKIN-2: a posed actor's additive/blend parts (the energy-sword blade)
             // animate through the same drifting fs_holo material as a world-placed one.
             || !self.actor_holo_meshes.is_empty()
@@ -3098,6 +3122,17 @@ impl SceneRenderer {
         self.fp_fov_scale = if scale.is_finite() { scale.clamp(0.25, 4.0) } else { 1.0 };
     }
 
+    /// #fp-wave  The first-person rig is drawn CAMERA-RELATIVE: its instance matrices and bone
+    /// palettes are expressed relative to `origin` (the eye, in world units), so every number in
+    /// the vertex transform is a fraction of a world unit instead of 100-450 -- an f32 world
+    /// coordinate has a ULP of 1.5e-5 to 3e-5 wu there and the rig is 0.1-0.5 wu from the lens, which
+    /// is the shimmer ("looks wavy like a floating-point error"). The shader adds `origin` back for
+    /// everything that wants a WORLD position (lighting, shadows, fog), where the loss is smooth.
+    /// The CPU side (`ActorScene::fp_origin`) must hand the actors the same value.
+    pub fn set_first_person_origin(&mut self, origin: Vec3) {
+        self.fp_origin = if origin.is_finite() { origin } else { Vec3::ZERO };
+    }
+
     /// The factor in force, and how many meshes ride it (status line / gates).
     pub fn first_person_view(&self) -> (f32, usize) {
         (
@@ -3126,6 +3161,12 @@ impl SceneRenderer {
     /// Holo/objective objects (hill markers, globe) drawn through the additive holo pass.
     pub fn set_dynamic_holo_meshes(&mut self, meshes: Vec<GpuMesh>) {
         self.dynamic_holo_meshes = meshes;
+    }
+    /// #projectile-sim  This frame's light-volume ribbons of the projectiles in flight (a plasma
+    /// bolt's streak, a rifle tracer), drawn in the same back-to-front additive sequence as the
+    /// other holo meshes. Replaced every frame; empty when nothing is flying.
+    pub fn set_beam_meshes(&mut self, meshes: Vec<GpuMesh>) {
+        self.beam_meshes = meshes;
     }
     /// Object markers (spawn Spartans, hill globes, kill/safe boundary shells) drawn through the
     /// alpha-blended holo pass so their translucent SHAPE stays readable at every angle.
@@ -3274,7 +3315,7 @@ impl SceneRenderer {
         // recorded once by `static_bundles` and replayed; `live:` lanes go through wgpu-core's
         // validated pass path on every frame. The actor and first-person lanes were missing
         // entirely, which is exactly the set a Theater frame adds.
-        let lists: [(&str, (usize, u32)); 22] = [
+        let lists: [(&str, (usize, u32)); 23] = [
             ("bundle:static", n(&self.static_meshes)),
             ("bundle:terrain", n(&self.terrain_meshes)),
             ("bundle:alphatest", n(&self.alphatest_meshes)),
@@ -3289,6 +3330,7 @@ impl SceneRenderer {
             ("live:dyn_opaque", n(&self.dynamic_meshes)),
             ("live:dyn_cutout", n(&self.dynamic_cutout_meshes)),
             ("live:dyn_holo", n(&self.dynamic_holo_meshes)),
+            ("live:beams", n(&self.beam_meshes)),
             ("live:dyn_holo_solid", n(&self.dynamic_holo_solid_meshes)),
             ("live:dyn_blend", n(&self.dynamic_blend_meshes)),
             ("live:actor_opaque", n(&self.actor_meshes)),
@@ -3651,8 +3693,8 @@ impl SceneRenderer {
                 // #fp-fov The flat view is one unlit pass through ONE camera, so the rig is drawn
                 // through the world camera here; it is a debug/geometry view, not a picture of
                 // what the game looks like.
-                flat::FlatRenderer::draw_list(&mut pass, &self.fp_meshes);
-                flat::FlatRenderer::draw_list(&mut pass, &self.fp_cutout_meshes);
+                // #fp-wave  The rig's matrices are camera-relative now, so through the world camera it
+                // would be drawn at the wrong place; this debug view leaves it out.
             }
             flat::FlatRenderer::draw_list(&mut pass, &self.imported_meshes);
             flat::FlatRenderer::draw_list(&mut pass, &self.imported_cutout_meshes);
@@ -3738,12 +3780,18 @@ impl SceneRenderer {
         let fp_vp = {
             let mut c = *camera;
             c.fov_y = (c.fov_y * self.fp_fov_scale).clamp(0.01, 3.0);
+            // #fp-wave  Camera-relative: the eye sits at (camera - origin), which is ~0 when the rig
+            // is mounted on it, so the view matrix carries no large translation.
+            c.pos = camera.pos - self.fp_origin;
             c.view_proj(aspect)
         };
+        // `time.w = 1` tells the vertex shader that `world` is relative to `cam_pos`; `cam_pos` is the
+        // ORIGIN (a world position), which the shader adds back for lighting / shadow / fog.
+        let fp_origin = [self.fp_origin.x, self.fp_origin.y, self.fp_origin.z, cam.cam_pos[3]];
         queue.write_buffer(&self.fp_camera_buf, 0, bytemuck::bytes_of(&CameraUniform {
             view_proj: fp_vp.to_cols_array_2d(),
-            cam_pos: cam.cam_pos,
-            time: cam.time,
+            cam_pos: fp_origin,
+            time: [cam.time[0], cam.time[1], cam.time[2], 1.0],
             inv_view_proj: fp_vp.inverse().to_cols_array_2d(),
         }));
         // #wire-visible  Selection-wireframe params: xy = 1 / HDR target size (the halo offset is
@@ -3986,7 +4034,11 @@ impl SceneRenderer {
         if self.rtgi.enabled && self.rtgi.has_scene() && !self.env.rtgi_freeze {
             let parts = self.rtgi.parts_per_frame();
             let part = self.rtgi.updates.get() % parts;
+            // the fine inner probe grid follows the camera (whole cells, with hysteresis; newly owned cells are traced first)
+            self.rtgi.focus([camera.pos.x, camera.pos.y, camera.pos.z]);
             self.rtgi.dispatch_part(&mut encoder, queue, None, parts, part);
+            // ray-traced sun shadow cascades around the camera (one re-traced per frame when stale)
+            self.rtgi.update_sun(&mut encoder, queue, [camera.pos.x, camera.pos.y, camera.pos.z]);
         }
         // One-shot env-cube SKY CAPTURE. Render the dome into the 6 cube faces so glossy
         // surfaces reflect the MAP's actual sky (clouds/nebula/planet), not a gradient. Runs once
@@ -4349,6 +4401,7 @@ impl SceneRenderer {
                 || self.underwater_enabled
                 || (self.quality.particles && !self.particle_meshes.is_empty())
                 || !self.dynamic_holo_meshes.is_empty()
+                || !self.beam_meshes.is_empty()
                 || !self.marker_holo_meshes.is_empty()
                 || !self.blend_meshes.is_empty()
                 || !self.dynamic_blend_meshes.is_empty()
@@ -4418,6 +4471,7 @@ impl SceneRenderer {
                 if self.show_objects {
                     lists.push((&self.dynamic_holo_solid_meshes, K::HoloSolid));
                     lists.push((&self.dynamic_holo_meshes, K::Additive));
+                    lists.push((&self.beam_meshes, K::Additive));
                     // #sword-blade SKIN-2: the posed actors' transparent thirds join the SAME
                     // back-to-front sequence (their opaque/cutout halves already share the object
                     // opaque pass above), so an energy-sword blade composites over whatever is
@@ -4448,7 +4502,7 @@ impl SceneRenderer {
                     fp_lists.push((&self.fp_holo_meshes, K::Additive));
                     fp_lists.push((&self.fp_blend_meshes, K::Blend));
                     if fp_lists.iter().any(|(l, _)| !l.is_empty()) {
-                        self.mesh_renderer.draw_transparent_sorted(&mut pass, &self.fp_camera_bg, &fp_lists, eye);
+                        self.mesh_renderer.draw_transparent_sorted(&mut pass, &self.fp_camera_bg, &fp_lists, [eye[0] - self.fp_origin.x, eye[1] - self.fp_origin.y, eye[2] - self.fp_origin.z]);
                     }
                 }
             }
@@ -6346,6 +6400,17 @@ mod wgsl_tests {
         assert!(src.contains("let det_alpha_only = i.spec_from_alpha > 1.5;")
             && src.contains("detail_c = select(detail_c, vec3<f32>(1.0), det_alpha_only);"),
             "the alpha-only detail binding would leak the detail COLOUR into a Forge piece's albedo");
+    }
+
+    /// The two camera-group uniforms the Rust side sizes by hand (`LIGHT_UNIFORM_BYTES`, the SimpleLights block) are
+    /// at least what the mesh shader's `Light` / `SimpleLights` declare — wgpu only complains at the draw.
+    #[test]
+    fn the_light_and_simple_light_buffers_cover_their_shader_structs() {
+        let sizes = crate::rtgi::tests::min_binding_sizes(&subst(&format!("{}{}{}{}{}", crate::mesh::FOG_WGSL, crate::mesh::SHADOW_SAMPLE_WGSL, crate::rtgi::GI_FRAGMENT_WGSL, crate::rtgi::GI_SHARED_WGSL, crate::mesh::TERRAIN_WGSL)));
+        let light = *sizes.get(&(0, 2)).expect("light uniform");
+        let slights = *sizes.get(&(0, 6)).expect("simple lights uniform");
+        assert!(super::LIGHT_UNIFORM_BYTES >= light, "Light buffer {} B < shader {light} B", super::LIGHT_UNIFORM_BYTES);
+        assert!(16 + 8 * 80 >= slights, "SimpleLights buffer {} B < shader {slights} B", 16 + 8 * 80);
     }
 
     #[test]

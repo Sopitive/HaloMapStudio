@@ -41,6 +41,25 @@ pub const SLOT_TOTAL: u32 = 0;
 pub const SLOT_RELOC: u32 = 9;
 pub const SLOT_GATHER: u32 = 10;
 pub const SLOT_SKY: u32 = 19;
+/// RAY-TRACED SUN SHADOW MAPS (see `update_sun`): cascades of an orthographic first-hit depth map seen
+/// from the sun, traced through the SAME BVH as the probes (static map + the placed Forge pieces).
+pub const SUN_CASCADES: usize = 4;
+pub const SUN_RES: u32 = 1024;
+/// Half extent (wu) of each cascade's square window: texels of 0.031 / 0.094 / 0.28 / 0.84 wu (a x3 step each: the
+/// handoff to the next cascade is at most 3x coarser, <= 3.4 px per texel at 1080p / 90 deg FOV).
+pub const SUN_HALF: [f32; SUN_CASCADES] = [16.0, 48.0, 144.0, 432.0];
+/// Rays start this far along +sun from the world origin (the map is a few thousand wu across).
+pub const SUN_ORIGIN_DIST: f32 = 5000.0;
+/// bytes of the buffer header: (cascade windows + 1) x vec4
+const SUN_HDR_BYTES: u64 = 16 * (SUN_CASCADES as u64 + 1);
+/// The placeholder buffers bound in the camera group before a scene exists. wgpu checks every draw against the
+/// SHADER's minimum binding size (a struct ending in a runtime array needs its header plus ONE element), so each
+/// must be at least that big: the sun placeholder was 8 bytes short when its texels grew from vec2 to vec4 and the
+/// first object draw panicked (`Buffer is bound with size 72 where the shader expects 80`).
+/// `the_camera_group_buffers_are_at_least_the_size_the_shaders_declare` pins them against the WGSL.
+pub(crate) const SUN_DUMMY_BYTES: u64 = SUN_HDR_BYTES + 16;
+pub(crate) const PROBES_DUMMY_BYTES: u64 = (SH_N as u64) * 16;
+pub(crate) const VIS_DUMMY_BYTES: u64 = (VIS_TEXELS as u64) * 8;
 /// Hard cap on the probe count (the update dispatch is one workgroup per probe).
 pub const MAX_PROBES: u32 = 32_768;
 /// Capacity (triangles / BVH nodes / materials) of the DYNAMIC occluder region appended behind the
@@ -51,6 +70,27 @@ pub const DYN_NODE_CAP: u32 = 131_072;
 pub const DYN_MAT_CAP: u32 = 1_024;
 /// Most sky-light records the engine-mode tracer carries (the workgroup holds one RGB per record).
 pub const MAX_SKY_RECORDS: usize = 256;
+
+/// The camera-centred INNER probe grid: a fine lattice (`spacing` wu, `dims` cells) that follows the camera as a toroidal
+/// window, blended into the coarse map-wide grid over its outer 3.5 cells. It exists because the coarse grid (about 9 wu on
+/// Forge World) lets sky light leak into shadowed nooks and pits (measured: 29 % of sky-clear shadowed points more than 1.5x
+/// the shipped atlas, 18 % with a 2.5 wu grid). Its probes COUNT against `MAX_PROBES`, so the per-frame tracing budget
+/// (`parts_per_frame`: 4096 probes of 64 x rays-per-thread rays) does not change.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InnerGrid { pub spacing: f32, pub dims: [u32; 3] }
+impl InnerGrid {
+    pub fn count(&self) -> u32 { self.dims[0] * self.dims[1] * self.dims[2] }
+}
+/// Default inner grid and the coarse spacing above which it is worth having.
+/// (3.0 wu x 32 x 32 x 16 = 96 x 96 x 48 wu around the camera, 16384 probes = half the cap; measured on Forge World against the shipped atlas,
+/// together with the baked-light term: mean |ln(ratio)| 0.39 -> 0.32; see `rtgi_shadow_fill_vs_the_shipped_atlas`)
+pub const INNER_DEFAULT: InnerGrid = InnerGrid { spacing: 3.0, dims: [32, 32, 16] };
+pub const INNER_MIN_OUTER_SPACING: f32 = 6.0;
+/// How the inner grid is chosen: `Auto` = the default one on big maps (coarse spacing >= `INNER_MIN_OUTER_SPACING`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum InnerPolicy { Auto, Off, Fixed(InnerGrid) }
+#[derive(Default)]
+struct InnerState { init: bool, base: [i32; 3] }
 
 /// Per-dispatch / per-frame GI parameters (std140; matches `GiParams` in the WGSL).
 #[repr(C)]
@@ -70,6 +110,12 @@ pub struct GiParams {
     /// inside the `mats` buffer, z = index of the probe list inside `tri_mat`, w = flags (bit0 the
     /// dispatch reads its probes from the list, bit1 refresh the sky-direct SH of every probe).
     pub dynp: [u32; 4],
+    /// INNER (camera-centred) probe grid, a toroidal window of cells of the lattice anchored at `inner_org.xyz` with
+    /// spacing `inner_org.w` (0 = no inner grid); `inner_dims` = cells per axis + the index of its first probe;
+    /// `inner_base` = the integer cell coordinate of the window's minimum corner.
+    pub inner_org: [f32; 4],
+    pub inner_dims: [u32; 4],
+    pub inner_base: [i32; 4],
 }
 
 impl Default for GiParams {
@@ -86,6 +132,9 @@ impl Default for GiParams {
             bias: [0.2, 0.3, 1.5, 1.0],
             nee: [2.0, 12.0, 0.0, 0.0],
             dynp: [0xFFFF_FFFF, 0, 0, 0],
+            inner_org: [0.0; 4],
+            inner_dims: [1, 1, 1, 0],
+            inner_base: [0; 4],
         }
     }
 }
@@ -192,6 +241,50 @@ pub struct RtGi {
     dyn_tris: std::cell::Cell<u32>,
     /// probe indices owed a full-quality re-estimate after an edit, and how many passes already ran
     region: std::cell::RefCell<Option<(Vec<u32>, u32)>>,
+    /// the inner grid in use (None = single coarse grid), how it is chosen, its window, and the probes whose cell was
+    /// just handed over by a window move (traced from scratch before anything else)
+    pub inner: Option<InnerGrid>,
+    pub inner_policy: InnerPolicy,
+    inner_state: std::cell::RefCell<InnerState>,
+    pending_new: std::cell::RefCell<Vec<u32>>,
+    pub n_outer: u32,
+    /// ray-traced sun shadow cascades: pipeline, layout, the buffer the shading side reads (binding 15 of
+    /// the camera group) and its update state
+    sun_pipeline: wgpu::ComputePipeline,
+    sun_bgl: wgpu::BindGroupLayout,
+    sun_buf: wgpu::Buffer,
+    sun_bg: Option<wgpu::BindGroup>,
+    sun_state: std::cell::RefCell<SunState>,
+}
+
+/// Where each cascade's window currently is (light-plane coordinates) and which need a refresh.
+#[derive(Default)]
+struct SunState {
+    centers: [[f32; 2]; SUN_CASCADES],
+    valid: [bool; SUN_CASCADES],
+    dirty: [bool; SUN_CASCADES],
+    tan_half: f32,
+    /// ray-traced sun maps off (e.g. no scene): the header says inactive, fragments see a lit sun
+    active: bool,
+}
+
+/// Orthonormal light-plane basis for a unit direction TOWARD the sun; the WGSL (`gi_sun_basis_x`) is the
+/// same formula so compute and shading agree on texel coordinates.
+pub fn sun_basis(l: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let up = if l[2].abs() > 0.95 { [1.0f32, 0.0, 0.0] } else { [0.0f32, 0.0, 1.0] };
+    let c = [up[1] * l[2] - up[2] * l[1], up[2] * l[0] - up[0] * l[2], up[0] * l[1] - up[1] * l[0]];
+    let n = (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt();
+    let x = [c[0] / n, c[1] / n, c[2] / n];
+    let y = [l[1] * x[2] - l[2] * x[1], l[2] * x[0] - l[0] * x[2], l[0] * x[1] - l[1] * x[0]];
+    (x, y)
+}
+
+/// tan of the sun disc's half angle: the Tool shoots sun rays in a cone of half angle `acos(1 - Omega/2pi)`
+/// (`faux_light_sky.cpp`, `sub_1401904E0`: `v5 = acos(1 - a1[40]*0.5/pi)`), Omega = the sun record's solid angle.
+pub fn sun_tan_half(omega: f32) -> f32 {
+    let c = (1.0 - omega * 0.5 / std::f32::consts::PI).clamp(-1.0, 1.0);
+    let a = c.acos();
+    a.tan()
 }
 
 /// Passes of a region update (blend 1, 2/3, 1/2, 2/5: a running mean of four independent ray sets).
@@ -259,6 +352,28 @@ impl RtGi {
             compilation_options: Default::default(),
             cache: None,
         });
+        // sun shadow pipeline: a different layout (5 storage + 2 uniform, under the default per-stage limit)
+        let sun_entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None,
+        };
+        let sun_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("rtgi-sun-bgl"),
+            entries: &[
+                sun_entry(0, wgpu::BufferBindingType::Storage { read_only: true }),
+                sun_entry(1, wgpu::BufferBindingType::Storage { read_only: true }),
+                sun_entry(2, wgpu::BufferBindingType::Storage { read_only: true }),
+                sun_entry(3, wgpu::BufferBindingType::Storage { read_only: true }),
+                sun_entry(6, wgpu::BufferBindingType::Uniform),
+                sun_entry(11, wgpu::BufferBindingType::Storage { read_only: false }),
+            ],
+        });
+        let sun_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("rtgi-sun-pl"), bind_group_layouts: &[&sun_bgl], push_constant_ranges: &[] });
+        let sun_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("rtgi-sun-shadow"), layout: Some(&sun_pl), module: &shader, entry_point: Some("sun_main"), compilation_options: Default::default(), cache: None,
+        });
+        let sun_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rtgi-sun-dummy"), size: SUN_DUMMY_BYTES, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
         let params = GiParams::default();
         let params_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("rtgi-params"),
@@ -268,13 +383,13 @@ impl RtGi {
         // Dummy (one-probe) records so the camera bind group is valid before a scene is set.
         let probes_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rtgi-probes"),
-            size: (SH_N as u64) * 16,
+            size: PROBES_DUMMY_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let vis_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rtgi-vis"),
-            size: (VIS_TEXELS as u64) * 8,
+            size: VIS_DUMMY_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -290,10 +405,14 @@ impl RtGi {
             engine: false, n_nodes: 0, n_tris: 0, n_mats: 0, sky_base: 0, list_base: 0,
             dyn_nodes: std::cell::Cell::new(0), dyn_tris: std::cell::Cell::new(0),
             region: std::cell::RefCell::new(None),
+            inner: None, inner_policy: InnerPolicy::Auto, inner_state: std::cell::RefCell::new(InnerState::default()), pending_new: std::cell::RefCell::new(Vec::new()), n_outer: 1,
+            sun_pipeline, sun_bgl, sun_buf, sun_bg: None, sun_state: std::cell::RefCell::new(SunState::default()),
         }
     }
 
     pub fn probes_buf(&self) -> &wgpu::Buffer { &self.probes_buf }
+    /// The ray-traced sun cascades the shading side reads (camera group binding 15).
+    pub fn sun_buf(&self) -> &wgpu::Buffer { &self.sun_buf }
     pub fn vis_buf(&self) -> &wgpu::Buffer { &self.vis_buf }
     pub fn params_buf(&self) -> &wgpu::Buffer { &self.params_buf }
     pub fn has_scene(&self) -> bool { self.scene.is_some() }
@@ -364,11 +483,31 @@ impl RtGi {
                     lum(faces[0]), lum(faces[1]), lum(faces[2]), lum(faces[3]), lum(faces[4]), lum(faces[5]), l_avg, target, cube_norm);
             }
         }
-        let max_probes: u32 = std::env::var("HMS_RTGI_MAX_PROBES").ok().and_then(|v| v.parse().ok()).unwrap_or(16_384u32).clamp(64, MAX_PROBES);
+        let max_probes: u32 = std::env::var("HMS_RTGI_MAX_PROBES").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_PROBES).clamp(64, MAX_PROBES);
+        // (the cap was 16384; measured on a Forge World patch, the sky-light error of the grid falls with its spacing:
+        // p90 error 0.29 / 0.13 / 0.046 of the open-sky irradiance at 16.5 / 10 / 5 wu — see `forge_world_probe_spacing_vs_sky_occlusion_truth`)
         let min_spacing: f32 = std::env::var("HMS_RTGI_MIN_SPACING").ok().and_then(|v| v.parse().ok()).unwrap_or(1.5f32).max(0.25);
-        let (origin, spacing, dims) = Self::plan_grid(s.bounds_min, s.bounds_max, max_probes, min_spacing);
-        let nprobes = dims[0] * dims[1] * dims[2];
+        let (mut origin, mut spacing, mut dims) = Self::plan_grid(s.bounds_min, s.bounds_max, max_probes, min_spacing);
+        // camera-centred inner grid on maps whose coarse grid is wide; its probes come out of the same cap
+        let want_inner = match self.inner_policy {
+            InnerPolicy::Off => None,
+            InnerPolicy::Fixed(g) => Some(g),
+            InnerPolicy::Auto => if spacing >= INNER_MIN_OUTER_SPACING { Some(INNER_DEFAULT) } else { None },
+        };
+        let mut inner: Option<InnerGrid> = None;
+        if let Some(g) = want_inner {
+            if g.count() + 512 < max_probes {
+                let (o2, s2, d2) = Self::plan_grid(s.bounds_min, s.bounds_max, max_probes - g.count(), min_spacing);
+                if s2 > 1.5 * g.spacing || matches!(self.inner_policy, InnerPolicy::Fixed(_)) { origin = o2; spacing = s2; dims = d2; inner = Some(g); }
+            }
+        }
+        let n_outer = dims[0] * dims[1] * dims[2];
+        let nprobes = n_outer + inner.map_or(0, |g| g.count());
         self.nprobes = nprobes.max(1);
+        self.n_outer = n_outer;
+        self.inner = inner;
+        *self.inner_state.borrow_mut() = InnerState::default();
+        self.pending_new.borrow_mut().clear();
         self.spacing = spacing;
         self.dims = dims;
         if let Some(k) = s.sky.as_ref() {
@@ -482,8 +621,30 @@ impl RtGi {
                   std::env::var("HMS_RTGI_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(12.0f32).max(0.1),
                   std::env::var("HMS_RTGI_NEE_MARGIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.05f32).max(0.0), 0.0],
             dynp: [0xFFFF_FFFF, sky_base, self.list_base, 0],
+            inner_org: match &inner { Some(i) => [origin[0], origin[1], origin[2], i.spacing], None => [0.0; 4] },
+            inner_dims: match &inner { Some(i) => [i.dims[0], i.dims[1], i.dims[2], n_outer], None => [1, 1, 1, 0] },
+            inner_base: [0; 4],
         };
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.push_params(queue);
+        // ray-traced sun cascades: a header (windows + global record) then 3 square maps of (first-hit distance,
+        // translucent transmittance); inactive (header zero) until `update_sun` has traced a cascade
+        let sun_texels = SUN_CASCADES as u64 * SUN_RES as u64 * SUN_RES as u64;
+        self.sun_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rtgi-sun"), size: SUN_HDR_BYTES + sun_texels * 16, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+        });
+        self.sun_bg = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rtgi-sun-bg"),
+            layout: &self.sun_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: nodes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: tris.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: tri_mat.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: mats_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.params_buf.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.sun_buf.as_entire_binding() },
+            ],
+        }));
+        *self.sun_state.borrow_mut() = SunState { tan_half: s.sky.as_ref().and_then(|k| k.sun).map_or(0.0, |sn| sun_tan_half(sn.omega)), dirty: [true; SUN_CASCADES], ..Default::default() };
         self.scene = Some(SceneBufs { nodes, tris, tri_mat, mats: mats_b, _lights: lights_b, _emitters: emit_b, bg });
         self.frame.set(0);
         self.updates.set(0);
@@ -498,30 +659,318 @@ impl RtGi {
     pub fn set_enabled(&mut self, queue: &wgpu::Queue, on: bool) {
         self.enabled = on;
         self.params.dims[3] = if on && self.scene.is_some() { 1 } else { 0 };
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.push_params(queue);
     }
 
     pub fn set_gain(&mut self, queue: &wgpu::Queue, gain: f32) {
         self.params.bias[3] = gain.clamp(0.01, 16.0);
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.push_params(queue);
     }
     pub fn clear_scene(&mut self, queue: &wgpu::Queue) {
         self.scene = None;
         self.enabled = false;
         self.params.dims[3] = 0;
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.push_params(queue);
     }
     /// Override the sun (direction to sun + HDR colour) for the tracer — the Lighting Lab sun controls.
     pub fn set_sun(&mut self, queue: &wgpu::Queue, dir: [f32; 3], color: [f32; 3]) {
         self.params.sun_dir = [dir[0], dir[1], dir[2], self.params.sun_dir[3]];
         self.params.sun_color = [color[0], color[1], color[2], self.params.sun_color[3]];
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.push_params(queue);
         // The probe field still holds the previous sun and the temporal blend would take ~30 frames
         // to wash it out; kick every slice once at full weight so a dragged sun slider follows immediately.
         self.kick.set(self.parts_per_frame() + 1);
+        self.mark_sun_dirty();
     }
     /// Force the next slices to REPLACE rather than blend (after any lighting change).
     pub fn kick(&self) { self.kick.set(self.parts_per_frame() + 1); }
+
+    /// Re-trace the sun cascades the next frames (the sun moved, or an occluder did).
+    pub fn mark_sun_dirty(&self) { self.sun_state.borrow_mut().dirty = [true; SUN_CASCADES]; }
+
+    /// Keep the ray-traced sun shadow cascades around the camera: ONE cascade per call is re-traced when it is
+    /// stale (never traced, an occluder / the sun changed) or when the camera has left the middle of its window.
+    /// Each cascade is an orthographic view from the sun (`sun_basis`) of the first-hit distance through the
+    /// probe tracer's BVH, so the static map AND the placed Forge pieces cast. Recorded into `encoder` ahead of
+    /// the passes that read it (`gi_sun_vis` in the shading shaders).
+    pub fn update_sun(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, cam: [f32; 3]) {
+        let Some(bg) = self.sun_bg.as_ref() else { return };
+        if self.scene.is_none() || !self.enabled { return; }
+        let sd = self.params.sun_dir;
+        let n = (sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]).sqrt();
+        if n < 0.5 { return; }
+        let l = [sd[0] / n, sd[1] / n, sd[2] / n];
+        let (bx, by) = sun_basis(l);
+        let (cu, cv) = (cam[0] * bx[0] + cam[1] * bx[1] + cam[2] * bx[2], cam[0] * by[0] + cam[1] * by[1] + cam[2] * by[2]);
+        let mut st = self.sun_state.borrow_mut();
+        let mut pick: Option<(usize, [f32; 2])> = None;
+        for c in 0..SUN_CASCADES {
+            let texel = 2.0 * SUN_HALF[c] / SUN_RES as f32;
+            let want = [(cu / texel).round() * texel, (cv / texel).round() * texel];
+            let moved = (want[0] - st.centers[c][0]).abs().max((want[1] - st.centers[c][1]).abs()) > 0.25 * SUN_HALF[c];
+            if !st.valid[c] || st.dirty[c] || moved { pick = Some((c, want)); break; }
+        }
+        let Some((c, want)) = pick else { return };
+        st.centers[c] = want;
+        let mut hdr = [[0f32; 4]; SUN_CASCADES + 1];
+        // z: 0 = never traced (the shading side skips it), 1 = valid, 2 = being re-traced by this dispatch
+        for k in 0..SUN_CASCADES { hdr[k] = [st.centers[k][0], st.centers[k][1], if k == c { 2.0 } else if st.valid[k] { 1.0 } else { 0.0 }, SUN_HALF[k]]; }
+        hdr[SUN_CASCADES] = [1.0, st.tan_half, SUN_RES as f32, SUN_ORIGIN_DIST];
+        queue.write_buffer(&self.sun_buf, 0, bytemuck::cast_slice(&hdr));
+        {
+            let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rtgi-sun-shadow"), timestamp_writes: None });
+            cp.set_pipeline(&self.sun_pipeline);
+            cp.set_bind_group(0, bg, &[]);
+            cp.dispatch_workgroups(SUN_RES / 8, SUN_RES / 8, SUN_CASCADES as u32);
+        }
+        st.valid[c] = true;
+        st.dirty[c] = false;
+        st.active = true;
+    }
+
+    /// Run the shading shaders' own `gi_sun_vis(p, n)` (the very WGSL text the mesh / terrain shaders compile) for a
+    /// list of (position, normal) against the cascades now held; returns sqrt(visible fraction) per point. A blocking
+    /// measurement (gates, `HMS_RTGI_COMPARE`), never called per frame.
+    pub fn sample_sun_vis(&self, device: &wgpu::Device, queue: &wgpu::Queue, pts: &[([f32; 3], [f32; 3])], objects: bool) -> Vec<f32> {
+        let src = format!(
+            "{}{}{}",
+            GI_FRAGMENT_WGSL,
+            GI_SHARED_WGSL.replace("__GI_DEBUG__", "0"),
+            r#"
+    @group(0) @binding(20) var<storage, read> t_in: array<vec4<f32>>;
+    @group(0) @binding(21) var<storage, read_write> t_out: array<f32>;
+    @compute @workgroup_size(1)
+    fn t_main(@builtin(global_invocation_id) g: vec3<u32>) {
+        t_out[g.x] = gi_sun_vis(t_in[2u * g.x].xyz, t_in[2u * g.x + 1u].xyz, __OBJ__);
+    }
+    "#
+        )
+        .replace("__OBJ__", if objects { "true" } else { "false" });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sunvis-test"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let ent = |b: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                ent(11, wgpu::BufferBindingType::Uniform),
+                ent(15, wgpu::BufferBindingType::Storage { read_only: true }),
+                ent(20, wgpu::BufferBindingType::Storage { read_only: true }),
+                ent(21, wgpu::BufferBindingType::Storage { read_only: false }),
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pl), module: &module, entry_point: Some("t_main"), compilation_options: Default::default(), cache: None });
+        let mut input: Vec<[f32; 4]> = Vec::new();
+        for (p, n) in pts { input.push([p[0], p[1], p[2], 0.0]); input.push([n[0], n[1], n[2], 0.0]); }
+        let inb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&input), usage: wgpu::BufferUsages::STORAGE });
+        let outb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: pts.len() as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: pts.len() as u64 * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 11, resource: self.params_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 15, resource: self.sun_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: inb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 21, resource: outb.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        { let mut cp = enc.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(pts.len() as u32, 1, 1); }
+        enc.copy_buffer_to_buffer(&outb, 0, &rb, 0, pts.len() as u64 * 4);
+        queue.submit(Some(enc.finish()));
+        let sl = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sl.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let v: Vec<f32> = bytemuck::cast_slice(&sl.get_mapped_range()).to_vec();
+        v
+    }
+
+    /// Run the shading shaders' own `gi_irradiance(p, n, v)` (the WGSL text the mesh / terrain shaders compile) for a list of
+    /// (position, normal) against the probes now held; the viewer vector is the normal. Returns irradiance/pi RGB per
+    /// point. A blocking measurement for gates, never called per frame.
+    pub fn sample_irradiance(&self, device: &wgpu::Device, queue: &wgpu::Queue, pts: &[([f32; 3], [f32; 3])]) -> Vec<[f32; 3]> {
+        self.sample_irradiance_variant(device, queue, pts, 0, &[])
+    }
+
+    /// `sample_irradiance` for probe SH slot `slot` (0 = total, 10 = gather only, 19 = sky-direct only) with the
+    /// shader text edited by `edits` (exact substring replacements: the test seam that turns one term of
+    /// `gi_irradiance_set` off to measure how much of the result it carries). Panics when an edit does not apply.
+    pub fn sample_irradiance_variant(&self, device: &wgpu::Device, queue: &wgpu::Queue, pts: &[([f32; 3], [f32; 3])], slot: u32, edits: &[(&str, &str)]) -> Vec<[f32; 3]> {
+        let mut shared = GI_SHARED_WGSL.replace("__GI_DEBUG__", "0");
+        for (a, b) in edits { assert!(shared.contains(a), "shader edit does not apply: {a}"); shared = shared.replace(a, b); }
+        let src = format!(
+            "{}{}{}",
+            GI_FRAGMENT_WGSL,
+            shared,
+            r#"
+    @group(0) @binding(20) var<storage, read> t_in: array<vec4<f32>>;
+    @group(0) @binding(21) var<storage, read_write> t_out: array<vec4<f32>>;
+    @compute @workgroup_size(1)
+    fn t_main(@builtin(global_invocation_id) g: vec3<u32>) {
+        let n = t_in[2u * g.x + 1u].xyz;
+        t_out[g.x] = vec4<f32>(gi_irradiance_set(t_in[2u * g.x].xyz, n, n, __SLOT__), 0.0);
+    }
+    "#
+        ).replace("__SLOT__", &format!("{slot}u"));
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("irr-test"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let ent = |b: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[ent(10, ro), ent(11, wgpu::BufferBindingType::Uniform), ent(12, ro), ent(20, ro), ent(21, wgpu::BufferBindingType::Storage { read_only: false })],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pl), module: &module, entry_point: Some("t_main"), compilation_options: Default::default(), cache: None });
+        let mut input: Vec<[f32; 4]> = Vec::new();
+        for (p, n) in pts { input.push([p[0], p[1], p[2], 0.0]); input.push([n[0], n[1], n[2], 0.0]); }
+        let inb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&input), usage: wgpu::BufferUsages::STORAGE });
+        let bytes = pts.len() as u64 * 16;
+        let outb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 10, resource: self.probes_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: self.params_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: self.vis_buf().as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 20, resource: inb.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 21, resource: outb.as_entire_binding() },
+            ],
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        { let mut cp = enc.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(pts.len() as u32, 1, 1); }
+        enc.copy_buffer_to_buffer(&outb, 0, &rb, 0, bytes);
+        queue.submit(Some(enc.finish()));
+        let sl = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sl.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let v: Vec<[f32; 4]> = bytemuck::cast_slice(&sl.get_mapped_range()).to_vec();
+        v.iter().map(|c| [c[0], c[1], c[2]]).collect()
+    }
+
+    /// Run `gi_light_vis` (the WGSL the pixel shaders use to hide a baked light behind walls) for (point, normal, light position)
+    /// triples against the probes now held. A blocking measurement for gates.
+    pub fn sample_light_vis(&self, device: &wgpu::Device, queue: &wgpu::Queue, pts: &[([f32; 3], [f32; 3], [f32; 3])]) -> Vec<f32> {
+        let src = format!(
+            "{}{}{}",
+            GI_FRAGMENT_WGSL,
+            GI_SHARED_WGSL.replace("__GI_DEBUG__", "0"),
+            r#"
+    @group(0) @binding(20) var<storage, read> t_in: array<vec4<f32>>;
+    @group(0) @binding(21) var<storage, read_write> t_out: array<f32>;
+    @compute @workgroup_size(1)
+    fn t_main(@builtin(global_invocation_id) g: vec3<u32>) {
+        t_out[g.x] = gi_light_vis(t_in[3u * g.x].xyz, t_in[3u * g.x + 1u].xyz, t_in[3u * g.x + 2u].xyz);
+    }
+    "#
+        );
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("lightvis-test"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let ent = |b: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[ent(10, ro), ent(11, wgpu::BufferBindingType::Uniform), ent(12, ro), ent(20, ro), ent(21, wgpu::BufferBindingType::Storage { read_only: false })] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pl), module: &module, entry_point: Some("t_main"), compilation_options: Default::default(), cache: None });
+        let mut input: Vec<[f32; 4]> = Vec::new();
+        for (p, n, l) in pts { input.push([p[0], p[1], p[2], 0.0]); input.push([n[0], n[1], n[2], 0.0]); input.push([l[0], l[1], l[2], 0.0]); }
+        let inb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&input), usage: wgpu::BufferUsages::STORAGE });
+        let bytes = pts.len() as u64 * 4;
+        let outb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: bytes, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 10, resource: self.probes_buf().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 11, resource: self.params_buf().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 12, resource: self.vis_buf().as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 20, resource: inb.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 21, resource: outb.as_entire_binding() },
+        ] });
+        let mut enc = device.create_command_encoder(&Default::default());
+        { let mut cp = enc.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(pts.len() as u32, 1, 1); }
+        enc.copy_buffer_to_buffer(&outb, 0, &rb, 0, bytes);
+        queue.submit(Some(enc.finish()));
+        let sl = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sl.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let v: Vec<f32> = bytemuck::cast_slice(&sl.get_mapped_range()).to_vec();
+        v
+    }
+
+    /// GROUND TRUTH for the shadow maps: the visible fraction of the sun disc from each (position, normal) by 32 real
+    /// rays through the SAME BVH (static + placed pieces), no cascades, no filter. Returns the fraction (not its
+    /// square root). A blocking measurement for gates and diagnostics.
+    pub fn trace_sun_fraction(&self, device: &wgpu::Device, queue: &wgpu::Queue, pts: &[([f32; 3], [f32; 3])]) -> Vec<f32> {
+        let Some(sc) = self.scene.as_ref() else { return Vec::new() };
+        let tan_h = self.sun_state.borrow().tan_half;
+        let src = format!("{}{}", compute_source(0), r#"
+@group(0) @binding(20) var<storage, read> t_in: array<vec4<f32>>;
+@group(0) @binding(21) var<storage, read_write> t_out: array<f32>;
+@compute @workgroup_size(1)
+fn tv_main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let p = t_in[2u * g.x].xyz;
+    let th = t_in[2u * g.x].w;
+    let n = t_in[2u * g.x + 1u].xyz;
+    let l = normalize(gi.sun_dir.xyz);
+    let bx = gi_sun_basis_x(l);
+    let by = cross(l, bx);
+    var acc = 0.0;
+    for (var k = 0u; k < 32u; k = k + 1u) {
+        let r = sqrt((f32(k) + 0.5) / 32.0) * th;
+        let a = f32(k) * 2.39996323;
+        let d = normalize(l + (bx * cos(a) + by * sin(a)) * r);
+        let v = visibility(p + n * 0.05, d, T_MAX);
+        acc = acc + (v.x + v.y + v.z) / 3.0;
+    }
+    t_out[g.x] = acc / 32.0;
+}
+"#);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("sun-truth"), source: wgpu::ShaderSource::Wgsl(src.into()) });
+        let ent = |b: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry { binding: b, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
+        let ro = wgpu::BufferBindingType::Storage { read_only: true };
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[
+            ent(0, ro), ent(1, ro), ent(2, ro), ent(3, ro), ent(6, wgpu::BufferBindingType::Uniform), ent(20, ro), ent(21, wgpu::BufferBindingType::Storage { read_only: false }),
+        ] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&pl), module: &module, entry_point: Some("tv_main"), compilation_options: Default::default(), cache: None });
+        let mut input: Vec<[f32; 4]> = Vec::new();
+        for (p, n) in pts { input.push([p[0], p[1], p[2], tan_h]); input.push([n[0], n[1], n[2], 0.0]); }
+        let inb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&input), usage: wgpu::BufferUsages::STORAGE });
+        let outb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: pts.len() as u64 * 4, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+        let rb = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: pts.len() as u64 * 4, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &bgl, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: sc.nodes.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: sc.tris.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: sc.tri_mat.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: sc.mats.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: self.params_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 20, resource: inb.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 21, resource: outb.as_entire_binding() },
+        ] });
+        let mut enc = device.create_command_encoder(&Default::default());
+        { let mut cp = enc.begin_compute_pass(&Default::default()); cp.set_pipeline(&pipe); cp.set_bind_group(0, &bg, &[]); cp.dispatch_workgroups(pts.len() as u32, 1, 1); }
+        enc.copy_buffer_to_buffer(&outb, 0, &rb, 0, pts.len() as u64 * 4);
+        queue.submit(Some(enc.finish()));
+        let sl = rb.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        sl.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let v: Vec<f32> = bytemuck::cast_slice(&sl.get_mapped_range()).to_vec();
+        v
+    }
+
+    /// Trace every stale cascade now (headless runs and tests): loops `update_sun` until nothing is pending.
+    pub fn update_sun_now(&self, device: &wgpu::Device, queue: &wgpu::Queue, cam: [f32; 3]) {
+        for _ in 0..(2 * SUN_CASCADES) {
+            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("rtgi-sun-now") });
+            self.update_sun(&mut enc, queue, cam);
+            queue.submit(Some(enc.finish()));
+        }
+        let _ = device.poll(wgpu::Maintain::Wait);
+    }
 
     /// Record one probe-update pass into `encoder`. `blend` overrides the temporal alpha (None =
     /// 1 − hysteresis, or 1.0 on the very first update so the records start from a full estimate).
@@ -532,9 +981,20 @@ impl RtGi {
     /// A pending edit region (see `invalidate_region`) takes the frame's dispatch first.
     pub fn dispatch_part(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, blend: Option<f32>, parts: u32, part: u32) {
         let Some(sc) = self.scene.as_ref() else { return };
+        // probes whose cell the inner window just handed over: traced from scratch, ahead of everything (4096 a frame)
+        {
+            let mut pend = self.pending_new.borrow_mut();
+            if !pend.is_empty() {
+                let take = pend.len().min(4096);
+                let list: Vec<u32> = pend.drain(..take).collect();
+                drop(pend);
+                self.dispatch_list(encoder, queue, sc, &list, 1.0, 1 | 2 | 4);
+                return;
+            }
+        }
         if blend.is_none() {
             if let Some((list, done)) = self.next_region_pass() {
-                self.dispatch_list(encoder, queue, sc, &list, 2.0 / (done as f32 + 2.0));
+                self.dispatch_list(encoder, queue, sc, &list, 2.0 / (done as f32 + 2.0), 3);
                 return;
             }
         }
@@ -553,6 +1013,7 @@ impl RtGi {
         p.misc2[3] = base;
         p.fog[3] = alpha;
         p.dynp[3] = 0;
+        p.inner_base = self.inner_base_now();
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
         {
             let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rtgi-probe-update"), timestamp_writes: None });
@@ -568,7 +1029,7 @@ impl RtGi {
     /// One dispatch over an explicit probe list (an edit region): the list rides in the `tri_mat` buffer
     /// behind the dynamic region, `dynp.w` bit0 makes the shader read it, bit1 re-traces the sky-direct
     /// SH of those probes (an occluder moved: their sky visibility changed).
-    fn dispatch_list(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, sc: &SceneBufs, list: &[u32], alpha: f32) {
+    fn dispatch_list(&self, encoder: &mut wgpu::CommandEncoder, queue: &wgpu::Queue, sc: &SceneBufs, list: &[u32], alpha: f32, flags: u32) {
         if list.is_empty() { return; }
         let f = self.frame.get();
         queue.write_buffer(&sc.tri_mat, self.list_base as u64 * 4, bytemuck::cast_slice(list));
@@ -577,7 +1038,8 @@ impl RtGi {
         p.misc[1] = self.rays_per_thread;
         p.misc2[3] = 0;
         p.fog[3] = alpha;
-        p.dynp[3] = 3;
+        p.dynp[3] = flags;
+        p.inner_base = self.inner_base_now();
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
         {
             let mut cp = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rtgi-region-update"), timestamp_writes: None });
@@ -588,6 +1050,63 @@ impl RtGi {
         self.frame.set(f.wrapping_add(1));
         self.updates.set(self.updates.get() + 1);
         self.last_dispatch_probes.set(list.len() as u32);
+    }
+
+    fn push_params(&self, queue: &wgpu::Queue) {
+        let mut p = self.params;
+        p.inner_base = self.inner_base_now();
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
+    }
+    fn inner_base_now(&self) -> [i32; 4] { let b = self.inner_state.borrow().base; [b[0], b[1], b[2], 0] }
+
+    /// The integer cell an inner slot (0-based within the inner grid) holds for a window whose minimum corner is `base`.
+    pub fn inner_cell_of(g: &InnerGrid, base: [i32; 3], slot: u32) -> [i32; 3] {
+        let d = [g.dims[0] as i32, g.dims[1] as i32, g.dims[2] as i32];
+        let r = slot as i32;
+        let sc = [r % d[0], (r / d[0]) % d[1], r / (d[0] * d[1])];
+        let mut c = [0i32; 3];
+        for a in 0..3 { c[a] = base[a] + (sc[a] - base[a]).rem_euclid(d[a]); }
+        c
+    }
+    /// The inner slot (0-based) that holds integer cell `c`.
+    pub fn inner_slot_of(g: &InnerGrid, c: [i32; 3]) -> u32 {
+        let d = [g.dims[0] as i32, g.dims[1] as i32, g.dims[2] as i32];
+        let m = [c[0].rem_euclid(d[0]), c[1].rem_euclid(d[1]), c[2].rem_euclid(d[2])];
+        (m[0] + m[1] * d[0] + m[2] * d[0] * d[1]) as u32
+    }
+    /// Where the inner window's minimum cell sits now (diagnostics / gates).
+    #[cfg(test)]
+    pub(crate) fn default_probe_base_for_test() -> [i32; 3] { [0, 0, 0] }
+    pub fn inner_window(&self) -> Option<(InnerGrid, [i32; 3], [f32; 3])> {
+        let g = self.inner?;
+        Some((g, self.inner_state.borrow().base, [self.params.origin[0], self.params.origin[1], self.params.origin[2]]))
+    }
+
+    /// Centre the inner window on `cam` (world position). The window moves in whole cells and only once the camera is two
+    /// cells off its centre (hysteresis, so a camera hovering on a cell border does not shuffle probes); the cells that
+    /// change owner are queued for a from-scratch trace. Returns how many probes were queued. Cheap when nothing moves.
+    pub fn focus(&self, cam: [f32; 3]) -> usize {
+        let Some(g) = self.inner else { return 0 };
+        let o = self.params.origin;
+        let mut st = self.inner_state.borrow_mut();
+        // vertical: two thirds of the window above the camera's floor-ish position is wasted sky; centre it slightly low
+        let want: [i32; 3] = std::array::from_fn(|a| {
+            let c = ((cam[a] - o[a]) / g.spacing).floor() as i32;
+            c - (g.dims[a] as i32) / 2
+        });
+        let moved = if !st.init { true } else { (0..3).any(|a| (want[a] - st.base[a]).abs() >= 2) };
+        if !moved { return 0; }
+        let old = st.base;
+        let first = !st.init;
+        st.base = want;
+        st.init = true;
+        let mut list: Vec<u32> = Vec::new();
+        for slot in 0..g.count() {
+            if first || Self::inner_cell_of(&g, old, slot) != Self::inner_cell_of(&g, want, slot) { list.push(self.n_outer + slot); }
+        }
+        let n = list.len();
+        self.pending_new.borrow_mut().extend(list);
+        n
     }
 
     /// The pending edit region's probe list and the number of passes already done; advances the count.
@@ -628,8 +1147,18 @@ impl RtGi {
     pub fn invalidate_region(&self, min: [f32; 3], max: [f32; 3]) -> usize {
         if self.scene.is_none() { return 0; }
         let pad = 2.0 * self.spacing;
-        let add = Self::probes_in_box(
+        let mut add = Self::probes_in_box(
             [self.params.origin[0], self.params.origin[1], self.params.origin[2]], self.spacing, self.dims, min, max, pad);
+        if let Some(g) = self.inner {
+            let (base, o) = (self.inner_state.borrow().base, self.params.origin);
+            let ipad = 2.0 * g.spacing;
+            let mut lo = [0i32; 3]; let mut hi = [0i32; 3];
+            for a in 0..3 {
+                lo[a] = (((min[a] - ipad - o[a]) / g.spacing).ceil() as i32).max(base[a]);
+                hi[a] = (((max[a] + ipad - o[a]) / g.spacing).floor() as i32).min(base[a] + g.dims[a] as i32 - 1);
+            }
+            for z in lo[2]..=hi[2] { for y in lo[1]..=hi[1] { for x in lo[0]..=hi[0] { add.push(self.n_outer + Self::inner_slot_of(&g, [x, y, z])); } } }
+        }
         if add.is_empty() { return 0; }
         let mut r = self.region.borrow_mut();
         let mut list = r.take().map(|(l, _)| l).unwrap_or_default();
@@ -664,11 +1193,12 @@ impl RtGi {
                 queue.write_buffer(&sc.mats, self.n_mats as u64 * 3 * 16, bytemuck::cast_slice(&d.mats));
             }
         }
+        self.mark_sun_dirty();
         let live = nn > 0 && nt > 0;
         self.dyn_nodes.set(if live { nn as u32 } else { 0 });
         self.dyn_tris.set(if live { nt as u32 } else { 0 });
         self.params.dynp[0] = if live { self.n_nodes } else { 0xFFFF_FFFF };
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&self.params));
+        self.push_params(queue);
         true
     }
     pub fn dynamic_tris(&self) -> u32 { self.dyn_tris.get() }
@@ -795,10 +1325,123 @@ pub const GI_FRAGMENT_WGSL: &str = r#"
 struct GiParams {
     origin: vec4<f32>, dims: vec4<u32>, sun_dir: vec4<f32>, sun_color: vec4<f32>, sky_color: vec4<f32>,
     misc: vec4<u32>, misc2: vec4<u32>, fog: vec4<f32>, bias: vec4<f32>, nee: vec4<f32>, dynp: vec4<u32>,
+    inner_org: vec4<f32>, inner_dims: vec4<u32>, inner_base: vec4<i32>,
 };
 @group(0) @binding(10) var<storage, read> gi_probes: array<vec4<f32>>;
 @group(0) @binding(11) var<uniform> gi: GiParams;
 @group(0) @binding(12) var<storage, read> gi_vis: array<vec2<f32>>;
+// Ray-traced sun shadow cascades (rtgi.rs `update_sun`): hdr[k] = (window centre u, v in the light plane, _, half
+// extent; z = 0 never traced / 1 valid / 2 being re-traced) for k < 3, hdr[3] = (active, tan(sun half angle), resolution, ray-origin distance); tex = (distance
+// from the ray origin to the first opaque hit in the STATIC map, the same in the placed pieces, transmittance of
+// translucent surfaces in front of the nearer one, 0).
+struct GiSunBuf { hdr: array<vec4<f32>, 5>, tex: array<vec4<f32>> };
+@group(0) @binding(15) var<storage, read> gi_sun: GiSunBuf;
+
+fn gi_sun_vogel(k: u32, n: u32, rot: f32) -> vec2<f32> {
+    let r = sqrt((f32(k) + 0.5) / f32(n));
+    let a = f32(k) * 2.39996323 + rot;
+    return vec2<f32>(cos(a), sin(a)) * r;
+}
+fn gi_sun_tex(c: u32, x: i32, y: i32, res: u32) -> vec4<f32> {
+    let xi = u32(clamp(x, 0, i32(res) - 1));
+    let yi = u32(clamp(y, 0, i32(res) - 1));
+    return gi_sun.tex[c * res * res + yi * res + xi];
+}
+// The sun's visibility at a surface point, as the engine stores it: the engine multiplies the analytic sun by
+// DM.g TWICE, so this returns sqrt(visible fraction) and the existing `vis * vis` gates stay as they are.
+// The fraction is a percentage-closer filter over the sun DISC: a blocker search over the occluder-to-receiver
+// gap, then a filter of radius tan(half angle) x gap (the Tool's sun cone, `acos(1 - Omega/2pi)`), so contact
+// shadows are sharp and far ones soft. Every filter tap is a BILINEAR comparison (the four texels' lit/shadowed
+// results weighted by the sub-texel position) and the radius never drops below 2 texels (a binary staircase of edge samples needs ~2 texels of blur to read as a straight line), so a shadow edge is
+// smooth at any distance instead of stepping texel by texel. Near the edge of a cascade's window the next, coarser
+// cascade is blended in so the handoff does not pop. 1.0 when the maps are not active or the point is outside them.
+// `objects` = the receiver is a placed piece / dynamic object: it sees the STATIC map only (its own coarse physics
+// hull is in the placed-piece layer and would shadow its own surface; pieces shadow each other through the raster
+// shadow pass), level receivers see static + placed pieces.
+fn gi_sun_t(c: u32, x: i32, y: i32, res: u32, objects: bool) -> f32 {
+    let v = gi_sun_tex(c, x, y, res);
+    return select(min(v.x, v.y), v.x, objects);
+}
+// bilinear lit fraction at continuous texel coordinates (x, y) against receiver distance `lim`
+fn gi_sun_lit_bilinear(c: u32, x: f32, y: f32, res: u32, objects: bool, lim: f32) -> f32 {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = i32(floor(fx));
+    let y0 = i32(floor(fy));
+    let ax = fx - floor(fx);
+    let ay = fy - floor(fy);
+    let l00 = select(0.0, 1.0, gi_sun_t(c, x0, y0, res, objects) >= lim);
+    let l10 = select(0.0, 1.0, gi_sun_t(c, x0 + 1, y0, res, objects) >= lim);
+    let l01 = select(0.0, 1.0, gi_sun_t(c, x0, y0 + 1, res, objects) >= lim);
+    let l11 = select(0.0, 1.0, gi_sun_t(c, x0 + 1, y0 + 1, res, objects) >= lim);
+    return mix(mix(l00, l10, ax), mix(l01, l11, ax), ay);
+}
+// visible fraction through cascade `c` (window `hc`) at point p
+fn gi_sun_frac(c: u32, hc: vec4<f32>, p: vec3<f32>, n: vec3<f32>, l: vec3<f32>, bx: vec3<f32>, by: vec3<f32>, h3: vec4<f32>, objects: bool) -> f32 {
+    let res = u32(h3.z);
+    let resf = h3.z;
+    let texel = 2.0 * hc.w / resf;
+    // receiver, pulled off the surface along its normal and toward the sun by a texel or two
+    // slope-scaled bias: the depth of a sloped receiver varies by texel x tan(angle) across one texel
+    let ndl_b = max(dot(n, l), 0.05);
+    let tan_t = min(sqrt(1.0 - ndl_b * ndl_b) / ndl_b, 6.0);
+    let pb = p + n * (texel * 0.5) + l * (texel * 0.25);
+    let u0 = ((dot(pb, bx) - hc.x) / hc.w * 0.5 + 0.5) * resf;
+    let v0 = ((dot(pb, by) - hc.y) / hc.w * 0.5 + 0.5) * resf;
+    let tr = h3.w - dot(pb, l);
+    let eps = texel * (0.5 + 0.5 * tan_t) + 0.02;
+    // a FIXED tap pattern (no per-pixel rotation): the bilinear taps make the result a continuous function of the
+    // position, where a per-pixel random rotation turned every edge into grain of +-0.15 (16 taps)
+    let rot = 0.0;
+    let tan_h = h3.y;
+    let rs = max(clamp(tan_h * 24.0, texel * 1.5, 1.5), texel * 2.0); // never narrower than the minimum filter radius
+    var nb = 0.0;
+    var sum_t = 0.0;
+    for (var k = 0u; k < 12u; k = k + 1u) {
+        let o = gi_sun_vogel(k, 12u, rot) * (rs / texel);
+        let t = gi_sun_t(c, i32(floor(u0 + o.x)), i32(floor(v0 + o.y)), res, objects);
+        if (t < tr - eps) { nb = nb + 1.0; sum_t = sum_t + t; }
+    }
+    let trans = gi_sun_tex(c, i32(floor(u0)), i32(floor(v0)), res).z;
+    if (nb < 0.5) { return clamp(trans, 0.0, 1.0); }
+    let gap = tr - sum_t / nb;
+    let w = clamp(tan_h * gap, texel * 2.0, 6.0);
+    var lit = 0.0;
+    for (var k = 0u; k < 16u; k = k + 1u) {
+        let o = gi_sun_vogel(k, 16u, rot + 1.7) * (w / texel);
+        lit = lit + gi_sun_lit_bilinear(c, u0 + o.x, v0 + o.y, res, objects, tr - eps);
+    }
+    return clamp(lit / 16.0 * trans, 0.0, 1.0);
+}
+fn gi_sun_vis(p: vec3<f32>, n: vec3<f32>, objects: bool) -> f32 {
+    let h3 = gi_sun.hdr[4];
+    if (h3.x < 0.5 || gi.dims.w == 0u) { return 1.0; }
+    let l = normalize(gi.sun_dir.xyz);
+    let ndl = dot(n, l);
+    if (ndl <= 0.0) { return 1.0; }
+    let bx = gi_sun_basis_x(l);
+    let by = cross(l, bx);
+    let pu = dot(p, bx);
+    let pv = dot(p, by);
+    var c = 4u;
+    var edge = 0.0;
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let h = gi_sun.hdr[k];
+        let m = max(abs((pu - h.x) / h.w), abs((pv - h.y) / h.w));
+        if (h.z > 0.5 && m < 0.94) { c = k; edge = m; break; }
+    }
+    if (c == 4u) { return 1.0; }
+    var f = gi_sun_frac(c, gi_sun.hdr[c], p, n, l, bx, by, h3, objects);
+    // blend toward the next (coarser, valid) cascade over the outer 14 % of this window
+    if (c < 3u && edge > 0.80) {
+        let hn = gi_sun.hdr[c + 1u];
+        if (hn.z > 0.5 && max(abs((pu - hn.x) / hn.w), abs((pv - hn.y) / hn.w)) < 0.94) {
+            let fn_ = gi_sun_frac(c + 1u, hn, p, n, l, bx, by, h3, objects);
+            f = mix(f, fn_, smoothstep(0.80, 0.94, edge));
+        }
+    }
+    return sqrt(f);
+}
 "#;
 
 const COMPUTE_DECLS_WGSL: &str = r#"
@@ -814,6 +1457,7 @@ struct Emitter { v0: vec4<f32>, v1: vec4<f32>, v2: vec4<f32>, rad: vec4<f32> };
 struct GiParams {
     origin: vec4<f32>, dims: vec4<u32>, sun_dir: vec4<f32>, sun_color: vec4<f32>, sky_color: vec4<f32>,
     misc: vec4<u32>, misc2: vec4<u32>, fog: vec4<f32>, bias: vec4<f32>, nee: vec4<f32>, dynp: vec4<u32>,
+    inner_org: vec4<f32>, inner_dims: vec4<u32>, inner_base: vec4<i32>,
 };
 @group(0) @binding(0) var<storage, read> nodes: array<BvhNode>;
 @group(0) @binding(1) var<storage, read> tris: array<Tri>;
@@ -826,6 +1470,8 @@ struct GiParams {
 @group(0) @binding(8) var<storage, read_write> gi_vis: array<vec2<f32>>;
 @group(0) @binding(9) var env_cube: texture_cube<f32>;
 @group(0) @binding(10) var env_samp: sampler;
+struct SunBuf { hdr: array<vec4<f32>, 5>, tex: array<vec4<f32>> };
+@group(0) @binding(11) var<storage, read_write> sun: SunBuf;
 "#;
 
 /// The probe LOOKUP shared by the compute (previous-frame irradiance at ray hits) and fragment
@@ -852,7 +1498,21 @@ fn gi_oct_decode(uv: vec2<f32>) -> vec3<f32> {
     if (v.z < 0.0) { let t = (1.0 - abs(v.yx)) * gi_sign_not_zero(v.xy); v = vec3<f32>(t.x, t.y, v.z); }
     return normalize(v);
 }
-fn gi_probe_count() -> u32 { return gi.dims.x * gi.dims.y * gi.dims.z; }
+fn gi_n_outer() -> u32 { return gi.dims.x * gi.dims.y * gi.dims.z; }
+fn gi_probe_count() -> u32 { return gi.misc2.z; }
+// INNER grid: a toroidal window of lattice cells (see GiParams.inner_*). Slot of an integer cell, and the cell a slot holds.
+fn gi_inner_slot(c: vec3<i32>) -> u32 {
+    let d = vec3<i32>(gi.inner_dims.xyz);
+    let m = ((c % d) + d) % d;
+    return gi.inner_dims.w + u32(m.x + m.y * d.x + m.z * d.x * d.y);
+}
+fn gi_inner_cell_of(rel: u32) -> vec3<i32> {
+    let d = vec3<i32>(gi.inner_dims.xyz);
+    let r = i32(rel);
+    let sc = vec3<i32>(r % d.x, (r / d.x) % d.y, r / (d.x * d.y));
+    let b = gi.inner_base.xyz;
+    return b + (((sc - b) % d) + d) % d;
+}
 fn gi_probe_index(c: vec3<u32>) -> u32 { return c.x + c.y * gi.dims.x + c.z * gi.dims.x * gi.dims.y; }
 fn gi_probe_pos(c: vec3<u32>) -> vec3<f32> { return gi.origin.xyz + vec3<f32>(c) * gi.origin.w; }
 fn gi_vis_texel(pi: u32, t: vec2<i32>) -> vec2<f32> {
@@ -885,12 +1545,17 @@ fn gi_sh_irradiance_at(pi: u32, n: vec3<f32>, slot: u32) -> vec3<f32> {
     e = e + a2 * (1.092548 * (x * y * c4 + y * z * c5 + x * z * c7) + 0.315392 * (3.0 * z * z - 1.0) * c6 + 0.546274 * (x * x - y * y) * c8);
     return max(e, vec3<f32>(0.0));
 }
+// light-plane basis for a unit direction toward the sun (rtgi.rs `sun_basis` is the same formula)
+fn gi_sun_basis_x(l: vec3<f32>) -> vec3<f32> {
+    let up = select(vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(1.0, 0.0, 0.0), abs(l.z) > 0.95);
+    return normalize(cross(up, l));
+}
 fn gi_on() -> bool { return gi.dims.w > 0u; }
 fn gdbg_ignore_valid() -> bool { return __GI_DEBUG__ == 3; }
 // Irradiance / π at surface point p with normal n (v = unit vector from p toward the viewer/probe
 // side, used for the DDGI bias), from the 8 surrounding probes with backface + Chebyshev
 // visibility weights. Same units as the baked `bake.rgb`.
-fn gi_irradiance_set(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, slot: u32) -> vec3<f32> {
+fn gi_outer_set(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, slot: u32) -> vec3<f32> {
     let sp = gi.origin.w;
     let o = gi.origin.xyz;
     let bp = p + (n * gi.bias.x + v * gi.bias.y) * sp;
@@ -937,10 +1602,175 @@ fn gi_irradiance_set(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, slot: u32) -> vec
     let gdbg = __GI_DEBUG__;
     if (gdbg == 1) { return vec3<f32>(f32(nvalid) / 8.0, f32(nin) / 8.0, select(0.0, 1.0, wsum > 1e-5)); }
     if (gdbg == 2) { let gg = (p - o) / sp; return fract(gg * 0.25); }
-    if (wsum <= 1e-5) { return vec3<f32>(0.0); }
+    if (wsum <= 1e-5) {
+        // No corner of the cell survived (every probe of the cell sits inside geometry): the old code returned BLACK, a hole
+        // in the lighting. Fall back to the valid probes of the surrounding 4x4x4 block, weighted by distance, by how
+        // squarely they sit in FRONT of the surface (a probe behind it lights the other side of the wall) and by the same
+        // Chebyshev visibility the corners get, so a pocket takes the light of the air it faces and not the next room's.
+        var fsum = vec3<f32>(0.0); var fw = 0.0; var fden = 0.0;
+        var asum = vec3<f32>(0.0); var aw = 0.0;
+        for (var k = 0u; k < 64u; k = k + 1u) {
+            let cc = base + vec3<f32>(f32(k & 3u) - 1.0, f32((k >> 2u) & 3u) - 1.0, f32((k >> 4u) & 3u) - 1.0);
+            if (any(cc < vec3<f32>(0.0)) || any(cc > maxc)) { continue; }
+            let pi = gi_probe_index(vec3<u32>(cc));
+            let rec = gi_probes[pi * GI_SH_N + 9u];
+            if (rec.w < 0.5) { continue; }
+            let d = cc - gc;
+            let wd = 1.0 / (0.25 + dot(d, d));
+            let e = gi_sh_irradiance_at(pi, n, slot);
+            asum = asum + wd * e; aw = aw + wd;
+            let ppos = o + cc * sp + rec.xyz;
+            let to_probe = ppos - p;
+            let dist0 = length(to_probe);
+            let dir = to_probe / max(dist0, 1e-4);
+            let fr = max(dot(dir, n), 0.0);
+            var w = wd * fr * fr;
+            fden = fden + w; // the same weight WITHOUT the visibility test: an occluded pocket stays dark instead of renormalising to the open air
+            let dist = min(length(ppos - bp), vmax);
+            let vs = gi_vis_sample(pi, -dir);
+            if (dist > vs.x) {
+                let variance = abs(vs.y - vs.x * vs.x) + 1e-4;
+                var cheb = variance / (variance + (dist - vs.x) * (dist - vs.x));
+                cheb = max(cheb * cheb * cheb, 0.0);
+                w = w * max(cheb, 0.25); // a pocket narrower than the probe spacing is not resolved: some light always seeps in
+            }
+            fsum = fsum + w * e; fw = fw + w;
+        }
+        // nothing in front and visible: the plain distance-weighted valid probes (still better than black)
+        if (fden <= 1e-4) { fsum = asum; fden = aw; }
+        if (fden <= 0.0) { return vec3<f32>(0.0); }
+        return (fsum / fden) * (gi.bias.w / GI_PI);
+    }
     return (sum / wsum) * (gi.bias.w / GI_PI);
 }
+
+// Irradiance / pi from the INNER grid (w = 1 when at least one corner contributed, else 0 and the caller uses the outer grid).
+// Same weights as the outer grid (trilinear x backface x Chebyshev), without the hole fallback.
+fn gi_inner_eval(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, slot: u32) -> vec4<f32> {
+    let sp = gi.inner_org.w;
+    let o = gi.inner_org.xyz;
+    let bp = p + (n * gi.bias.x + v * gi.bias.y) * sp;
+    let g = (bp - o) / sp;
+    let bf = floor(g);
+    let f = g - bf;
+    let b0 = gi.inner_base.xyz;
+    let d = vec3<i32>(gi.inner_dims.xyz);
+    var sum = vec3<f32>(0.0);
+    var wsum = 0.0;
+    var cover = 0.0;
+    let vmax = sp * gi.bias.z;
+    for (var k = 0u; k < 8u; k = k + 1u) {
+        let offi = vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32((k >> 2u) & 1u));
+        let ci = vec3<i32>(bf) + offi;
+        if (any(ci < b0) || any(ci >= b0 + d)) { continue; }
+        let pi = gi_inner_slot(ci);
+        let rec = gi_probes[pi * GI_SH_N + 9u];
+        if (rec.w < 0.5) { continue; }
+        let off = vec3<f32>(offi);
+        let ppos = o + vec3<f32>(ci) * sp + rec.xyz;
+        let tw = mix(vec3<f32>(1.0) - f, f, off);
+        var w = tw.x * tw.y * tw.z;
+        cover = cover + w;
+        let to_probe = ppos - p;
+        let dir = normalize(to_probe);
+        let wb = (dot(dir, n) + 1.0) * 0.5;
+        w = w * (wb * wb + 0.2);
+        let dist = min(length(ppos - bp), vmax);
+        let vs = gi_vis_sample(pi, -dir);
+        let mean = vs.x;
+        if (dist > mean) {
+            let variance = abs(vs.y - mean * mean) + 1e-4;
+            var cheb = variance / (variance + (dist - mean) * (dist - mean));
+            cheb = max(cheb * cheb * cheb, 0.0);
+            w = w * max(cheb, 0.02);
+        }
+        sum = sum + w * gi_sh_irradiance_at(pi, n, slot);
+        wsum = wsum + w;
+    }
+    if (wsum <= 1e-5) { return vec4<f32>(0.0); }
+    // w = how much of the cell's trilinear weight sits on valid probes: the caller fades to the coarse grid as it goes to 0, so
+    // a cell whose probes sit in geometry hands over smoothly instead of jumping
+    return vec4<f32>((sum / wsum) * (gi.bias.w / GI_PI), clamp(cover * 2.0, 0.0, 1.0));
+}
+// Weight of the inner grid at p: 0 outside / near the window's edge, 1 deep inside (a 2-cell smooth fade, so the seam to
+// the coarse grid is continuous and a freshly exposed slab of probes is never shown before it has been traced).
+fn gi_inner_weight(p: vec3<f32>) -> f32 {
+    if (gi.inner_org.w <= 0.0) { return 0.0; }
+    let gp = (p - gi.inner_org.xyz) / gi.inner_org.w;
+    let lo = vec3<f32>(gi.inner_base.xyz);
+    let hi = lo + vec3<f32>(gi.inner_dims.xyz) - vec3<f32>(1.0);
+    let e3 = min(gp - lo, hi - gp);
+    let e = min(e3.x, min(e3.y, e3.z));
+    let t = clamp((e - 1.5) / 2.0, 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+}
+fn gi_irradiance_set(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, slot: u32) -> vec3<f32> {
+    let t = gi_inner_weight(p);
+    if (t > 0.0) {
+        let ei = gi_inner_eval(p, n, v, slot);
+        let tc = t * ei.w;
+        if (tc > 0.0) {
+            if (tc >= 1.0) { return ei.rgb; }
+            return mix(gi_outer_set(p, n, v, slot), ei.rgb, tc);
+        }
+    }
+    return gi_outer_set(p, n, v, slot);
+}
 fn gi_irradiance(p: vec3<f32>, n: vec3<f32>, v: vec3<f32>) -> vec3<f32> { return gi_irradiance_set(p, n, v, 0u); }
+// How visible a point light at `lp` is from the surface point p, read from the probe field instead of tracing: the nearest valid
+// probe of the cell (inner grid when p is inside it) knows how far it sees in every direction (its distance map), so the light is
+// hidden when the probe sees a wall before reaching the light's distance (the Chebyshev test the probes' own weights use). Resolution is the
+// probe spacing, so a light behind a thin wall next to the probe can leak or a doorway can clip; it is a shadow at room scale.
+fn gi_light_vis(p: vec3<f32>, n: vec3<f32>, lp: vec3<f32>) -> f32 {
+    var best_d = 1.0e9;
+    var best_pi = 0u;
+    var best_pos = vec3<f32>(0.0);
+    var have = false;
+    let tin = gi_inner_weight(p);
+    if (tin > 0.5) {
+        let sp = gi.inner_org.w;
+        let g = (p + n * 0.2 * sp - gi.inner_org.xyz) / sp;
+        let bf = vec3<i32>(floor(g));
+        let b0 = gi.inner_base.xyz;
+        let d3 = vec3<i32>(gi.inner_dims.xyz);
+        for (var k = 0u; k < 8u; k = k + 1u) {
+            let ci = bf + vec3<i32>(i32(k & 1u), i32((k >> 1u) & 1u), i32((k >> 2u) & 1u));
+            if (any(ci < b0) || any(ci >= b0 + d3)) { continue; }
+            let pi = gi_inner_slot(ci);
+            let rec = gi_probes[pi * GI_SH_N + 9u];
+            if (rec.w < 0.5) { continue; }
+            let pp = gi.inner_org.xyz + vec3<f32>(ci) * sp + rec.xyz;
+            let dd = length(pp - p);
+            if (dd < best_d) { best_d = dd; best_pi = pi; best_pos = pp; have = true; }
+        }
+    }
+    if (!have) {
+        let sp = gi.origin.w;
+        let maxc = vec3<f32>(gi.dims.xyz) - vec3<f32>(1.0);
+        let gc = clamp((p + n * 0.2 * sp - gi.origin.xyz) / sp, vec3<f32>(0.0), maxc);
+        let base = floor(min(gc, maxc - vec3<f32>(1.0)));
+        for (var k = 0u; k < 8u; k = k + 1u) {
+            let cc = base + vec3<f32>(f32(k & 1u), f32((k >> 1u) & 1u), f32((k >> 2u) & 1u));
+            if (any(cc < vec3<f32>(0.0)) || any(cc > maxc)) { continue; }
+            let pi = gi_probe_index(vec3<u32>(cc));
+            let rec = gi_probes[pi * GI_SH_N + 9u];
+            if (rec.w < 0.5) { continue; }
+            let pp = gi.origin.xyz + cc * sp + rec.xyz;
+            let dd = length(pp - p);
+            if (dd < best_d) { best_d = dd; best_pi = pi; best_pos = pp; have = true; }
+        }
+    }
+    if (!have) { return 1.0; }
+    let to_l = lp - best_pos;
+    let dl = length(to_l);
+    if (dl < 1e-3) { return 1.0; }
+    let vs = gi_vis_sample(best_pi, to_l / dl);
+    // the light is nearer than the first wall the probe sees in that direction: visible; else a soft Chebyshev fall-off
+    if (dl <= vs.x) { return 1.0; }
+    let variance = abs(vs.y - vs.x * vs.x) + 1e-3;
+    let c = variance / (variance + (dl - vs.x) * (dl - vs.x));
+    return clamp(c * c * c, 0.0, 1.0);
+}
 "#;
 
 const COMPUTE_WGSL: &str = r#"
@@ -1266,20 +2096,32 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     let rpt = clamp(gi.misc.y, 1u, 4u);
     let nrays = WG * rpt;
     let nx = gi.dims.x; let ny = gi.dims.y;
-    let c = vec3<u32>(probe % nx, (probe / nx) % ny, probe / (nx * ny));
-    let rec_old = gi_probes[probe * GI_SH_N + 9u];
-    let ppos = gi_probe_pos(c) + rec_old.xyz;
+    let n_out = gi_n_outer();
+    let is_inner = probe >= n_out;
+    // a probe whose cell was just handed to it by the moving inner window starts from scratch
+    let new_cell = (gi.dynp.w & 4u) != 0u;
+    var rec_old = gi_probes[probe * GI_SH_N + 9u];
+    if (new_cell) { rec_old = vec4<f32>(0.0, 0.0, 0.0, 1.0); }
+    var ppos: vec3<f32>;
+    var sp_p = gi.origin.w;
+    if (is_inner) {
+        sp_p = gi.inner_org.w;
+        ppos = gi.inner_org.xyz + vec3<f32>(gi_inner_cell_of(probe - n_out)) * sp_p + rec_old.xyz;
+    } else {
+        let c = vec3<u32>(probe % nx, (probe / nx) % ny, probe / (nx * ny));
+        ppos = gi_probe_pos(c) + rec_old.xyz;
+    }
     // ENGINE mode = the scene carried the sky render_model's light list (see engine_gi.rs)
     let nsky = sky_n();
     let engine = nsky > 0u;
     // uninitialised probe (vis record still zero) → take the full estimate this pass
-    let fresh = gi_vis[probe * GI_VIS_RES * GI_VIS_RES].y <= 0.0;
+    let fresh = gi_vis[probe * GI_VIS_RES * GI_VIS_RES].y <= 0.0 || new_cell;
     // per-frame random rotation of the fibonacci set (Shoemake uniform quaternion)
     var rs: u32 = gi.misc.x * 7919u + 17u;
     let u1 = randf(&rs); let u2 = randf(&rs); let u3 = randf(&rs);
     let q = vec4<f32>(sqrt(1.0 - u1) * sin(6.2831853 * u2), sqrt(1.0 - u1) * cos(6.2831853 * u2), sqrt(u1) * sin(6.2831853 * u3), sqrt(u1) * cos(6.2831853 * u3));
     var rng: u32 = probe * 9781u + gi.misc.x * 6271u + t * 131u + 1u;
-    let vmax = gi.origin.w * gi.bias.z;
+    let vmax = sp_p * gi.bias.z;
     var my_back = 0u;
     var my_cb = 1.0e9; var my_cbd = vec3<f32>(0.0); var my_cf = 1.0e9;
     for (var k = 0u; k < rpt; k = k + 1u) {
@@ -1375,7 +2217,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
             cf = min(cf, cf_dist[i]);
         }
         var off = rec_old.xyz;
-        let sp = gi.origin.w;
+        let sp = sp_p;
         if (back_frac > 0.25 && best < 1.0e8) {
             off = off - bd * (best + 0.1 * sp);
         } else if (cf < 0.08 * sp) {
@@ -1428,12 +2270,94 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
         gi_vis[vi] = mix(gi_vis[vi], nv, alpha);
     }
 }
+
+// Ray-traced sun shadow cascade (rtgi.rs `update_sun`): one ray per texel from the sun through the probe tracer's
+// BVH (static map + placed pieces). Stores the distance to the first OPAQUE hit and the transmittance of the
+// translucent surfaces (glass, foliage cards) in front of it. Sky shells are never hit.
+@compute @workgroup_size(8, 8, 1)
+fn sun_main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let c = g.z;
+    let h3 = sun.hdr[4];
+    if (h3.x < 0.5 || c >= 4u) { return; }
+    let hc = sun.hdr[c];
+    if (hc.z < 1.5) { return; }
+    let res = u32(h3.z);
+    if (g.x >= res || g.y >= res) { return; }
+    let l = normalize(gi.sun_dir.xyz);
+    let bx = gi_sun_basis_x(l);
+    let by = cross(l, bx);
+    let d = -l;
+    // Coarse cascades (texel >= 0.25 wu) trace 2x2 rays per texel and keep the NEAREST hit: an occluder thinner than a
+    // texel (rail, trunk, wall edge) anywhere in the texel marks it, which is what the Tool's per-fragment rays see.
+    let nsub = select(1u, 2u, c >= 2u);
+    var tsv = 1.0e9;
+    var tdv = 1.0e9;
+    var trn = 1.0;
+    for (var sy = 0u; sy < nsub; sy = sy + 1u) {
+        for (var sx = 0u; sx < nsub; sx = sx + 1u) {
+            let jx = select(0.0, (f32(sx) + 0.5) / f32(nsub) - 0.5, nsub > 1u);
+            let jy = select(0.0, (f32(sy) + 0.5) / f32(nsub) - 0.5, nsub > 1u);
+            let fx = (f32(g.x) + 0.5 + jx) / h3.z * 2.0 - 1.0;
+            let fy = (f32(g.y) + 0.5 + jy) / h3.z * 2.0 - 1.0;
+            let o = bx * (hc.x + fx * hc.w) + by * (hc.y + fy * hc.w) + l * h3.w;
+            var tri: u32 = 0u;
+            let ts = trace_root(0u, o, d, T_MAX, &tri);
+            var td = -1.0;
+            if (gi.dynp.x != 0xffffffffu) { td = trace_root(gi.dynp.x, o, d, T_MAX, &tri); }
+            let a = select(1.0e9, ts, ts >= 0.0);
+            let b = select(1.0e9, td, td >= 0.0);
+            tsv = min(tsv, a);
+            tdv = min(tdv, b);
+            let tm = min(a, b);
+            let vis = visibility(o, d, select(T_MAX, max(tm - 0.02, 0.0), tm < 1.0e8));
+            trn = min(trn, (vis.x + vis.y + vis.z) / 3.0);
+        }
+    }
+    sun.tex[c * res * res + g.y * res + g.x] = vec4<f32>(tsv, tdv, trn, 0.0);
+}
 "#;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use naga::valid::{Capabilities, ValidationFlags, Validator};
+
+    /// wgpu's minimum binding size of every uniform / storage global of a WGSL module, by (group, binding): the
+    /// struct's size, or for a struct ending in a runtime array / a bare runtime array, header + ONE element.
+    pub(crate) fn min_binding_sizes(src: &str) -> std::collections::HashMap<(u32, u32), u64> {
+        let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("WGSL parse error:\n{}", e.emit_to_string(src)));
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let mut out = std::collections::HashMap::new();
+        for (_, g) in module.global_variables.iter() {
+            let (Some(b), true) = (&g.binding, matches!(g.space, naga::AddressSpace::Uniform | naga::AddressSpace::Storage { .. })) else { continue };
+            let size = match &module.types[g.ty].inner {
+                naga::TypeInner::Struct { members, span } => match members.last().map(|m| (&module.types[m.ty].inner, m.offset)) {
+                    Some((naga::TypeInner::Array { size: naga::ArraySize::Dynamic, stride, .. }, off)) => (off + *stride) as u64,
+                    _ => *span as u64,
+                },
+                naga::TypeInner::Array { size: naga::ArraySize::Dynamic, stride, .. } => *stride as u64,
+                _ => layouter[g.ty].size as u64,
+            };
+            out.insert((b.group, b.binding), size);
+        }
+        out
+    }
+
+    /// **THE SIZE GATE.** Every buffer the camera bind group carries for the GI must be at least as large as the
+    /// shader's declaration needs, placeholders included — wgpu validates this only at the DRAW, so a short buffer
+    /// ships as a crash on the first frame that draws an object (it did: sun placeholder 72 B, shader 80 B).
+    #[test]
+    fn the_camera_group_buffers_are_at_least_the_size_the_shaders_declare() {
+        let frag = min_binding_sizes(&format!("{}{}", GI_FRAGMENT_WGSL, GI_SHARED_WGSL.replace("__GI_DEBUG__", "0")));
+        let have = [(10u32, PROBES_DUMMY_BYTES, "probes"), (11, std::mem::size_of::<GiParams>() as u64, "params"), (12, VIS_DUMMY_BYTES, "vis"), (15, SUN_DUMMY_BYTES, "sun")];
+        for (binding, bytes, name) in have {
+            let need = *frag.get(&(0, binding)).unwrap_or_else(|| panic!("binding {binding} ({name}) is not declared"));
+            assert!(bytes >= need, "camera-group binding {binding} ({name}): buffer is {bytes} B, the shader declares {need} B");
+        }
+        // the real scene buffers are always larger than their placeholders (set_scene sizes them from the counts)
+        assert!(SUN_HDR_BYTES + SUN_CASCADES as u64 * SUN_RES as u64 * SUN_RES as u64 * 16 >= SUN_DUMMY_BYTES);
+    }
 
     fn check(name: &str, src: &str) {
         let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| panic!("{name}: WGSL parse error:\n{}", e.emit_to_string(src)));
@@ -1471,8 +2395,10 @@ mod tests {
         assert!(COMPUTE_WGSL.contains(&format!("const SLOT_SKY: u32 = {}u;", SLOT_SKY)));
         assert_eq!(SLOT_RELOC, 9);
         assert!(SLOT_GATHER == 10 && SLOT_SKY == SLOT_GATHER + 9 && SH_N == SLOT_SKY + 9);
-        // 11 vec4 / u32x4 in the uniform block (WGSL struct has the same 11 members)
-        assert_eq!(std::mem::size_of::<GiParams>(), 11 * 16);
+        // 14 vec4 in the uniform block (WGSL struct has the same 14 members: 11 + the inner grid's three)
+        assert_eq!(std::mem::size_of::<GiParams>(), 14 * 16);
+        assert_eq!(GI_FRAGMENT_WGSL.matches("inner_base: vec4<i32>").count(), 1);
+        assert_eq!(COMPUTE_DECLS_WGSL.matches("inner_base: vec4<i32>").count(), 1);
         assert_eq!(GI_FRAGMENT_WGSL.matches("dynp: vec4<u32>").count(), 1);
         assert_eq!(COMPUTE_DECLS_WGSL.matches("dynp: vec4<u32>").count(), 1);
     }

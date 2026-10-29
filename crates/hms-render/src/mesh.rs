@@ -4255,7 +4255,11 @@ fn calc_simple_lights(world_pos: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
         let cone = pow(saturate((cos_ang - L.cone.x) * max(L.cone.y, 1e-4)), max(L.cone.z, 1.0));
         let ang_atten = mix(cone, 1.0, L.dir_sphere.w);
         let ndl = saturate(dot(n, lhat) + 0.06);        // engine cosine raise
-        sum += L.color_smooth.xyz * (ndl * ang_atten * dist_att * 0.3183);
+        // a BAKED stli light (smooth lane = 2, real-time probe GI only): its direct term is in the shipped lightmap, so the
+        // lit-by-probes mode draws it here and hides it behind walls with the probe field's own distance maps
+        var lvis = 1.0;
+        if (L.color_smooth.w > 1.5 && gi_on()) { lvis = gi_light_vis(world_pos, n, L.pos_cutoffsq.xyz); }
+        sum += L.color_smooth.xyz * (ndl * ang_atten * dist_att * 0.3183 * lvis);
     }
     return min(sum, vec3<f32>(8.0, 8.0, 8.0));
 }
@@ -4737,7 +4741,7 @@ __SKIN_WIND__
     // cross(axis, to_camera) so the ribbon always faces the viewer without a CPU rebuild.
     if (v.bump_xform.w > 3.5 && v.bump_xform.w < 4.5) {
         let axis = normalize(v.tangent.xyz);
-        let to_cam = cam.cam_pos.xyz - world.xyz;
+        let to_cam = cam.cam_pos.xyz * (1.0 - cam.time.w) - world.xyz;
         var across = cross(axis, to_cam);
         let al = length(across);
         let fallback = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), abs(axis.x) > 0.9);
@@ -4757,7 +4761,9 @@ __SKIN_WIND__
     o.itint = v.tint;             // RAW instance colour — holo markers must NOT be modulated by the
                                   // per-vertex airprobe ambient (it corrupted team-tint hues).
     o.vdepth = o.clip.w;   // linear view-space distance for aerial fog
-    o.world_pos = world.xyz;
+    // #fp-wave  cam.time.w = 1 on the first-person lane: `world` is RELATIVE to cam_pos (the rig's
+    // origin), so the vertex transform stays small; every consumer of a world position gets it back.
+    o.world_pos = world.xyz + cam.cam_pos.xyz * cam.time.w;
     o.scroll = v.scroll.xy;   // UV scroll rate/sec (waterfalls); 0 elsewhere
     o.tile = v.scroll.zw;     // per-material base-map UV tile (1,1 = untiled)
     o.detail_xform = v.detail_xform;  // opaque detail-map xform; [0;4] = fallback
@@ -5364,7 +5370,8 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     if (gi_on()) {
         let gi_v = normalize(cam.cam_pos.xyz - i.world_pos);
         let gi_e = gi_irradiance(i.world_pos, n, gi_v);
-        bake = vec4<f32>(gi_e, 1.0);
+        // the sun's visibility from the ray-traced cascades takes the place of the baked DM.g / PVL vis
+        bake = vec4<f32>(gi_e, gi_sun_vis(i.world_pos, n, i.lm.w > 1.5));
         bake_fill = gi_e;
         key = normalize(light.sun_dir.xyz);
         sun_col = light.sun_tint.rgb;
@@ -9147,7 +9154,7 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     // normal, like mesh_shade) when this terrain mesh is atlas-lit; else the per-vertex i.vcolor.
     var bake = i.vcolor;
     if (i.lm.x > 0.5) { bake = t_lightmap_tint(i.uv2, n, i.lm.y, i.lm.z).total; }
-    if (gi_on()) { bake = vec4<f32>(gi_irradiance(i.world_pos, n, normalize(cam.cam_pos.xyz - i.world_pos)), 1.0); }
+    if (gi_on()) { bake = vec4<f32>(gi_irradiance(i.world_pos, n, normalize(cam.cam_pos.xyz - i.world_pos)), gi_sun_vis(i.world_pos, n, false)); }
     let sun_dir = normalize(light.sun_dir.xyz);
     let ndl = max(dot(n, sun_dir), 0.0);
     let shadow = shadow_strength(i.world_pos);

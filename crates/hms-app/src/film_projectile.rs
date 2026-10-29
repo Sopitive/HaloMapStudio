@@ -15,12 +15,10 @@
 //!   `projectile_object_impact_effect` (7) and `projectile_attached` (4) as well as
 //!   `action_weapon_fire` (26).
 //!
-//! What it does NOT state is a bullet. A rifle round is predicted on each client and never
-//! replicated, so those have to be simulated — and the honest limit on simulating them is the
-//! AIM: a Reach film records one player's look direction and zero-fills everybody else's (see
-//! `film_play::ActorDriver::live_aim`). A shot whose direction the recording does not state is
-//! **not drawn**, and the caption says how many were dropped, rather than aiming it along the
-//! body yaw and calling that a simulation.
+//! What it does NOT state is a bullet: a rifle round is predicted on each client and never
+//! replicated. Those are flown from the `action_weapon_fire` events by `film_shots` /
+//! `play_projectile`, with the recorder's exact aim where the film has it and an inferred aim
+//! otherwise (a Reach film records one player's look direction and zero-fills every other slot's).
 //!
 //! # The three lanes
 //!
@@ -160,6 +158,12 @@ pub fn install(sc: &mut crate::scene::SceneController, want: &[FilmEffect]) -> F
                 // `plasma_grenade` all author exactly `["root"]`, and the first three carry no
                 // render model at all, so there is no marker it could ever have meant.
                 (Vec3::ZERO, Quat::IDENTITY)
+            } else if fx.mode == WORLD_BURST_MODE {
+                // A world burst (explosion, impact) is placed at its contact point: the markers its
+                // systems name are locations of the effect's OWN placement, which is the frame
+                // itself. Measured: every explosion's `cpem` systems name one, so skipping them
+                // drew nothing at all.
+                (Vec3::ZERO, Quat::IDENTITY)
             } else if fx.mode == 0 || fx.mode == 0xFFFF_FFFF {
                 // The effect names a marker and this definition has no model to find it on.
                 // Counted and skipped, never swapped for the origin -- that substitution is
@@ -213,6 +217,8 @@ pub struct WeaponShot {
     pub projectile: Option<(u32, ProjectileDef)>,
     /// `rounds per second` of barrel 0 (initial), for the diagnostics.
     pub rounds_per_second: f32,
+    /// `rounds between tracers` of barrel 0 (see `Barrel::rounds_between_tracers`).
+    pub rounds_between_tracers: i16,
 }
 
 /// What one `proj` plays, resolved once per film.
@@ -224,10 +230,41 @@ pub struct ProjectileFx {
     /// Its travelling attachments: `obje` +0x104 effects that are LOOPING, i.e. persistent for
     /// the life of the projectile.
     pub attached: Vec<u32>,
+    /// Its LIGHT VOLUMES: `(ltvl tag, marker string id)` -- a plasma bolt's own `ltvl` attachment and
+    /// the `light_volume_system` of its attached effects (a rifle tracer).
+    /// See [`crate::reach_projectile::projectile_beam_parts`].
+    pub beams: Vec<(u32, u32)>,
+    /// Its CONTRAILS: `(cntl tag, marker string id)`. A rifle round's tracer is one of these and
+    /// nothing else. See [`crate::reach_projectile::projectile_contrail_parts`].
+    pub contrails: Vec<(u32, u32)>,
     /// `detonation effect (ground)` falling back to `(airborne)` — what an impact plays.
     pub detonation: Option<u32>,
     /// The tag leaf, for the diagnostics.
     pub name: String,
+}
+
+impl ProjectileFx {
+    /// Resolve one `proj`: its flight summary, render model, travelling attachments and
+    /// detonation. The ONE constructor -- Theater's table and test mode's `play_projectile::Law`
+    /// both read a projectile through it.
+    pub fn read(
+        native: &hms_native::NativeDll,
+        cache: hms_native::CacheHandle,
+        proj: u32,
+        mut object_effects: impl FnMut(u32) -> Vec<u32>,
+    ) -> Option<ProjectileFx> {
+        let def = crate::reach_projectile::projectile_def(native, cache, proj)?;
+        let name = native.tag_name(cache, proj).unwrap_or_default();
+        Some(ProjectileFx {
+            def,
+            mode: native.resolve_mode(cache, proj),
+            attached: object_effects(proj),
+            beams: crate::reach_projectile::projectile_beam_parts(native, cache, proj),
+            contrails: crate::reach_projectile::projectile_contrail_parts(native, cache, proj),
+            detonation: def.detonation_effect(false),
+            name: name.rsplit('\\').next().unwrap_or("").to_string(),
+        })
+    }
 }
 
 /// Everything about one film's weapons and projectiles, resolved once when the map is open.
@@ -271,6 +308,8 @@ impl ProjectileTable {
                         def: d,
                         mode: native.resolve_mode(cache, p),
                         attached: object_effects(p),
+                        beams: crate::reach_projectile::projectile_beam_parts(native, cache, p),
+                        contrails: crate::reach_projectile::projectile_contrail_parts(native, cache, p),
                         detonation: d.detonation_effect(false),
                         name: name.rsplit('\\').next().unwrap_or("").to_string(),
                     }
@@ -283,6 +322,7 @@ impl ProjectileTable {
                     mode: native.resolve_mode(cache, w),
                     projectile: proj,
                     rounds_per_second: b.rounds_per_second[0],
+                    rounds_between_tracers: b.rounds_between_tracers,
                 },
             );
         }
@@ -309,6 +349,8 @@ impl ProjectileTable {
                 def: d,
                 mode: native.resolve_mode(cache, proj),
                 attached: object_effects(proj),
+                beams: crate::reach_projectile::projectile_beam_parts(native, cache, proj),
+                contrails: crate::reach_projectile::projectile_contrail_parts(native, cache, proj),
                 detonation: d.detonation_effect(false),
                 name: name.rsplit('\\').next().unwrap_or("").to_string(),
             },
@@ -331,6 +373,114 @@ impl ProjectileTable {
 // ---------------------------------------------------------------------------------------------
 // The recorded flight of one projectile
 // ---------------------------------------------------------------------------------------------
+
+/// #projectile-sim  The TRAVELLING effects of one projectile -- its `obje` attachments (a rocket's
+/// smoke, a plasma bolt's glow, a bullet's streak) -- as moving sources.
+///
+/// **The one producer.** Theater (`ActorDriver::film_effects`, from a recorded track) and test
+/// mode (`play_projectile::Field::effects`, from a simulated flight) both build their trail
+/// through this function, so a projectile is drawn the same way whoever flew it: same seeds, same
+/// marker rule (`mode`), same moving-source path. `path` is the flight so far in scene seconds.
+pub fn trail_effects(
+    id: u32,
+    fx: &ProjectileFx,
+    world: Mat4,
+    born: f32,
+    path: std::sync::Arc<Vec<(f32, Vec3)>>,
+) -> Vec<FilmEffect> {
+    fx.attached
+        .iter()
+        .enumerate()
+        .map(|(i, &effe)| FilmEffect {
+            seed: FILM_FX_SEED ^ 0x02 ^ ((id as u64) << 24) ^ ((i as u64) << 8),
+            effe,
+            mode: fx.mode,
+            world,
+            birth: born,
+            // A MOVING source: the flight, so the trail is left in the air behind the projectile
+            // instead of dragged along with it.
+            path: Some(path.clone()),
+            label: format!("trail #{id:#x} {}", fx.name),
+        })
+        .collect()
+}
+
+/// #projectile-sim  One LIGHT VOLUME a projectile draws itself with this frame.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilmBeam {
+    pub ltvl: u32,
+    pub marker_sid: u32,
+    /// The render model the marker is looked up on, or 0 (a model-less bullet: the beam then sits
+    /// on the projectile's origin along its forward).
+    pub mode: u32,
+    pub world: Mat4,
+}
+
+/// #projectile-sim  The light volumes of one projectile at `world`. The ONE producer, shared by
+/// Theater and test mode exactly as [`trail_effects`] is.
+pub fn trail_beams(fx: &ProjectileFx, world: Mat4) -> Vec<FilmBeam> {
+    fx.beams.iter().map(|&(ltvl, marker_sid)| FilmBeam { ltvl, marker_sid, mode: fx.mode, world }).collect()
+}
+
+/// #projectile-sim  One CONTRAIL a projectile draws itself with: the tracer of a bullet.
+pub type FilmContrail = crate::scene::FilmContrail;
+
+/// #projectile-sim  The contrails of one projectile at `world`, laid on the flight so far (`path`,
+/// scene seconds) from `born`. The ONE producer for Theater and test mode, like [`trail_effects`].
+pub fn trail_contrails(fx: &ProjectileFx, world: Mat4, born: f32, path: std::sync::Arc<Vec<(f32, Vec3)>>) -> Vec<FilmContrail> {
+    fx.contrails
+        .iter()
+        .map(|&(cntl, marker_sid)| FilmContrail { cntl, marker_sid, mode: fx.mode, world, birth: born, path: path.clone() })
+        .collect()
+}
+
+/// #projectile-sim  Hand the frame's contrails to the scene (replaces the previous frame's).
+pub fn install_contrails(sc: &mut crate::scene::SceneController, want: Vec<FilmContrail>) {
+    sc.set_film_contrails(want);
+}
+
+/// #projectile-sim  Hand the frame's light volumes to the scene (replaces the previous frame's).
+pub fn install_beams(sc: &mut crate::scene::SceneController, want: &[FilmBeam]) -> usize {
+    let w: Vec<(u32, u32, u32, Mat4)> = want.iter().map(|b| (b.ltvl, b.marker_sid, b.mode, b.world)).collect();
+    sc.set_film_beams(&w);
+    sc.film_beam_count()
+}
+
+/// `FilmEffect::mode` of a world burst: no render model, and named locations are the frame itself.
+pub const WORLD_BURST_MODE: u32 = 0xFFFF_FFFE;
+
+/// #projectile-sim  A projectile's ending as a ONE-SHOT in the world: an explosion or an impact
+/// spark. Its systems name no marker, so it has no model (`mode` 0).
+pub fn burst_effect(kind: u64, id: u32, effe: u32, at: Vec3, normal: Option<Vec3>, born: f32, label: String) -> FilmEffect {
+    FilmEffect {
+        seed: FILM_FX_SEED ^ kind ^ ((id as u64) << 24),
+        effe,
+        mode: WORLD_BURST_MODE,
+        world: effect_frame(at, normal),
+        birth: born,
+        path: None,
+        label,
+    }
+}
+
+/// #projectile-sim  The frame an impact or detonation effect plays in: at `at`, its forward (+X, the
+/// axis an effect's emitters and light volumes run along -- the lift lane's marker maps +X to up)
+/// along `normal`, which is the surface the projectile struck (or world up when it ended in the air).
+/// INFERRED convention (the engine builds its own effect vectors in `build_common_effect_vectors`);
+/// with no normal the effect keeps the world axes, exactly as before.
+pub fn effect_frame(at: Vec3, normal: Option<Vec3>) -> Mat4 {
+    let Some(n) = normal.map(|n| n.normalize_or_zero()).filter(|n| *n != Vec3::ZERO) else {
+        return Mat4::from_translation(at);
+    };
+    let hint = if n.z.abs() > 0.99 { Vec3::X } else { Vec3::Z };
+    let y = hint.cross(n).normalize();
+    let z = n.cross(y);
+    Mat4::from_cols(n.extend(0.0), y.extend(0.0), z.extend(0.0), at.extend(1.0))
+}
+
+/// Seed kind of a detonation (`0x03`, as the recorded lane has always used) and of an impact.
+pub const SEED_DETONATION: u64 = 0x03;
+pub const SEED_IMPACT: u64 = 0x04;
 
 /// The recorded path of one projectile, in SCENE SECONDS, ready to hand to a moving particle
 /// source.

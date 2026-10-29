@@ -341,6 +341,8 @@ pub enum EditorCommand {
     /// #wire-visible  `wirexray on|off`: draw the selection wireframe THROUGH other objects
     /// (View > "Selection wireframe through objects", default off); `wirexray get` (None) reports.
     WireXray(Option<bool>),
+    /// #cannon-preview  `cannontraj on|off|get`: the selected man cannon's landing-spot preview.
+    CannonPreview(Option<bool>),
     /// #quant-error  `precision …`: the save-precision prediction -- what pose the `.mvar` will
     /// actually hold once the game's quantisers have had their way with it.
     ///   `precision` / `precision get`      the open variant's grid + aggregate error stats
@@ -887,7 +889,7 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
         // #film  Reach Theater saved films.
         "film" | "theater" | "clip" => {
             let sub = t.get(1).map(|s| s.to_string()).ok_or(
-                "film <path> | info | scene | index | seek <s> | step <n> | speed <x> | play | pause | show | ragdoll [on|off] | extract variant|gametype [dir] | records | folders",
+                "film <path> | info | scene | index | seek <s> | step <n> | speed <x> | play | pause | show | ragdoll [on|off] | extract variant|gametype [dir] | records | folders | megalo [decls|vars|at <t>|get <scope> <owner> <kind> <slot>] | variant | events | seats | score | highlight | objects [filter...] | object <id> | inside <id|filter...> [time|a..b] | near <id> r=R | dump",
             )?;
             let args = t.get(2..).map(|v| v.iter().map(|s| s.to_string()).collect()).unwrap_or_default();
             EditorCommand::Film { sub, args }
@@ -901,6 +903,9 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
         // #wire-visible  the selection wireframe's depth mode (View menu).
         "wirexray" | "wire_xray" | "wirethrough" | "xraywire" => {
             EditorCommand::WireXray(parse_onoff_get(t.get(1).copied(), "wirexray")?)
+        }
+        "cannontraj" | "mancannon" | "cannonpreview" => {
+            EditorCommand::CannonPreview(parse_onoff_get(t.get(1).copied(), "cannontraj")?)
         }
         "softceilings" | "softceiling" | "soft_ceilings" | "ceilings" | "mapfloor" | "floor" => {
             EditorCommand::SoftCeilings(parse_onoff_get(t.get(1).copied(), "softceilings")?)

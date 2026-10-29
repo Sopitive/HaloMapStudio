@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.6.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -27,6 +27,7 @@
 <li><a href="scripting.html">Scripting reference</a></li>
 <li><a href="headless.html" class="cur" aria-current="page">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
@@ -46,6 +47,7 @@
 <li><a href="#switches">Forge FX, flags and overlays in batch renders</a></li>
 <li><a href="#batch">Batch rendering with scripts</a></li>
 <li><a href="#dump-maps">--dump-maps and other flags</a></li>
+<li><a href="#follow">--film-follow: stream a Theater film as JSON lines</a></li>
 <li><a href="#env">Environment variables</a></li>
 <li><a href="#gpu">GPU notes</a></li>
 </ul></div>
@@ -120,7 +122,8 @@ foreach variants all as $v
   camera frame
   screenshot out/$stem.png 1280x720
 end</code></pre>
-<pre><code>./hms-app --script shots.hscr            # or:  hms-app.exe --exec "loadmap 45_aftship" "camera frame" "screenshot zealot.png 1920x1080"</code></pre>
+<pre><code>./hms-app --script shots.hscr            # or, one quoted string with newlines:
+./hms-app --exec $'loadmap 45_aftship\ncamera frame\nscreenshot zealot.png 1920x1080'</code></pre>
 <p><code>list variants all</code> (and <code>foreach variants</code>) enumerate the <code>mvars/</code> folder next to the executable plus any folders in <code>HMS_MVAR_DIRS</code> (<code>;</code>-separated, searched recursively). <code>HMS_SHOT_SIZE</code> sets the initial render size for the headless script runner as well; individual <code>screenshot</code> commands can override it. Every command is documented in the <a href="scripting.html">Scripting reference</a>.</p>
 
 <h2 id="dump-maps">--dump-maps and other flags</h2>
@@ -142,6 +145,25 @@ end</code></pre>
 <tr><td><code>--resolve-mvar &lt;map&gt; &lt;mvar&gt; [--all]</code></td><td>Show how each object in a variant resolves against a map's palette — useful when the GUI reports unresolved objects.</td></tr>
 </table></div>
 <p class="small">Further flags (<code>--bench-mvar</code>, <code>--dump-model</code>, <code>--dump-mask</code>, <code>--dump-parts</code>) exist for development and are not documented here.</p>
+
+<h2 id="follow"><code>--film-follow</code>: stream a Theater film as JSON lines</h2>
+<p>Reads a saved film, or a <code>.temp</code> the game is still writing, and prints what happens in it as one JSON object per line. It never opens a window, a GPU device or audio: the flag is handled before any of those exist, so it works over SSH, in a service, or with no display at all. Run it in the background and read its output.</p>
+<pre><code>hms-app --film-follow &lt;film.temp|film.mov&gt; [--emit json-lines|csv] [--poll-ms 1000] [--since T]
+        [--watch-label NAME]... [--watch-id ID]... [--watch-radius R]
+        [--objects] [--filter key=value]... [--all-events] [--clock] [--map cache.map] [--once] [--max-seconds N]</code></pre>
+<div class="tablewrap"><table>
+<tr><th>Flag</th><th>Meaning</th></tr>
+<tr><td><code>--emit</code></td><td><code>json-lines</code> (default) or <code>csv</code> with columns <code>id,tick,seconds,type,data</code>.</td></tr>
+<tr><td><code>--poll-ms</code></td><td>How often to look at the file (default 1000, minimum 20). The game rewrites a <code>.temp</code> about every 15 seconds.</td></tr>
+<tr><td><code>--since T</code></td><td>Skip events at or before <code>T</code> (seconds, <code>mm:ss</code> or <code>t1234</code>) &mdash; how a consumer resumes after a restart.</td></tr>
+<tr><td><code>--watch-label NAME</code> / <code>--watch-id ID</code></td><td>Report <code>zone_enter</code> / <code>zone_exit</code> for bodies and vehicles entering the object(s) with that Forge label or id. Repeatable. An object with no boundary of its own needs <code>--watch-radius R</code> (a sphere around it).</td></tr>
+<tr><td><code>--objects</code>, <code>--filter</code></td><td>Also report <code>object_spawn</code> / <code>object_delete</code>, optionally only for objects matching the filters (same keys as <code>film objects</code>).</td></tr>
+<tr><td><code>--all-events</code>, <code>--clock</code></td><td>Include every event-channel event (not just kills and medals); include the once-a-second round clock.</td></tr>
+<tr><td><code>--map</code></td><td>Resolve object definitions to tag paths.</td></tr>
+<tr><td><code>--once</code></td><td>Process the file as it is and exit.</td></tr>
+</table></div>
+<p>Every event has <code>id</code> (<code>&lt;tick&gt;-&lt;n&gt;</code>), <code>tick</code>, <code>seconds</code> and <code>type</code>. The stream is deterministic, so ids never repeat across refreshes and <code>--since</code> is safe. Nothing is printed until the film has 256 records (about four seconds). If the file is replaced by a different match, a <code>reset</code> event is printed and following starts over. Standard output carries only events; status lines (<code>refresh: ...</code>, <code>waiting: ...</code>) go to standard error.</p>
+<p>The event types (<code>player_join</code>, <code>incident</code>, <code>score</code>, <code>megalo</code>, <code>game</code>, <code>object_spawn</code>, <code>zone_enter</code> / <code>zone_exit</code>, &hellip;) with all their fields, how to follow a <code>.temp</code> the game is still writing (it rewrites the file about every 15 seconds), resuming with <code>--since</code>, the measured polling cost, and shell and Python consumers are on the <a href="film-data.html#follow">Film data</a> page. The same decoders are available as <a href="film-data.html#verbs">script verbs</a> (<code>film objects</code>, <code>film inside</code>, <code>film megalo</code> ...) for reading a finished film.</p>
 
 <h2 id="env">Environment variables</h2>
 <div class="tablewrap"><table>
@@ -167,7 +189,7 @@ end</code></pre>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.6.0 source (2026-10-21). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

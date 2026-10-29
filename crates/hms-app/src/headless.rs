@@ -1255,15 +1255,32 @@ pub fn run() -> anyhow::Result<()> {
         let n: u32 = std::env::var("HMS_RTGI_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
         let ship = scene.shipped_airprobes();
         logln!("RTGI_COMPARE {} shipped airprobes", ship.len());
+        // The baked-lightmap frame of this very view, captured BEFORE the real-time field exists; the real-time
+        // frame follows the engine pass below. Same camera, same meter warm-up (3 frames each).
+        for _ in 0..3 { renderer.render(&device, &queue, &cam, shot_time); }
+        let (baked_px, _, _) = renderer.capture_rgba(&device, &queue);
         for (label, engine) in [("BEFORE (legacy sky model)", false), ("AFTER  (engine sky lights)", true)] {
             let Some(mut sd) = scene.rtgi_scene_data() else { logln!("RTGI_COMPARE: no occluder geometry"); break };
             if !engine { sd.sky = None; }
             renderer.set_rtgi_scene(&device, &queue, &sd);
             renderer.set_rtgi_enabled(&queue, true);
+            renderer.rtgi_focus([cam.pos.x, cam.pos.y, cam.pos.z]);
             renderer.rtgi_warm_up(&device, &queue, n);
             let (probes, o, sp, d) = renderer.rtgi_probes(&device, &queue);
             let st = crate::rtgi_compare::compare(&ship, &probes, o, sp, d);
             logln!("{}", crate::rtgi_compare::report(label, &st));
+            // sun visibility at the shipped airprobes (their baked `mask`) and the whole frame, vs the baked frame
+            let cam_p = [cam.pos.x, cam.pos.y, cam.pos.z];
+            renderer.rtgi_update_sun_now(&device, &queue, cam_p);
+            let pts: Vec<([f32; 3], [f32; 3])> = ship.iter().map(|p| (p.pos, [0.0, 0.0, 1.0])).collect();
+            let vis = renderer.rtgi_sample_sun_vis(&device, &queue, &pts, false);
+            let masks: Vec<f32> = ship.iter().map(|p| p.mask).collect();
+            let near: Vec<usize> = (0..pts.len()).filter(|&i| (0..3).all(|a| (pts[i].0[a] - cam_p[a]).abs() < 400.0)).collect();
+            let (ra, rb): (Vec<f32>, Vec<f32>) = near.iter().map(|&i| (masks[i], vis[i])).unzip();
+            logln!("{}", crate::rtgi_compare::mask_report(&format!("{label} sun visibility vs shipped airprobe masks (within 400 wu of the camera)"), &crate::rtgi_compare::mask_compare(&ra, &rb)));
+            for _ in 0..3 { renderer.render(&device, &queue, &cam, shot_time); }
+            let (rt_px, _, _) = renderer.capture_rgba(&device, &queue);
+            logln!("{}", crate::rtgi_compare::frame_report(&format!("{label} frame vs baked-lightmap frame"), &crate::rtgi_compare::frame_stats(&baked_px, &rt_px)));
         }
     }
     if std::env::var("HMS_RTGI").is_ok() {
@@ -1272,6 +1289,8 @@ pub fn run() -> anyhow::Result<()> {
             Some(sd) => {
                 renderer.set_rtgi_scene(&device, &queue, &sd);
                 renderer.set_rtgi_enabled(&queue, true);
+                renderer.rtgi_focus([cam.pos.x, cam.pos.y, cam.pos.z]);
+                scene.set_stli_direct(scene.engine_sky_lights().is_some());
                 let n: u32 = std::env::var("HMS_RTGI_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(48);
                 let t1 = std::time::Instant::now();
                 renderer.rtgi_warm_up(&device, &queue, n);

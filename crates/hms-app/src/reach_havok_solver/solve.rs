@@ -202,6 +202,9 @@ fn safe_rsqrt(x: f32) -> f32 {
 ///   rec4 = e * vn * (dt/8) * -1.3
 ///   mem  = e <= 0 ? 0 : rec4 + dist
 /// ```
+/// Approach speed (wu/s) below which a new contact point gets no restitution seed.
+pub(super) const RESTITUTION_SEED_SPEED: f32 = 0.5;
+
 pub(super) fn init_new_points(m: &mut Manifold, bodies: &[HavokBody], info: &SolverInfo) {
     let pa = &bodies[m.a];
     let (ima, vb_lin, vb_ang, comb, imb) = match m.b {
@@ -215,9 +218,14 @@ pub(super) fn init_new_points(m: &mut Manifold, bodies: &[HavokBody], info: &Sol
         let vb = vb_lin + vb_ang.cross(p.pos - comb);
         let vn = p.normal.dot(va - vb);
         p.st.impulse = 1.0 / (ima + imb + 1.0e-10) * -0.2 * vn * (e + 1.0);
-        let rec4 = e * vn * info.sub_dt * -1.3;
+        // Restitution is seeded only for a real impact. A body at rest on a seam or a hull's edge re-admits its contact
+        // points every few ticks (the engine's admission rule); each re-admission with `e > 0` took the point's penetration as
+        // already absorbed and added a bounce, and a rocking rifle pumped itself up from 0.07 to 5 rad/s and slid off its
+        // table. INFERRED (not the engine's rule as far as it was read).
+        let e_seed = if vn.abs() < RESTITUTION_SEED_SPEED { 0.0 } else { e };
+        let rec4 = e_seed * vn * info.sub_dt * -1.3;
         p.st.pending = rec4;
-        p.st.mem = if e <= 0.0 { 0.0 } else { rec4 + p.dist };
+        p.st.mem = if e_seed <= 0.0 { 0.0 } else { rec4 + p.dist };
         p.st.is_new = false;
     }
 }
@@ -839,6 +847,22 @@ mod tests {
         assert!((p.st.mem - (0.0027083 + 0.01)).abs() < 1e-6, "mem {}", p.st.mem);
         assert!((p.st.impulse - 6.0).abs() < 1e-3, "rec0 {}", p.st.impulse);
         assert!(!p.st.is_new);
+    }
+
+    /// A point admitted at a creep (0.2 wu/s) gets no restitution seed: `mem` 0 and no bounce, as for `e = 0`; one admitted at an
+    /// impact (2 wu/s, above) does (`new_point_seed_numbers`).
+    ///
+    /// SABOTAGE: `RESTITUTION_SEED_SPEED` -> 0 -> red here (and the woken-props gates rock their rifles off tables).
+    #[test]
+    fn a_creeping_new_point_gets_no_restitution_seed() {
+        let info = info();
+        let mut a = point_mass(Vec3::new(0.0, 0.0, 0.5));
+        a.v = Vec3::new(0.0, 0.0, -0.2);
+        let mut m = Manifold::new(0, None, super::super::manifold::ContactMaterial { friction_code: 40, restitution_code: 64 });
+        m.sync(&[super::super::manifold::ContactPoint::new(1, Vec3::ZERO, Vec3::Z, -0.01)]);
+        init_new_points(&mut m, &[a], &info);
+        assert_eq!(m.points[0].st.pending, 0.0);
+        assert_eq!(m.points[0].st.mem, 0.0);
     }
 
     /// Friction cap: `mu_mean * sum(last normal impulses) / 8`.

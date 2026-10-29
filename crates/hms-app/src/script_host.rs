@@ -188,6 +188,8 @@ pub struct ScriptHost {
     /// `precision ghost on|off|<factor>` changes it), so a batch capture can show the predicted
     /// pose exactly as the interactive viewport does.
     quant_ghost: crate::quant_error_ui::GhostSetting,
+    /// #cannon-preview  run-local (`cannontraj on|off`), default off.
+    cannon_preview: crate::man_cannon_preview::State,
     /// Draw the structure-design soft ceilings (HMS_SOFT_CEILINGS seeds it,
     /// default off; `softceilings on|off` changes it for this run).
     show_soft_ceilings: bool,
@@ -282,7 +284,12 @@ impl ScriptHost {
         let mut renderer = SceneRenderer::new(&device, &queue, (w, h));
         renderer.show_grid = false;
         let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())).unwrap_or_default();
-        let dll_path = exe_dir.join(crate::PAYLOAD_DLL);
+        // The native library sits beside the app; a `cargo test` binary lives one level down in
+        // `deps/`, so look there too (this is what lets a gate drive the real script host).
+        let dll_path = [exe_dir.join(crate::PAYLOAD_DLL), exe_dir.join("..").join(crate::PAYLOAD_DLL)]
+            .into_iter()
+            .find(|p| p.is_file())
+            .unwrap_or_else(|| exe_dir.join(crate::PAYLOAD_DLL));
         let mut cam = Camera::default();
         cam.far = 8000.0;
         Ok(Self {
@@ -331,6 +338,7 @@ impl ScriptHost {
             show_physics_hull: false,
             wire_xray: crate::wire_xray::env_wire_xray(),
             quant_ghost: crate::quant_error_ui::env_setting().unwrap_or_default(),
+            cannon_preview: Default::default(),
             show_soft_ceilings: crate::soft_ceilings::env_show_soft_ceilings(),
             show_triggers: false,
             show_hard_floor: crate::hard_floor::env_show_hard_floor(),
@@ -921,11 +929,17 @@ impl ScriptHost {
         if crate::h4::mvar::is_h4_variant(std::path::Path::new(path)) {
             return self.h4_apply_variant(path);
         }
-        let t_all = Instant::now();
         let t_parse0 = Instant::now();
         let variant = mvar::parse_variant(std::path::Path::new(path))
             .ok_or_else(|| format!("cannot parse variant '{path}'"))?;
-        let t_parse = t_parse0.elapsed();
+        let stem = std::path::Path::new(path).file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        self.apply_variant_value(variant, stem, t_parse0.elapsed())
+    }
+
+    /// Apply an already-parsed variant (a file's, or the film's own in-memory one -- see
+    /// `film_export::variant_from_film`). `stem` names the scene for later captures.
+    fn apply_variant_value(&mut self, variant: mvar::Variant, stem: String, t_parse: std::time::Duration) -> Result<String, String> {
+        let t_all = Instant::now();
         self.seed_globals(variant.globals.clone());
         // The base-map (BSP + palette pre-decode) load is a one-time cost excluded from the
         // between-variant timing: it only fires when the base map id changes. Reported
@@ -1010,7 +1024,7 @@ impl ScriptHost {
             placed_pos.push(glam::Vec3::from(o.pos));
             placed += 1;
         }
-        self.cur_stem = std::path::Path::new(path).file_stem().unwrap_or_default().to_string_lossy().into_owned();
+        self.cur_stem = stem;
         self.dirty = true;
         // Camera priority — mirror the "initial loadout camera" intent on every variant:
         //   1. the authored spawning_camera object (the true initial loadout camera)
@@ -1189,6 +1203,10 @@ impl ScriptHost {
             if !want_fx.is_empty() || sc.film_particle_source_count() > 0 {
                 self.film_fx = crate::film_projectile::install(sc, &want_fx);
             }
+            if !self.film_driver.beams.is_empty() || !self.film_driver.contrails.is_empty() || sc.film_beam_count() > 0 {
+                crate::film_projectile::install_beams(sc, &self.film_driver.beams);
+                crate::film_projectile::install_contrails(sc, self.film_driver.contrails.clone());
+            }
         }
     }
 
@@ -1249,6 +1267,9 @@ impl ScriptHost {
                     .map(|sc| sc.build_particle_meshes(pos, fwd, right, up, anim_t, mr, &self.device, &self.queue))
             };
             if let Some(pm) = pm { self.renderer.set_particle_meshes(pm); }
+            // #projectile-sim  And the projectiles' light volumes.
+            let bm = self.scene.as_mut().map(|sc| sc.build_film_beam_meshes(anim_t, self.renderer.mesh_renderer(), &self.device, &self.queue));
+            if let Some(bm) = bm { self.renderer.set_beam_meshes(bm); }
         }
         let t_render0 = Instant::now();
         self.renderer.render(&self.device, &self.queue, &self.camera, anim_t);
@@ -1355,6 +1376,13 @@ impl ScriptHost {
         // wireframe in the same dedicated depth-ALWAYS lane the interactive viewport uses
         let mut ghost: Vec<([f32; 3], [f32; 3], [f32; 3])> = Vec::new();
         self.push_quant_ghost(&mut ghost);
+        // #cannon-preview  the selected cannon's arc, in the same lane the GUI draws it in
+        let mut retry = false;
+        match (self.cannon_preview.on, self.scene.as_ref()) {
+            (true, Some(sc)) => { self.cannon_preview.sync(sc, &self.objects, &self.selected, &mut retry); }
+            _ => { self.cannon_preview.clear(); }
+        }
+        ghost.extend(self.cannon_preview.segments());
         self.renderer.set_ghost_lines(&self.device, &ghost);
         self.renderer.set_xray_lines(&self.device, &xray);
         if self.show_triggers {
@@ -1493,6 +1521,10 @@ impl ScriptHost {
                 .map(|(k, v)| format!("{k:<18}{v}\n"))
                 .collect()
         };
+        // #film-data  megalo / variant / events / seats / score: shared with the GUI command server.
+        if let Some(r) = crate::film_data::dispatch(self.film_path.as_deref(), self.film.as_deref(), self.film_play.as_ref().map(|p| &p.index), sub, args) {
+            return r;
+        }
         match sub {
             "info" | "summary" => {
                 let f = self.film.as_deref().ok_or("film: no film open (film <path>)")?;
@@ -1529,7 +1561,7 @@ impl ScriptHost {
                 // new entity on every respawn.
                 let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
                 let f = film::open(&path).map_err(|e| e.to_string())?;
-                let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                let idx = crate::film_decode::build_index_film(&f);
                 let mut out = String::new();
                 let aimed: Vec<usize> =
                     (0..idx.player_aims.len()).filter(|&i| idx.player_aims[i].len() >= 30).collect();
@@ -1725,7 +1757,7 @@ impl ScriptHost {
                 if self.film_play.is_none() {
                     let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
                     let f = film::open(&path).map_err(|e| e.to_string())?;
-                    let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                    let idx = crate::film_decode::build_index_film(&f);
                     self.film_play = Some(crate::film_play::Playback::new(idx));
                 self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
                 }
@@ -2121,12 +2153,19 @@ impl ScriptHost {
                 }
                 if matches!(what, "gametype" | "gv" | "game" | "both") {
                     let stem = film_export::safe_stem(&f.header.game_variant.title, "extracted_gametype");
-                    match film_export::export_game_variant(&f, &dir.join(stem)) {
-                        Ok(r) => out.push_str(&format!(
-                            "gametype: {} bytes -> {} (raw struct, NOT a loadable .bin -- see {})\n",
-                            r.bytes, r.struct_path.display(),
-                            r.notes_path.file_name().unwrap_or_default().to_string_lossy()
-                        )),
+                    match film_export::export_game_variant(&f, &dir.join(format!("{stem}.bin"))) {
+                        Ok(r) => match (&r.bin_path, &r.why_no_bin) {
+                            (Some(bin), _) => out.push_str(&format!(
+                                "gametype: {} bytes -> {} (a loadable Reach game variant .bin; notes in {})\n",
+                                r.bytes, bin.display(),
+                                r.notes_path.file_name().unwrap_or_default().to_string_lossy()
+                            )),
+                            (None, why) => out.push_str(&format!(
+                                "gametype: no .bin could be built ({}); raw struct ({} bytes) -> {} instead\n",
+                                why.clone().unwrap_or_default(), r.bytes,
+                                r.struct_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                            )),
+                        },
                         Err(e) => out.push_str(&format!("gametype: {e}\n")),
                     }
                 }
@@ -2173,7 +2212,7 @@ impl ScriptHost {
             "index" => {
                 let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
                 let f = film::open(&path).map_err(|e| e.to_string())?;
-                let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                let idx = crate::film_decode::build_index_film(&f);
                 let text = idx.report();
                 self.film_play = Some(crate::film_play::Playback::new(idx));
                 self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
@@ -2184,7 +2223,7 @@ impl ScriptHost {
                     // `film seek` implies an index; build it rather than scolding the user.
                     let path = self.film_path.clone().ok_or("film: no film open (film <path>)")?;
                     let f = film::open(&path).map_err(|e| e.to_string())?;
-                    let idx = crate::film_decode::build_index_players(&f.bytes, &f.data, &f.header.map_variant, f.recorder_slot(), &f.header.players);
+                    let idx = crate::film_decode::build_index_film(&f);
                     self.film_play = Some(crate::film_play::Playback::new(idx));
                 self.film_spawn_weapon = None; // #gamevariant re-arm for the new index
                 }
@@ -2213,14 +2252,14 @@ impl ScriptHost {
                 // while. `film <path>` stays header-only (it must work with no map loaded at
                 // all), so this is the first point where a scene is both wanted and possible.
                 if self.film_scene.is_none() {
-                    let note = match self.film.as_deref().map(crate::film_export::scene_request) {
+                    let note = match self.film.as_deref().map(crate::film_export::variant_from_film) {
                         None => "no film open".to_string(),
                         Some(Err(why)) => format!("no Forge scene: {why}"),
-                        Some(Ok(r)) => {
-                            let p = r.path.to_string_lossy().into_owned();
-                            let n = r.objects;
-                            match self.apply_variant(&p) {
-                                Ok(_) => format!("Forge scene: {n} object(s) from {:?}", r.title),
+                        Some(Ok(v)) => {
+                            let n = v.objects.len();
+                            let title = v.title.clone();
+                            match self.apply_variant_value(v, "film_scene".into(), std::time::Duration::ZERO) {
+                                Ok(_) => format!("Forge scene: {n} object(s) from {title:?}"),
                                 Err(e) => format!("no Forge scene: the variant would not apply ({e})"),
                             }
                         }
@@ -2296,6 +2335,15 @@ impl ScriptHost {
                             rep.created,
                             self.film_scene.as_deref().unwrap_or("scene not attempted")
                         );
+                        // #projectile-sim  Theater's simulated shots, before the mesh build, exactly
+                        // where the window runs them.
+                        {
+                            let sc = self.scene.as_deref().unwrap();
+                            let world = crate::play_projectile::SceneWorld(sc as &dyn crate::objscene::ObjectScene);
+                            if let Some(cache) = sc.cache_handle() {
+                                self.film_driver.synth_shots(&pbc, Some(&world), &mut self.actors, sc.native_dll(), cache);
+                            }
+                        }
                         if self.actors.rebuild {
                             let b = crate::reach_actor::build_actor_meshes(
                                 &mut self.actors, self.scene.as_mut().unwrap(),
@@ -2571,13 +2619,14 @@ impl ScriptHost {
                 Ok(dirs.iter().map(|d| format!("{}\n", d.display())).collect())
             }
             // #film-action  Still here to FORCE a redraw; playback now does it by itself. One
-            // decision, in `film_export::scene_request`.
+            // decision, in `film_export::variant_from_film`.
             "scene" | "draw" => {
                 let f = self.film.clone().ok_or("film: no film open (film <path>)")?;
-                let r = film_export::scene_request(&f).map_err(|e| format!("film scene: {e}"))?;
-                let applied = self.apply_variant(&r.path.to_string_lossy())?;
-                self.film_scene = Some(format!("Forge scene: {} object(s) from {:?}", r.objects, r.title));
-                Ok(format!("film scene: {} objects from {:?}\n{applied}", r.objects, r.title))
+                let v = film_export::variant_from_film(&f).map_err(|e| format!("film scene: {e}"))?;
+                let (n, title) = (v.objects.len(), v.title.clone());
+                let applied = self.apply_variant_value(v, "film_scene".into(), std::time::Duration::ZERO)?;
+                self.film_scene = Some(format!("Forge scene: {n} object(s) from {title:?}"));
+                Ok(format!("film scene: {n} objects from {title:?}\n{applied}"))
             }
             other => {
                 let path = std::path::PathBuf::from(other);
@@ -3164,6 +3213,16 @@ impl ScriptHost {
             // #quant-error  The save-precision prediction, headless. Same numbers and the same
             // snap as the interactive app (the host has no viewport, so `ghost` only reports).
             EditorCommand::Precision { sub, args } => self.precision_cmd(&sub, &args),
+            // #cannon-preview  Run-local; recomputed and drawn on every screenshot.
+            EditorCommand::CannonPreview(set) => {
+                if let Some(on) = set { self.cannon_preview.on = on; }
+                let mut retry = false;
+                if let (true, Some(sc)) = (self.cannon_preview.on, self.scene.as_ref()) {
+                    self.cannon_preview.sync(sc, &self.objects, &self.selected, &mut retry);
+                }
+                let lines: Vec<String> = self.cannon_preview.results.iter().map(|t| format!("  {:#x}: {:?} {}", t.datum, t.verdict, t.label().join(" | "))).collect();
+                Ok(format!("man cannon trajectory: {}\n{}", if self.cannon_preview.on { "on" } else { "off" }, lines.join("\n")))
+            }
             // Run-local; the overlay is re-merged on every screenshot.
             EditorCommand::SoftCeilings(set) => {
                 if let Some(on) = set { self.show_soft_ceilings = on; }
@@ -3250,6 +3309,13 @@ impl ScriptHost {
             // #play  Test mode is a WINDOW mode: it needs the viewport's own input, camera and
             // per-frame clock, none of which the headless host has. Refused in words rather than
             // silently doing nothing, which is what a "not supported" that returns Ok would be.
+            // `play propdiag [fixed]`: the print-only prop-world report on the host's REAL scene
+            // (the one `play` verb that works headless; see `prop_diag`).
+            EditorCommand::Play(a) if a.first().is_some_and(|w| w.eq_ignore_ascii_case("propdiag")) => {
+                self.ensure_built();
+                let scene = self.scene.as_deref().ok_or("no map loaded")?;
+                Ok(crate::prop_diag::run(scene, &self.objects, a.get(1).is_some_and(|w| w.eq_ignore_ascii_case("fixed")), 8.0))
+            }
             EditorCommand::Play(_) => Err(
                 "test mode runs in the window (it needs the viewport's input and camera);                  use the GUI's `play` verb over the command server"
                     .into(),
@@ -3467,9 +3533,7 @@ impl ScriptHost {
             // #fp-arms  The CAMERA's subject, by slot -- including the owner-keyed route the
             // window's camera list uses. Asking only the body's slot binding returned None for an
             // owner group the recording never bound, and no armour was installed at all.
-            let slot = pb.subject_slot()?;
-            let a = self.film.as_deref()?.header.players.iter().find(|p| p.index as u8 == slot)?.appearance()?;
-            Some((slot, a.slots.to_vec()))
+            pb.subject_armour()
         });
         if let (Some((slot, app)), Some(sc)) = (dress, self.scene.as_deref_mut()) {
             self.film_fp_armour = self.film_driver.dress_first_person(sc, slot, &app, self.film_fp_armour);
@@ -3537,6 +3601,7 @@ impl ScriptHost {
         self.renderer.set_planar_fog_volumes(Vec::new());
         self.renderer.set_lens_flare(Vec::new());
         self.renderer.set_particle_meshes(Vec::new());
+        self.renderer.set_beam_meshes(Vec::new()); // #projectile-sim
         self.renderer.set_overlay_lines(&self.device, &[]);
         self.renderer.set_xray_lines(&self.device, &[]);
         self.renderer.set_exposure(&self.queue, 1.0);
@@ -4361,5 +4426,722 @@ impl ScriptHost {
             ));
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod film_draw_gates {
+    //! #projectile-draw  Does a projectile reach the SCREEN?
+    //!
+    //! Every earlier projectile gate stopped at "the source was installed" or "the actor was
+    //! posed". The owner reported nothing visible, which is exactly what those cannot see. These
+    //! gates drive the real script host (the same `film` / `shot` verbs a scripted capture uses and
+    //! the same lane order `App::update_actors` runs), render on a real offscreen GPU device and
+    //! compare PIXELS: the frame with the projectile lanes installed against the same frame with
+    //! them emptied. A render of the same frame twice must be identical (the noise floor), which
+    //! is what makes any difference near the projectile evidence of the projectile.
+    //!
+    //! Map- and GPU-backed, so `#[ignore]`d; run ONE per process:
+    //! `cargo test --release -p hms-app film_draw_gates::<name> -- --ignored --nocapture --test-threads=1 --skip sound::probes`
+    use super::*;
+
+    /// The least number of pixels near the projectile that must differ for it to count as drawn.
+    const MIN_PX: usize = 40;
+
+    /// A host with `forge_halo` open, or None when this machine cannot (no GPU, no map, no DLL).
+    fn host() -> Option<ScriptHost> {
+        let mut h = ScriptHost::new().ok()?;
+        let out = script::run_program(&mut h, "openmap forge_halo");
+        if h.scene.is_none() {
+            eprintln!("film_draw_gates SKIPPED: forge_halo did not open: {out}");
+            return None;
+        }
+        Some(h)
+    }
+
+    /// Every real Reach film recorded on `forge_halo` with `min` projectile tracks, best first.
+    fn films_with_projectiles(min: usize) -> Vec<(std::path::PathBuf, usize)> {
+        let mut v = Vec::new();
+        for p in crate::film::spec_corpus() {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.scenario_name() != "forge_halo" {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let n = idx.tracks.iter().filter(|t| t.entity_type == crate::film_projectile::PROJECTILE_TYPE && t.positions.len() >= 3).count();
+            if n >= min {
+                v.push((p, n));
+            }
+        }
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    /// RGBA of the last rendered frame.
+    fn last_frame(h: &mut ScriptHost) -> (Vec<u8>, u32, u32) {
+        h.renderer.capture_rgba(&h.device, &h.queue)
+    }
+
+    /// Pixels whose largest channel differs by more than `thr`, split into those within `r` px
+    /// of `(cx, cy)` and the rest.
+    fn diff_points(a: &[u8], b: &[u8], w: u32, cx: f32, cy: f32, r: f32, thr: i32) -> Vec<(f32, f32)> {
+        let mut out = Vec::new();
+        for (i, (pa, pb)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+            let d = (0..3).map(|k| (pa[k] as i32 - pb[k] as i32).abs()).max().unwrap();
+            if d > thr {
+                let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
+                if ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() <= r {
+                    out.push((x, y));
+                }
+            }
+        }
+        out
+    }
+
+    /// Principal axis of a point cloud: `(angle of the major axis in radians, major/minor spread)`.
+    fn principal_axis(pts: &[(f32, f32)]) -> Option<(f32, f32)> {
+        if pts.len() < 12 {
+            return None;
+        }
+        let n = pts.len() as f32;
+        let (mx, my) = (pts.iter().map(|p| p.0).sum::<f32>() / n, pts.iter().map(|p| p.1).sum::<f32>() / n);
+        let (mut sxx, mut syy, mut sxy) = (0.0f32, 0.0f32, 0.0f32);
+        for p in pts {
+            let (dx, dy) = (p.0 - mx, p.1 - my);
+            sxx += dx * dx;
+            syy += dy * dy;
+            sxy += dx * dy;
+        }
+        let tr = sxx + syy;
+        let det = sxx * syy - sxy * sxy;
+        let disc = (tr * tr / 4.0 - det).max(0.0).sqrt();
+        let (l1, l2) = (tr / 2.0 + disc, (tr / 2.0 - disc).max(1.0e-6));
+        Some((0.5 * (2.0 * sxy).atan2(sxx - syy), (l1 / l2).sqrt()))
+    }
+
+    fn diff_split(a: &[u8], b: &[u8], w: u32, cx: f32, cy: f32, r: f32, thr: i32) -> (usize, usize) {
+        let (mut near, mut far) = (0usize, 0usize);
+        for (i, (pa, pb)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+            let d = (0..3).map(|k| (pa[k] as i32 - pb[k] as i32).abs()).max().unwrap();
+            if d > thr {
+                let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
+                if ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() <= r { near += 1 } else { far += 1 }
+            }
+        }
+        (near, far)
+    }
+
+    /// Where `p` lands on the screen of the host's current camera, in pixels.
+    fn project(h: &ScriptHost, p: Vec3, w: u32, hh: u32) -> (f32, f32) {
+        let c = h.camera.view_proj(w as f32 / hh as f32) * p.extend(1.0);
+        ((c.x / c.w * 0.5 + 0.5) * w as f32, (1.0 - (c.y / c.w * 0.5 + 0.5)) * hh as f32)
+    }
+
+    /// Empty every projectile lane (what the CONTROL frame is rendered with).
+    fn empty_lanes(h: &mut ScriptHost, actor_ids: &[u32]) {
+        if let Some(sc) = h.scene.as_mut() {
+            sc.set_film_particle_sources(Vec::new());
+            sc.set_film_beams(&[]);
+            sc.set_film_contrails(Vec::new());
+        }
+        for &id in actor_ids {
+            if let Some(a) = h.actors.get_mut(id) {
+                a.pos = Vec3::new(0.0, 0.0, -9000.0);
+                a.world_override = None;
+            }
+        }
+        h.actors.update(0.0, &h.queue);
+    }
+
+    /// Which of a field's lanes a frame installs.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lanes {
+        All,
+        /// only the render models on the actor lane
+        ModelsOnly,
+        /// only the impact / detonation bursts
+        BurstsOnly,
+    }
+
+    /// What one frame did to the picture.
+    #[derive(Default)]
+    struct Pts(Vec<(f32, f32)>);
+    impl std::fmt::Debug for Pts {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{} px", self.0.len())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct View {
+        /// the differing pixels near the focus (for measuring the SHAPE of what was drawn)
+        pts: Pts,
+        /// pixels that differ within / outside 90 px of the focus between WITH and WITHOUT
+        near: usize,
+        far: usize,
+        /// the same frame rendered twice: must be 0
+        noise: usize,
+        sources: usize,
+        beams: usize,
+    }
+
+    /// Render the CURRENT lanes, render again (the noise floor), empty the lanes and render the
+    /// control. `focus` is the world point the camera looks at and where "near" is measured.
+    fn compare(h: &mut ScriptHost, focus: Vec3, actor_ids: &[u32], out: &std::path::Path, name: &str, radius: f32) -> Option<View> {
+        let shot = out.join(format!("{name}.png"));
+        h.screenshot(&shot.to_string_lossy(), None).ok()?;
+        let (full, w, hh) = last_frame(h);
+        let (cx, cy) = project(h, focus, w, hh);
+        h.screenshot(&shot.to_string_lossy(), None).ok()?;
+        let (again, _, _) = last_frame(h);
+        let (noise, _) = diff_split(&full, &again, w, cx, cy, radius, 6);
+        let sources = h.scene.as_ref().map_or(0, |s| s.film_particle_source_count());
+        let beams = h.scene.as_ref().map_or(0, |s| s.film_beam_count());
+        empty_lanes(h, actor_ids);
+        h.screenshot(&out.join(format!("{name}_ctl.png")).to_string_lossy(), None).ok()?;
+        let (ctl, _, _) = last_frame(h);
+        let (near, far) = diff_split(&full, &ctl, w, cx, cy, radius, 6);
+        let pts = Pts(diff_points(&full, &ctl, w, cx, cy, radius, 6));
+        Some(View { near, far, noise, sources, beams, pts })
+    }
+
+    /// The `weap` tag whose leaf is `leaf`.
+    fn weapon_named(native: &hms_native::NativeDll, cache: hms_native::CacheHandle, leaf: &str) -> Option<u32> {
+        native.tags_by_group(cache, "weap").into_iter().find(|&t| native.tag_name(cache, t).map_or(false, |n| n.rsplit('\\').next() == Some(leaf)))
+    }
+
+    /// Fire barrel `barrel` of weapon `leaf` from `origin` along `dir` in the REAL scene, fly it
+    /// `ticks` ticks through `play_projectile::Field` (the production integrator and the production
+    /// `SceneWorld`), draw it through the production lane -- `sync_actors` + `effects` + `beams` +
+    /// `contrails` + `film_projectile::install*` + the actor mesh build, in the order
+    /// `App::update_actors` runs them -- and compare pixels.
+    ///
+    /// The scene clock is arranged so the frame is rendered at t = 0 and the shot was launched
+    /// `ticks` ticks before it (negative birth times), because a scripted capture runs the particle
+    /// lane on `HMS_TIME` and there is no film here.
+    fn shoot(h: &mut ScriptHost, leaf: &str, barrel: usize, origin: Vec3, dir: Vec3, ticks: u32, out: &std::path::Path, lanes: Lanes) -> Option<(View, std::sync::Arc<crate::play_projectile::Law>, Vec3)> {
+        use crate::play_projectile::{Field, Launch, SceneWorld, TICK};
+        let (native, cache) = {
+            let sc = h.scene.as_ref()?;
+            (sc.native_dll() as *const hms_native::NativeDll, sc.cache_handle()?)
+        };
+        // SAFETY: the NativeDll is owned by the scene, which outlives this function and is not replaced in it.
+        let native: &hms_native::NativeDll = unsafe { &*native };
+        let weap = weapon_named(native, cache, leaf)?;
+        let proj = crate::reach_projectile::weapon_barrels(native, cache, weap).get(barrel)?.projectile?;
+        let mut field = Field::new();
+        let law = field.law(native, cache, proj)?;
+        let t0 = -(ticks as f32) * TICK;
+        field.launch(&law, &[Launch { origin, dir, tracer: true }], t0);
+        {
+            let sc = h.scene.as_ref()?;
+            let world = SceneWorld(sc.as_ref() as &dyn crate::objscene::ObjectScene);
+            for k in 0..ticks {
+                field.advance(TICK, t0 + (k + 1) as f32 * TICK, &world);
+            }
+        }
+        let focus = field.live.first()?.pos;
+        let travel = field.live.first()?.vel.normalize_or_zero();
+        draw_field(h, &mut field, native, cache, lanes);
+        let side = dir.cross(Vec3::Z).normalize_or_zero();
+        let cam = focus + side * 4.0 + Vec3::Z * 0.6;
+        script::run_program(h, &format!("camera to {} {} {}\ncamera lookat {} {} {}", cam.x, cam.y, cam.z, focus.x, focus.y, focus.z));
+        let v = compare(h, focus, &field.pool_ids(), out, &format!("play_{leaf}{}", match lanes { Lanes::All => "", Lanes::ModelsOnly => "_model", Lanes::BurstsOnly => "_burst" }), 90.0)?;
+        Some((v, law, travel))
+    }
+
+    /// Install `field`'s lanes exactly as the window's `update_actors` does.
+    fn draw_field(h: &mut ScriptHost, field: &mut crate::play_projectile::Field, native: &hms_native::NativeDll, cache: hms_native::CacheHandle, lanes: Lanes) {
+        field.sync_actors(native, cache, &mut h.actors);
+        let mut fx = field.effects();
+        if lanes == Lanes::BurstsOnly {
+            fx.retain(|e| e.label.starts_with("impact") || e.label.starts_with("detonation"));
+        }
+        if let Some(sc) = h.scene.as_mut() {
+            // `models_only` leaves the particle / light-volume / contrail lanes empty, so what is
+            // measured is the render model on the actor lane and nothing else.
+            if lanes == Lanes::ModelsOnly {
+                sc.set_film_particle_sources(Vec::new());
+                sc.set_film_beams(&[]);
+                sc.set_film_contrails(Vec::new());
+            } else if lanes == Lanes::BurstsOnly {
+                h.film_fx = crate::film_projectile::install(sc, &fx);
+                sc.set_film_beams(&[]);
+                sc.set_film_contrails(Vec::new());
+            } else {
+                h.film_fx = crate::film_projectile::install(sc, &fx);
+                crate::film_projectile::install_beams(sc, &field.beams());
+                crate::film_projectile::install_contrails(sc, field.contrails());
+            }
+        }
+        if h.actors.rebuild {
+            let b = crate::reach_actor::build_actor_meshes(&mut h.actors, h.scene.as_mut().unwrap(), h.renderer.mesh_renderer(), &h.device, &h.queue);
+            h.install_actor_build(b);
+        }
+        h.actors.update(0.0, &h.queue);
+    }
+
+    /// An airborne point inside the map (the middle of the bounds).
+    fn open_air(h: &ScriptHost) -> Vec3 {
+        let (lo, hi) = h.scene.as_ref().and_then(|s| s.scene_bounds()).unwrap_or(([0.0; 3], [0.0; 3]));
+        Vec3::new((lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, lo[2] + (hi[2] - lo[2]) * 0.5)
+    }
+
+    /// Projectiles whose tag authors NO visual of their own: no render model, no attached effect
+    /// that draws, no light volume, no contrail. PROVEN from the tags (`probe_projectile_table`,
+    /// `probe_projectile_attachments_of_every_group`). The engine draws nothing for these in
+    /// flight either; their shots are seen through the muzzle flash and the impact. KNOWN ZERO: a
+    /// gate that goes red the day one of them gains a visual.
+    const AUTHORED_INVISIBLE: &[&str] = &["magnum", "shotgun", "focus_rifle", "spartan_laser"];
+
+    /// Weapons whose projectile must be on screen: model, light volume, contrail or particle effect.
+    const MUST_DRAW: &[&str] = &[
+        "assault_rifle", "dmr", "sniper_rifle", "plasma_pistol", "plasma_rifle", "plasma_repeater", "needler",
+        "rocket_launcher", "grenade_launcher", "concussion_rifle", "plasma_launcher", "spike_rifle",
+        "machinegun_turret", "plasma_turret", "scorpion_cannon",
+    ];
+
+    /// **TEST MODE: every shot the player can fire is on screen**, or is one of the four whose tag
+    /// authors no projectile visual at all.
+    #[test]
+    #[ignore = "opens the native library, a GPU and forge_halo; run alone"]
+    fn test_mode_shots_are_drawn_on_screen() {
+        let Some(mut h) = host() else { return };
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        let origin = open_air(&h);
+        let dir = Vec3::new(1.0, 0.2, 0.05).normalize();
+        let mut drawn = 0usize;
+        let mut report = Vec::new();
+        for &leaf in MUST_DRAW {
+            let (v, law, _) = shoot(&mut h, leaf, 0, origin, dir, 6, &out, Lanes::All).unwrap_or_else(|| panic!("{leaf}: the shot could not be set up"));
+            report.push(format!("{leaf}: near {} (noise {}) model {} effects {} beams {} contrails {}", v.near, v.noise, law.has_model(), law.fx.attached.len(), law.fx.beams.len(), law.fx.contrails.len()));
+            assert_eq!(v.noise, 0, "{leaf}: the same frame rendered twice differs ({}) -- the comparison is not trustworthy", v.noise);
+            assert!(
+                v.near >= MIN_PX,
+                "{leaf} ({}) is NOT DRAWN: only {} pixels near it differ with its lanes installed (need {MIN_PX}). model {} / {} effect(s) / {} light volume(s) / {} contrail(s); sources {} beams+contrails {}",
+                law.fx.name, v.near, law.has_model(), law.fx.attached.len(), law.fx.beams.len(), law.fx.contrails.len(), v.sources, v.beams
+            );
+            drawn += 1;
+        }
+        assert_eq!(drawn, MUST_DRAW.len(), "liveness: every listed weapon was shot");
+        for &leaf in AUTHORED_INVISIBLE {
+            let (v, law, _) = shoot(&mut h, leaf, 0, origin, dir, 6, &out, Lanes::All).unwrap_or_else(|| panic!("{leaf}: the shot could not be set up"));
+            assert!(
+                !law.has_model() && law.fx.attached.is_empty() && law.fx.beams.is_empty() && law.fx.contrails.is_empty(),
+                "{leaf}'s projectile now authors a visual: it belongs in MUST_DRAW"
+            );
+            assert_eq!(v.near, 0, "{leaf} draws {} pixels but its tag authors no projectile visual", v.near);
+        }
+        for r in &report {
+            eprintln!("  {r}");
+        }
+    }
+
+    /// **TEST MODE: a projectile's RENDER MODEL** is drawn on the actor lane (the lane Theater draws a
+    /// recorded one on), with every particle / light-volume / contrail lane left empty.
+    #[test]
+    #[ignore = "opens the native library, a GPU and forge_halo; run alone"]
+    fn a_projectile_model_is_drawn_on_the_actor_lane() {
+        let Some(mut h) = host() else { return };
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        let origin = open_air(&h);
+        let dir = Vec3::new(1.0, 0.2, 0.05).normalize();
+        let mut seen = 0usize;
+        for leaf in ["rocket_launcher", "grenade_launcher", "concussion_rifle", "plasma_launcher", "needler"] {
+            let (v, law, _) = shoot(&mut h, leaf, 0, origin, dir, 6, &out, Lanes::ModelsOnly).unwrap_or_else(|| panic!("{leaf}: the shot could not be set up"));
+            assert!(law.has_model(), "{leaf}: expected a projectile with a render model");
+            eprintln!("  {leaf}: model-only near {} noise {}", v.near, v.noise);
+            assert_eq!(v.noise, 0, "{leaf}: render noise");
+            if v.near >= MIN_PX {
+                seen += 1;
+            }
+        }
+        assert!(seen >= 4, "only {seen} of 5 projectile models reached the screen on the actor lane");
+    }
+
+    /// **TEST MODE: a projectile model POINTS ALONG ITS TRAVEL.** The picture, not the matrix: the
+    /// model is drawn alone (every other lane empty) from the side, and the principal axis of what it
+    /// covers on screen must lie along the screen projection of its velocity -- for two different
+    /// flight directions, so a model drawn along a fixed axis cannot pass by luck.
+    #[test]
+    #[ignore = "opens the native library, a GPU and forge_halo; run alone"]
+    fn a_projectile_model_points_along_its_travel_on_screen() {
+        let Some(mut h) = host() else { return };
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        let origin = open_air(&h);
+        let mut tested = 0usize;
+        for leaf in ["rocket_launcher", "needler", "spike_rifle"] {
+            for dir in [Vec3::new(1.0, 0.2, 0.05).normalize(), Vec3::new(0.15, 1.0, 0.1).normalize()] {
+                let (v, law, travel) = shoot(&mut h, leaf, 0, origin, dir, 6, &out, Lanes::ModelsOnly).unwrap_or_else(|| panic!("{leaf}: no shot"));
+                assert!(law.has_model(), "{leaf}");
+                let sc_pts = &v.pts.0;
+                let Some((axis, elong)) = principal_axis(sc_pts) else { panic!("{leaf}: the model covered only {} px", sc_pts.len()) };
+                // screen direction of travel
+                let (w, hh) = h.size;
+                let focus = h.camera.pos + h.camera.forward() * 4.0; // looking at the focus from 4 wu
+                let _ = focus;
+                let a = project(&h, h.camera.pos + h.camera.forward() * 4.0, w, hh);
+                let b = project(&h, h.camera.pos + h.camera.forward() * 4.0 + travel * 0.5, w, hh);
+                let want = (b.1 - a.1).atan2(b.0 - a.0);
+                let mut d = (axis - want).abs() % std::f32::consts::PI;
+                if d > std::f32::consts::FRAC_PI_2 {
+                    d = std::f32::consts::PI - d;
+                }
+                eprintln!("  {leaf} dir {dir:?}: major axis {:.1} deg, travel {:.1} deg, off by {:.1}, elongation {elong:.2}", axis.to_degrees(), want.to_degrees(), d.to_degrees());
+                if elong >= 1.6 {
+                    assert!(d.to_degrees() < 20.0, "{leaf} is drawn {:.0} degrees off its direction of travel (elongation {elong:.2})", d.to_degrees());
+                    tested += 1;
+                }
+            }
+        }
+        assert!(tested >= 4, "liveness: only {tested} elongated model shots could be measured");
+    }
+
+    /// **TEST MODE: a hit PLAYS ITS EFFECT ON SCREEN.** The projectile is fired at the real ground of
+    /// `forge_halo` and flown through the real collision until it ends; a quarter second later the frame
+    /// with the impact / detonation bursts installed is compared with the same frame without them.
+    #[test]
+    #[ignore = "opens the native library, a GPU and forge_halo; run alone"]
+    fn a_hit_plays_its_effect_on_screen() {
+        use crate::play_projectile::{Field, Launch, SceneWorld, TICK};
+        let Some(mut h) = host() else { return };
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        let sky = open_air(&h);
+        // 12 wu above the ground under the middle of the map
+        let ground = {
+            let sc = h.scene.as_ref().unwrap();
+            let t = crate::objscene::ObjectScene::raycast_solid(sc.as_ref(), sky, Vec3::NEG_Z, 5000.0).expect("ground under the map centre");
+            sky - Vec3::Z * t
+        };
+        let origin = ground + Vec3::Z * 12.0;
+        let dir = Vec3::new(0.25, 0.1, -1.0).normalize();
+        let mut seen = 0usize;
+        for leaf in ["rocket_launcher", "concussion_rifle", "assault_rifle", "sniper_rifle", "plasma_rifle"] {
+            // how long until it ends, from a throwaway flight in the same world
+            let ticks_to_end = {
+                let sc = h.scene.as_ref().unwrap();
+                let (native, cache) = (sc.native_dll(), sc.cache_handle().unwrap());
+                let weap = weapon_named(native, cache, leaf).unwrap();
+                let proj = crate::reach_projectile::weapon_barrels(native, cache, weap)[0].projectile.unwrap();
+                let mut f = Field::new();
+                let law = f.law(native, cache, proj).unwrap();
+                f.launch(&law, &[Launch { origin, dir, tracer: true }], 0.0);
+                let w = SceneWorld(sc.as_ref() as &dyn crate::objscene::ObjectScene);
+                let mut e = None;
+                for k in 0..1200u32 {
+                    f.tick(k as f32 * TICK, &w);
+                    if f.live[0].ended.is_some() {
+                        e = Some(k + 1);
+                        break;
+                    }
+                }
+                e
+            };
+            let Some(e) = ticks_to_end else { panic!("{leaf}: never hit the ground it was fired at") };
+            let (v, law, _) = shoot(&mut h, leaf, 0, origin, dir, e + 12, &out, Lanes::BurstsOnly).unwrap_or_else(|| panic!("{leaf}: no shot"));
+            eprintln!("  {leaf}: ended after {e} ticks; burst near {} noise {} sources {} (impact {:?} material {:?} detonation {:?}); install: {}", v.near, v.noise, v.sources, law.fx.def.impact_effect, law.material_impact, law.fx.def.detonation_effect(false), h.film_fx.line());
+            assert_eq!(v.noise, 0, "{leaf}: render noise");
+            assert!(v.near >= MIN_PX, "{leaf}: its hit played NOTHING on screen ({} px near the contact)", v.near);
+            seen += 1;
+        }
+        assert_eq!(seen, 5);
+    }
+
+    /// **TEST MODE: the shotgun's pellets** come from the `proj`'s `conical spread` (PROVEN,
+    /// `projectile_initial_update`): 5 x 3 = 15 pellets per shot, all inside the authored 4 degree cone.
+    #[test]
+    #[ignore = "opens the native library and forge_halo; run alone"]
+    fn the_shotgun_launches_its_authored_pellets() {
+        let Some(h) = host() else { return };
+        let sc = h.scene.as_ref().unwrap();
+        let (native, cache) = (sc.native_dll(), sc.cache_handle().unwrap());
+        let weap = weapon_named(native, cache, "shotgun").expect("forge_halo has a shotgun");
+        let proj = crate::reach_projectile::weapon_barrels(native, cache, weap)[0].projectile.expect("the shotgun fires a projectile");
+        let law = crate::play_projectile::Law::read(native, cache, proj).expect("readable");
+        let c = law.extra.conical.expect("the shotgun's projectile authors a conical spread");
+        assert_eq!((c.azimuth_strata, c.radial_strata), (5, 3), "the authored strata");
+        assert!((c.max_angle - 0.0698).abs() < 1.0e-3, "the authored cone is 4 degrees, got {} rad", c.max_angle);
+        let mut f = crate::play_projectile::Field::new();
+        let law = std::sync::Arc::new(law);
+        f.launch(&law, &[crate::play_projectile::Launch { origin: Vec3::ZERO, dir: Vec3::X, tracer: true }], 0.0);
+        assert_eq!(f.live.len(), 15, "one shot launches 5 x 3 pellets");
+        let widest = f.live.iter().map(|p| p.fwd.dot(Vec3::X).clamp(-1.0, 1.0).acos()).fold(0.0f32, f32::max);
+        assert!(widest <= c.max_angle + 1.0e-4 && widest > 0.02, "pellets spread out to {widest} rad of a {} rad cone", c.max_angle);
+    }
+
+    /// **TEST MODE: the muzzle flash** -- the barrel's own firing effect played on the gun model's
+    /// markers -- is on screen.
+    #[test]
+    #[ignore = "opens the native library, a GPU and forge_halo; run alone"]
+    fn a_muzzle_flash_is_drawn_on_screen() {
+        let Some(mut h) = host() else { return };
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        let origin = open_air(&h);
+        let (native, cache) = {
+            let sc = h.scene.as_ref().unwrap();
+            (sc.native_dll() as *const hms_native::NativeDll, sc.cache_handle().unwrap())
+        };
+        // SAFETY: owned by the scene, which is not replaced below.
+        let native: &hms_native::NativeDll = unsafe { &*native };
+        let mut seen = 0usize;
+        for leaf in ["assault_rifle", "plasma_rifle", "rocket_launcher"] {
+            let weap = weapon_named(native, cache, leaf).unwrap();
+            let b = crate::reach_projectile::weapon_barrels(native, cache, weap)[0].clone();
+            let fx = b.firing_effect.expect("a firing effect");
+            let mode = native.resolve_mode(cache, weap);
+            let mut field = crate::play_projectile::Field::new();
+            field.flash(fx, mode, glam::Mat4::from_translation(origin), 0.0);
+            draw_field(&mut h, &mut field, native, cache, Lanes::All);
+            let cam = origin + Vec3::new(-1.2, 0.8, 0.3);
+            script::run_program(&mut h, &format!("camera to {} {} {}\ncamera lookat {} {} {}", cam.x, cam.y, cam.z, origin.x, origin.y, origin.z));
+            let v = compare(&mut h, origin, &[], &out, &format!("flash_{leaf}"), 160.0).expect("frame");
+            assert_eq!(v.noise, 0, "{leaf}: render noise");
+            eprintln!("  {leaf}: muzzle flash near {} sources {}", v.near, v.sources);
+            if v.near >= MIN_PX {
+                seen += 1;
+            }
+        }
+        assert!(seen >= 2, "only {seen} of 3 muzzle flashes drew anything: the flash lane is not on screen");
+    }
+
+    /// **THEATER: the projectiles the film REPLICATES** (grenades, rockets, missiles, flak) are on
+    /// screen mid-flight, one of each kind the clip holds.
+    #[test]
+    #[ignore = "opens the native library, a GPU, forge_halo and the films on this machine; run alone"]
+    fn theater_recorded_projectiles_are_drawn_on_screen() {
+        let Some(mut h) = host() else { return };
+        let films = films_with_projectiles(40);
+        let Some((path, _)) = films.first().cloned() else {
+            eprintln!("theater gate SKIPPED: no Reach film with projectiles on this machine");
+            return;
+        };
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        script::run_program(&mut h, &format!("film {}\nfilm seek 20", path.to_string_lossy()));
+        // one mid-flight sample per projectile KIND: the longest-lived track of each that moves
+        let mut pick: std::collections::BTreeMap<String, (u32, usize, Vec3, Vec3)> = Default::default();
+        {
+            let pb = h.film_play.as_ref().unwrap();
+            let ot = h.film_driver.objects.as_ref().unwrap();
+            for tr in &pb.index.tracks {
+                let Some(o) = ot.objects.get(&tr.net_id) else { continue };
+                if o.draw != crate::film_objective::Draw::Projectile || tr.positions.len() < 12 {
+                    continue;
+                }
+                let m = tr.positions.len() / 2;
+                let d = Vec3::from(tr.positions[m + 1].1) - Vec3::from(tr.positions[m].1);
+                if d.length() < 1.0e-3 {
+                    continue;
+                }
+                if pick.get(&o.name).map_or(true, |b| tr.positions.len() > b.1) {
+                    pick.insert(o.name.clone(), (tr.positions[m].0, tr.positions.len(), Vec3::from(tr.positions[m].1), d.normalize()));
+                }
+            }
+        }
+        assert!(pick.len() >= 3, "liveness: the clip holds {} projectile kinds with a moving track, need >= 3", pick.len());
+        let mut drawn = 0usize;
+        for (name, (tick, _n, pos, fwd)) in pick {
+            let side = fwd.cross(Vec3::Z).normalize_or_zero();
+            let cam = pos + side * 5.0 + Vec3::Z * 0.8;
+            script::run_program(&mut h, &format!("film seek {}\ncamera to {} {} {}\ncamera lookat {} {} {}", tick as f32 / 60.0, cam.x, cam.y, cam.z, pos.x, pos.y, pos.z));
+            let ids: Vec<u32> = h.film_driver.object_actor.values().copied().collect();
+            let v = compare(&mut h, pos, &ids, &out, &format!("theater_{name}"), 90.0).expect("frame");
+            eprintln!("  {name:<26} near {} noise {} sources {} beams+contrails {}", v.near, v.noise, v.sources, v.beams);
+            // A kind whose effect keeps emitter state (flak, frag smoke) does not render the same
+            // twice. Its own re-render noise is subtracted: it counts only by the margin it beats it.
+            if v.near >= v.noise + MIN_PX {
+                drawn += 1;
+            }
+            script::run_program(&mut h, "film seek 20");
+        }
+        assert!(drawn >= 3, "only {drawn} of the clip's projectile kinds are on screen mid-flight (beating their own re-render noise by 40 px)");
+    }
+
+    /// **THEATER: the rounds the film does NOT replicate** (plasma, rifle, needler ...) are flown from
+    /// their fire events and are on screen a few ticks after firing.
+    #[test]
+    #[ignore = "opens the native library, a GPU, forge_halo and the films on this machine; run alone"]
+    fn theater_simulated_shots_are_drawn_on_screen() {
+        let Some(mut h) = host() else { return };
+        let films = films_with_projectiles(10);
+        if films.is_empty() {
+            eprintln!("theater gate SKIPPED: no Reach film with projectiles on this machine");
+            return;
+        }
+        let out = std::env::temp_dir().join("hms_proj_gate");
+        let _ = std::fs::create_dir_all(&out);
+        let (mut drawn, mut tried, mut sources, mut scrubbed) = (0usize, 0usize, std::collections::BTreeSet::new(), false);
+        let mut kinds = std::collections::BTreeSet::new();
+        for (path, _) in films.iter().take(8) {
+            if tried >= 12 {
+                break;
+            }
+            script::run_program(&mut h, &format!("film {}\nfilm seek 20", path.to_string_lossy()));
+            // Fire events of bodies whose weapon launches a projectile the film does not carry as an
+            // entity (a sword's swing is also an `action_weapon_fire`, and most films are mostly
+            // swords or rockets).
+            let shooter = |h: &ScriptHost, net: u32, t: u32| -> bool {
+                let (Some(pb), Some(pt)) = (h.film_play.as_ref(), h.film_driver.projectiles.as_ref()) else { return false };
+                let Some(&ti) = h.film_driver.track_of.get(&net) else { return false };
+                let Some(w) = pb.index.tracks.get(ti).and_then(|tr| tr.weapon_at(t)).and_then(|i| h.film_driver.weap_tags.get(i as usize)) else { return false };
+                pt.by_weapon.get(w).and_then(|s| s.projectile).map_or(false, |(p, _)| {
+                    !h.film_driver.objects.as_ref().map_or(false, |ot| ot.objects.values().any(|o| o.obj_tag == p && o.draw == crate::film_objective::Draw::Projectile))
+                })
+            };
+            let mut events: Vec<(u32, u32)> = Vec::new();
+            for (&net, ticks) in &h.film_driver.fire_of {
+                let ok: Vec<u32> = ticks.iter().copied().filter(|&t| shooter(&h, net, t)).collect();
+                for &t in ok.iter().skip(2).step_by(9).take(3) {
+                    events.push((net, t));
+                }
+            }
+            events.sort();
+            // spread over every body rather than the first few ids (some bodies hold a sword)
+            let step = (events.len() / 24).max(1);
+            for (net, ft) in events.into_iter().step_by(step).take(24) {
+                script::run_program(&mut h, &format!("film seek {}", (ft + 2) as f32 / 60.0));
+                let key = (net, ft);
+                let Some(Some(fl)) = h.film_driver.flights.get(&key).cloned() else {
+                    eprintln!("  body {net:#x} tick {ft}: no flight ({:?})", h.film_driver.shots_report);
+                    continue;
+                };
+                if fl.pellets[0].path.len() < 3 {
+                    continue; // a shot that ended in the shooter's face has no flight to look at
+                }
+                let pe = &fl.pellets[0];
+                let i = 2usize.min(pe.path.len() - 1);
+                let (pos, dir) = (pe.path[i], (pe.path[i] - pe.path[0]).normalize_or_zero());
+                if dir == Vec3::ZERO {
+                    continue;
+                }
+                let side = dir.cross(Vec3::Z).normalize_or_zero();
+                let cam = pos - dir * 3.0 + side * 3.0 + Vec3::Z * 0.5;
+                script::run_program(&mut h, &format!("camera to {} {} {}\ncamera lookat {} {} {}", cam.x, cam.y, cam.z, pos.x, pos.y, pos.z));
+                let ids = h.film_driver.shots.pool_ids();
+                let src = h.film_driver.shot_sources.get(&key).copied();
+                let v = compare(&mut h, pos, &ids, &out, &format!("synth_{net:x}_{ft}"), 60.0).expect("frame");
+                eprintln!("  body {net:#x} tick {ft} {:<24} aim {src:?} near {} noise {}", fl.law.fx.name, v.near, v.noise);
+                // a projectile whose tag authors no visual (magnum, shotgun ...) cannot be seen in flight
+                if AUTHORED_INVISIBLE.iter().any(|w| fl.law.fx.name.starts_with(w)) {
+                    continue;
+                }
+                tried += 1;
+                if v.near >= v.noise + MIN_PX {
+                    drawn += 1;
+                    kinds.insert(fl.law.fx.name.clone());
+                    if let Some(s) = src {
+                        sources.insert(format!("{s:?}"));
+                    }
+                    // SCRUB: away and back lands on the very same bullet (the flight is a pure function
+                    // of the tick, not state integrated frame to frame).
+                    if !scrubbed {
+                        let here: Vec<Vec3> = h.film_driver.shots.live.iter().map(|p| p.pos).collect();
+                        assert!(!here.is_empty(), "liveness: the shot being scrubbed is on screen");
+                        script::run_program(&mut h, &format!("film seek {}", (ft + 400) as f32 / 60.0));
+                        script::run_program(&mut h, &format!("film seek {}", (ft + 2) as f32 / 60.0));
+                        let again: Vec<Vec3> = h.film_driver.shots.live.iter().map(|p| p.pos).collect();
+                        assert_eq!(here, again, "scrubbing away and back moved the bullet");
+                        scrubbed = true;
+                    }
+                }
+            }
+        }
+        assert!(tried >= 4, "liveness: only {tried} simulated shots were examined");
+        assert!(drawn >= 2 && kinds.len() >= 2, "only {drawn} of {tried} simulated shots ({} kinds: {kinds:?}) are on screen", kinds.len());
+        assert!(!sources.is_empty(), "the shots that drew had no recorded aim source");
+    }
+}
+
+#[cfg(test)]
+mod cannon_draw_gates {
+    //! #cannon-preview  Does the selected man cannon's arc reach the SCREEN?
+    //!
+    //! Same method as `film_draw_gates`: the real script host (`cannontraj` verb, the same
+    //! `ScriptHost::sync` + lane merge a screenshot runs) renders on an offscreen GPU device and
+    //! the frame with the preview on is compared pixel by pixel to the same frame with it off.
+    //! Map- and GPU-backed, so `#[ignore]`d; run alone:
+    //! `cargo test --release -p hms-app cannon_draw_gates -- --ignored --nocapture --test-threads=1 --skip sound::probes`
+    use super::*;
+
+    fn frame(h: &mut ScriptHost, name: &str) -> (Vec<u8>, u32, u32) {
+        let shot = std::env::temp_dir().join(format!("hms_cannon_{name}.png"));
+        h.screenshot(&shot.to_string_lossy(), None).expect("a screenshot");
+        h.renderer.capture_rgba(&h.device, &h.queue)
+    }
+
+    fn project(h: &ScriptHost, p: Vec3, w: u32, hh: u32) -> (f32, f32) {
+        let c = h.camera.view_proj(w as f32 / hh as f32) * p.extend(1.0);
+        ((c.x / c.w * 0.5 + 0.5) * w as f32, (1.0 - (c.y / c.w * 0.5 + 0.5)) * hh as f32)
+    }
+
+    /// Pixels that differ by more than `thr`, within `r` px of `(cx, cy)` and in the whole frame.
+    fn diff(a: &[u8], b: &[u8], w: u32, cx: f32, cy: f32, r: f32) -> (usize, usize) {
+        let (mut near, mut all) = (0, 0);
+        for (i, (pa, pb)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+            if (0..3).map(|k| (pa[k] as i32 - pb[k] as i32).abs()).max().unwrap() > 6 {
+                all += 1;
+                let (x, y) = ((i as u32 % w) as f32, (i as u32 / w) as f32);
+                if ((x - cx).powi(2) + (y - cy).powi(2)).sqrt() <= r {
+                    near += 1;
+                }
+            }
+        }
+        (near, all)
+    }
+
+    #[test]
+    #[ignore = "opens the native library, a GPU and forge_halo; run alone"]
+    fn the_selected_cannons_arc_and_landing_marker_are_drawn_on_screen() {
+        let mut h = match ScriptHost::new() {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        script::run_program(&mut h, "openmap forge_halo");
+        let Some((native, cache)) = h.scene.as_ref().and_then(|s| Some((s.native_dll() as *const hms_native::NativeDll, s.cache_handle()?))) else { return };
+        // SAFETY: owned by the scene, which outlives this test body and is not replaced in it.
+        let native: &hms_native::NativeDll = unsafe { &*native };
+        let tag = native.tags_by_group(cache, "bloc").into_iter().find(|&t| native.tag_name(cache, t).is_some_and(|n| n.ends_with("ff_man_cannon_forge\\ff_man_cannon_forge"))).expect("the man cannon");
+        let site = crate::play_launch::tests::flat_site(native, cache, h.scene.as_ref().unwrap()).expect("a flat site");
+        let mut cannon = crate::play_launch::tests::placed(tag, 0x7100, site, 0.0);
+        cannon.fwd = [1.0, 0.0, 0.0];
+        h.objects.push(cannon);
+        h.selected = vec![cannon.datum];
+        h.dirty = true;
+        // a side-on view of the whole arc (it flies ~15 wu toward -X)
+        let mid = site + Vec3::new(-7.0, 0.0, 2.0);
+        let cam = mid + Vec3::new(0.0, 22.0, 6.0);
+        script::run_program(&mut h, &format!("camera to {} {} {}\ncamera lookat {} {} {}", cam.x, cam.y, cam.z, mid.x, mid.y, mid.z));
+
+        script::run_program(&mut h, "cannontraj off");
+        let (off, w, hh) = frame(&mut h, "off");
+        let (off2, _, _) = frame(&mut h, "off2");
+        let out = script::run_program(&mut h, "cannontraj on");
+        eprintln!("{out}");
+        let (on, _, _) = frame(&mut h, "on");
+        let t = h.cannon_preview.results.first().cloned().expect("liveness: the selected cannon was predicted");
+        let landing = t.landing.expect("it lands");
+        let (lx, ly) = project(&h, landing, w, hh);
+        let (ax, ay) = project(&h, t.apex, w, hh);
+        let noise = diff(&off, &off2, w, lx, ly, 40.0).1;
+        let (near_land, all) = diff(&off, &on, w, lx, ly, 40.0);
+        let (near_apex, _) = diff(&off, &on, w, ax, ay, 40.0);
+        eprintln!("CANNON-DRAW noise {noise}, differing px {all}, near landing {near_land}, near apex {near_apex}, landing at px ({lx:.0},{ly:.0})");
+        assert_eq!(noise, 0, "the same frame rendered twice differs: the comparison is not trustworthy");
+        assert!(all >= 300, "the arc is not on screen: only {all} pixels differ with the preview on");
+        assert!(near_land >= 60, "no landing marker where the body lands: {near_land} px near ({lx:.0},{ly:.0})");
+        assert!(near_apex >= 8, "the arc is not drawn through its apex: {near_apex} px");
+        // selecting nothing removes it again: the frame equals the same nothing-selected frame
+        // rendered with the preview switched off
+        h.selected.clear();
+        let (none_on, _, _) = frame(&mut h, "none_on");
+        script::run_program(&mut h, "cannontraj off");
+        let (none_off, _, _) = frame(&mut h, "none_off");
+        assert_eq!(diff(&none_off, &none_on, w, lx, ly, 40.0).1, 0, "with nothing selected the preview is still on screen");
+        assert!(h.cannon_preview.results.is_empty());
     }
 }
