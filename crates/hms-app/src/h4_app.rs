@@ -177,6 +177,7 @@ pub fn obj_meta_from_h4(m: &H4ObjMeta) -> ObjMeta {
         label_idx: m.label_idx,
         label: m.label.clone(),
         placement: m.placement,
+        h3_engine: 0,
         boundary_shape: m.boundary_shape,
         boundary: m.h4.shape_values,
         weapon_clips: m.weapon_clips,

@@ -4060,7 +4060,7 @@ pub(crate) const SHADOW_SAMPLE_WGSL: &str = r#"
 // Halo 4 tail (zeros on Reach maps): h4s0 = (shadow texel uv, bias inner, edge, corner), h4s1 =
 // (burn active, depth range wu, texel wu, _), cvp = the floating-shadow cascade view_proj, casc0 =
 // (half_width, length, receiver bias, poisson radius uv), casc1 = (taps, resolution, active, _).
-struct Light { light_view_proj: mat4x4<f32>, sun_dir: vec4<f32>, sun_tint: vec4<f32>, ambient_tint: vec4<f32>, sky_ambient: vec4<f32>, dbg: vec4<f32>, expo: vec4<f32>, expo2: vec4<f32>, h4s0: vec4<f32>, h4s1: vec4<f32>, cvp: mat4x4<f32>, casc0: vec4<f32>, casc1: vec4<f32> };
+struct Light { light_view_proj: mat4x4<f32>, sun_dir: vec4<f32>, sun_tint: vec4<f32>, ambient_tint: vec4<f32>, sky_ambient: vec4<f32>, dbg: vec4<f32>, expo: vec4<f32>, expo2: vec4<f32>, h4s0: vec4<f32>, h4s1: vec4<f32>, cvp: mat4x4<f32>, casc0: vec4<f32>, casc1: vec4<f32>, objdbg0: vec4<f32>, objdbg1: vec4<f32>, objdbg2: vec4<f32> };
 @group(0) @binding(2) var<uniform> light: Light;
 @group(0) @binding(3) var shadow_tex: texture_depth_2d;
 @group(0) @binding(4) var shadow_cmp: sampler_comparison;
@@ -4209,6 +4209,8 @@ fn shadow_strength(world_pos: vec3<f32>) -> f32 {
 // Luma-preserving warm tint (the hue shift survives the post exposure) with a blue/green floor so
 // daylight R/G warmth reads without over-yellowing. Strength 0.68; a neutral [1,1,1] → exact no-op.
 fn scene_grade(rgb: vec3<f32>) -> vec3<f32> {
+    // Lighting Lab 'Object lighting terms (diagnostic)': objdbg0.x = 1 switches the grade off (0 = default = on).
+    if (light.objdbg0.x > 0.5) { return rgb; }
     let a = light.ambient_tint.rgb;
     var g = vec3<f32>(
         1.0 + (a.x - 1.0) * 0.68,
@@ -4218,6 +4220,17 @@ fn scene_grade(rgb: vec3<f32>) -> vec3<f32> {
     g = g * g;
     let gl = max(dot(g, vec3<f32>(0.299, 0.587, 0.114)), 1e-3);
     return rgb * (g / gl);
+}
+
+// Texture decode for the 2.2-power albedo maps. Default (objdbg1.w = 0) is exactly pow(c, 2.2); the Lighting Lab
+// 'Object lighting terms' debug switch (objdbg1.w = 1) uses the piecewise sRGB curve instead.
+fn tex_decode(c: vec3<f32>) -> vec3<f32> {
+    let g = pow(c, vec3<f32>(2.2));
+    if (light.objdbg1.w > 0.5) {
+        let s = select(pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)), c / 12.92, c <= vec3<f32>(0.04045));
+        return s;
+    }
+    return g;
 }
 
 // Scenario SimpleLights (point/spot). Each light = 5×vec4 mirroring the native
@@ -4491,6 +4504,23 @@ struct Camera { view_proj: mat4x4<f32>, cam_pos: vec4<f32>, time: vec4<f32>, inv
 @group(0) @binding(7) var vmf_lut: texture_2d<f32>;
 @group(0) @binding(8) var vmf_samp: sampler;
 @group(0) @binding(13) var dps_lut: texture_3d<f32>;  // rasterizer\diffuse_power_specular\diffuse_power (x = dot(dom,R)*0.5+0.5, y = bandwidth, z = roughness), value*3
+// ENGINE-LITERAL diffuse_power_specular lookup (diffuse_specular.hlsl_include vmf_diffuse_specular +
+// global_texture.hlsl_include convert_3d_texture_coord_to_array_texture; verified against the shipped DX11
+// cook_torrance + dynamic-env pixel shader, Sapien capture ps_11197159538964788000 instr 146-161):
+// the LUT is a 2D ARRAY (4 roughness slices), NOT a filtered 3D volume. zs = frac(roughness) * slices;
+// slice A = array index zs (hardware rounds a float index to nearest), slice B = zs + 1 (wraps to 0 once
+// zs >= slices - 1); result = lerp(A, B, frac(zs)) * 3. A trilinear 3D fetch (z centred on (k + .5)/4)
+// lerps the two NEAREST slices instead, which reads a glossier lobe (roughness 0.2: slices 0/1 vs the
+// engine's 1/2) -- up to 1.6x too bright at the lobe peak.
+fn dps_engine(x: f32, bw: f32, roughness: f32) -> f32 {
+    let zs = fract(roughness) * 4.0;
+    let nz = select(zs + 1.0, 0.0, zs >= 3.0);
+    let ia = clamp(floor(zs + 0.5), 0.0, 3.0);
+    let ib = clamp(floor(nz + 0.5), 0.0, 3.0);
+    let a = textureSampleLevel(dps_lut, vmf_samp, vec3<f32>(x, bw, (ia + 0.5) * 0.25), 0.0).r;
+    let b = textureSampleLevel(dps_lut, vmf_samp, vec3<f32>(x, bw, (ib + 0.5) * 0.25), 0.0).r;
+    return mix(a, b, fract(zs)) * 3.0;
+}
 @group(1) @binding(0) var base_tex: texture_2d<f32>;
 @group(1) @binding(1) var base_samp: sampler;
 @group(1) @binding(2) var emis_tex: texture_2d<f32>;
@@ -5509,7 +5539,8 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     // the sky_halo backdrop flag (fine_xform.w>0.5): its baked term is lifted below
     let no_dist_fade = i.fine_xform.w > 0.5;
     let detail_s4 = textureSampleGrad(detail_tex, base_samp, detail_uv, ddux, dduy);
-    let detail = pow(detail_s4.rgb, vec3<f32>(2.2)) * MESH_DETAIL_MULT;
+    // Lighting Lab diagnostic: objdbg1.y = 1 drops the detail-map COLOUR (neutral 1.0); 0 = default.
+    let detail = select(tex_decode(detail_s4.rgb) * MESH_DETAIL_MULT, vec3<f32>(1.0), light.objdbg1.y > 0.5);
     // The engine spec mask for specular_mask_from_diffuse is the composed albedo ALPHA —
     // albedo.hlsl_include:121 `albedo.w = base.w * detail.w * albedo_color.w`, saturated by
     // entry_points.hlsl_include:102 `albedo = saturate(albedo)` and read verbatim by
@@ -5528,7 +5559,7 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     let fuv = i.uv * i.fine_xform.xy + i.scroll * cam.time.x;
     let fgx = dpdx(fuv);
     let fgy = dpdy(fuv);
-    let fine_s = pow(textureSampleGrad(base_tex, base_samp, fuv, fgx, fgy).rgb, vec3<f32>(2.2)) * MESH_DETAIL_MULT;
+    let fine_s = tex_decode(textureSampleGrad(base_tex, base_samp, fuv, fgx, fgy).rgb) * MESH_DETAIL_MULT;
     let fine = select(vec3<f32>(1.0), fine_s, i.fine_xform.z > 0.5);
     // Surface-contrast gain for macro-tile floors: the combined detail deviation around its mean
     // (1.0), mean-preserving. Only the low-frequency tile/grout layer (detail_tex) — it survives
@@ -5541,7 +5572,7 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     // #objmask alpha-only detail binding: the colour layer is a no-op (the part's albedo is the
     // CPU-composed base × albedo_color, unchanged by this lane).
     detail_c = select(detail_c, vec3<f32>(1.0), det_alpha_only);
-    var albedo = pow(tex.rgb, vec3<f32>(2.2)) * detail_c * fine;
+    var albedo = tex_decode(tex.rgb) * detail_c * fine;
     // two/four_change_color albedo (Forge pallets): mattex.w == 6 → at_tex holds the change_color_map
     // (r = primary mask, g = secondary), the instance colour alpha carries the change-colour index sentinel.
     // Engine: albedo *= (1 − m.r + m.r·primary)·(1 − m.g + m.g·secondary); Forge sets both from the object colour.
@@ -5624,8 +5655,12 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     let fres_edge = select(1.0, i.mat_spec2.w, i.mat_spec2.w > 0.0);
     // authored specular_tint / fresnel_color COLOURS when present (engine lerps normal_specular_tint ->
     // glancing tint by the Fresnel blend); the scalar luminance lanes otherwise.
-    let f0_col = select(vec3<f32>(f0_base), i.spec_rgb.rgb, i.spec_rgb.w > 0.5);
-    let edge_col = select(vec3<f32>(fres_edge), i.fres_rgb.rgb, i.fres_rgb.w > 0.5);
+    let f0_col_a = select(vec3<f32>(f0_base), i.spec_rgb.rgb, i.spec_rgb.w > 0.5);
+    let edge_col_a = select(vec3<f32>(fres_edge), i.fres_rgb.rgb, i.fres_rgb.w > 0.5);
+    // Lighting Lab diagnostic (objdbg1.x = 1): authored specular tint / fresnel colour -> their own luminance (grey).
+    let tint_grey = light.objdbg1.x > 0.5;
+    let f0_col = select(f0_col_a, vec3<f32>(dot(f0_col_a, vec3<f32>(0.2126, 0.7152, 0.0722))), tint_grey);
+    let edge_col = select(edge_col_a, vec3<f32>(dot(edge_col_a, vec3<f32>(0.2126, 0.7152, 0.0722))), tint_grey);
     let F0 = mix(f0_col, albedo, metal);
     // The engine's artist Fresnel curve is on N·V (a rim/edge tint), NOT the microfacet V·H:
     // `F = lerp(F0, fresnel_color, pow(1-N·V, steepness))`.
@@ -5733,13 +5768,18 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     if (obj_mat_lane) {
         let dom_dir_o = normalize(i.obj_probe0.xyz);
         let bw_o = clamp(i.obj_probe0.w, 0.0, 1.0);
-        let dom_rgb_o = max(i.obj_probe1.rgb, vec3<f32>(0.0));
+        // c[1].rgb = colour0 * s (the chmt min-luminance lift), the SAME constant the diffuse lobe reads (`obj_dom`);
+        // the raw probe colour under-lit the lifted objects' glossy lobe (Sapien capture: v8.xyz feeds both).
+        let dom_rgb_o = max(select(i.obj_probe1.rgb, obj_dom, obj_engine), vec3<f32>(0.0));
         let rough_lut_o = clamp(i.spec_rgb.w - 1.0, 0.0, 1.0);
         let rdotd_o = dot(dom_dir_o, refl);
-        let lut3_o = textureSampleLevel(dps_lut, vmf_samp, vec3<f32>(rdotd_o * 0.5 + 0.5, bw_o, rough_lut_o), 0.0).r * 3.0;
+        let lut3_o = dps_engine(rdotd_o * 0.5 + 0.5, bw_o, rough_lut_o);
         let sh_glossy = Fv * (lut3_o * dom_rgb_o + 0.25 * max(obj_fill, vec3<f32>(0.0)));
         let raised_o = saturate(dot(n, key) * 0.45 + 0.55);
-        let seed_o = raised_o * sun_col * obj_b * 0.25 * Fv;
+        // the engine multiplies the shadow into the analytical mask that feeds the seed (Sapien capture
+        // ps_11197159538964788000 instr 28/39/43: seed = raised * I * (shadow * gel) * c2.w * 0.25) AND again on the
+        // whole envmap_area_specular_only below (instr 174), so the seed carries the shadow TWICE.
+        let seed_o = raised_o * sun_col * obj_b * 0.25 * Fv * shadow;
         let area_env = max(sh_glossy + seed_o, vec3<f32>(0.001)) * shadow;
         // #objmask engine specular_mask = saturate(base.a x detail.a x albedo_color.a) (albedo_w)
         let omask = select(1.0, albedo_w, sfa_on) * eff_spec_mult;
@@ -5774,7 +5814,7 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     // map's HDR sun tint, magnitude = BOUNCE_FILL. Added INSIDE the `·albedo` group, exactly as the
     // engine adds it to diffuse_radiance before the ×albedo multiply.
     var bounce = vec3<f32>(0.0);
-    if (i.lm.w > 1.5) {
+    if (i.lm.w > 1.5 && light.objdbg1.z < 0.5) { // objdbg1.z = 1: Lighting Lab 'bounce fill' switch
         bounce = light.sun_tint.rgb * (BOUNCE_FILL * max(dot(key, n), 0.0));
     }
     // entry_points.hlsl_include:473: the engine scales self_illum_radiance by ILLUM_SCALE =
@@ -5794,9 +5834,10 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     // pow(2a−1,power)·colour·intensity term is ≤0.004 on the shipped materials; not ported.)
     let mm_kill_spec = (mm == 0) || (mm == 3) || (mm == 4) || rmfl;
     let mm_kill_env = (mm == 0) || rmfl_bsp; // the foliage shader has no environment term
-    let spec_d = select(spec, vec3<f32>(0.0), mm_kill_spec);
-    let env_d = select(env, vec3<f32>(0.0), mm_kill_env);
-    let spec_area_d = select(spec_area, vec3<f32>(0.0), mm_kill_spec);
+    // Lighting Lab 'Object lighting terms': per-term multipliers, stored as (mult - 1) so a zero tail = 1.0.
+    let spec_d = select(spec, vec3<f32>(0.0), mm_kill_spec) * (1.0 + light.objdbg0.w);
+    let env_d = select(env, vec3<f32>(0.0), mm_kill_env) * (1.0 + light.objdbg0.y);
+    let spec_area_d = select(spec_area, vec3<f32>(0.0), mm_kill_spec) * (1.0 + light.objdbg0.z);
     // self_illumination MODE routing: the engine links exactly one calc_self_illumination_<m>_ps
     // per shader. Only from_albedo (mode 4) diverges from the single-composite emissive path: it
     // emits `albedo · self_illum_color · intensity` as the self-illum AND ZEROS albedo so the lit
@@ -5821,6 +5862,22 @@ fn mesh_shade(i: VOut) -> vec4<f32> {
     let lit_albedo = select(albedo, vec3<f32>(0.0), si_from_albedo) * dcoef;
     let simple_d = select(simple, vec3<f32>(0.0), si_from_albedo) * dcoef;
     var shaded = lit_albedo * (baked_lit + sun_term + bounce) + simple_d + emis * illum_scale + env_d + spec_d + spec_area_d;
+    // Lighting Lab single-term VIEW (objdbg2.x, 0 = off): shows ONE linear term pre-grade/pre-fog so the
+    // 'Dump object radiance' button can read each term of the composite from the HDR frame.
+    let tview = i32(light.objdbg2.x + 0.5);
+    if (tview > 0) {
+        var tv = shaded;
+        if (tview == 1) { tv = lit_albedo * (baked_lit + sun_term + bounce); }
+        if (tview == 2) { tv = env_d; }
+        if (tview == 3) { tv = spec_area_d; }
+        if (tview == 4) { tv = spec_d; }
+        if (tview == 5) { tv = lit_albedo * baked_lit; }
+        if (tview == 6) { tv = lit_albedo * bounce; }
+        if (tview == 7) { tv = emis * illum_scale; }
+        if (tview == 8) { tv = lit_albedo * sun_term; }
+        if (tview == 9) { tv = albedo; }
+        return vec4<f32>(tv, 1.0);
+    }
     // HMS_MDBG per-term HDR probes (mesh path; read via HMS_HDR_DUMP, pre-fog): 1 bake, 2 baked_lit, 3 sun_term,
     // 4 albedo, 5 tint(fill lane), 6 obj_probe1 (dom rgb), 7 [probe0.w, probe1.w, ol_flag], 8 [shadow, darken, baked_vis]
     // and, for the OBJECT lane (#objshine), 26 diffuse group, 27 bounce, 28 full composite,
@@ -6297,7 +6354,7 @@ fn blend_shade(i: VOut) -> vec4<f32> {
     let rdotd = dot(dom_dir_g, refl);
     // objects: this PART's `roughness` (LUT z) rides spec_rgb.w (mat_rough is the model's shader-0 value).
     let rough_lut_g = select(i.mat_rough, i.spec_rgb.w, obj_lanes_g);
-    let lut_g = textureSampleLevel(dps_lut, vmf_samp, vec3<f32>(rdotd * 0.5 + 0.5, bw_g, clamp(rough_lut_g, 0.0, 1.0)), 0.0).r * 3.0;
+    let lut_g = dps_engine(rdotd * 0.5 + 0.5, bw_g, clamp(rough_lut_g, 0.0, 1.0));
     // objects: c[3] = fill + 2*bounce (bounce-to-ambient, doc 16 s2.3) -- the merge helper's fill.
     let okg = obj_key_light(i.obj_probe0, i.obj_probe1, i.itint.rgb, i.obj_light);
     let fill_area_g = select(fill_rgb_g, max(okg.fill, vec3<f32>(0.0)), obj_lanes_g);

@@ -408,7 +408,7 @@ impl Follower {
                     }
                 }
                 if let Some(or) = st.orientation_raw {
-                    let (fw, up) = crate::film_decode::orientation_world(or);
+                    let (fw, up) = crate::film_decode::orientation_world_after(or, o.tr.orientations.last().map(|k| (k.1, k.2)));
                     o.tr.orientations.push((tick, fw, up));
                 }
                 if st.rebuilt_mask & (1 << 12) != 0 {
@@ -614,40 +614,85 @@ pub fn run_cli(args: &[String], names: Option<&dyn crate::film_stats::NameSource
     }
     let mut fol = Follower::new(opts);
     let started = std::time::Instant::now();
-    let mut last_sig: Option<(u64, std::time::SystemTime)> = None;
+    // #film-reader  ONE handle, kept open across polls: read-only, share READ|WRITE|DELETE, the
+    // size always asked of the handle (a path stat of a file MCC is appending to can be stale on
+    // NTFS), and a finalise rename that never has to wait for us.
+    let mut tail: Option<crate::film_reader::Tail> = None;
+    let mut last_err: Option<String> = None;
     let mut header_done = false;
+    let mut parsed_once = false;
+    let mut announced_final = false;
+    let target = std::path::PathBuf::from(&path);
     loop {
-        let sig = std::fs::metadata(&path).ok().map(|m| (m.len(), m.modified().unwrap_or(std::time::UNIX_EPOCH)));
-        if sig.is_some() && sig != last_sig {
-            match crate::film::open(std::path::Path::new(&path)) {
-                Ok(f) => {
-                    last_sig = sig;
-                    let cpu0 = cpu_seconds();
-                    let evs = fol.refresh(&f, names);
-                    let cpu = cpu_seconds() - cpu0;
-                    for e in &evs {
-                        let r = if emit_csv {
-                            if !header_done {
-                                let _ = writeln!(out, "id,tick,seconds,type,data");
-                                header_done = true;
-                            }
-                            writeln!(out, "{},{},{:.3},{},{}", e.id, e.tick, e.tick as f64 / 60.0, e.json["type"].as_str().unwrap_or(""), csv_quote(&e.json.to_string()))
-                        } else {
-                            writeln!(out, "{}", e.json)
-                        };
-                        if r.is_err() {
-                            return 0; // the consumer went away
-                        }
-                    }
-                    let _ = out.flush();
-                    let _ = writeln!(err, "refresh: {} records ({} new), {} events, {:.1} ms wall, {:.1} ms cpu", fol.last.records_total, fol.last.records_new, evs.len(), fol.last.wall.as_secs_f64() * 1e3, cpu * 1e3);
+        if tail.is_none() {
+            match crate::film_reader::Tail::open(&target, &crate::film_reader::Retry::PATIENT, crate::film::same_recording, crate::film::film_search_dirs()) {
+                Ok(t) => {
+                    tail = Some(t);
+                    last_err = None;
                 }
                 Err(e) => {
-                    let _ = writeln!(err, "waiting: {e}");
+                    let m = e.to_string();
+                    if last_err.as_deref() != Some(m.as_str()) {
+                        let _ = writeln!(err, "waiting: {m} (details are logged to {})", crate::film_reader::LOG_FILE);
+                        last_err = Some(m);
+                    }
                 }
             }
         }
-        if once && sig.is_some() {
+        let mut processed = false;
+        let mut dropped = false;
+        if let Some(t) = tail.as_mut() {
+            match t.poll() {
+                Ok(p) => {
+                    if p.new_bytes > 0 || p.restarted || !parsed_once {
+                        match crate::film::parse(t.bytes()) {
+                            Ok(f) => {
+                                parsed_once = true;
+                                processed = true;
+                                let cpu0 = cpu_seconds();
+                                let evs = fol.refresh(&f, names);
+                                let cpu = cpu_seconds() - cpu0;
+                                for e in &evs {
+                                    let r = if emit_csv {
+                                        if !header_done {
+                                            let _ = writeln!(out, "id,tick,seconds,type,data");
+                                            header_done = true;
+                                        }
+                                        writeln!(out, "{},{},{:.3},{},{}", e.id, e.tick, e.tick as f64 / 60.0, e.json["type"].as_str().unwrap_or(""), csv_quote(&e.json.to_string()))
+                                    } else {
+                                        writeln!(out, "{}", e.json)
+                                    };
+                                    if r.is_err() {
+                                        return 0; // the consumer went away
+                                    }
+                                }
+                                let _ = out.flush();
+                                let _ = writeln!(err, "refresh: {} records ({} new), {} events, {:.1} ms wall, {:.1} ms cpu", fol.last.records_total, fol.last.records_new, evs.len(), fol.last.wall.as_secs_f64() * 1e3, cpu * 1e3);
+                            }
+                            Err(e) => {
+                                let _ = writeln!(err, "waiting: {e}");
+                            }
+                        }
+                    }
+                    if p.just_finalised && !announced_final {
+                        announced_final = true;
+                        let name = t.finalised_as.as_ref().and_then(|f| f.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        let line = serde_json::json!({"id": "finalised", "tick": fol.last.records_total, "seconds": 0.0, "type": "finalised", "file": name});
+                        let _ = if emit_csv { writeln!(out, "finalised,{},0.000,finalised,{}", fol.last.records_total, csv_quote(&line.to_string())) } else { writeln!(out, "{line}") };
+                        let _ = out.flush();
+                        let _ = writeln!(err, "the recording was finalised as {name}");
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "read error ({e}); re-opening");
+                    dropped = true;
+                }
+            }
+        }
+        if dropped {
+            tail = None;
+        }
+        if once && processed {
             return 0;
         }
         if max_secs.map_or(false, |m| started.elapsed().as_secs() >= m) {
@@ -796,6 +841,58 @@ mod tests {
         let expect: Vec<&Event> = whole.iter().filter(|e| e.tick > 20000).collect();
         assert_eq!(tail.len(), expect.len());
         assert!(tail.iter().zip(expect.iter()).all(|(a, b)| a.json == b.json));
+    }
+
+    /// #film-reader  GATE. A real film appended to a file in chunks that end MID-RECORD, read through
+    /// the shared-handle tail, parses to a monotonically growing record count that never exceeds
+    /// what has been written, the follower's events over all the refreshes equal the one-shot
+    /// events, and `same_recording` tells a truncated copy from a different match.
+    #[test]
+    fn a_real_film_written_in_odd_chunks_is_followed_to_the_same_events() {
+        use std::io::Write;
+        let Some(full) = crate::film_megalo::tests_castle_wars() else {
+            eprintln!("SKIPPED: Castle Wars fixture (*53C14E9D*) not on this machine");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("hms-follow-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("live.temp");
+        std::fs::write(&p, b"").unwrap();
+        let bytes = full.bytes.clone();
+        let mut tail = crate::film_reader::Tail::open(&p, &crate::film_reader::Retry::NONE, crate::film::same_recording, vec![]).unwrap();
+        let mut fol = Follower::new(opts());
+        let mut acc: Vec<Event> = Vec::new();
+        let (mut at, mut last_records, mut steps) = (0usize, 0usize, 0u32);
+        let mut w = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+        while at < bytes.len() {
+            // chunk ends are deliberately not on record boundaries
+            let n = (1 + (steps as usize * 7919 + 1237) % 400_000).min(bytes.len() - at);
+            w.write_all(&bytes[at..at + n]).unwrap();
+            w.flush().unwrap();
+            at += n;
+            steps += 1;
+            let r = tail.poll().unwrap();
+            assert_eq!(r.new_bytes, n);
+            assert_eq!(tail.bytes(), &bytes[..at]);
+            let Ok(f) = crate::film::parse(tail.bytes()) else { continue };
+            let recs = f.data.records.len();
+            assert!(recs >= last_records && recs <= full.data.records.len(), "records only grow and never exceed the whole ({recs})");
+            last_records = recs;
+            acc.extend(fol.refresh(&f, None));
+        }
+        assert!(steps > 10);
+        assert_eq!(last_records, full.data.records.len());
+        let whole = Follower::new(opts()).refresh(&full, None);
+        assert_eq!(acc.len(), whole.len());
+        assert!(acc.iter().zip(whole.iter()).all(|(a, b)| a.json == b.json));
+        // same_recording: a truncated copy is the same recording, a different match is not
+        let cut = &bytes[..bytes.len() / 2];
+        assert!(crate::film::same_recording(&bytes[..], cut));
+        if let Some(other) = crate::film::spec_corpus().into_iter().find(|q| !q.to_string_lossy().contains("53C14E9D")).and_then(|q| std::fs::read(q).ok()) {
+            assert!(!crate::film::same_recording(&bytes, &other));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// #film-follow  GATE (headless). The follower must not be able to reach the GPU, the window

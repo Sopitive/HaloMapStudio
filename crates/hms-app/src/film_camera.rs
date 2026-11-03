@@ -958,7 +958,12 @@ pub fn resolve(
                 .map(|s| s.to_tick)
                 .max()
                 .unwrap_or(0);
-            let ticks = (ENTER_VEHICLE_TRANSITION_SECONDS * TICK_HZ).round() as u32;
+            // #sync-camera  `c_game_director::update` (halo3_tag_test.xex 0x82D1E3B0) hands
+            // `camera_globals+0x98` (the matg `exit vehicle transition time`) to the change INTO first
+            // person and `+0x94` (`enter vehicle transition time`) to the change into third person.
+            // Returning to a first-person preference is the former.
+            let secs = if preferred == EngineCameraMode::FirstPerson { EXIT_VEHICLE_TRANSITION_SECONDS } else { ENTER_VEHICLE_TRANSITION_SECONDS };
+            let ticks = (secs * TICK_HZ).round() as u32;
             let blend = if ticks == 0 || entered == 0 {
                 1.0
             } else {
@@ -1045,10 +1050,17 @@ pub fn context_pose(
         // vehicle's own facing rather than behind the player's aim.
         ContextDetail::VehicleSeat { vehicle, .. } => {
             let tr = pb.index.tracks.iter().find(|t| t.net_id == *vehicle)?;
-            let p = tr.sample(tick)?;
-            let yaw = tr
-                .facing_at(tick)
-                .or_else(|| tr.sample_orientation(tick).map(|(f, _)| f[1].atan2(f[0])))
+            // #cam-jitter  The vehicle is DRAWN at the fractional playback clock
+            // (`film_vehicle::position_at` / `orientation_at`, "#film-jitter"). The camera that
+            // frames it must read the SAME clock through the SAME functions: it used to read the
+            // rounded tick, so it moved in 60 Hz steps while the hull moved smoothly, and at any
+            // display rate that is not exactly 60 Hz the hull wobbled in the view by up to a tick of
+            // travel (7 px RMS at 144 fps on a Mongoose doing ~20 wu/s, measured).
+            let ft = pb.tick.max(0.0);
+            let p = crate::film_vehicle::position_at(tr, ft)?.to_array();
+            let yaw = crate::film_vehicle::orientation_at(tr, ft)
+                .map(|(f, _)| f[1].atan2(f[0]))
+                .or_else(|| tr.facing_at(tick))
                 .unwrap_or(plain.yaw);
             orbit(p, crate::film_play::FOLLOW_PIVOT_WU, yaw + rig.yaw_off, rig.elev, rig.dist)
         }
@@ -1090,9 +1102,11 @@ pub fn context_pose(
         // for anyone but the recorder.
         ContextDetail::WeaponThirdPerson { .. } => {
             let tr = pb.index.tracks.iter().find(|t| t.net_id == ctx.subject)?;
-            let p = tr.sample(tick)?;
+            // #fp-jitter  the fractional clock, like the plain follow camera it replaces
+            let ft = pb.tick.max(0.0);
+            let p = crate::film_vehicle::position_at(tr, ft).map(|v| v.to_array()).or_else(|| tr.sample(tick))?;
             let yaw = tr
-                .facing_at(tick)
+                .facing_at_f(ft)
                 .or_else(|| tr.sample_orientation(tick).map(|(f, _)| f[1].atan2(f[0])))
                 .unwrap_or(plain.yaw);
             orbit(p, crate::film_play::FOLLOW_PIVOT_WU, yaw + rig.yaw_off, rig.elev, rig.dist)

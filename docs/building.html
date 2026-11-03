@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Building from source — Halo Map Studio</title>
+<meta name="description" content="Build Halo Map Studio from source on Windows with one script (build-windows.ps1): requirements, what it produces, pointing it at your own MCC install, and troubleshooting. Linux notes included.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html" class="cur" aria-current="page">Building from source</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Building from source -->
+<!-- desc: Build Halo Map Studio from source on Windows with one script (build-windows.ps1): requirements, what it produces, pointing it at your own MCC install, and troubleshooting. Linux notes included. -->
+<h1>Building from source</h1>
+<p class="lead">On Windows the whole build is one command, <code>.\build-windows.ps1</code>. It needs no Linux, no WSL and no cross-compiler: just Rust and the Visual Studio C++ build tools. The same steps are in <code>BUILDING.md</code> at the root of the repository.</p>
+
+<div class="note"><strong>No game content is included.</strong> Halo Map Studio reads the game files of a copy of Halo: The Master Chief Collection that you own and have installed. A source build downloads nothing but Rust crates from crates.io and bundles no Halo maps, tags, textures or shaders. Source builds are under the same licence as the program (PolyForm Noncommercial 1.0.0); see <a href="license.html">Licence &amp; commercial use</a>.</div>
+
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#req">Requirements</a></li>
+<li><a href="#build">Build</a></li>
+<li><a href="#out">What you get</a></li>
+<li><a href="#run">Run it and point it at your game</a></li>
+<li><a href="#trouble">Troubleshooting</a></li>
+<li><a href="#linux">Linux</a></li>
+</ul></div>
+
+<h2 id="req">Requirements</h2>
+<div class="tablewrap"><table>
+<tr><th>What</th><th>Version</th><th>Notes</th></tr>
+<tr><td>Windows</td><td>10 or 11, 64-bit</td><td></td></tr>
+<tr><td>Rust, via <a href="https://rustup.rs">rustup</a></td><td>stable, <strong>MSVC host</strong></td><td><code>rust-toolchain.toml</code> pins the channel and the <code>x86_64-pc-windows-msvc</code> target.</td></tr>
+<tr><td>Visual Studio 2022 or Build Tools 2022</td><td>workload <strong>Desktop development with C++</strong></td><td>Provides MSVC (toolset v143), MSBuild and the linker.</td></tr>
+<tr><td>Windows 10/11 SDK</td><td>10.0.19041 or newer</td><td>Part of the workload.</td></tr>
+<tr><td>Disk space</td><td>about 10 GB free</td><td>Build Tools about 6 GB, <code>target\</code> about 3 GB.</td></tr>
+<tr><td>Time</td><td>5&ndash;20 minutes the first time</td><td>About 220 crates; later builds are incremental.</td></tr>
+</table></div>
+<p>No CMake, git submodules, WSL, LLVM or cargo-xwin are needed, and you do not have to start from a Developer prompt. Install what is missing (the script prints these commands at the first missing item):</p>
+<pre><code>winget install Rustlang.Rustup
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"</code></pre>
+<p>Open a new terminal afterwards so <code>cargo</code> is on the <code>PATH</code>.</p>
+
+<h2 id="build">Build</h2>
+<pre><code>git config --global core.longpaths true
+git clone https://github.com/Sopitive/HaloMapStudio.git
+cd HaloMapStudio
+.\build-windows.ps1</code></pre>
+<p><code>build-windows.cmd</code> does the same for double-clicking or <code>cmd.exe</code>. The script works in Windows PowerShell 5.1 and PowerShell 7, stops at the first missing prerequisite with the command that fixes it, writes only inside the repository folder and downloads nothing itself. It checks Rust, Visual Studio, MSBuild, the C++ toolset and the Windows SDK; builds <code>HaloMapStudioDLL.dll</code> with MSBuild (Release|x64); runs <code>cargo build --release --locked -p hms-app</code>; and assembles <code>dist\windows-x64\</code>.</p>
+<div class="tablewrap"><table>
+<tr><th>Option</th><th>Effect</th></tr>
+<tr><td><code>-Package</code></td><td>Also write <code>dist\release\HaloMapStudio-&lt;version&gt;-windows-x64.zip</code> and a <code>.sha256</code>.</td></tr>
+<tr><td><code>-SkipNative</code></td><td>Reuse an existing <code>native\x64\Release\HaloMapStudioDLL.dll</code>.</td></tr>
+<tr><td><code>-Debug</code></td><td>Debug build; stays in <code>target\debug\</code>.</td></tr>
+<tr><td><code>-Clean</code></td><td>Delete previous build output first.</td></tr>
+<tr><td><code>-Verbose</code></td><td>Show the MSBuild and cargo command lines and verbose output.</td></tr>
+</table></div>
+<p>If PowerShell says running scripts is disabled, use <code>build-windows.cmd</code>.</p>
+
+<h2 id="out">What you get</h2>
+<pre><code>dist\windows-x64\
+  hms-app.exe              the application
+  HaloMapStudioDLL.dll     the native map parser (keep it next to hms-app.exe)
+  README.md  LICENSE.md  COMMERCIAL-LICENSE.md  THIRD-PARTY-NOTICES.md</code></pre>
+<p>This is the same set of files as the release archive. The default build is the offline viewer and editor.</p>
+
+<h2 id="run">Run it and point it at your game</h2>
+<p>Run <code>dist\windows-x64\hms-app.exe</code>. It finds an MCC installed through Steam (other library drives and Workshop maps included) by itself, and Microsoft Store / Xbox installs in the default folders when there is no Steam copy. Install Halo: Reach (and Halo 4, Halo 3 or Halo 2 Anniversary if you want those) in MCC first. For an unusual location set <code>HMS_MCC_DIRS</code>, as described in the <a href="faq.html#no-maps">FAQ</a>; <code>hms-app --dump-maps</code> prints what was found. The files are read in place and never copied or modified. A GPU with DirectX 12 or Vulkan support is required.</p>
+
+<h2 id="trouble">Troubleshooting</h2>
+<ul>
+<li><strong>Visual Studio not found, or <code>link.exe</code> not found.</strong> The C++ workload is missing: run the <code>winget</code> command above or tick &ldquo;Desktop development with C++&rdquo; in the Visual Studio Installer. If cargo reports <code>linking with link.exe failed</code> and the workload is installed, another <code>link.exe</code> (for example Git for Windows&rsquo; <code>usr\bin</code>) is first on the <code>PATH</code>: build from the &ldquo;x64 Native Tools Command Prompt for VS 2022&rdquo; or the &ldquo;Developer PowerShell for VS 2022&rdquo;.</li>
+<li><strong><code>kernel32.lib</code> or <code>windows.h</code> not found.</strong> Add the Windows 10/11 SDK in the Visual Studio Installer.</li>
+<li><strong>The Rust host is <code>x86_64-pc-windows-gnu</code>.</strong> <code>rustup set default-host x86_64-pc-windows-msvc</code>, then <code>rustup toolchain install stable-x86_64-pc-windows-msvc</code>.</li>
+<li><strong>&ldquo;path too long&rdquo;, or files missing after cloning.</strong> Run <code>git config --global core.longpaths true</code>, clone again, and keep the folder near the drive root (for example <code>C:\src\hms</code>).</li>
+<li><strong>Antivirus quarantines <code>hms-app.exe</code> or the DLL, or the build is very slow.</strong> Freshly linked, unsigned programs are sometimes flagged. Exclude the repository folder from real-time scanning while building and restore the quarantined file.</li>
+<li><strong>The file is in use.</strong> A running <code>hms-app.exe</code> holds the files. Close it and rebuild.</li>
+<li><strong>The app says the native library is unavailable.</strong> <code>HaloMapStudioDLL.dll</code> must be in the same folder as <code>hms-app.exe</code>; unblock it (Properties) if it came from a downloaded archive. On another PC install the Microsoft Visual C++ Redistributable (x64).</li>
+<li><strong>No window, or a black window.</strong> Update the GPU driver; DirectX 12 or Vulkan is required.</li>
+</ul>
+<p class="small">The Windows script was written and checked on Linux and has not yet been run on every Windows setup. If a step fails on yours, please open an issue with the script output.</p>
+
+<h2 id="linux">Linux</h2>
+<p>Needs stable Rust, a C++20 compiler, the <code>libdeflate</code> development files and a Vulkan-capable GPU.</p>
+<pre><code>./build-all.sh linux</code></pre>
+<p>This builds <code>libhalomapstudio.so</code> and <code>target/release/hms-app</code>; keep the two together. <code>./build-all.sh windows</code> cross-builds the Windows release from Linux (cargo-xwin, clang-cl, lld-link); it is for maintainers, and Windows users should use <code>build-windows.ps1</code>.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

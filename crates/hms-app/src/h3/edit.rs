@@ -56,14 +56,16 @@ pub struct H3ObjMeta {
     pub slot: usize,
     /// Spare clips / teleporter channel / spawn order, by object type (see `StorageRole`).
     pub shared_storage: u8,
-    /// The record's multiplayer flags byte (symmetry is bits 2-3; the rest rides through a save).
+    /// The record's multiplayer flags byte (unique 0x01, not-at-start 0x02, symmetry 0x0C; the rest rides through a save).
     pub mp_flags: u8,
+    /// The record's 10-bit game-engine mask (which gametype engines the object appears in; 0x3FF = all).
+    pub game_engine_flags: u16,
 }
 
 impl H3ObjMeta {
     pub fn from_record(o: &H3VariantObject, name: &str) -> Self {
         H3ObjMeta { name: name.to_string(), quota: o.quota, team: o.team, object_type: o.object_type, spawn_time: o.spawn_time,
-            boundary_shape: o.boundary_shape, boundary_q: o.boundary_q, slot: o.slot, shared_storage: o.shared_storage, mp_flags: o.mp_flags }
+            boundary_shape: o.boundary_shape, boundary_q: o.boundary_q, slot: o.slot, shared_storage: o.shared_storage, mp_flags: o.mp_flags, game_engine_flags: o.game_engine_flags }
     }
 }
 
@@ -102,7 +104,7 @@ pub fn new_placement_meta(it: &H3PaletteItem) -> H3ObjMeta {
         name: it.name.clone(), quota: -1, team: super::palette::TEAM_NEUTRAL, object_type: mp.object_type,
         spawn_time: mp.spawn_time.clamp(0, 255) as u8, boundary_shape: mp.boundary_shape,
         boundary_q: super::mvar::quantize_boundary(mp.boundary),
-        slot: NEW_SLOT, shared_storage: 0, mp_flags: super::palette::PLACED_MP_FLAGS,
+        slot: NEW_SLOT, shared_storage: 0, mp_flags: super::palette::PLACED_MP_FLAGS, game_engine_flags: super::palette::ALL_ENGINES,
     }
 }
 
@@ -139,6 +141,18 @@ pub fn boundary_q_of(wu: f32) -> u16 { super::mvar::quantize_boundary([wu; 4])[0
 /// bit is which is a naming question only; HMS calls `0x04` symmetric and `0x08` asymmetric, by the
 /// order the Forge menu lists them.
 pub const MP_SYMMETRY_MASK: u8 = 0x0C;
+/// Multiplayer-flags bit 0: the Forge menu's `unique_object`. PROVEN: halo3.dll copies variant flag bit 0 to the
+/// live object's multiplayer flag 0x40 (c_map_variant::apply_multiplayer_properties, sub_1800BD3BC); INFERRED:
+/// the NAME, from the Reach prototype's tag enum `multiplayer_object_placement_spawn_flags` (bit 0 "unique
+/// spawn") and the menu key order. No shipped file sets it (0 of 62 527 objects).
+pub const MP_UNIQUE: u8 = 0x01;
+/// Bit 1: the Forge menu's `on_map_at_start`, STORED INVERTED (set = NOT placed at the start of the match),
+/// the same `not initially placed` the Reach tag enum names as flag 1. Live flag 0x80. Set on 805 shipped objects.
+pub const MP_NOT_AT_START: u8 = 0x02;
+/// The four bits halo3.dll reads from the byte (bits 0-1 and the symmetry pair). Bits 4-7 are stored by the
+/// encoder but never read by the engine's apply / setup paths (0x40 on 25 shipped objects, 0x80 on 3 051): the
+/// editor leaves them exactly as found.
+pub const MP_EDIT_MASK: u8 = 0x0F;
 
 /// A scenario-owned slot the editor holds (scenario.rs): the base map's own object. Its editor
 /// object is live while it exists; one that is no longer live was DELETED, and the save writes its
@@ -268,9 +282,12 @@ pub struct H3LiveMeta {
     pub palette_item: Option<usize>,
     /// The editor's `shared_storage` byte; None leaves the record's (a type with no editable role).
     pub shared_storage: Option<u8>,
-    /// The editor's symmetry bits (`MP_SYMMETRY_MASK`); None leaves the record's flags alone. Only
-    /// those two bits are ever taken, so the rest of the byte rides through a save as read.
-    pub symmetry: Option<u8>,
+    /// The editor's multiplayer-flag bits (`MP_EDIT_MASK`: unique, not-at-start, symmetry pair); None leaves
+    /// the record's flags alone. Only those four bits are ever taken, so the rest of the byte rides through
+    /// a save as read.
+    pub mp_bits: Option<u8>,
+    /// The editor's game-engine mask; None leaves the record's alone.
+    pub engine: Option<u16>,
 }
 
 /// What Forge refuses a placement for, in the order the engine checks (halo3.dll sub_1800BBBD0: a
@@ -302,7 +319,8 @@ fn apply_live_meta(rec: &mut H3VariantObject, m: &H3LiveMeta) {
     rec.team = m.team;
     rec.spawn_time = m.spawn_time;
     if let Some(ss) = m.shared_storage { rec.shared_storage = ss; }
-    if let Some(sym) = m.symmetry { rec.mp_flags = (rec.mp_flags & !MP_SYMMETRY_MASK) | (sym & MP_SYMMETRY_MASK); }
+    if let Some(bits) = m.mp_bits { rec.mp_flags = (rec.mp_flags & !MP_EDIT_MASK) | (bits & MP_EDIT_MASK); }
+    if let Some(e) = m.engine { rec.game_engine_flags = e & super::palette::ALL_ENGINES; }
     if m.boundary_shape != rec.boundary_shape || m.boundary_q != rec.boundary_q {
         rec.boundary_shape = m.boundary_shape;
         rec.boundary_q = m.boundary_q;
@@ -440,7 +458,7 @@ mod tests {
         let deleted = set.scn.iter().filter(|e| e.rec.flags & SLOT_DELETED != 0).count();
         assert_eq!(set.objects.len() + set.kept.len() + deleted, v.objects.len());
         assert!(set.objects.len() > 30);
-        let meta: HashMap<u32, H3LiveMeta> = set.meta.iter().map(|(&d, m)| (d, H3LiveMeta { team: m.team, spawn_time: m.spawn_time, boundary_shape: m.boundary_shape, boundary_q: m.boundary_q, palette_item: None, shared_storage: None, symmetry: None })).collect();
+        let meta: HashMap<u32, H3LiveMeta> = set.meta.iter().map(|(&d, m)| (d, H3LiveMeta { team: m.team, spawn_time: m.spawn_time, boundary_shape: m.boundary_shape, boundary_q: m.boundary_q, palette_item: None, shared_storage: None, mp_bits: None, engine: None })).collect();
         let (v2, list, report) = build_h3_save_list(&v, &items, &set.src, &set.objects, &[], &set.kept, &set.scn, &meta, false);
         assert_eq!(report, H3SaveReport { scenario_deleted: deleted, ..Default::default() });
         assert_eq!(list, v.objects, "no-edit save list is the file's record list");
@@ -463,7 +481,7 @@ mod tests {
         let w = items.iter().position(|it| it.category == "Weapons").unwrap();
         let extra = [ObjectInfo { datum: 0xF000_0001, type_sig: 0, sig0: 0, sig1: 0, pos: [1.0, -10.0, 17.0], health: 1.0, shield: 1.0, mode_tag: 0, fwd: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], attached: [0; 8], primary_tag: h3_tag(items[w].tag), variant_name_sid: 0 }];
         let mut meta2 = meta.clone();
-        meta2.insert(0xF000_0001, H3LiveMeta { team: 8, spawn_time: 30, boundary_shape: 0, boundary_q: [0; 4], palette_item: Some(w), shared_storage: None, symmetry: None });
+        meta2.insert(0xF000_0001, H3LiveMeta { team: 8, spawn_time: 30, boundary_shape: 0, boundary_q: [0; 4], palette_item: Some(w), shared_storage: None, mp_bits: None, engine: None });
         let (v3, list3, report3) = build_h3_save_list(&v, &items, &set.src, &set.objects, &extra, &set.kept, &set.scn, &meta2, false);
         assert_eq!(list3.len(), v.objects.len() + 1);
         let added = list3.iter().find(|r| r.flags == super::super::palette::PLACED_FLAGS && !v.objects.iter().any(|o| o.slot == r.slot)).unwrap();
@@ -492,7 +510,7 @@ mod tests {
         let live = [ObjectInfo { datum: d, type_sig: 0, sig0: 0, sig1: 0, pos: at, health: 1.0, shield: 1.0, mode_tag: 0,
             fwd: [1.0, 0.0, 0.0], up: [0.0, 0.0, 1.0], attached: [0; 8], primary_tag: h3_tag(items[row].tag), variant_name_sid: 0 }];
         let mut meta: HashMap<u32, H3LiveMeta> = HashMap::new();
-        meta.insert(d, H3LiveMeta { team: super::super::palette::TEAM_NEUTRAL, spawn_time: 30, boundary_shape: 0, boundary_q: [0; 4], palette_item: Some(row), shared_storage: None, symmetry: None });
+        meta.insert(d, H3LiveMeta { team: super::super::palette::TEAM_NEUTRAL, spawn_time: 30, boundary_shape: 0, boundary_q: [0; 4], palette_item: Some(row), shared_storage: None, mp_bits: None, engine: None });
         let (v2, list, report) = build_h3_save_list(&v, &items, &HashMap::new(), &live, &[], &kept, &[], &meta, true);
         assert_eq!(report.unsaveable, 0);
         assert_eq!(report.over_slot_cap, 0);
@@ -632,7 +650,7 @@ mod tests {
                 let rec = &set.src[&d];
                 // a base-map object that stands where the scenario put it has no properties of its own to edit in place (the scenario gates cover its promotion)
                 if !rec.placed { continue; }
-                let flagged = rec.mp_flags & !MP_SYMMETRY_MASK != 0;
+                let flagged = rec.mp_flags & !MP_EDIT_MASK != 0;
                 let pick = match want_role {
                     StorageRole::SpareClips if !seen_clips => { seen_clips = true; true }
                     StorageRole::TeleporterChannel if !seen_chan => { seen_chan = true; true }
@@ -650,24 +668,98 @@ mod tests {
                         StorageRole::SpawnOrder => om.spawn_seq = 9,
                         StorageRole::None => {}
                     }
-                    om.placement = (om.placement & !MP_SYMMETRY_MASK) | 0x04;
+                    om.placement = (om.placement & !MP_EDIT_MASK) | 0x05;
                 });
                 let (_, list, _) = build_h3_save_list(v, items, &set.src, &set.objects, &[], &set.kept, &set.scn, &metas, false);
                 let changed: Vec<&H3VariantObject> = list.iter().zip(v.objects.iter()).filter(|(a, b)| a != b).map(|(a, _)| a).collect();
                 let new = list.iter().find(|r| r.slot == rec.slot).unwrap();
                 if want_role != StorageRole::None { assert_eq!(new.shared_storage, 9, "{:?} edit did not reach the record", want_role); }
                 else { assert_eq!(new.shared_storage, rec.shared_storage, "a type with no role keeps its byte"); }
-                assert_eq!(new.mp_flags, (rec.mp_flags & !MP_SYMMETRY_MASK) | 0x04, "symmetry rewrote bits beyond its two");
+                assert_eq!(new.mp_flags, (rec.mp_flags & !MP_EDIT_MASK) | 0x05, "the flag edit rewrote bits beyond its four");
                 assert!(changed.len() <= 1 && changed.iter().all(|r| r.slot == rec.slot), "{} records changed for a one-object edit", changed.len());
                 if want_role == StorageRole::None { continue; }
                 let mut want = rec.clone();
                 want.shared_storage = 9;
-                want.mp_flags = (rec.mp_flags & !MP_SYMMETRY_MASK) | 0x04;
+                want.mp_flags = (rec.mp_flags & !MP_EDIT_MASK) | 0x05;
                 assert_eq!(*new, want, "something besides storage / symmetry moved");
             }
         });
         eprintln!("STORAGE EDITS: {n} variants; clips {seen_clips} channel {seen_chan} order {seen_order} flagged {seen_flagged}");
         if n > 0 { assert!(seen_clips && seen_chan && seen_order && seen_flagged, "the sweep never met every case"); }
+    }
+
+    /// THE property gate: every panel property of a Halo 3 object, edited the way the properties panel
+    /// edits it (record -> ObjMeta -> edit -> live meta -> save list -> file), on a Forge record of every
+    /// installed variant: the record carries the new value, equals the source record with ONLY that field
+    /// changed, no other record moved, and the written file decodes back to the same list. Map-backed
+    /// (#[ignore]).
+    #[test]
+    #[ignore]
+    fn every_panel_property_edit_reaches_its_record_and_nothing_else() {
+        type Edit = Box<dyn Fn(&mut crate::ObjMeta, &mut H3LiveMeta)>;
+        type Want = Box<dyn Fn(&mut H3VariantObject)>;
+        let mut total = 0usize;
+        let n = each_installed_variant(|file, cache, items, v| {
+            let set = variant_to_editor(cache, items, v);
+            let data = crate::mvar::read_expanded(file).unwrap();
+            // a Forge record, and one that has a shape if the file has any
+            let pick = |want_shape: bool| set.src.iter().filter(|(_, r)| r.placed && r.flags & SLOT_SCENARIO == 0 && (!want_shape || r.boundary_shape != 0)).map(|(&d, r)| (r.slot, d)).min();
+            let mut targets: Vec<(usize, u32)> = pick(false).into_iter().collect();
+            targets.extend(pick(true).filter(|t| !targets.contains(t)));
+            for (_, d) in targets {
+                let rec = set.src[&d].clone();
+                let role = StorageRole::of(rec.object_type);
+                let mut cases: Vec<(String, Edit, Want)> = Vec::new();
+                for t in [0u8, 3, 7, 8] { cases.push((format!("team {t}"), Box::new(move |_, l| l.team = t), Box::new(move |r| r.team = t))); }
+                for t in [0u8, 1, 255] { cases.push((format!("spawn time {t}"), Box::new(move |om, _| om.respawn = t), Box::new(move |r| r.spawn_time = t))); }
+                for sym in [0x04u8, 0x08, 0x0C] { cases.push((format!("symmetry {sym:#x}"), Box::new(move |om, _| om.placement = (om.placement & !MP_SYMMETRY_MASK) | sym), Box::new(move |r| r.mp_flags = (r.mp_flags & !MP_SYMMETRY_MASK) | sym))); }
+                for on in [true, false] {
+                    cases.push((format!("unique {on}"), Box::new(move |om, _| om.placement = (om.placement & !MP_UNIQUE) | if on { MP_UNIQUE } else { 0 }), Box::new(move |r| r.mp_flags = (r.mp_flags & !MP_UNIQUE) | if on { MP_UNIQUE } else { 0 })));
+                    cases.push((format!("not at start {on}"), Box::new(move |om, _| om.placement = (om.placement & !MP_NOT_AT_START) | if on { MP_NOT_AT_START } else { 0 }), Box::new(move |r| r.mp_flags = (r.mp_flags & !MP_NOT_AT_START) | if on { MP_NOT_AT_START } else { 0 })));
+                }
+                for e in [1u16, 0x155, 0x3FF] { cases.push((format!("engine {e:#x}"), Box::new(move |om, _| om.h3_engine = e), Box::new(move |r| r.game_engine_flags = e))); }
+                for x in [0u8, 9, 255] {
+                    match role {
+                        StorageRole::SpareClips => cases.push((format!("spare clips {x}"), Box::new(move |om, _| om.weapon_clips = x), Box::new(move |r| r.shared_storage = x))),
+                        StorageRole::TeleporterChannel => cases.push((format!("channel {x}"), Box::new(move |om, _| om.tele_channel = x), Box::new(move |r| r.shared_storage = x))),
+                        StorageRole::SpawnOrder => cases.push((format!("spawn order {x}"), Box::new(move |om, _| om.spawn_seq = x as i32), Box::new(move |r| r.shared_storage = x))),
+                        StorageRole::None => {}
+                    }
+                }
+                if rec.boundary_shape != 0 {
+                    for q in [0u16, 1000, 65535] {
+                        cases.push((format!("size q{q}"), Box::new(move |om, _| om.boundary[0] = q), Box::new(move |r| { r.boundary_q[0] = q; r.boundary[0] = super::super::mvar::dequantize_real(q as u32, 0.0, super::super::mvar::H3_BOUNDARY_MAX, 16, false); })));
+                    }
+                } else {
+                    cases.push(("sphere radius".into(), Box::new(|om, _| { om.boundary_shape = 1; om.boundary[0] = 20000; }), Box::new(|r| { r.boundary_shape = 1; r.boundary_q[0] = 20000; r.boundary[0] = super::super::mvar::dequantize_real(20000, 0.0, super::super::mvar::H3_BOUNDARY_MAX, 16, false); })));
+                }
+                for (name, edit, want) in &cases {
+                    let mut metas = live_metas(&set, |_, _| {});
+                    // apply the edit on the one object, through ObjMeta -> live meta exactly as the app does
+                    let m = &set.meta[&d];
+                    let mut om = super::super::app::obj_meta_from_h3(m, rec.pos);
+                    let mut live = super::super::app::live_meta_of(&om, m.team, None);
+                    edit(&mut om, &mut live);
+                    let mut live2 = super::super::app::live_meta_of(&om, m.team, None);
+                    live2.team = live.team;
+                    metas.insert(d, live2);
+                    let (v2, list, _) = build_h3_save_list(v, items, &set.src, &set.objects, &[], &set.kept, &set.scn, &metas, false);
+                    let mut expect = rec.clone();
+                    want(&mut expect);
+                    let got = list.iter().find(|r| r.slot == rec.slot).unwrap();
+                    assert_eq!(*got, expect, "{}: '{name}' did not produce exactly the edited record", file.display());
+                    let moved = list.iter().zip(v.objects.iter()).filter(|(a, b)| a != b).count();
+                    assert!(moved <= 1 && list.len() == v.objects.len(), "{}: '{name}' changed {moved} records", file.display());
+                    let bytes = super::super::mvar::rebuild_h3_file(&data, &v2, &list, None).unwrap();
+                    let (body, _, _) = super::super::mvar::blf_h3_mvar_chunk(&bytes).unwrap();
+                    let back = super::super::mvar::parse_h3_payload(body).unwrap();
+                    assert_eq!(back.objects, list, "{}: '{name}' did not survive the file", file.display());
+                    total += 1;
+                }
+            }
+        });
+        eprintln!("PANEL PROPERTY EDITS: {total} edits over {n} variants");
+        if n > 0 { assert!(total > 0); }
     }
 
     /// What the save check is told: a quota over its `maximum_allowed`, a spent budget over the

@@ -248,6 +248,8 @@ fn read_h4(cat: &Catalog, path: &Path, game: Game) -> Result<XVariant, String> {
     Ok(out)
 }
 
+use crate::h3::edit::StorageRole;
+
 fn read_h3(cat: &Catalog, path: &Path) -> Result<XVariant, String> {
     let v = crate::h3::mvar::parse_h3_variant(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let canvas = canvas_of(Game::Halo3, v.map_id).unwrap_or_default();
@@ -262,6 +264,7 @@ fn read_h3(cat: &Catalog, path: &Path) -> Result<XVariant, String> {
         // is `(sandbox block + 1) << 16 | entry`, which is what the catalog's spot carries.
         let Some(q) = usize::try_from(o.quota).ok().and_then(|i| v.quotas.get(i)) else { out.unresolved += 1; continue };
         let Some(crate::h3::mvar::QuotaSource::Sandbox(block)) = q.source() else { out.unresolved += 1; continue };
+        let role = StorageRole::of(o.object_type);
         let entry = q.index() as u32;
         let Some(c) = cat.of_game(Game::Halo3).find(|c| c.places.iter().any(|p| p.canvas.eq_ignore_ascii_case(&canvas) && p.category_index == block as u32 && p.quota == entry)) else {
             out.unresolved += 1; continue
@@ -269,10 +272,13 @@ fn read_h3(cat: &Catalog, path: &Path) -> Result<XVariant, String> {
         out.objects.push(XObject {
             key: c.key.clone(), display: c.display.clone(), pos: o.pos, fwd: o.fwd, up: o.up,
             team: if o.team == 0xFF { -1 } else { o.team as i8 }, color: None,
-            spawn_time: o.spawn_time, spawn_sequence: 0, user_data: 0,
+            spawn_time: o.spawn_time, spawn_sequence: if role == StorageRole::SpawnOrder && o.shared_storage != 255 { o.shared_storage as i32 } else { 0 }, user_data: 0,
             shape: o.boundary_shape, shape_wu: o.boundary,
-            object_type: o.object_type, placement: 0x0C, labels: Vec::new(),
-            tele_channel: o.shared_storage, tele_passability: 0, weapon_clips: o.shared_storage, slot: o.slot as u16,
+            // the neutral placement byte is Reach-spelled: Halo 3's unique / not-at-start bits move to Reach's
+            object_type: o.object_type, placement: crate::prefab::translate_placement(Game::Halo3, Game::Reach, o.mp_flags), labels: Vec::new(),
+            // the record's one shared byte is a channel, a clip count or a spawn order by object type, never all three
+            tele_channel: if role == StorageRole::TeleporterChannel { o.shared_storage } else { 0 }, tele_passability: 0,
+            weapon_clips: if role == StorageRole::SpareClips { o.shared_storage } else { 0 }, slot: o.slot as u16,
         });
     }
     Ok(out)
@@ -1039,7 +1045,15 @@ fn write_h3(cat: &Catalog, tmpl: &Template, canvas_map: &Path, canvas: &str, pla
         o.team = if p.src.team < 0 { crate::h3::palette::TEAM_NEUTRAL } else { (p.src.team as u8).min(8) };
         if p.src.spawn_time != 0 { o.spawn_time = p.src.spawn_time; }
         if p.src.shape != 0 && o.boundary_shape == p.src.shape { o.set_boundary(o.boundary_shape, p.src.shape_wu); }
-        if p.src.tele_channel != 0 { o.shared_storage = p.src.tele_channel; }
+        // the shared byte by the TARGET object's role; the placement byte's four Halo 3 bits from the neutral (Reach-spelled) one
+        match StorageRole::of(o.object_type) {
+            StorageRole::TeleporterChannel if p.src.tele_channel != 0 => o.shared_storage = p.src.tele_channel,
+            StorageRole::SpareClips if p.src.weapon_clips != 0 => o.shared_storage = p.src.weapon_clips,
+            StorageRole::SpawnOrder if p.src.spawn_sequence > 0 => o.shared_storage = p.src.spawn_sequence.min(255) as u8,
+            _ => {}
+        }
+        let mp = crate::prefab::translate_placement(Game::Reach, Game::Halo3, p.src.placement);
+        o.mp_flags = (o.mp_flags & !crate::h3::edit::MP_EDIT_MASK) | (mp & crate::h3::edit::MP_EDIT_MASK);
         used[next] = true;
         next += 1;
         list.push(o);

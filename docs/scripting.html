@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
 <li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
 </ul>
@@ -152,6 +155,22 @@ set selection &lt;field&gt; &lt;value&gt;      # every selected object (aliases:
 </table></div>
 <p><code>get</code> prints an extra <code>h4:</code> block for a Halo 4 object (quota / variant with the palette name, type, spawn sequence / time, all four labels, placement + bits 8–9, parent, slot, shape values in raw and world units, the type tail, <code>record_scale</code> with its quantum, user data, the lock, and <code>gametype_scale</code> — the size the scale-label rule gives — with the effective value).</p>
 
+<h3 id="set-h3">Halo 3 objects</h3>
+<p>When a Halo 3 variant is open, <code>set</code> takes the Halo 3 record's own fields (Forge menu names; the Reach names where it is the same property). <code>color</code>, <code>label</code>, <code>scale</code>, <code>scaled</code>, <code>cached_type</code> and <code>passability</code> are refused with the reason: the record has no such field. <code>shadow</code> and <code>damage</code> (display-only) work as everywhere. <code>get</code> prints the Halo 3 properties instead of the Reach block.</p>
+<div class="tablewrap"><table>
+<tr><th>Field</th><th>Value</th><th>Notes</th></tr>
+<tr><td><code>team</code></td><td>0 … 8 or a name</td><td>No <code>none</code> (Halo 3 has no unset team).</td></tr>
+<tr><td><code>respawn</code> (<code>spawntime</code>, <code>respawn_rate</code>)</td><td>0 … 255</td><td>Respawn seconds</td></tr>
+<tr><td><code>spawn_order</code> (<code>spawnseq</code>)</td><td>0 … 255</td><td>Spawns and objective objects only (types 12–23); 255 = none</td></tr>
+<tr><td><code>clips</code> (<code>spare_clips</code>)</td><td>0 … 255</td><td>Weapons and grenades only</td></tr>
+<tr><td><code>channel</code> (<code>teleporter_channel</code>)</td><td>0 … 255</td><td>Teleporters only</td></tr>
+<tr><td><code>symmetry</code></td><td><code>both</code> <code>symmetric</code> <code>asymmetric</code></td><td></td></tr>
+<tr><td><code>unique</code></td><td><code>on</code> <code>off</code></td><td>The menu's "unique object"</td></tr>
+<tr><td><code>atstart</code> (<code>placed_at_start</code>)</td><td><code>on</code> <code>off</code></td><td>The menu's "on map at start"</td></tr>
+<tr><td><code>engine</code> (<code>gametypes</code>)</td><td><code>all</code> or a mask 1 … 0x3FF</td><td>Bit n = gametype engine n</td></tr>
+<tr><td><code>shape</code>, <code>radius</code> <code>width</code> <code>length</code> <code>top</code> <code>bottom</code></td><td>world units, 0 … 60</td><td>Which sizes exist depends on the shape (sphere radius; cylinder radius, top, bottom; box width, length, top, bottom); <code>b0</code>…<code>b3</code> take the raw 0 … 65535 quanta</td></tr>
+</table></div>
+
 <h2 id="coincident">coincident (face mate)</h2>
 <pre><code>coincident &lt;datumA&gt; &lt;faceA&gt; &lt;datumB&gt; &lt;faceB&gt; [centered] [noturn]</code></pre>
 <div class="note"><p>Needs the objects' mesh bounds, which the interactive app has after the scene is built. In a headless <code>--script</code> run, objects placed in the same run currently answer <code>coincident: no bounds for 0x…</code>; use it from the GUI console or the MCP server.</p></div>
@@ -257,7 +276,7 @@ captures are complete either way.</p>
 <tr><td><code>scale on|off|get</code> (<code>scaled</code>, <code>scaling</code>)</td><td>Settings ▸ <em>Scaled objects</em> (default on)</td><td>Global switch: objects whose SCALED flag is on render at the size their spawn sequence encodes. Off = every object at x1. (Different from <code>set &lt;datum&gt; scale N</code>, which writes the size.)</td></tr>
 <tr><td><code>shadowcasters on|off|get</code> (<code>shadowcaster</code>, <code>casters</code>, <code>shadows</code>)</td><td>Settings ▸ <em>Shadow casters (Forge)</em> (default on)</td><td>Global switch: objects whose SHADOW flag is on are drawn into the sun shadow map. Off = only the engine's default casters (vehicles, weapons and so on) cast.</td></tr>
 <tr><td><code>mapspawns on|off|get</code> (<code>map_spawns</code>, <code>scnrspawns</code>)</td><td>View ▸ <em>Show map spawn points</em> (default off)</td><td>Draw the base map's own built-in spawn markers (respawn points, respawn zones, spawning cameras). They are not part of your variant and cannot be edited or saved; your placed spawn points always show. Reports how many markers are hidden or drawn.</td></tr>
-<tr><td><code>precision</code> (<code>quant</code>, <code>saveerror</code>, <code>drift</code>)<br><code>precision &lt;datum&gt;</code><br><code>precision worst [n]</code><br><code>precision snap [selection|all|&lt;datum&gt;]</code><br><code>precision ghost [on|off] [&lt;factor&gt;]</code></td><td>Object panel &#9656; <em>save precision</em>; View &#9656; Overlays &#9656; <em>Save-precision ghost</em></td><td>The <strong>save-precision prediction</strong>: what pose the <code>.mvar</code> will actually hold once the game's quantisers have had their way with it (see <a href="editing.html#precision">Save precision</a>). With no argument it reports the open variant's world box, the position grid in world units and bits per axis, the worst rotation the format can impose, and the error statistics over every placed object (how many are exactly representable, how many quantise badly, mean and maximum position and rotation error). <code>precision &lt;datum&gt;</code> prints one object's live pose, the pose that will be stored, the per-axis and total deltas, and how much of the available error it is using. <code>precision worst [n]</code> (default 10) ranks the worst offenders twice, by position error and by rotation error. <code>precision snap</code> moves objects onto the nearest exactly-storable pose (one undo step in the app; a no-op the second time). <code>precision ghost</code> turns the viewport overlay on or off and sets the exaggeration factor (<code>x40</code> or <code>40</code>; 1 = true scale) — persisted like the View checkbox, and seeded by <code>HMS_QUANT_GHOST=1</code> / <code>HMS_QUANT_GHOST=1x40</code>. In the batch host the ghost is run-local and the next <code>screenshot</code> draws it, so a precision ghost can be captured headlessly.</td></tr>
+<tr><td><code>precision</code> (<code>quant</code>, <code>saveerror</code>, <code>drift</code>)<br><code>precision &lt;datum&gt;</code><br><code>precision worst [n]</code><br><code>precision snap [selection|all|&lt;datum&gt;]</code><br><code>precision report</code><br><code>precision on|off</code><br><code>precision ghost [on|off] [&lt;factor&gt;]</code></td><td>Object panel &#9656; <em>save precision</em>; Settings &#9656; <em>Saving &#9656; Save precision</em>; View &#9656; Overlays &#9656; <em>Show in-game pose (ghost)</em></td><td>The <strong>save-precision prediction</strong> (and, after a save, the report of what it adjusted: <code>precision report</code>; <code>precision on|off</code> turns the post-save adjustment on or off &mdash; on by default, <code>save</code> then moves the objects onto exactly what the game will load and prints the summary): what pose the <code>.mvar</code> will actually hold once the game's quantisers have had their way with it (see <a href="editing.html#precision">Save precision</a>). With no argument it reports the open variant's world box, the position grid in world units and bits per axis, the worst rotation the format can impose, and the error statistics over every placed object (how many are exactly representable, how many quantise badly, mean and maximum position and rotation error). <code>precision &lt;datum&gt;</code> prints one object's live pose, the pose that will be stored, the per-axis and total deltas, and how much of the available error it is using. <code>precision worst [n]</code> (default 10) ranks the worst offenders twice, by position error and by rotation error. <code>precision snap</code> moves objects onto the nearest exactly-storable pose (one undo step in the app; a no-op the second time). <code>precision ghost</code> turns the viewport overlay on or off and sets the exaggeration factor (<code>x40</code> or <code>40</code>; 1 = true scale) — persisted like the View checkbox, and seeded by <code>HMS_QUANT_GHOST=1</code> / <code>HMS_QUANT_GHOST=1x40</code>. In the batch host the ghost is run-local and the next <code>screenshot</code> draws it, so a precision ghost can be captured headlessly.</td></tr>
 <tr><td><code>wirexray on|off|get</code> (<code>wire_xray</code>, <code>wirethrough</code>, <code>xraywire</code>)</td><td>View ▸ <em>Selection wireframe through objects</em> (default off)</td><td>Draw the selection wireframe THROUGH other objects instead of only where it is unoccluded &mdash; the way to see a piece buried in the terrain or behind a wall. <code>get</code> reports the mode and how many wireframe edges the selection currently holds. In the interactive app the switch is persisted like the View checkbox; in a <code>--script</code> / <code>--exec</code> run it is run-local and seeded by <code>HMS_WIRE_XRAY=1</code>.</td></tr>
 <tr><td><code>softceilings on|off|get</code> (<code>ceilings</code>, <code>mapfloor</code>, <code>floor</code>)</td><td>View ▸ <em>Soft ceilings (map floor)</em> (default off)</td><td>Draw the map's soft ceilings — the invisible planes that bound the playable space (the floor under Forge World, the outer walls, the sky ceiling): red = soft kill, orange = acceleration, yellow = slip surface; the edges show through terrain and water. <code>get</code> reports the count per kind and lists every ceiling with its name, kind, triangle count and height range.</td></tr>
 <tr><td><code>hardfloor on|off|get</code> (<code>mapbounds</code>, <code>worldbounds</code>, <code>bounds</code>)</td><td>View ▸ <em>Hard floor (world bounds)</em> (default off)</td><td>Draw the map's world box (magenta): the physics broadphase built from every structure BSP's bounds plus 64 units — the invisible wall nothing can pass — with its floor gridded at the lowest height. <code>get</code> reports the box, the floor height and the source, and lists every structure BSP with its world and physics bounds.</td></tr>
@@ -447,7 +466,7 @@ screenshot forge_ground.png 1280x720</code></pre>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

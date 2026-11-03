@@ -188,6 +188,10 @@ pub struct ScriptHost {
     /// `precision ghost on|off|<factor>` changes it), so a batch capture can show the predicted
     /// pose exactly as the interactive viewport does.
     quant_ghost: crate::quant_error_ui::GhostSetting,
+    /// #save-precision  Run-local (default ON; `precision on|off`): after `save` the objects adopt the
+    /// poses the game will load. `last_save_report` is what `precision report` prints.
+    save_precision_on: bool,
+    last_save_report: Option<crate::quant_error::SaveReport>,
     /// #cannon-preview  run-local (`cannontraj on|off`), default off.
     cannon_preview: crate::man_cannon_preview::State,
     /// Draw the structure-design soft ceilings (HMS_SOFT_CEILINGS seeds it,
@@ -338,6 +342,8 @@ impl ScriptHost {
             show_physics_hull: false,
             wire_xray: crate::wire_xray::env_wire_xray(),
             quant_ghost: crate::quant_error_ui::env_setting().unwrap_or_default(),
+            save_precision_on: true,
+            last_save_report: None,
             cannon_preview: Default::default(),
             show_soft_ceilings: crate::soft_ceilings::env_show_soft_ceilings(),
             show_triggers: false,
@@ -752,6 +758,32 @@ impl ScriptHost {
         Ok(format!("snap: {n} object(s) moved onto the nearest representable pose (up to {moved:.6} wu / {turned:.5} deg); predicted save error is now zero"))
     }
 
+    /// #save-precision  After a save: adopt the poses the written file decodes to (the host has no
+    /// undo stack, so this is a straight edit of the live objects and the records a save starts from).
+    fn apply_save_precision(&mut self, written: &crate::h4::mvar::H4Variant) -> String {
+        let q = crate::quant_error::PoseQuant::new(crate::quant_error::QuantGame::Halo4, written.bounds);
+        let bits: Vec<crate::quant_error::PoseBits> = written.objects.iter().map(|o| crate::quant_error::pose_bits(o.pos, o.fwd, o.up)).collect();
+        let objs: Vec<(u32, [f32; 3], [f32; 3], [f32; 3])> = self.objects.iter().filter(|o| self.meta.contains_key(&o.datum)).map(|o| (o.datum, o.pos, o.fwd, o.up)).collect();
+        let name_of = |d: u32| self.meta.get(&d).map(|m| m.name.clone()).unwrap_or_default();
+        let (changes, report) = crate::quant_error::plan_save_precision(&q, &bits, &objs, &name_of, self.save_precision_on, self.pose_quant_game_name());
+        if self.save_precision_on {
+            for c in &changes {
+                let Some(i) = self.movable_index(c.datum) else { continue };
+                let o = &mut self.objects[i];
+                o.pos = c.new_pos;
+                o.fwd = c.new_fwd;
+                o.up = c.new_up;
+                if let Some(rec) = self.h4_records.get_mut(&c.datum) {
+                    rec.pos = c.new_pos;
+                    rec.set_orientation(c.new_fwd, c.new_up);
+                }
+            }
+        }
+        let line = report.status();
+        self.last_save_report = Some(report);
+        line
+    }
+
     /// The ghost's violet wireframe for the selected object(s), appended to the depth-ALWAYS
     /// lane. Mirrors `App::push_quant_ghost` through the shared `ghost_transform`.
     fn push_quant_ghost(&self, xray: &mut Vec<([f32; 3], [f32; 3], [f32; 3])>) {
@@ -826,6 +858,20 @@ impl ScriptHost {
                     Some(_) => vec![crate::script::parse_datum(&args[0])?],
                 };
                 self.snap_datums_to_representable(&targets)
+            }
+            "report" => match &self.last_save_report {
+                Some(r) => Ok(r.text()),
+                None => Err("no save has happened yet in this run".into()),
+            },
+            "mode" | "on" | "off" => {
+                let want = match (sub, args.first().map(|s| s.to_lowercase()).as_deref()) {
+                    ("on", _) => Some(true),
+                    ("off", _) => Some(false),
+                    (_, Some(a)) => crate::map_spawns::parse_flag(a),
+                    _ => None,
+                };
+                if let Some(on) = want { self.save_precision_on = on; }
+                Ok(format!("save precision: {}", if self.save_precision_on { "ON (after save the objects adopt the poses the game will load)" } else { "off (saving leaves the objects as authored)" }))
             }
             "ghost" => {
                 let mut g = self.quant_ghost;
@@ -3968,9 +4014,11 @@ impl ScriptHost {
         if !clamped.is_empty() { self.dirty = true; }
         let reparsed = crate::h4::mvar::parse_h4_variant(&dst).map_err(|e| format!("saved but cannot re-read {}: {e}", dst.display()))?;
         self.seed_globals(reparsed.globals()); // the file carries the edits from here on
+        // #save-precision: the objects adopt exactly what the written file decodes to
+        let prec = self.apply_save_precision(&reparsed);
         self.h4_variant = Some((dst.clone(), reparsed));
         self.cur_stem = dst.file_stem().unwrap_or_default().to_string_lossy().into_owned();
-        Ok(format!("saved {} objects -> {} ({} unresolved carried, budget {}{}{}){}",
+        Ok(format!("saved {} objects -> {} ({} unresolved carried, budget {}{}{}){}\n{prec}",
             slots.len(), dst.display(), self.h4_unresolved.len(), report.budget_spent, if edits.is_some() { ", header edited" } else { "" },
             if clamped.is_empty() { String::new() } else { format!(", {} clamped into the bounds", clamped.len()) },
             if warnings.is_empty() { String::new() } else { format!("\n{}", warnings.trim_end()) }))
@@ -4003,9 +4051,52 @@ impl ScriptHost {
         out
     }
 
+    /// `variant get render-pack <out.json>`: write the open variant's base-map RENDER PACK (see
+    /// `render_pack.rs`) built from the user's own installed game. Print-only apart from that one
+    /// file; refuses to overwrite nothing it did not just name.
+    fn variant_render_pack(&self, out: &str) -> Result<String, String> {
+        use crate::render_pack::{build_pack, summary, PackItem};
+        if out.is_empty() { return Err("variant get render-pack <out.json>  (writes the local render pack for the open variant's map)".into()); }
+        let g = self.variant_globals.as_ref().ok_or("no variant is open (loadvariant first)")?;
+        let scene = self.objscene().ok_or("no map is loaded")?;
+        let (game, items): (&str, Vec<PackItem>) = if let Some(pal) = self.h4_pal.as_ref() {
+            let items = pal.entries.iter().map(|e| {
+                let v = e.variants.first();
+                PackItem {
+                    index: e.quota as usize,
+                    name: e.display.clone(),
+                    category: pal.categories.get(e.category).map(|c| c.display.clone()).unwrap_or_default(),
+                    class: v.map(|v| v.class_str()).unwrap_or_default(),
+                    obj_tag: v.and_then(|v| v.tag).map(h4_tag).unwrap_or(0),
+                    variants: e.variants.iter().map(|v| (v.index as u32, if v.name.is_empty() { v.display.clone() } else { v.name.clone() }, v.tag.map(h4_tag).unwrap_or(0))).collect(),
+                }
+            }).collect();
+            ("halo4", items)
+        } else {
+            let items = self.types.iter().enumerate().map(|(i, &(pi, ew))| {
+                let e = self.palette.iter().find(|e| e.palette_index == pi && e.entry_within == ew);
+                PackItem {
+                    index: i,
+                    name: e.map(|e| e.name.clone()).unwrap_or_default(),
+                    category: e.map(|e| e.category_name.clone()).unwrap_or_default(),
+                    class: e.and_then(|e| scene.raw_tag_class(e.tag_short)).unwrap_or_default(),
+                    obj_tag: e.map(|e| e.tag_short).unwrap_or(0),
+                    variants: self.palette.iter().filter(|p| p.palette_index == pi && p.entry_within == ew).map(|p| (p.variant_within, if p.variant_name.is_empty() { scene.tag_name_of(p.tag_short).rsplit('\\').next().unwrap_or("").to_string() } else { p.variant_name.clone() }, p.tag_short)).collect(),
+                }
+            }).collect();
+            ("reach", items)
+        };
+        let pack = build_pack(game, g.map_id, g.bounds, scene, &items, &|t| self.scene.as_deref().map(|s| s.render_info_for_pack(t)).unwrap_or_default());
+        std::fs::write(out, pack.to_string()).map_err(|e| format!("render-pack: cannot write {out}: {e}"))?;
+        Ok(format!("{} -> {out}", summary(&pack)))
+    }
+
     /// `variant get [field]`.
     fn variant_get(&self, field: Option<&str>) -> Result<String, String> {
         let g = self.variant_globals.as_ref().ok_or("no variant is open (loadvariant first)")?;
+        if let Some(rest) = field.and_then(|f| f.strip_prefix("render-pack")) {
+            return self.variant_render_pack(rest.trim());
+        }
         let names = self.quota_names(g.game == "Halo 4", g.quotas.len());
         let (t, d, a, e) = match (&self.global_strings, &self.h4_variant) {
             (Some(s), _) => s.clone(),
@@ -4278,6 +4369,7 @@ impl crate::prefab::PrefabScene for ScriptHost {
             spawn_sequence: m.spawn_seq,
             user_data: rec.map(|r| r.user_data as i32).unwrap_or(0),
             placement: rec.map(|r| (r.placement & 0xFF) as u8).unwrap_or(mvar::PLACEMENT_DEFAULT_SPAWNABLE),
+            engine_flags: 0,
             placement_hi: rec.map(|r| (r.placement >> 8) as u8).unwrap_or(0),
             shape: m.boundary_shape,
             shape_wu,

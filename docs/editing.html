@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
 <li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
 </ul>
@@ -231,6 +234,21 @@ positions are relative to the prefab's anchor:</p>
 <tr><td><em>raw forward / up (advanced)</em></td><td>The underlying orientation vectors and their lengths, with <em>reset to unit</em> to normalise them. Stretched/skewed vectors preview in the viewer but are not yet written to the file.</td></tr>
 <tr><td><em>save precision</em></td><td>What this pose will cost when the variant is written: the exact position and rotation the file will hold, the error per axis and in total, and the rotation error split into roll / pitch / yaw. See <a href="#precision">Save precision</a>.</td></tr>
 </table></div>
+<h3 id="panel-h3">Halo 3 objects</h3>
+<p>A Halo 3 record stores fewer properties than a Reach one, so the Object panel shows exactly the ones it has and hides the rest (rather than greying them out). Everything below is written to the <code>.mvar</code>, is undoable, edits a whole multi-selection (only the box you changed is copied to the others), is carried by <a href="#prefabs">prefabs</a>, and has a <code>set</code> verb of the same name.</p>
+<div class="tablewrap"><table>
+<tr><th>Row</th><th>Meaning</th><th>Script</th></tr>
+<tr><td><code>quota</code></td><td>The record's quota-table row, read-only (the palette row decides it).</td><td></td></tr>
+<tr><td><code>team</code></td><td>Neutral, red, blue, green, orange, purple, yellow, brown, pink. There is no <em>none</em> (halo3.dll folds a team past 8 back to team 0).</td><td><code>team</code></td></tr>
+<tr><td><code>object type</code></td><td>The multiplayer object type (read-only; the palette row dictates it).</td><td></td></tr>
+<tr><td><code>spare clips</code> / <code>teleporter channel</code> / <code>spawn order</code></td><td>One row, named for the object's type: weapons and grenades have spare clips, teleporters a channel (0–255), spawn points and objective objects a spawn order (0–255; 255 is "none" on stock spawns). They share one stored byte.</td><td><code>clips</code> · <code>channel</code> · <code>spawn_order</code></td></tr>
+<tr><td><code>respawn (s)</code></td><td>Respawn time, 0–255 seconds.</td><td><code>respawn</code></td></tr>
+<tr><td><code>symmetry</code></td><td>both / symmetric / asymmetric (the Forge menu's three choices).</td><td><code>symmetry</code></td></tr>
+<tr><td><code>placement</code></td><td><em>placed at start</em> (the Forge menu's "on map at start"; stored inverted) and <em>unique</em> (the menu's "unique object").</td><td><code>atstart</code> · <code>unique</code></td></tr>
+<tr><td><code>game types</code></td><td>The record's 10-bit mask of the gametype engines the object appears in (all ten by default). The Forge menu does not offer it; stock maps use it to keep, say, CTF spawns out of Slayer. Five of the bits are labelled by what they do on the stock variants; the rest are numbered.</td><td><code>engine</code></td></tr>
+<tr><td><code>boundary</code> / <code>size (wu)</code></td><td>Shape and its sizes in <strong>world units</strong> (the file keeps 16 bits over 0–60 wu, so a size snaps to 0.001 wu). Sphere: radius; cylinder: radius, top, bottom; box: width, length, top, bottom.</td><td><code>shape</code> · <code>radius</code> <code>width</code> <code>length</code> <code>top</code> <code>bottom</code> · <code>b0</code>…<code>b3</code></td></tr>
+</table></div>
+<p>Not shown on Halo 3 because the record has no field for it: <em>color</em> (a Halo 3 object only has a team), <em>label</em> and <em>parent</em> (labels are Reach and later), <em>cached type</em>, <em>teleporter passability</em>, and <em>scale</em> / <em>SCALED</em> (there is no spawn-sequence size). <code>set</code> refuses those names on a Halo 3 object with that reason. The flags byte's upper four bits and the slot flags are kept exactly as found.</p>
 <p>Below the grid the panel lists the object's material (diffuse and emissive bitmap tags, blend mode) for reference. Every property edit is undoable.</p>
 <p>The fields that belong to the <em>variant</em> rather than to one object - its name, ids, budget, world bounds and the per-piece quota table - live in the left panel's <em>Variant properties</em> group; see <a href="maps-and-variants.html#properties">Variant properties</a>.</p>
 
@@ -259,26 +277,39 @@ exactly between two representable values &mdash; is flagged as <strong>quantisin
 because a nudge of less than half a grid step would make the save free. A pose that survives the save
 untouched is reported as exact — and most objects are, because they were loaded from a file and have
 never been moved.</p>
-<p><strong>See it in the viewport.</strong> Tick <em>View &#9656; Overlays &#9656; Save-precision
-ghost</em> (off by default, remembered between runs) and the selected object is drawn a second time,
-in violet, at the pose the file will really hold. The ghost is drawn through anything in front of it,
-because at true scale it sits <em>inside</em> the object's own surface. The drift is small &mdash; on a
-Reach or Halo&nbsp;4 canvas the position lands under a millimetre out, and the rotation under a fifth
-of a degree &mdash; so an <strong>exaggerate</strong> factor next to the checkbox amplifies it so
-you can see which way the piece slides and which way it turns; &times;1 is the truth. The status bar
-says the ghost is on for as long as it is, and says <em>EXAGGERATED &times;N</em> whenever the factor
-is not 1, so an amplified ghost is never mistaken for the real result. An object whose pose is
-already exact draws no ghost at all — its absence is the answer.</p>
-<p><strong>Remove the error instead of watching it.</strong> <em>Snap to representable</em> moves the
-selection onto the nearest pose the file can store exactly, after which the predicted error is zero
-and a save changes nothing. It is one undo step, it is never applied automatically, and applying it
-twice does nothing the second time. With several objects selected it snaps all of them.</p>
-<p><strong>Scripted / headless.</strong> <code>precision</code> prints the open variant's grid and
-the error statistics over every object; <code>precision &lt;datum&gt;</code> details one object;
-<code>precision worst [n]</code> ranks the worst offenders by position and by rotation, which is the
-list to work through before releasing a map; <code>precision snap [selection|all|&lt;datum&gt;]</code>
-applies the snap; <code>precision ghost [on|off] [&lt;factor&gt;]</code> drives the overlay. See the
-<a href="scripting.html">scripting reference</a>.</p>
+<p><strong>Saving makes the editor honest.</strong> With <em>Settings &#9656; Lighting &amp; rendering &#9656;
+Saving &#9656; Save precision</em> on (the default), saving a variant &mdash; Save, Save As, or the
+script verb <code>save</code> &mdash; re-reads the file it just wrote with the game's own decoder and moves
+every object whose pose differs onto <em>exactly</em> the values the game will load. What you see after a
+save is what the map will literally look like in game, to the last bit. It is one undo step
+(<kbd>Ctrl</kbd>+<kbd>Z</kbd> puts the objects back as you authored them; the file keeps what it holds),
+it never touches an object the file already holds exactly, and saving again changes nothing &mdash; the
+second save writes identical bytes. A small <em>Save precision</em> window reports how many objects moved,
+the largest and median change in degrees and world units, and the ten worst objects (with a button to
+select each one); the status bar carries the one-line summary. Turn the setting <strong>off</strong> and a
+save leaves the scene as you authored it, still reporting the difference (<code>precision report</code>).</p>
+<p><strong>The encoder picks the best codes.</strong> A pose is stored as an up direction on a grid plus an
+angle about it, and the angle is measured from a reference that depends on which up cell was chosen. So
+the save searches the codes near your orientation and keeps the pair whose <em>decoded</em> rotation is
+closest to what you built, instead of rounding each field on its own; positions pick the code whose
+decoded value is nearest. What remains is what the format cannot represent: the angle grid has no code
+at exactly 0&deg; (the nearest is about 0.011&deg; away on Reach, Halo&nbsp;4 and Halo&nbsp;2 Anniversary,
+about 0.7&deg; for a 90&deg; turn on Halo&nbsp;3), and a tilted up direction lands up to about 0.19&deg;
+(Halo&nbsp;3: 0.45&deg; per cell) from where you aimed it.</p>
+<p><strong>Preview before you save.</strong> <em>View &#9656; Overlays &#9656; Show in-game pose
+(ghost)</em> (off by default, remembered between runs) draws the selected object a second time, in
+violet, at the pose the file will hold, through anything in front of it. An <strong>exaggerate</strong>
+factor amplifies the drift so you can see which way it slides and turns; &times;1 is the truth and the
+status bar says <em>EXAGGERATED &times;N</em> whenever it is not 1. An object whose pose is already exact
+draws no ghost. <em>Snap to representable</em> moves the selection onto the nearest storable pose by
+hand (one undo step); with Save precision on you rarely need it.</p>
+<p><strong>Scripted / headless.</strong> <code>save</code> prints the same summary; <code>precision</code>
+prints the open variant's grid and the error statistics over every object; <code>precision
+&lt;datum&gt;</code> details one object (before: live pose, after: stored pose);
+<code>precision worst [n]</code> ranks the worst offenders; <code>precision report</code> prints the last
+save's adjustment report; <code>precision on|off</code> sets Save precision; <code>precision snap
+[selection|all|&lt;datum&gt;]</code> applies the snap; <code>precision ghost [on|off] [&lt;factor&gt;]</code>
+drives the overlay. See the <a href="scripting.html">scripting reference</a>.</p>
 <div class="note"><p>Halo 2 Anniversary stores a pose the way Halo 4 does, so the prediction there is the
 Halo 4 one.</p></div>
 
@@ -342,7 +373,7 @@ Halo 4 one.</p></div>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

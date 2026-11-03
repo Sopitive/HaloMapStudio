@@ -888,6 +888,7 @@ pub fn run() -> anyhow::Result<()> {
             let t_a = std::time::Instant::now();
             loop {
                 renderer.set_first_person_fov_scale(crate::film_play::first_person_fov_scale());
+                renderer.set_first_person_fov_y(Some(crate::film_play::reach_first_person_model_fov()));
                 let built = crate::reach_actor::build_actor_meshes(
                     &mut actor_scene, &mut scene, renderer.mesh_renderer(), &device, &queue);
                 if !built.pending || t_a.elapsed().as_secs() > 300 {

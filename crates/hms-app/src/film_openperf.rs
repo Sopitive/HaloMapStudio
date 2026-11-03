@@ -118,28 +118,19 @@ pub(crate) struct OpenMap {
     pub native: std::sync::Arc<hms_native::NativeDll>,
     pub cache: hms_native::CacheHandle,
     pub map: std::path::PathBuf,
+    /// The suite-wide native-library lock (`reach_actor::tests`): every map-backed gate holds it, so
+    /// two of them never drive the one native library at once (the cause of a gate that passed alone
+    /// and found no carriers in the parallel suite).
+    _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 pub(crate) fn open_forge() -> Option<OpenMap> {
-    let mut roots: Vec<std::path::PathBuf> = Vec::new();
-    let mut d = std::env::current_exe().ok()?.parent().map(|p| p.to_path_buf());
-    for _ in 0..3 {
-        if let Some(p) = &d {
-            roots.push(p.clone());
-            d = p.parent().map(|q| q.to_path_buf());
-        }
-    }
-    let dll = roots.iter().map(|r| r.join(crate::PAYLOAD_DLL)).find(|p| p.is_file())?;
-    let native = std::sync::Arc::new(hms_native::NativeDll::load(&dll).ok()?);
+    let (guard, native, cache) = crate::reach_actor::tests::open_reach_for("forge_halo")?;
     let m = crate::mapcat::enumerate().into_iter().find(|c| {
         c.game == crate::mapcat::Game::Reach
             && c.path.file_stem().map_or(false, |s| s.to_string_lossy().eq_ignore_ascii_case("forge_halo"))
     })?;
-    if let Some(d) = m.path.parent() {
-        native.set_shared_cache_dirs(&[d.to_path_buf()]);
-    }
-    let cache = native.open_cache(&m.path.to_string_lossy()).ok()?;
-    Some(OpenMap { native, cache, map: m.path })
+    Some(OpenMap { native, cache, map: m.path, _guard: guard })
 }
 
 /// What the UI thread does with a MAP once the index lands: names, spawn weapons, the biped
@@ -510,5 +501,755 @@ fn attachment_offsets_probe() {
             }
         }
         println!("  set {set}, cleared {cleared}; nodes {:?}", nodes);
+    }
+}
+
+#[cfg(test)]
+mod carry_probe {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn carried_weapon_census() {
+        let Some(o) = open_forge() else { return };
+        let want: Vec<String> = std::env::var("HMS_FILM_SUBSTR").unwrap_or_default().split(',').map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+        let mut v = film::spec_corpus();
+        v.extend(std::fs::read_dir(std::path::Path::new(&std::env::var("HOME").unwrap()).join("Downloads")).into_iter().flatten().flatten().map(|e| e.path()));
+        for p in v {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if !want.iter().any(|w| name.contains(w.as_str())) { continue }
+            let Ok(f) = film::open(&p) else { continue };
+            let pb = Playback::new(fd::build_index_film(&f));
+            let mut d = ActorDriver::default();
+            d.resolve_bipeds(&pb, &o.native, o.cache, Some(&o.map));
+            let Some(ot) = d.objects.as_ref() else { continue };
+            let weap_nets: std::collections::HashSet<u32> = ot.objects.iter().filter(|(_, i)| i.group == "weap").map(|(n, _)| *n).collect();
+            let mut by_kind: std::collections::BTreeMap<u8, usize> = Default::default();
+            let (mut pick_w, mut drop_w) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+            let mut ex = vec![];
+            for e in &pb.index.events {
+                if e.kind == 32 || e.kind == 34 || e.kind == crate::film_action::EV_PICKUP {
+                    *by_kind.entry(e.kind).or_default() += 1;
+                    for n in [e.subject, e.other].into_iter().flatten() {
+                        if weap_nets.contains(&n) { if e.kind == 34 { drop_w.insert(n); } else { pick_w.insert(n); } }
+                    }
+                    if ex.len() < 3 && e.kind == 32 { ex.push((e.tick, e.subject, e.other)); }
+                }
+            }
+            let bip_nets: std::collections::HashSet<u32> = pb.index.tracks.iter().filter(|t| t.entity_type == 11).map(|t| t.net_id).collect();
+            let with_weapon_field = pb.index.tracks.iter().filter(|t| t.entity_type == 11 && !t.weapons.is_empty()).count();
+            let with_spawn_weapon = pb.index.tracks.iter().filter(|t| t.entity_type == 11 && t.spawn_weapon.is_some()).count();
+            println!("=== {name}: weap entities {}, event counts {:?}, weap entities with a pickup {}, with a drop {}; bipeds {} (with weapon field {with_weapon_field}, with spawn weapon {with_spawn_weapon}); sample pickups {:?}; subject is biped for first: {:?}", weap_nets.len(), by_kind, pick_w.len(), drop_w.len(), bip_nets.len(), ex, ex.first().map(|e| (e.1.map_or(false, |n| bip_nets.contains(&n)), e.2.map_or(false, |n| weap_nets.contains(&n)))));
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic"]
+    fn carry_distance_histogram() {
+        let Some(o) = open_forge() else { return };
+        let want: Vec<String> = std::env::var("HMS_FILM_SUBSTR").unwrap_or_default().split(',').map(|s| s.to_string()).filter(|s| !s.is_empty()).collect();
+        for p in film::spec_corpus() {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
+            if !want.iter().any(|w| name.contains(w.as_str())) { continue }
+            let Ok(f) = film::open(&p) else { continue };
+            let pb = Playback::new(fd::build_index_film(&f));
+            let mut d = ActorDriver::default();
+            d.resolve_bipeds(&pb, &o.native, o.cache, Some(&o.map));
+            let Some(ot) = d.objects.as_ref() else { continue };
+            let bips: Vec<&fd::EntityTrack> = pb.index.tracks.iter().filter(|t| t.entity_type == 11).collect();
+            let nearest = |k: u32, pos: [f32; 3]| -> Option<(u32, f32)> {
+                bips.iter().filter(|b| k >= b.first_tick && k <= b.last_tick && b.destroyed_tick.map_or(true, |dt| k < dt))
+                    .filter_map(|b| b.sample(k).map(|q| (b.net_id, ((q[0]-pos[0]).powi(2)+(q[1]-pos[1]).powi(2)+(q[2]-pos[2]).powi(2)).sqrt())))
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            };
+            let edges = [0.3f32, 0.6, 0.9, 1.2, 1.5, 2.0, 3.0, 99.0];
+            let mut hist = [0usize; 8];
+            let (mut samples, mut stable, mut alive_total) = (0usize, 0usize, 0usize);
+            let mut stable_hist = [0usize; 8];
+            for t in &pb.index.tracks {
+                let Some(id) = ot.objects.get(&t.net_id) else { continue };
+                if id.group != "weap" { continue }
+                let mut k = t.first_tick + 30;
+                while k <= t.last_tick {
+                    if let Some(pos) = t.sample(k) {
+                        alive_total += 1;
+                        if let Some((bn, dd)) = nearest(k, pos) {
+                            samples += 1;
+                            let bi = edges.iter().position(|e| dd <= *e).unwrap();
+                            hist[bi] += 1;
+                            let same = |kk: u32| t.sample(kk).and_then(|pp| nearest(kk, pp)).map_or(false, |(n2, d2)| n2 == bn && d2 < 1.5);
+                            if dd < 1.5 && same(k - 15) && same(k - 30) { stable += 1; stable_hist[bi] += 1; }
+                        }
+                    }
+                    k += 15;
+                }
+            }
+            println!("=== {name}: weapon samples {alive_total}; nearest-biped distance histogram (<=0.3,0.6,0.9,1.2,1.5,2,3,more): {hist:?}; stable carry (same biped <1.5wu over 30 ticks) {stable} -> by distance {stable_hist:?}");
+        }
+    }
+}
+
+// =============================================================================================
+// #film-carry  A weapon a Spartan CARRIES is drawn in its hand, not as a loose object beside it.
+// =============================================================================================
+#[cfg(test)]
+mod carry_gate {
+    use super::*;
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct Tally {
+        /// loose-lane weapons drawn within 1.5 wu of a live body
+        loose_near_body: usize,
+        /// carried weapons the loose lane STILL drew (must be 0)
+        carried_but_loose: usize,
+        /// carriers and how many of them hold the derived weapon in the hand actor
+        carriers: usize,
+        in_hand: usize,
+        /// worst distance, hand node -> the carried weapon's recorded position
+        worst_hand_wu: f32,
+    }
+
+    fn measure(o: &OpenMap, f: &film::Film, derive: bool) -> Tally {
+        let mut pb = Playback::new(fd::build_index_film(f));
+        pb.moving_only = false;
+        let mut d = ActorDriver::default();
+        d.cap = 64;
+        d.derive_carried = derive;
+        d.resolve_bipeds(&pb, &o.native, o.cache, Some(&o.map));
+        let mut actors = crate::reach_actor::ActorScene::default();
+        let total = pb.total_ticks();
+        let mut t = Tally::default();
+        for k in 1..=7u32 {
+            pb.seek_tick((total / 8 * k) as f32);
+            d.sync(&pb, &mut actors, &o.native, o.cache);
+            actors.update_poses_headless(0.0);
+            let tick = pb.tick as u32;
+            let park = glam::Vec3::from(d.park);
+            let Some(ot) = d.objects.as_ref() else { continue };
+            // the loose lane
+            for (net, id) in d.object_actor.iter() {
+                let Some(a) = actors.get(*id) else { continue };
+                let c = a.world().w_axis.truncate();
+                if (c - park).length() < 1.0 { continue }
+                let Some(ident) = ot.ident(*net) else { continue };
+                if ident.group != "weap" { continue }
+                if d.carry_hidden.contains(net) { t.carried_but_loose += 1; }
+                let near = d.body_actor.values().filter_map(|b| actors.get(*b)).any(|b| (b.world().w_axis.truncate() - c).length() < 1.5);
+                if near {
+                    t.loose_near_body += 1;
+                    if std::env::var("HMS_CARRY_WHY").is_ok() {
+                        let wt = pb.index.tracks.iter().find(|x| x.net_id == *net).unwrap();
+                        let bodies: Vec<&fd::EntityTrack> = pb.index.tracks.iter().filter(|x| x.entity_type == 11).collect();
+                        let nr = |k: u32| -> Option<(u32, f32)> { let p = wt.sample(k)?; bodies.iter().filter(|b| k >= b.first_tick && k <= b.last_tick && pb.death_at(b).map_or(true, |dd| k < dd)).filter_map(|b| b.sample(k).map(|q| (b.net_id, ((q[0]-p[0]).powi(2)+(q[1]-p[1]).powi(2)+(q[2]-p[2]).powi(2)).sqrt()))).min_by(|a, b| a.1.total_cmp(&b.1)) };
+                        println!("   still loose near body: tick {tick} {} net {:#x} now {:?} -15 {:?} -30 {:?} age {} draw {:?}", ident.name, net, nr(tick), nr(tick.saturating_sub(15)), nr(tick.saturating_sub(30)), tick - wt.first_tick, ident.draw);
+                    }
+                }
+            }
+            // the hands
+            for (carrier, widx) in d.carry_hand.iter() {
+                let Some(bid) = d.body_actor.get(carrier) else { continue };
+                let Some(b) = actors.get(*bid) else { continue };
+                t.carriers += 1;
+                let want = d.weap_tags.get(*widx as usize).copied();
+                let Some(w) = b.weapon.as_ref().filter(|w| Some(w.obj_tag) == want) else { continue };
+                t.in_hand += 1;
+                // hand node in world space
+                let hand = (b.world() * b.pose.model.get(w.parent_node.max(0) as usize).copied().unwrap_or(glam::Mat4::IDENTITY) * w.parent_local).w_axis.truncate();
+                // the weapon entity this carrier holds: the nearest carried one to the hand
+                let mut best = f32::MAX;
+                for net in d.carry_hidden.iter() {
+                    if let Some(tr) = pb.index.tracks.iter().find(|t| t.net_id == *net) {
+                        if let Some(p) = tr.sample(tick) { best = best.min((glam::Vec3::from(p) - hand).length()); }
+                    }
+                }
+                if best < f32::MAX { t.worst_hand_wu = t.worst_hand_wu.max(best); }
+                if best > 2.0 { println!("   far hand: tick {tick} carrier {carrier:#x} body_origin {:?} hand {:?} parent_node {} anim {:?} nearest_carried_weapon_dist {best:.2}", b.world().w_axis.truncate(), hand, w.parent_node, b.anim_name); }
+            }
+        }
+        println!("   tags that could not be held: {:?}", d.hold_failed.iter().map(|t| o.native.tag_name(o.cache, *t).unwrap_or_default()).collect::<Vec<_>>());
+        t
+    }
+
+    fn film_named(sub: &str) -> Option<film::Film> {
+        film::spec_corpus().into_iter().find(|p| p.file_name().map_or(false, |n| n.to_string_lossy().contains(sub))).and_then(|p| film::open(&p).ok())
+    }
+    const CLIPS: [&str; 2] = ["53C14E9D", "2BAB2586"];
+
+    #[test]
+    #[ignore = "diagnostic: before/after table"]
+    fn carry_table() {
+        let Some(o) = open_forge() else { return };
+        for c in CLIPS {
+            let Some(f) = film_named(c) else { continue };
+            println!("{c}\n  before: {:?}\n  after:  {:?}", measure(&o, &f, false), measure(&o, &f, true));
+            let _ = ();
+        }
+    }
+
+    /// Hand-carried weapons are drawn by their carrier, in its hand, within 2 wu of where the
+    /// recording put the weapon; the loose lane draws none of them and far fewer sit beside bodies.
+    #[test]
+    fn carried_weapons_are_in_the_hand_and_not_loose() {
+        let Some(o) = open_forge() else { eprintln!("no forge_halo / native library: gate skipped"); return };
+        for c in CLIPS {
+            let f = film_named(c).unwrap_or_else(|| panic!("fixture film {c} missing: the gate cannot run"));
+            let after = measure(&o, &f, true);
+            let before = measure(&o, &f, false);
+            println!("{c}: before {before:?}\n      after  {after:?}");
+            assert!(after.carriers >= 3, "{c}: liveness -- only {} carriers were found", after.carriers);
+            assert!(after.in_hand >= 1, "{c}: no carried weapon reached a hand ({after:?})");
+            assert_eq!(after.carried_but_loose, 0, "{c}: a carried weapon was also drawn loose");
+            assert!(after.worst_hand_wu <= 2.0, "{c}: a hand is {:.2} wu from the weapon it carries", after.worst_hand_wu);
+            assert!(before.loose_near_body >= 3, "{c}: liveness -- the old path had only {} loose weapons beside bodies", before.loose_near_body);
+            assert!(after.loose_near_body + after.carriers / 2 <= before.loose_near_body, "{c}: loose weapons beside bodies {} -> {} with {} carriers", before.loose_near_body, after.loose_near_body, after.carriers);
+        }
+    }
+
+    /// SABOTEUR: turn the derivation off and the same conditions must fail.
+    #[test]
+    fn saboteur_without_the_carry_resolver_the_gate_fails() {
+        let Some(o) = open_forge() else { return };
+        let f = film_named(CLIPS[0]).expect("fixture film missing");
+        let off = measure(&o, &f, false);
+        let on = measure(&o, &f, true);
+        assert!(off.in_hand == 0 && off.carriers == 0, "saboteur: nothing should be carried when derivation is off: {off:?}");
+        assert!(on.loose_near_body + on.carriers / 2 <= off.loose_near_body, "the gate's reduction condition does not separate on {on:?} from off {off:?}");
+        // ...and the gate's own conditions reject the off run:
+        assert!(off.carriers < 3 && off.in_hand < 1, "the off run would pass the liveness conditions: {off:?}");
+    }
+}
+
+#[cfg(test)]
+mod light_model_probe {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn do_the_light_and_beacon_have_models() {
+        let Some(o) = open_forge() else { return };
+        let mut actors = crate::reach_actor::ActorScene::default();
+        for g in ["bloc", "weap"] {
+            for t in o.native.tags_by_group(o.cache, g) {
+                let name = o.native.tag_name(o.cache, t).unwrap_or_default();
+                if !(name.contains("ff_light") || name.contains("hill_beacon") || name.ends_with("energy_sword") || name.contains("knife") || name.contains("blade")) { continue }
+                match actors.add_object(&o.native, o.cache, t, glam::Vec3::ZERO, 0.0) {
+                    Ok(id) => { let a = actors.get(id).unwrap(); println!("{g} {name}: drawn, model tag {:#x}, nodes {}, regions {}", a.def.model.mode_tag, a.def.model.skel.nodes.len(), a.def.model.region_names.len()); }
+                    Err(e) => println!("{g} {name}: NOT drawn ({e})"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod knife_scan {
+    use super::*;
+    use crate::film_stats::NameSource;
+
+    #[test]
+    #[ignore = "diagnostic: HMS_FILM_LIST = a file of film paths"]
+    fn find_knives_everywhere() {
+        let list = std::env::var("HMS_FILM_LIST").expect("HMS_FILM_LIST");
+        let paths: Vec<std::path::PathBuf> = std::fs::read_to_string(list).unwrap().lines().map(std::path::PathBuf::from).collect();
+        let mut caches: std::collections::HashMap<String, Option<(std::sync::Arc<hms_native::NativeDll>, hms_native::CacheHandle, crate::film_stats::MapNames)>> = Default::default();
+        let (mut films, mut with_knife) = (0usize, 0usize);
+        for p in paths {
+            let Ok(f) = film::open(&p) else { continue };
+            let stem = f.header.scenario_name().to_ascii_lowercase().replace('\\', "/").rsplit('/').next().unwrap_or("").to_string();
+            let entry = caches.entry(stem.clone()).or_insert_with(|| {
+                let (n, c) = crate::film_action::objective_inventory::open_reach(&stem)?;
+                let map = crate::mapcat::enumerate().into_iter().find(|m| m.game == crate::mapcat::Game::Reach && m.path.file_stem().map_or(false, |s| s.to_string_lossy().eq_ignore_ascii_case(&stem)))?;
+                let names = crate::film_stats::MapNames::build_with_map(&n, c, Some(&map.path));
+                Some((std::sync::Arc::new(n), c, names))
+            });
+            let Some((_, _, names)) = entry else { continue };
+            let idx = fd::build_index_film(&f);
+            films += 1;
+            let mut found: std::collections::BTreeMap<String, (usize, usize, usize)> = Default::default();
+            for t in &idx.tracks {
+                let Some((_, _, path)) = t.def_wire.and_then(|w| names.definition(w)) else { continue };
+                if path.contains("knife") || path.contains("sheath") || path.contains("spartan_k") {
+                    let e = found.entry(path.rsplit('\\').next().unwrap_or(&path).to_string()).or_default();
+                    e.0 += 1;
+                    if t.rides() { e.1 += 1; }
+                    if t.positions.len() > 1 { e.2 += 1; }
+                }
+            }
+            let ass = idx.events.iter().filter(|e| e.kind == crate::film_action::EV_ASSASSINATE).count();
+            if !found.is_empty() { with_knife += 1; }
+            println!("{} [{stem}] ticks {} assassinate_events {ass}: {:?}", p.file_name().unwrap().to_string_lossy(), idx.ticks, found);
+        }
+        println!("SCANNED {films} films, {with_knife} with knife/sheath tracks");
+    }
+}
+
+#[cfg(test)]
+mod knife_tag_probe {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn who_owns_the_spartan_knife() {
+        let Some(o) = open_forge() else { return };
+        let knife: Vec<u32> = o.native.tags_by_group(o.cache, "weap").into_iter().filter(|t| o.native.tag_name(o.cache, *t).unwrap_or_default().contains("spartan_knife")).collect();
+        println!("knife tags: {:?}", knife.iter().map(|t| o.native.tag_name(o.cache, *t).unwrap_or_default()).collect::<Vec<_>>());
+        for g in ["bipd", "weap", "vehi", "bloc", "scen", "eqip", "crea"] {
+            for t in o.native.tags_by_group(o.cache, g) {
+                for a in o.native.enumerate_attachments(o.cache, t) {
+                    let co = a.child_obj;
+                    if knife.contains(&co) {
+                        let (m, vi, ms) = (a.marker_sid, a.variant_index, a.child_mode);
+                        println!("{g} {} has a child/attachment row -> knife: marker sid {m:#x} variant {vi} mode {ms}", o.native.tag_name(o.cache, t).unwrap_or_default());
+                    }
+                }
+            }
+        }
+        for t in o.native.tags_by_group(o.cache, "bipd") {
+            let n = o.native.tag_name(o.cache, t).unwrap_or_default();
+            if n.contains("spartan") || n.contains("elite") {
+                let rows = o.native.enumerate_attachments(o.cache, t);
+                for a in &rows { let (co, cm, vi, vs, ms, pos, rot) = (a.child_obj, a.child_mode, a.variant_index, a.variant_name_sid, a.marker_sid, a.pos, a.rot); println!("   row variant[{vi}] vsid {vs:#x} marker {ms:#x} child '{}' mode {cm:#x} pos {:?} rot {:?}", o.native.tag_name(o.cache, co).unwrap_or_default().rsplit('\\').next().unwrap_or(""), pos, rot); }
+                println!("{n}: {} attachment rows: {:?}", rows.len(), rows.iter().map(|a| { let c = a.child_obj; o.native.tag_name(o.cache, c).unwrap_or_default() }).collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+// =============================================================================================
+// #knife  A Spartan's hlmt CHILD objects (knife + sheath) ride the PARENT MARKER's node.
+// CPU-only: no GPU mesh is read -- the palette the children are skinned by is the production
+// function `reach_actor::child_palette_matrix`, applied to the child's bind point.
+// =============================================================================================
+#[cfg(test)]
+mod knife_gate {
+    use super::*;
+    use glam::{Mat4, Vec3};
+    use crate::reach_actor::{child_palette_matrix, Pose};
+
+    struct Rig {
+        o: OpenMap,
+    }
+
+    fn marker_of(model: &crate::reach_actor::ReachModel, sid: u32) -> Option<crate::reach_skel::Marker> {
+        model.markers.iter().find(|g| g.name == sid).and_then(|g| crate::reach_skel::pick_marker(&g.markers, -1, -1))
+    }
+
+    /// (name, node count) of the knife/sheath children the Spartan's DEFAULT variant selects.
+    fn children_of(o: &OpenMap, tag: u32, vsid: u32) -> Vec<String> {
+        let dsid = crate::scene::object_default_variant_sid(&o.native, o.cache, tag);
+        let rows: Vec<_> = o.native.enumerate_attachments(o.cache, tag).into_iter().filter(|a| { let c = a.child_mode; c != 0 && c != u32::MAX }).collect();
+        let sids: Vec<u32> = rows.iter().map(|a| a.variant_name_sid).collect();
+        let chosen = crate::scene::pick_child_variant(&sids, vsid, dsid);
+        rows.iter().filter(|a| crate::scene::child_row_selected(a.variant_name_sid, a.variant_index == 0, chosen))
+            .map(|a| { let co = a.child_obj; o.native.tag_name(o.cache, co).unwrap_or_default().rsplit('\\').next().unwrap_or("").to_string() })
+            .collect()
+    }
+
+    fn tag_of(o: &OpenMap, suffix: &str) -> Option<u32> {
+        o.native.tags_by_group(o.cache, "bipd").into_iter().find(|t| o.native.tag_name(o.cache, *t).unwrap_or_default().to_lowercase().ends_with(suffix))
+    }
+
+    /// Per pose: (max |old placement - marker world|, max |new placement - marker world|,
+    /// spread of the hip-to-knife distance, node travel from the bind pose), over `poses`.
+    struct Report { new_err: f32, old_err: f32, spread: f32, travel: f32, poses: usize }
+
+    fn measure(o: &OpenMap, child_palette_node: Option<i32>) -> Option<Report> {
+        let _ = child_palette_node;
+        let tag = tag_of(o, "spartans\\spartans")?;
+        let mut actors = crate::reach_actor::ActorScene::default();
+        let id = actors.add(&o.native, o.cache, "spartans\\spartans", Vec3::ZERO, 0.0).ok()?;
+        let (dsid, rows_sid) = (crate::scene::object_default_variant_sid(&o.native, o.cache, tag), 0u32);
+        let _ = rows_sid;
+        let (marker_sid, n) = crate::scene::child_marker_for(&o.native, o.cache, tag, dsid, dsid)?;
+        assert!(n >= 1);
+        let a0 = actors.get(id)?;
+        let model = a0.def.model.clone();
+        let inv = a0.def.inverse_bind.clone();
+        let marker = marker_of(&model, marker_sid)?;
+        assert!(marker.node >= 0, "the knife marker names a skeleton node");
+        let node = marker.node;
+        let bind = Pose::bind(&model.skel);
+        let p_bind = bind.marker_model(&marker).w_axis.truncate();
+        // names: idle, sprint, crouch, a death and an assassination clip, whichever the graph has
+        let g = a0.def.graph.clone()?;
+        let want = ["combat:rifle:idle", "sprint:rifle:move_front", "crouch:rifle:idle", "crouch:rifle:move_front", "combat:rifle:move_front", "combat:rifle:melee_strike", "death", "assassin", "sync_action", "airborne"];
+        let mut found: Vec<usize> = Vec::new();
+        for w in want {
+            if let Some(i) = g.find(w) { if !found.contains(&i) { found.push(i); } }
+        }
+        let mut rep = Report { new_err: 0.0, old_err: 0.0, spread: 0.0, travel: 0.0, poses: 0 };
+        let mut dists: Vec<f32> = Vec::new();
+        for ai in found {
+            let frames = g.anims[ai].frame_count.max(1) as f32;
+            for k in 0..4 {
+                let f = frames * k as f32 / 4.0;
+                actors.set_anim_index(&o.native, o.cache, id, ai, None).ok()?;
+                let a = actors.actors.iter_mut().find(|a| a.id == id)?;
+                a.frame = f;
+                a.compute_pose();
+                let pose: &Pose = &a.pose;
+                let want_p = pose.marker_model(&marker).w_axis.truncate();
+                let m = child_palette_matrix(Mat4::IDENTITY, pose, &inv, node);
+                let new_p = m.transform_point3(p_bind);
+                // the OLD placement: skinned by the body's own bones named by the child's node indices
+                let mut old_err = 0.0f32;
+                for kn in 0..3usize {
+                    let om = pose.model.get(kn).copied().unwrap_or(Mat4::IDENTITY) * inv.get(kn).copied().unwrap_or(Mat4::IDENTITY);
+                    old_err = old_err.max((om.transform_point3(p_bind) - want_p).length());
+                }
+                rep.new_err = rep.new_err.max((new_p - want_p).length());
+                rep.old_err = rep.old_err.max(old_err);
+                rep.travel = rep.travel.max((pose.model[node as usize].w_axis.truncate() - bind.model[node as usize].w_axis.truncate()).length());
+                dists.push((new_p - pose.model[node as usize].w_axis.truncate()).length());
+                rep.poses += 1;
+            }
+        }
+        let (lo, hi) = dists.iter().fold((f32::MAX, f32::MIN), |(l, h), d| (l.min(*d), h.max(*d)));
+        rep.spread = hi - lo;
+        Some(rep)
+    }
+
+    /// Variant gating and liveness: the Spartan and the hologram Spartan have a knife and a sheath
+    /// (the default variant selects both), the other model variants that author children select the
+    /// knife alone, and Elites select none.
+    #[test]
+    fn the_children_exist_for_the_spartan_and_not_the_elite() {
+        let Some(o) = open_forge() else { eprintln!("no forge_halo: gate skipped"); return };
+        let sp = tag_of(&o, "spartans\\spartans").expect("the Spartan biped");
+        let dsid = crate::scene::object_default_variant_sid(&o.native, o.cache, sp);
+        let kids = children_of(&o, sp, dsid);
+        println!("Spartan default-variant children: {kids:?}");
+        assert!(kids.iter().any(|k| k == "spartan_knife") && kids.iter().any(|k| k == "spartan_knife_sheath"), "{kids:?}");
+        let holo = tag_of(&o, "hologram_spartan").expect("hologram_spartan");
+        assert!(!children_of(&o, holo, 0).is_empty());
+        let elite = tag_of(&o, "elite\\elite").expect("the Elite biped");
+        assert!(children_of(&o, elite, 0).is_empty(), "Elites author no knife");
+        // a variant that authors only the knife
+        let rows: Vec<_> = o.native.enumerate_attachments(o.cache, sp);
+        let only_knife = rows.iter().map(|a| a.variant_name_sid).find(|&s| s != 0 && s != 1 && children_of(&o, sp, s).len() == 1);
+        assert!(only_knife.is_some(), "some Spartan model variant selects the knife alone");
+        // the children have render models
+        for k in rows.iter().take(2) {
+            let cm = k.child_mode;
+            let m = crate::reach_actor::ReachModel::read(&o.native, o.cache, cm).expect("child render model");
+            assert!(!m.skel.nodes.is_empty());
+        }
+    }
+
+    /// The children follow the marker's node in every pose; the old placements do not.
+    #[test]
+    fn the_knife_follows_the_hip_marker_in_every_pose() {
+        let Some(o) = open_forge() else { return };
+        let r = measure(&o, None).expect("the Spartan rig");
+        println!("knife: {} poses; node travel up to {:.3} wu; NEW error {:.5} wu, hip-distance spread {:.5} wu; OLD (body-bone) error {:.3} wu", r.poses, r.travel, r.new_err, r.spread, r.old_err);
+        assert!(r.poses >= 12, "liveness: only {} poses (the graph lacks the clips)", r.poses);
+        assert!(r.travel > 0.05, "liveness: the hip node never moved ({:.3} wu), the poses prove nothing", r.travel);
+        assert!(r.new_err < 1e-3, "the child strays {:.5} wu from its marker", r.new_err);
+        assert!(r.spread < 1e-3, "the knife-to-hip distance varies by {:.5} wu across poses", r.spread);
+    }
+
+    /// SABOTEUR: the previous behaviour (children skinned by the body bones their own node indices
+    /// name) must fail the same bound -- on this rig by more than the bound by a wide margin.
+    #[test]
+    fn saboteur_the_old_placement_leaves_the_hip() {
+        let Some(o) = open_forge() else { return };
+        let r = measure(&o, None).expect("the Spartan rig");
+        assert!(r.old_err > 0.02, "the gate does not bite: the old placement is within {:.4} wu", r.old_err);
+        assert!(r.old_err > 20.0 * r.new_err.max(1e-4), "old {:.4} vs new {:.5}", r.old_err, r.new_err);
+    }
+}
+
+#[cfg(test)]
+mod race_enum {
+    use super::*;
+
+    /// Every actor the draw path would show at spread ticks, by source, with its distance to the
+    /// nearest body / vehicle.
+    #[test]
+    #[ignore = "diagnostic: Reach(1).mov from ~/Downloads"]
+    fn enumerate_the_race_clip() {
+        let Some(o) = open_forge() else { return };
+        let Some(h) = std::env::var_os("HOME") else { return };
+        let Ok(f) = film::open(&std::path::Path::new(&h).join("Downloads").join("Reach(1).mov")) else { println!("no Reach(1).mov"); return };
+        let mut pb = Playback::new(fd::build_index_film(&f));
+        pb.moving_only = false;
+        let mut d = ActorDriver::default();
+        d.cap = 64;
+        d.resolve_bipeds(&pb, &o.native, o.cache, Some(&o.map));
+        let mut actors = crate::reach_actor::ActorScene::default();
+        let total = pb.total_ticks();
+        #[derive(Default, Debug)]
+        struct Agg { samples: usize, far: usize, first_far: Option<u32>, max_far: f32 }
+        let mut agg: std::collections::BTreeMap<String, Agg> = Default::default();
+        let (mut ticks, mut seated_total, mut bodies_total, mut with_child) = (0usize, 0usize, 0usize, 0usize);
+        let mut k = 0u32;
+        while k < total {
+            pb.seek_tick(k as f32);
+            d.sync(&pb, &mut actors, &o.native, o.cache);
+            actors.update_poses_headless(0.0);
+            ticks += 1;
+            let park = glam::Vec3::from(d.park);
+            let pos_of = |id: u32| actors.get(id).map(|a| a.world().w_axis.truncate());
+            let bodies: Vec<glam::Vec3> = d.body_actor.values().filter_map(|i| pos_of(*i)).filter(|p| (*p - park).length() > 1.0).collect();
+            let vehicles: Vec<glam::Vec3> = d.vehicle_actor.values().filter_map(|i| pos_of(*i)).filter(|p| (*p - park).length() > 1.0).collect();
+            bodies_total += bodies.len();
+            for bid in d.body_actor.values() {
+                if let Some(a) = actors.get(*bid) {
+                    if a.world_override.is_some() { seated_total += 1; }
+                    let tag = a.def.obj_tag;
+                    if crate::scene::child_marker_for(&o.native, o.cache, tag, a.variant_sid, crate::scene::object_default_variant_sid(&o.native, o.cache, tag)).is_some() { with_child += 1; }
+                }
+            }
+            let mut note = |kind: &str, id: u32, name: String| {
+                let Some(p) = pos_of(id) else { return };
+                if (p - park).length() < 1.0 { return }
+                let nb = bodies.iter().map(|b| (*b - p).length()).fold(f32::MAX, f32::min);
+                let nv = vehicles.iter().map(|b| (*b - p).length()).fold(f32::MAX, f32::min);
+                let dist = nb.min(nv);
+                let e = agg.entry(format!("{kind}: {name}")).or_default();
+                e.samples += 1;
+                if dist > 1.5 { e.far += 1; e.first_far.get_or_insert(k); e.max_far = e.max_far.max(if dist == f32::MAX { 0.0 } else { dist }); }
+            };
+            for (net, id) in d.object_actor.iter() {
+                let nm = d.objects.as_ref().and_then(|ot| ot.ident(*net)).map(|i| format!("{} {}", i.group, i.name)).unwrap_or_default();
+                note("object", *id, nm);
+            }
+            for (net, id) in d.vehicle_actor.iter() { let _ = net; note("vehicle", *id, actors.get(*id).map(|a| a.def.name.clone()).unwrap_or_default()); }
+            k += 300;
+        }
+        println!("race clip: {ticks} sampled ticks; mean bodies drawn {:.1}, seated {:.1}, bodies whose model has child rows {:.1}", bodies_total as f32 / ticks as f32, seated_total as f32 / ticks as f32, with_child as f32 / ticks as f32);
+        for (k, v) in agg { println!("  {k:<60} samples {:<5} farther than 1.5 wu from any body/vehicle: {:<5} first at tick {:?}, max {:.1}", v.samples, v.far, v.first_far, v.max_far); }
+    }
+}
+
+#[cfg(test)]
+mod size_probe {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn model_extents() {
+        let Some(o) = open_forge() else { return };
+        for (g, sub) in [("bloc", "mp_hill_beacon"), ("weap", "spartan_knife\\spartan_knife"), ("weap", "spartan_knife_sheath"), ("vehi", "mongoose\\mongoose"), ("bipd", "spartans\\spartans")] {
+            for t in o.native.tags_by_group(o.cache, g) {
+                let n = o.native.tag_name(o.cache, t).unwrap_or_default();
+                if !n.ends_with(sub) { continue }
+                let mode = o.native.resolve_mode(o.cache, t);
+                let Ok(h) = o.native.open_model(o.cache, mode) else { println!("{n}: no model"); continue };
+                let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+                let cnt = o.native.model_section_count(h);
+                for i in 0..cnt { if let Some(s) = o.native.model_section(h, i) { if cnt <= 2 { let (nid, vf, fc, vc) = (s.node_index, s.vertex_format, s.format_class, s.vertex_count); println!("   section {i}: node_index {nid} vertex_format {vf} format_class {fc} verts {vc}"); } for k in 0..3 { lo[k] = lo[k].min(s.bounds_min[k]); hi[k] = hi[k].max(s.bounds_max[k]); } } }
+                println!("{n}: sections {cnt}, extent {:.3} x {:.3} x {:.3} wu", hi[0]-lo[0], hi[1]-lo[1], hi[2]-lo[2]);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod marker_probe {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn knife_marker_instances() {
+        let Some(o) = open_forge() else { return };
+        for suffix in ["spartans\\spartans", "hologram_spartan"] {
+            let Some(tag) = o.native.tags_by_group(o.cache, "bipd").into_iter().find(|t| o.native.tag_name(o.cache, *t).unwrap_or_default().to_lowercase().ends_with(suffix)) else { continue };
+            let mut actors = crate::reach_actor::ActorScene::default();
+            let Ok(id) = actors.add(&o.native, o.cache, suffix, glam::Vec3::ZERO, 0.0) else { continue };
+            let a = actors.get(id).unwrap();
+            let bind = crate::reach_actor::Pose::bind(&a.def.model.skel);
+            let rows = o.native.enumerate_attachments(o.cache, tag);
+            let r0 = rows[0];
+            let (rp, rr) = (r0.pos, r0.rot);
+            println!("{suffix}: row0 composed pos {rp:?} rot {rr:?}");
+            for g in a.def.model.markers.iter().filter(|g| g.name == r0.marker_sid) {
+                for (i, m) in g.markers.iter().enumerate() {
+                    let p = bind.marker_model(m).w_axis.truncate();
+                    println!("   marker instance {i}: region {} perm {} node {} ({}) bind pos {:?}", m.region, m.permutation, m.node, a.def.model.node_names.get(m.node.max(0) as usize).cloned().unwrap_or_default(), p);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod race_beacons {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic: Reach(1).mov from ~/Downloads"]
+    fn why_are_beacons_far_from_bodies() {
+        let Some(o) = open_forge() else { return };
+        let Some(h) = std::env::var_os("HOME") else { return };
+        let Ok(f) = film::open(&std::path::Path::new(&h).join("Downloads").join("Reach(1).mov")) else { return };
+        let mut pb = Playback::new(fd::build_index_film(&f));
+        pb.moving_only = false;
+        let mut d = ActorDriver::default();
+        d.cap = 64;
+        d.resolve_bipeds(&pb, &o.native, o.cache, Some(&o.map));
+        let mut actors = crate::reach_actor::ActorScene::default();
+        let idx2 = fd::build_index_film(&f);
+        let by: std::collections::HashMap<u32, &fd::EntityTrack> = idx2.tracks.iter().map(|t| (t.net_id, t)).collect();
+        let lookup = |n: u32| by.get(&n).copied();
+        let total = pb.total_ticks();
+        let mut cats: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut shown = 0;
+        let mut k = 0u32;
+        while k < total {
+            pb.seek_tick(k as f32);
+            d.sync(&pb, &mut actors, &o.native, o.cache);
+            let park = glam::Vec3::from(d.park);
+            let bodies: Vec<glam::Vec3> = d.body_actor.values().filter_map(|i| actors.get(*i)).map(|a| a.world().w_axis.truncate()).filter(|p| (*p - park).length() > 1.0).collect();
+            for (net, id) in d.object_actor.iter() {
+                let Some(a) = actors.get(*id) else { continue };
+                let p = a.world().w_axis.truncate();
+                if (p - park).length() < 1.0 { continue }
+                let nb = bodies.iter().map(|b| (*b - p).length()).fold(f32::MAX, f32::min);
+                if nb <= 1.5 { *cats.entry("near a drawn body".into()).or_default() += 1; continue }
+                let t = by[net];
+                let att = t.attached_at(k);
+                let cat = match att {
+                    None => {
+                        let q = t.sample(k + 60).unwrap_or([p.x, p.y, p.z]);
+                        let v = ((q[0] - p.x).powi(2) + (q[1] - p.y).powi(2) + (q[2] - p.z).powi(2)).sqrt();
+                        let was_attached = t.attachments.iter().filter(|(kk, _)| *kk <= k).last().map_or(false, |(_, a)| a.is_none());
+                        let nxt = t.positions.iter().find(|(pt, _)| *pt > k).map(|(pt, _)| pt - k);
+                        let prv = t.positions.iter().rev().find(|(pt, _)| *pt <= k).map(|(pt, _)| k - pt);
+                        format!("NOT attached; released-earlier {was_attached}; moves {}; nearest own keys: prev {} / next {} ticks away", if v > 2.0 { ">2wu per second" } else { "<2wu per second (parked)" }, prv.map_or("none".into(), |x| if x > 600 { ">600".to_string() } else { "<=600".to_string() }), nxt.map_or("none".into(), |x| if x > 600 { ">600".to_string() } else { "<=600".to_string() }))
+                    }
+                    Some(at) => {
+                        let par = lookup(at.parent);
+                        let alive = par.map_or(false, |p| p.alive_at(k));
+                        let drawn = d.body_actor.contains_key(&at.parent);
+                        let target = par.and_then(|p| crate::film_objective::follow_position(&lookup, p, k as f32, 1));
+                        let dd = target.map(|tg| (tg - p).length()).unwrap_or(-1.0);
+                        format!("attached; parent type {} alive {alive} body-drawn {drawn}; drawn-vs-follow-target {}", par.map_or(255, |p| p.entity_type), if dd < 0.0 { "n/a" } else if dd < 1.0 { "<1wu" } else { ">=1wu" })
+                    }
+                };
+                *cats.entry(cat.clone()).or_default() += 1;
+                if shown < 6 && att.is_some() { shown += 1; println!("   far beacon sample: tick {k} net {net:#x} dist-to-nearest-body {nb:.1}: {cat}"); }
+            }
+            k += 300;
+        }
+        for (c, n) in cats { println!("  {n:>6}  {c}"); }
+    }
+}
+
+#[cfg(test)]
+mod vehicle_children {
+    use super::*;
+    #[test]
+    #[ignore = "diagnostic"]
+    fn mongoose_child_rows() {
+        let Some(o) = open_forge() else { return };
+        for t in o.native.tags_by_group(o.cache, "vehi") {
+            let n = o.native.tag_name(o.cache, t).unwrap_or_default();
+            if !n.ends_with("mongoose\\mongoose") { continue }
+            let rows = o.native.enumerate_attachments(o.cache, t);
+            println!("{n}: {} child rows", rows.len());
+            for a in rows.iter().take(8) { let (co, cm, vi, ms) = (a.child_obj, a.child_mode, a.variant_index, a.marker_sid); println!("   variant[{vi}] marker {ms:#x} child '{}' mode {cm:#x}", o.native.tag_name(o.cache, co).unwrap_or_default()); }
+        }
+        // every actor-drawn kind in the race: which object tags (any class) carry child rows?
+        for g in ["bipd", "vehi", "weap", "bloc", "scen", "eqip"] {
+            let mut with = 0; let mut all = 0;
+            for t in o.native.tags_by_group(o.cache, g) { all += 1; if !o.native.enumerate_attachments(o.cache, t).is_empty() { with += 1; } }
+            println!("{g}: {with} of {all} tags have hlmt child rows");
+        }
+    }
+}
+
+// =============================================================================================
+// #knife  On real clips (the race clip, Castle Wars): every drawn Spartan's knife/sheath child sits
+// on its hip marker in the pose the body is DRAWN in -- seated riders, corpses, sprinters alike.
+// =============================================================================================
+#[cfg(test)]
+mod knife_clip_gate {
+    use super::*;
+    use glam::{Mat4, Vec3};
+
+    /// (pairs checked, worst error of the production placement, worst error of the OLD placement,
+    /// worst distance from the body's origin, seated pairs)
+    fn run(o: &OpenMap, f: &film::Film, step: u32) -> (usize, f32, f32, f32, usize) {
+        let mut pb = Playback::new(fd::build_index_film(f));
+        pb.moving_only = false;
+        let mut d = ActorDriver::default();
+        d.cap = 64;
+        d.resolve_bipeds(&pb, &o.native, o.cache, Some(&o.map));
+        let mut actors = crate::reach_actor::ActorScene::default();
+        let total = pb.total_ticks();
+        let (mut n, mut seated, mut new_w, mut old_w, mut far) = (0usize, 0usize, 0.0f32, 0.0f32, 0.0f32);
+        let mut k = 0u32;
+        while k < total {
+            pb.seek_tick(k as f32);
+            d.sync(&pb, &mut actors, &o.native, o.cache);
+            actors.update_poses_headless(0.0);
+            let park = Vec3::from(d.park);
+            for id in d.body_actor.values() {
+                let Some(a) = actors.get(*id) else { continue };
+                let world = a.world();
+                if (world.w_axis.truncate() - park).length() < 1.0 { continue }
+                let tag = a.def.obj_tag;
+                let dsid = crate::scene::object_default_variant_sid(&o.native, o.cache, tag);
+                let Some((msid, _)) = crate::scene::child_marker_for(&o.native, o.cache, tag, a.variant_sid, dsid) else { continue };
+                let Some(marker) = a.def.model.markers.iter().find(|g| g.name == msid).and_then(|g| crate::reach_skel::pick_marker(&g.markers, -1, -1)) else { continue };
+                let bind = crate::reach_actor::Pose::bind(&a.def.model.skel);
+                let p_bind = bind.marker_model(&marker).w_axis.truncate();
+                let want = world.transform_point3(a.pose.marker_model(&marker).w_axis.truncate());
+                // PRODUCTION: the child palette (delta = the actor's world, the actor was never "built" here)
+                let m = crate::reach_actor::child_palette_matrix(world, &a.pose, &a.def.inverse_bind, marker.node);
+                let got = m.transform_point3(p_bind);
+                // OLD: skinned by the body bones named by the knife's own node indices (0..2)
+                let mut old = 0.0f32;
+                for kn in 0..3usize {
+                    let om = world * a.pose.model.get(kn).copied().unwrap_or(Mat4::IDENTITY) * a.def.inverse_bind.get(kn).copied().unwrap_or(Mat4::IDENTITY);
+                    old = old.max((om.transform_point3(p_bind) - want).length());
+                }
+                n += 1;
+                if a.world_override.is_some() { seated += 1; }
+                new_w = new_w.max((got - want).length());
+                old_w = old_w.max(old);
+                far = far.max((got - world.w_axis.truncate()).length());
+            }
+            k += step;
+        }
+        (n, new_w, old_w, far, seated)
+    }
+
+    fn clips() -> Vec<(String, film::Film)> {
+        let mut v: Vec<(String, film::Film)> = Vec::new();
+        if let Some(h) = std::env::var_os("HOME") {
+            if let Ok(f) = film::open(&std::path::Path::new(&h).join("Downloads").join("Reach(1).mov")) { v.push(("Reach(1)".into(), f)); }
+        }
+        for s in ["53C14E9D", "2BAB2586"] {
+            if let Some(p) = film::spec_corpus().into_iter().find(|p| p.file_name().map_or(false, |n| n.to_string_lossy().contains(s))) {
+                if let Ok(f) = film::open(&p) { v.push((s.to_string(), f)); }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn every_drawn_knife_is_on_its_hip_marker_on_real_clips() {
+        let Some(o) = open_forge() else { eprintln!("no forge_halo: gate skipped"); return };
+        let (mut n, mut seated, mut worst, mut far) = (0usize, 0usize, 0.0f32, 0.0f32);
+        for (name, f) in clips() {
+            let (pairs, new_w, old_w, far_w, s) = run(&o, &f, 600);
+            println!("{name}: {pairs} body-ticks with a knife ({s} seated); production error {new_w:.5} wu; old placement up to {old_w:.3} wu; farthest from body origin {far_w:.3} wu");
+            n += pairs; seated += s; worst = worst.max(new_w); far = far.max(far_w);
+        }
+        assert!(n >= 300, "liveness: only {n} drawn knives across the clips");
+        assert!(worst < 0.01, "a knife is {worst:.4} wu off its hip marker");
+        assert!(far < 1.2, "a knife is {far:.2} wu from its body's origin: not on the Spartan");
+        let _ = seated;
+    }
+
+    /// SABOTEUR: the previous placement fails the same bound by a wide margin on real poses.
+    #[test]
+    fn saboteur_the_old_placement_floats_on_real_clips() {
+        let Some(o) = open_forge() else { return };
+        let mut worst_old = 0.0f32;
+        let mut n = 0;
+        for (_, f) in clips() {
+            let (pairs, _, old_w, _, _) = run(&o, &f, 600);
+            n += pairs;
+            worst_old = worst_old.max(old_w);
+        }
+        assert!(n >= 300, "liveness");
+        assert!(worst_old > 0.02, "the gate does not bite: the old placement is within {worst_old:.4} wu");
     }
 }

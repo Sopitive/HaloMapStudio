@@ -327,6 +327,7 @@ impl PrefabScene for crate::App {
             spawn_sequence: m.spawn_seq,
             user_data: h4.map(|h| h.user_data as i32).unwrap_or(0),
             placement: m.placement,
+            engine_flags: if self.h3_active { m.h3_engine } else { 0 },
             placement_hi: h4.map(|h| h.placement_hi).unwrap_or(0),
             shape: m.boundary_shape,
             shape_wu: self.prefab_boundary_wu(m),
@@ -358,6 +359,7 @@ impl PrefabScene for crate::App {
             m.respawn = o.spawn_time;
             m.spawn_seq = o.spawn_sequence;
             m.placement = o.placement;
+            if self.h3_active && o.engine_flags != 0 { m.h3_engine = o.engine_flags; }
             m.weapon_clips = o.weapon_clips;
             m.tele_channel = o.tele_channel;
             m.tele_passability = o.tele_passability;

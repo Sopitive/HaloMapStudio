@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html" class="cur" aria-current="page">Theater</a></li>
 <li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
 </ul>
@@ -92,7 +95,8 @@
 <tr><td><strong>Follow</strong></td><td>Sits behind and slightly above a chosen player and tracks them. The mouse orbits around them at a fixed distance; <em>recenter</em> puts the camera back behind them.</td></tr>
 <tr><td><strong>First person</strong></td><td>Puts the camera at that player's eye, looking along their own recorded aim, and draws Reach's dedicated first-person arm model holding their weapon. The player you are watching through is not drawn, so you are not looking at the inside of their helmet.</td></tr>
 </table></div>
-<p>The first-person arms are posed by the first-person animation of the weapon the player is carrying. Where a weapon gives the arms no pose to play, the arms are not drawn and the panel says so rather than showing a frozen pose.</p>
+<p>The first-person arms are posed by the first-person animation of the weapon the player is carrying. Where a weapon gives the arms no pose to play, the arms are not drawn and the panel says so rather than showing a frozen pose. The arms keep a fixed size (the authored 78 degree field of view) whatever the world field of view is, and the camera is sampled at the exact playback time, so it stays smooth at 144 Hz and other refresh rates.</p>
+<p><strong>Sound.</strong> Theater plays the recorded shots, melee swings, reloads and spoken lines (announcer, Spartan and Elite voice). Coverage is partial: footsteps, vehicle engines and impact sounds are not yet played in films.</p>
 
 <h2 id="cast">Who is who</h2>
 <p>The cast list names every player in the match, with their service tag and team colour, and gives each one a <em>follow</em> and a <em>1st person</em> button. Floating name tags above the players use the same team colours.</p>
@@ -168,7 +172,7 @@ film variant | megalo | events | seats | score | objects | object | inside | nea
 </ul>
 <p>The general rule this feature is built on: a number that was read from the file and a number that was worked out from it are different kinds of fact, and the one that was worked out always says so.</p>
 
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </main>
 </div>
 </body>

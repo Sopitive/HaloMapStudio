@@ -222,6 +222,29 @@ pub fn forward_angle(fwd: Vec3, up: Vec3) -> f32 {
     fwd.dot(left).atan2(fwd.dot(seed))
 }
 
+/// The game's decode of an orientation's three codes -> (forward, up): the up vector (global +Z
+/// or the dequantised 19-bit one), then the 8-bit angle applied to the seed tangent about it.
+/// `read_axes` (the stream reader) is this same sequence.
+pub fn decode_axes(up_is_global: bool, up_q: u32, angle_q: u8) -> (Vec3, Vec3) {
+    let up = if up_is_global { Vec3::Z } else { dequantize_unit_vector(up_q) };
+    let angle = dequantize_real(angle_q as u32, -std::f32::consts::PI, std::f32::consts::PI, 8, true);
+    let (s, c) = if angle == std::f32::consts::PI || angle == -std::f32::consts::PI { (0.0, -1.0) } else { angle.sin_cos() };
+    (rotate_about(perpendicular_seed(up), up, s, c).normalize_or_zero(), up)
+}
+
+/// The engine's own field-by-field encoder (sub_1801102E8): nearest up cell, then the nearest
+/// angle measured against the DECODED up. The baseline `quant_opt::best_h3_axes` is measured
+/// against and its never-worse fallback candidate.
+pub fn h3_axes_nearest(fwd: [f32; 3], up: [f32; 3]) -> (bool, u32, u8) {
+    let up = Vec3::from(up).normalize_or_zero();
+    let fwd = Vec3::from(fwd).normalize_or_zero();
+    let global = (up.x - 0.0).abs() < 0.000099999997 && (up.y - 0.0).abs() < 0.000099999997 && (up.z - 1.0).abs() < 0.000099999997;
+    let (dec_up, up_q) = if global { (Vec3::Z, 0) } else { let q = quantize_unit_vector(up); (dequantize_unit_vector(q), q) };
+    let angle = forward_angle(fwd, dec_up);
+    let angle_q = quantize_real(angle, -std::f32::consts::PI, std::f32::consts::PI, 8, true, false) as u8;
+    (global, up_q, angle_q)
+}
+
 // ---------------------------------------------------------------------------------------------
 // decoded structures
 // ---------------------------------------------------------------------------------------------
@@ -318,23 +341,18 @@ impl H3VariantObject {
     /// store what the file will decode back, so the editor shows the saved pose.
     pub fn set_pose(&mut self, pos: [f32; 3], fwd: Vec3, up: Vec3, bounds: [f32; 6]) {
         for k in 0..3 {
-            self.pos_q[k] = quantize_pos(pos[k], bounds[2 * k], bounds[2 * k + 1]);
+            self.pos_q[k] = crate::quant_opt::h3_pos_code(pos[k], bounds[2 * k], bounds[2 * k + 1]);
             self.pos[k] = dequantize_real(self.pos_q[k] as u32, bounds[2 * k], bounds[2 * k + 1], H3_POSITION_BITS, false);
         }
-        let up = up.normalize_or_zero();
-        let fwd = fwd.normalize_or_zero();
-        let global = (up.x - 0.0).abs() < 0.000099999997 && (up.y - 0.0).abs() < 0.000099999997 && (up.z - 1.0).abs() < 0.000099999997;
-        let (dec_up, up_q) = if global { (Vec3::Z, 0) } else { let q = quantize_unit_vector(up); (dequantize_unit_vector(q), q) };
+        // #save-precision: the code pair whose DECODED orientation is closest to the request
+        // (`h3_axes_nearest` is the engine's own field-by-field answer, kept as the baseline)
+        let (global, up_q, angle_q) = crate::quant_opt::best_h3_axes(fwd.normalize_or_zero().to_array(), up.normalize_or_zero().to_array());
         self.up_is_global = global;
         self.up_q = up_q;
-        // the engine measures the angle against the basis of the DECODED up (the writer's
-        // sub_1801102E8 dequantises before sub_18010FFD8)
-        let angle = forward_angle(fwd, dec_up);
-        self.angle_q = quantize_real(angle, -std::f32::consts::PI, std::f32::consts::PI, 8, true, false) as u8;
-        let angle = dequantize_real(self.angle_q as u32, -std::f32::consts::PI, std::f32::consts::PI, 8, true);
-        let (s, c) = if angle == std::f32::consts::PI || angle == -std::f32::consts::PI { (0.0, -1.0) } else { angle.sin_cos() };
-        self.up = dec_up.to_array();
-        self.fwd = rotate_about(perpendicular_seed(dec_up), dec_up, s, c).normalize_or_zero().to_array();
+        self.angle_q = angle_q;
+        let (f, u) = decode_axes(global, up_q, angle_q);
+        self.up = u.to_array();
+        self.fwd = f.to_array();
     }
 
     /// Set the boundary sizes (wu, clamped to [0, 60]) through the 16-bit quantiser.
@@ -1362,6 +1380,35 @@ mod tests {
         }
     }
 
+    /// Probe (print-only, #[ignore]): which `game_engine_flags` bit goes with which header game
+    /// engine type (per variant: how often each bit is set on objects that do NOT carry the
+    /// all-engines mask), and the `mp_flags` bit census.
+    #[test]
+    #[ignore]
+    fn engine_bit_probe() {
+        use std::collections::BTreeMap;
+        let mut by_type: BTreeMap<u32, ([usize; 10], usize, usize)> = BTreeMap::new();
+        let mut mp: BTreeMap<u8, usize> = BTreeMap::new();
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            let e = by_type.entry(v.header.game_engine_type).or_default();
+            e.1 += 1;
+            for o in v.placed().filter(|o| o.slot >= v.num_scenario_objects as usize) {
+                *mp.entry(o.mp_flags).or_default() += 1;
+                if o.game_engine_flags != 0x3FF { e.2 += 1; for b in 0..10 { if o.game_engine_flags >> b & 1 == 1 { e.0[b] += 1; } } }
+            }
+        }
+        for (t, (bits, files, n)) in &by_type { eprintln!("ENG hdr type {t}: {files} files, {n} restricted objects, bit counts {bits:?}"); }
+        for (m, n) in &mp { eprintln!("MPFLAGS {m:#04x}: {n}"); }
+        let mut by_ty: BTreeMap<(u8, u16), usize> = BTreeMap::new();
+        for f in shipped_variants() {
+            let Ok(v) = parse_h3_variant(&f) else { continue };
+            for o in v.placed().filter(|o| o.slot >= v.num_scenario_objects as usize && o.game_engine_flags != 0x3FF) { *by_ty.entry((o.object_type, o.game_engine_flags)).or_default() += 1; }
+        }
+        let mut rows: Vec<_> = by_ty.into_iter().collect(); rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for ((t, m), n) in rows.iter().take(40) { eprintln!("ENGTYPE type {t:>2} mask {m:#05x}: {n}"); }
+    }
+
     /// Probe (print-only, #[ignore]): does `placed_on_map` count only the objects whose
     /// `game_engine_flags` include the variant's engine? Row agreement per candidate rule.
     #[test]
@@ -1469,6 +1516,136 @@ mod tests {
         v.quotas = rows.iter().map(|&(p, price)| H3Quota { placed_on_map: p, price, ..Default::default() }).collect();
         v.spent_budget = spent;
         v
+    }
+
+    /// Bit positions where two equal-length streams differ.
+    fn differing_bits(a: &[u8], b: &[u8]) -> Vec<usize> {
+        assert_eq!(a.len(), b.len(), "an in-place property edit changed the stream length");
+        let mut out = Vec::new();
+        for (i, (x, y)) in a.iter().zip(b).enumerate() { for k in 0..8 { if (x ^ y) >> (7 - k) & 1 == 1 { out.push(i * 8 + k); } } }
+        out
+    }
+
+    /// A small variant with three placed records (the middle one is the one the property tests edit).
+    fn three_object_variant() -> (H3Variant, Vec<H3VariantObject>) {
+        let mut v = H3Variant::default();
+        v.bounds = [-100.0, 100.0, -100.0, 100.0, -50.0, 150.0];
+        v.version = H3_VARIANT_VERSION;
+        v.num_scenario_objects = 0;
+        v.quotas = vec![H3Quota { definition: 0x0002_0001, maximum_allowed: 8, price: 10.0, ..Default::default() }];
+        let mut objs = Vec::new();
+        for (i, slot) in [4usize, 5, 6].into_iter().enumerate() {
+            let mut o = blank(slot, 0, true);
+            o.object_type = 12;
+            o.shared_storage = 7;
+            o.spawn_time = 30;
+            o.set_pose([i as f32 * 10.0, 5.0, 20.0], Vec3::X, Vec3::Z, v.bounds);
+            o.set_boundary(2, [4.0, 3.0, 2.0, 0.0]);
+            objs.push(o);
+        }
+        (v, objs)
+    }
+
+    /// EVERY per-object property the Halo 3 record stores is written at its own width and nowhere else:
+    /// each is set to its edge values on the middle record, the stream is encoded and decoded again, the
+    /// value reads back, the neighbours are untouched, and the changed bits all sit inside the field's width.
+    #[test]
+    fn every_object_property_round_trips_at_its_edges_and_touches_only_its_own_bits() {
+        let (v, base) = three_object_variant();
+        let base_bytes = encode_h3_payload(&v, &base, None).unwrap();
+        assert_eq!(parse_h3_payload(&base_bytes).unwrap().objects, base.iter().map(|o| o.clone()).collect::<Vec<_>>(), "the unedited records do not round-trip");
+        // (name, width in bits, edge values, setter, getter)
+        type Set = fn(&mut H3VariantObject, u32);
+        type Get = fn(&H3VariantObject) -> u32;
+        let props: Vec<(&str, u32, Vec<u32>, Set, Get)> = vec![
+            ("team", 8, vec![0, 1, 7, 8], |o, x| o.team = x as u8, |o| o.team as u32),
+            ("spawn_time", 8, vec![0, 1, 127, 255], |o, x| o.spawn_time = x as u8, |o| o.spawn_time as u32),
+            ("shared_storage", 8, vec![0, 1, 254, 255], |o, x| o.shared_storage = x as u8, |o| o.shared_storage as u32),
+            ("mp_flags", 8, vec![0x00, 0x01, 0x02, 0x04, 0x08, 0x0C, 0x0F, 0x40, 0x80, 0xFF], |o, x| o.mp_flags = x as u8, |o| o.mp_flags as u32),
+            ("game_engine_flags", 16, vec![0, 1, 0x155, 0x2AA, 0x3FF], |o, x| o.game_engine_flags = x as u16, |o| o.game_engine_flags as u32),
+            ("object_type", 8, vec![0, 1, 12, 23], |o, x| o.object_type = x as u8, |o| o.object_type as u32),
+            ("flags", 16, vec![0x00, 0x03, 0x83, 0x2B], |o, x| o.flags = x as u16, |o| o.flags as u32),
+            ("boundary q0", 16, vec![0, 1, 0x8000, 0xFFFF], |o, x| o.boundary_q[0] = x as u16, |o| o.boundary_q[0] as u32),
+            ("boundary q1", 16, vec![0, 1, 0x8000, 0xFFFF], |o, x| o.boundary_q[1] = x as u16, |o| o.boundary_q[1] as u32),
+            ("boundary q2", 16, vec![0, 1, 0x8000, 0xFFFF], |o, x| o.boundary_q[2] = x as u16, |o| o.boundary_q[2] as u32),
+        ];
+        for (name, width, values, set, get) in &props {
+            for &x in values {
+                let mut objs = base.clone();
+                set(&mut objs[1], x);
+                let bytes = encode_h3_payload(&v, &objs, None).unwrap();
+                let back = parse_h3_payload(&bytes).unwrap();
+                assert_eq!(get(&back.objects[1]), x, "{name} = {x:#x} did not read back");
+                assert_eq!(back.objects[0], base[0], "{name}: the previous record moved");
+                assert_eq!(back.objects[2], base[2], "{name}: the next record moved");
+                let d = differing_bits(&base_bytes, &bytes);
+                if let (Some(lo), Some(hi)) = (d.first(), d.last()) {
+                    assert!(hi - lo < *width as usize, "{name} = {x:#x}: changed bits {lo}..={hi} span more than the field's {width} bits");
+                }
+            }
+        }
+        // the boundary: every shape with edge sizes (the shape changes how many sizes follow, so the stream length may change)
+        for shape in 0u8..=3 {
+            for edge in [0.0f32, 0.001, 30.0, 60.0, 75.0] {
+                let mut objs = base.clone();
+                objs[1].set_boundary(shape, [edge; 4]);
+                let back = parse_h3_payload(&encode_h3_payload(&v, &objs, None).unwrap()).unwrap();
+                let (a, b) = (&objs[1], &back.objects[1]);
+                assert_eq!(a.boundary_shape, b.boundary_shape, "shape {shape} size {edge}");
+                let n = match shape { 1 => 1, 2 => 3, 3 => 4, _ => 0 };
+                assert_eq!(&a.boundary_q[..n], &b.boundary_q[..n], "shape {shape} size {edge}: stored sizes");
+                assert!((b.boundary[0] - edge.min(60.0)).abs() <= 60.0 / 65535.0 || shape == 0, "shape {shape} size {edge} reads back as {}", b.boundary[0]);
+                assert_eq!(back.objects[0], base[0]);
+                assert_eq!(back.objects[2], base[2]);
+            }
+        }
+    }
+
+    /// The same record-level property edits over every REAL variant: one placed record per file is edited
+    /// to several values of each property, written through the production file writer, re-read with the
+    /// decoder, and compared; the changed bits stay inside the field's width; an unedited re-save is
+    /// byte-identical. Print-only counts. Needs the game install (#[ignore]).
+    #[test]
+    #[ignore]
+    fn real_variants_accept_every_property_edit_at_its_own_bits() {
+        let files = shipped_variants();
+        if files.is_empty() { eprintln!("skip: no Halo 3 variants installed"); return; }
+        type Set = fn(&mut H3VariantObject, u32);
+        type Get = fn(&H3VariantObject) -> u32;
+        let props: Vec<(&str, u32, Vec<u32>, Set, Get)> = vec![
+            ("team", 8, vec![0, 3, 7, 8], |o, x| o.team = x as u8, |o| o.team as u32),
+            ("spawn_time", 8, vec![0, 1, 255], |o, x| o.spawn_time = x as u8, |o| o.spawn_time as u32),
+            ("shared_storage", 8, vec![0, 5, 255], |o, x| o.shared_storage = x as u8, |o| o.shared_storage as u32),
+            ("mp_flags", 8, vec![0x00, 0x01, 0x03, 0x04, 0x08, 0x0C, 0x0F], |o, x| o.mp_flags = (o.mp_flags & 0xF0) | x as u8, |o| (o.mp_flags & 0x0F) as u32),
+            ("game_engine_flags", 16, vec![1, 0x155, 0x3FF], |o, x| o.game_engine_flags = x as u16, |o| o.game_engine_flags as u32),
+        ];
+        let (mut edits, mut checked_files) = (0usize, 0usize);
+        for f in &files {
+            let data = crate::mvar::read_expanded(f).unwrap();
+            let v = parse_h3_variant(f).unwrap();
+            assert_eq!(rebuild_h3_file(&data, &v, &v.objects, None).unwrap(), data, "{}: unedited re-save", f.display());
+            // a Forge-placed record, preferring one that already has a shape (so the length stays put)
+            let Some(i) = v.objects.iter().position(|o| o.placed && o.slot >= v.num_scenario_objects as usize) else { continue };
+            checked_files += 1;
+            let (body, _, _) = blf_h3_mvar_chunk(&data).unwrap();
+            for (name, width, values, set, get) in &props {
+                for &x in values {
+                    let mut objs = v.objects.clone();
+                    set(&mut objs[i], x);
+                    let file = rebuild_h3_file(&data, &v, &objs, None).unwrap();
+                    let (nb, _, _) = blf_h3_mvar_chunk(&file).unwrap();
+                    let back = parse_h3_payload(nb).unwrap();
+                    assert_eq!(get(&back.objects[i]), x, "{}: {name} = {x:#x}", f.display());
+                    for (k, (a, b)) in objs.iter().zip(&back.objects).enumerate() { assert_eq!(a, b, "{}: {name} = {x:#x}: record {k} differs after the round trip", f.display()); }
+                    let d = differing_bits(body, nb);
+                    if let (Some(lo), Some(hi)) = (d.first(), d.last()) {
+                        assert!(hi - lo < *width as usize, "{}: {name} = {x:#x}: changed bits {lo}..={hi} span more than {width} bits", f.display());
+                    }
+                    edits += 1;
+                }
+            }
+        }
+        eprintln!("PROPERTY EDITS: {edits} edits over {checked_files} of {} variants, every one decoded back and touched only its own bits", files.len());
     }
 
     /// Nothing changed: the stored values come back bit-for-bit, STALE ones included (the shipped

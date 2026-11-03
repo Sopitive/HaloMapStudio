@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html" class="cur" aria-current="page">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
 <li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
 </ul>
@@ -110,7 +113,7 @@ HMS_CAM="62,208,68,0,-10" HMS_SHOT=asylum.png HMS_SHOT_SIZE=1280x720 ./hms-app</
 <tr><td><code>HMS_SOFT_CEILINGS=1</code></td><td>off</td><td>Draw the map's soft ceilings — the floor, walls and sky ceiling of the playable space (<em>View ▸ Soft ceilings</em>). The log always lists every ceiling with its kind, triangle count and height range.</td></tr>
 <tr><td><code>HMS_HARD_FLOOR=1</code></td><td>off</td><td>Draw the map's world box — the physics broadphase from every structure BSP's bounds plus 64 units — and its floor (<em>View ▸ Hard floor</em>). The log always lists every structure BSP with its world and physics bounds and the box.</td></tr>
 <tr><td><code>HMS_PLAYABLE_BOUNDS=1</code></td><td>off</td><td>Draw each playable BSP's own world-bounds box and floor (<em>View ▸ Playable BSP bounds</em>).</td></tr>
-<tr><td><code>HMS_QUANT_GHOST=1</code> (or <code>1x40</code>)</td><td>off, &times;1</td><td>Draw the <strong>save-precision ghost</strong> of the selected object(s) &mdash; the pose the <code>.mvar</code> will really hold after quantisation &mdash; in violet, with an optional exaggeration factor after the <code>x</code> (<em>View &#9656; Overlays &#9656; Save-precision ghost</em>). In a script run <code>precision ghost on|off|&lt;factor&gt;</code> changes it for that run and the next <code>screenshot</code> draws it; <code>precision</code>, <code>precision &lt;datum&gt;</code> and <code>precision worst</code> print the numbers. See <a href="editing.html#precision">Save precision</a>.</td></tr>
+<tr><td><code>HMS_QUANT_GHOST=1</code> (or <code>1x40</code>)</td><td>off, &times;1</td><td>Draw the <strong>in-game-pose ghost</strong> of the selected object(s) &mdash; the pose the <code>.mvar</code> will really hold after quantisation &mdash; in violet, with an optional exaggeration factor after the <code>x</code> (<em>View &#9656; Overlays &#9656; Show in-game pose (ghost)</em>). In a script run <code>precision ghost on|off|&lt;factor&gt;</code> changes it for that run and the next <code>screenshot</code> draws it; <code>precision</code>, <code>precision &lt;datum&gt;</code> and <code>precision worst</code> print the numbers. See <a href="editing.html#precision">Save precision</a>.</td></tr>
 </table></div>
 <p>The script runner has the same switches as commands (<code>screenfx</code>, <code>scale</code>, <code>shadowcasters</code>, <code>mapspawns</code>, <code>outlines</code>, <code>precision ghost</code>); set there they apply to that run only and are not written back to the settings folder.</p>
 
@@ -189,7 +192,7 @@ end</code></pre>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

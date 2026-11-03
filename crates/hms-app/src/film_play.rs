@@ -114,7 +114,10 @@ pub const FIRE_LOOKBACK_TICKS: u32 = 900 + 240;
 
 /// #melee  How long a swing is held, in film ticks. One melee clip: the shipped strikes are
 /// 24-33 frames at 30 fps against the film's 60 Hz tick line.
-pub const MELEE_TICKS: u32 = 60;
+pub const MELEE_TICKS: u32 = 72;
+/// #melee  Fade-in / fade-out of a swing's replacement lane, ticks (4 = 1/15 s, 6 = 0.1 s).
+pub const MELEE_FADE_IN_TICKS: f32 = 4.0;
+pub const MELEE_FADE_OUT_TICKS: f32 = 6.0;
 
 /// Which entity types this build knows how to place. Type 11 is the unit/biped — the one that
 /// matters for watching a match. The others decode positions too and are offered separately so
@@ -808,10 +811,13 @@ impl Playback {
             if self.death_at(t).is_some_and(|d| tick > d) {
                 continue;
             }
-            let Some(pos) = t.sample(tick) else { continue };
+            // #fp-jitter  Placed at the FRACTIONAL clock, the one the camera follows, so a followed
+            // body and the view of it can never disagree (equal to the rounded tick at a whole one).
+            let ft = self.tick.max(0.0);
+            let Some(pos) = crate::film_vehicle::position_at(t, ft).map(|p| p.to_array()).or_else(|| t.sample(tick)) else { continue };
             // A biped reports its body yaw in its own field, not the generic orientation, so
             // prefer that; without it a player would be drawn facing +X for their whole life.
-            let (yaw, has_yaw) = match t.facing_at(tick) {
+            let (yaw, has_yaw) = match t.facing_at_f(ft) {
                 Some(y) => (y.to_degrees(), true),
                 None => match t.sample_orientation(tick) {
                     Some((fwd, _up)) => (fwd[1].atan2(fwd[0]).to_degrees(), true),
@@ -1108,7 +1114,8 @@ impl Playback {
         let tick = self.tick.round().max(0.0) as u32;
         let hide = self.hidden_entity();
         let mut out: Vec<Placement> = Vec::new();
-        for a in self.assassinations() {
+        let mut placed: std::collections::HashSet<u32> = Default::default();
+        for a in self.assassinations().iter().rev() {
             if !a.covers(tick) {
                 continue;
             }
@@ -1121,7 +1128,7 @@ impl Playback {
                 });
             let Some((pos, yaw)) = root else { continue };
             for id in [a.attacker, a.victim].into_iter().flatten() {
-                if Some(id) == hide {
+                if Some(id) == hide || !placed.insert(id) {
                     continue;
                 }
                 let Some(tr) = self.index.tracks.iter().find(|t| t.net_id == id) else { continue };
@@ -1490,6 +1497,118 @@ impl SyncProf {
 ///
 /// Moving an actor is just `pos`/`yaw` — the bone palette folds the placement in — so a frame of
 /// playback costs no mesh rebuild. Only CREATING the pool does, which happens once.
+/// #film-carry  How near a loose weapon's recorded position must stay to one body for it to count
+/// as in that body's hands, world units. Measured on Castle Wars (`53C14E9D`): the recorded
+/// position of a carried weapon sits 0.2-1.5 wu from the body's origin (hand height and reach);
+/// nothing a body merely walks past stays inside that for half a second.
+pub const CARRY_RADIUS_WU: f32 = 1.5;
+/// ...and it must have been within it of the SAME body this many ticks ago, twice over.
+pub const CARRY_HOLD_TICKS: [u32; 2] = [15, 30];
+
+/// #film-carry  What the bodies are carrying this tick.
+#[derive(Clone, Debug, Default)]
+pub struct Carry {
+    /// Loose weapons (net ids) carried by a live body: the loose lane must not draw them.
+    pub hidden: std::collections::HashSet<u32>,
+    /// Per carrier body (net id): the `weap` tag INDEX of the nearest weapon it carries -- the one
+    /// drawn in its hand when the recording itself names none.
+    pub in_hand: HashMap<u32, u32>,
+}
+
+/// #film-carry  **Which loose weapons are being CARRIED, from the recording alone.**
+///
+/// The stream states almost nothing about carrying: no `weapon_pickup` / `weapon_drop` event
+/// reaches a clip that is not the recorder's (0 in the Castle Wars films), a held weapon states no
+/// parent (base field 12 is absent on 99.9% of `weap` tracks), and only 4% of bodies ever report a
+/// weapon of their own. What it does state is the weapon ENTITY's position, and a carried weapon's
+/// is the hand's. So a weapon is carried by body B at `tick` when B is the nearest live body within
+/// [`CARRY_RADIUS_WU`] now and again at each of [`CARRY_HOLD_TICKS`] earlier (checks before either
+/// party existed are waived). A body seated in a vehicle never carries. A pure function of the tick,
+/// so a scrub reproduces it.
+///
+/// Only [`Draw::LooseWeapon`](crate::film_objective::Draw::LooseWeapon) is considered: an
+/// objective (the flag, the bomb) keeps its recorded placement.
+pub fn carried_weapons(
+    pb: &Playback,
+    ot: &crate::film_objective::ObjectTable,
+    weap_tags: &[u32],
+    tick: u32,
+    unholdable: &std::collections::HashSet<u32>,
+    seated: &dyn Fn(u32) -> bool,
+) -> Carry {
+    use crate::film_objective::Draw;
+    let mut out = Carry::default();
+    let bodies: Vec<&EntityTrack> = pb.index.tracks.iter().filter(|t| t.entity_type == BIPED_TYPE).collect();
+    let live_at = |b: &EntityTrack, k: u32| {
+        k >= b.first_tick && k <= b.last_tick && pb.death_at(b).map_or(true, |d| k < d)
+    };
+    // A body in a vehicle seat is drawn AT the seat, not where its own track says: it is nobody's
+    // hand to put a sword in, and its weapon stays on the recorded placement.
+    let bodies: Vec<&EntityTrack> = bodies.into_iter().filter(|b| !seated(b.net_id)).collect();
+    let nearest = |k: u32, pos: [f32; 3]| -> Option<(u32, f32)> {
+        bodies
+            .iter()
+            .filter(|b| live_at(b, k))
+            .filter_map(|b| {
+                let q = b.sample(k)?;
+                let d = ((q[0] - pos[0]).powi(2) + (q[1] - pos[1]).powi(2) + (q[2] - pos[2]).powi(2)).sqrt();
+                Some((b.net_id, d))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    };
+    let mut best: HashMap<u32, (f32, u32)> = HashMap::new();
+    for (o, pos, _) in ot.to_draw_at(&pb.index, tick) {
+        // The Spartan's knife and sheath are hlmt CHILD objects of the biped, posed from its hip marker
+        // by the actor build (`reach_actor::child_palette_matrix`); never a weapon to put in a hand.
+        if o.group != "weap" || o.draw != Draw::LooseWeapon || unholdable.contains(&o.obj_tag) || o.name.starts_with("spartan_knife") {
+            continue;
+        }
+        let Some(wt) = pb.index.tracks.iter().find(|t| t.net_id == o.net_id) else { continue };
+        let Some((carrier, d)) = nearest(tick, pos) else { continue };
+        if d > CARRY_RADIUS_WU {
+            continue;
+        }
+        let cb = bodies.iter().find(|b| b.net_id == carrier).copied();
+        let held = CARRY_HOLD_TICKS.iter().all(|&h| {
+            let Some(k) = tick.checked_sub(h) else { return true };
+            if k < wt.first_tick || cb.map_or(true, |b| k < b.first_tick) {
+                return true;
+            }
+            wt.sample(k).and_then(|p| nearest(k, p)).map_or(false, |(n, dd)| n == carrier && dd <= CARRY_RADIUS_WU)
+        });
+        if !held {
+            continue;
+        }
+        out.hidden.insert(o.net_id);
+        if let Some(wi) = weap_tags.iter().position(|&t| t == o.obj_tag) {
+            if best.get(&carrier).map_or(true, |&(bd, _)| d < bd) {
+                best.insert(carrier, (d, wi as u32));
+            }
+        }
+    }
+    out.in_hand = best.into_iter().map(|(c, (_, w))| (c, w)).collect();
+    out
+}
+
+/// #seat-weapons  The weapon a recorded rider holds: `want`, unless the seat it sits in does not
+/// allow weapons (`unit_can_use_weapon_in_seat`: seat flag bit 5 clear => unusable; entering such a
+/// seat stows the weapon, `motor_task_enter_seat_internal`). A seat the recording does not name
+/// (a detected ride) keeps the weapon. `memo` caches the per-seat answer.
+pub fn weapon_in_seat(
+    memo: &mut HashMap<(u32, usize), bool>,
+    native: &hms_native::NativeDll,
+    cache: hms_native::CacheHandle,
+    vehicle_tag: Option<u32>,
+    seat_index: Option<usize>,
+    want: Option<u32>,
+) -> Option<u32> {
+    let (Some(vt), Some(si)) = (vehicle_tag, seat_index) else { return want };
+    let ok = *memo.entry((vt, si)).or_insert_with(|| {
+        crate::reach_seats::UnitSeats::read(native, cache, vt).and_then(|u| u.seats.get(si).map(|s| s.allows_weapons())).unwrap_or(true)
+    });
+    if ok { want } else { None }
+}
+
 /// #projectile-sim  What [`ActorDriver::synth_shots`] did at the last frame.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShotsReport {
@@ -1593,6 +1712,8 @@ pub struct ActorDriver {
     /// rider whose weapon class has none of its own. Resolved once per pair: it scans the graph's
     /// animation names.
     rider_clips: HashMap<(String, String), crate::film_riders::SeatClips>,
+    /// #seat-weapons  Per `(vehi tag, seat index)`: does the seat allow the occupant's own weapon.
+    seat_allows_weapons: HashMap<(u32, usize), bool>,
     /// #film-objects  Every OTHER object the film recorded — the flag, the dropped weapons, the
     /// debris — identified through its own 14-bit definition reference. Built once per
     /// (cache, film) by `resolve_objects`; `None` until a map is open to resolve against.
@@ -1601,6 +1722,15 @@ pub struct ActorDriver {
     /// from shows no flag at all. The user asked for a toggle rather than being forced, so this
     /// is it, and it is the ONE switch for the whole lane.
     pub show_objects: bool,
+    /// #film-carry  Derive which loose weapons a body is CARRYING and draw them in its hand (see
+    /// [`carried_weapons`]). Default on; off only for the gate's saboteur.
+    pub derive_carried: bool,
+    /// #film-carry  This frame's result: weapon net ids the loose lane must not draw, and the
+    /// weapon-tag INDEX each carrier holds in its hands.
+    pub carry_hidden: std::collections::HashSet<u32>,
+    /// #film-carry  Weapon tags a body failed to hold (no render model): never derived as carried.
+    pub hold_failed: std::collections::HashSet<u32>,
+    pub carry_hand: HashMap<u32, u32>,
     /// #film-highlight  Every non-unit object definition the film names, resolved once: wire ->
     /// (tag id, group, tag path). The highlight's tag names and hull lookups come from here.
     pub def_tags: HashMap<u32, (u32, String, String)>,
@@ -1959,9 +2089,14 @@ impl Default for ActorDriver {
             rider_index: Default::default(),
             riders_unplaced: 0,
             rider_clips: HashMap::new(),
+            seat_allows_weapons: HashMap::new(),
             vehicle_error: None,
             objects: None,
             show_objects: true,
+            derive_carried: true,
+            carry_hidden: Default::default(),
+            hold_failed: Default::default(),
+            carry_hand: HashMap::new(),
             def_tags: HashMap::new(),
             object_cap: 96,
             object_actor: HashMap::new(),
@@ -2179,6 +2314,7 @@ impl ActorDriver {
         self.biped_cache = Some(key);
         self.rider_index.reset();
         self.rider_clips.clear();
+        self.seat_allows_weapons.clear();
         self.biped_of.clear();
         self.monitor_owner.clear();
         self.biped_status = "no map is open to resolve the definition each spawn message names".into();
@@ -2413,7 +2549,10 @@ impl ActorDriver {
         tick: u32,
     ) -> Option<(crate::film_anim::SyncState, Option<([f32; 3], f32)>)> {
         use crate::film_anim::{SyncSide, SyncState};
-        let a = self.sync.iter().find(|a| {
+        // #assassination-timing  The MOST RECENT action covering this tick: a killer who finishes a second
+        // victim inside the first one's window (kill chains: 81 ticks apart on a measured clip) must start
+        // the NEW move at ITS incident, not carry on with the old one until that window runs out.
+        let a = self.sync.iter().rev().find(|a| {
             a.covers(tick) && (a.attacker == Some(net_id) || a.victim == Some(net_id))
         })?;
         let side = if a.attacker == Some(net_id) { SyncSide::Attacker } else { SyncSide::Victim };
@@ -3375,14 +3514,25 @@ impl ActorDriver {
         self.objectives_shown = 0;
         self.objects_on_spawn = 0;
         self.objects_capped = 0;
+        let carry = match (self.derive_carried, self.objects.as_ref()) {
+            (true, Some(ot)) => carried_weapons(pb, ot, &self.weap_tags, tick, &self.hold_failed, &|n| {
+                self.vehicles.as_ref().map_or(false, |v| v.seat_of(n, tick).is_some())
+            }),
+            _ => Carry::default(),
+        };
+        self.carry_hidden = carry.hidden;
+        self.carry_hand = carry.in_hand;
         if self.show_objects {
             let live: Vec<(u32, u32, [f32; 3], f32, Option<glam::Mat4>, bool, bool)> = match &self.objects {
                 Some(ot) => {
                     self.objects_on_spawn = ot.parked_on_spawn_at(&pb.index, tick);
                     let want = ot.to_draw_at(&pb.index, tick).len();
                     self.objects_capped = want.saturating_sub(self.object_cap);
-                    ot.to_draw_capped(&pb.index, tick, self.object_cap)
+                    ot.to_draw_at(&pb.index, tick)
                         .into_iter()
+                        // #film-carry  A weapon a body is carrying is drawn IN ITS HAND by the body.
+                        .filter(|(o, _, _)| !self.carry_hidden.contains(&o.net_id))
+                        .take(self.object_cap)
                         .map(|(o, pos, orient)| {
                             // #film-jitter  Re-sampled at the fractional clock, exactly as the
                             // vehicle lane above: a thrown garbage tire and a man-cannoned
@@ -3806,8 +3956,24 @@ impl ActorDriver {
                         .get(&p.net_id)
                         .and_then(|&i| pb.index.tracks.get(i))
                         .and_then(|tr| tr.weapon_at(tick))
-                        .map(|w| w as usize);
-                    let want_weapon = want_index.and_then(|w| self.weap_tags.get(w).copied());
+                        .map(|w| w as usize)
+                        // #film-carry  The recording rarely states a body's weapon; a loose weapon
+                        // it has been carrying for half a second is the one in its hands.
+                        .or_else(|| self.carry_hand.get(&p.net_id).map(|&w| w as usize));
+                    let mut want_weapon = want_index.and_then(|w| self.weap_tags.get(w).copied());
+                    // #seat-weapons  A rider in a seat that does not allow weapons has none in the
+                    // hand: the engine stows it on entering (`motor_task_enter_seat_internal` ->
+                    // `unit_can_use_weapon` -> `unit_action_weapon_put_away_end`), and `allows
+                    // weapons` (seat flag bit 5) is the test in `unit_can_use_weapon_in_seat`.
+                    // Unknown seat (a detected ride states none) keeps the weapon.
+                    want_weapon = weapon_in_seat(
+                        &mut self.seat_allows_weapons,
+                        native,
+                        cache,
+                        rider.as_ref().and_then(|r| r.vehicle_tag),
+                        rider.as_ref().and_then(|r| r.seat_index),
+                        want_weapon,
+                    );
                     weapons.push((slot, want_weapon));
                     if want_weapon.is_some() {
                         rep.armed += 1;
@@ -3940,6 +4106,11 @@ impl ActorDriver {
         for (slot, tag) in weapons {
             if let Err(e) = actors.set_weapon_tag(native, cache, slot, tag) {
                 self.weapon_error = Some(e);
+                // #film-carry  A weapon with no render model cannot be held, so the loose lane
+                // keeps drawing it (it would otherwise vanish): remember the tag.
+                if let Some(t) = tag {
+                    self.hold_failed.insert(t);
+                }
             }
         }
         // Load an animation only when it changes (set_anim reads a resource), then drive the
@@ -3953,8 +4124,13 @@ impl ActorDriver {
                 // Try the candidates in order: seat sets are named inconsistently across
                 // vehicles (`warthog_d:any:idle` but `ghost_d:idle`), so the first name the
                 // graph actually has wins.
+                // #assassination-timing  A synchronised action SNAPS both bodies onto a shared root at the
+                // incident tick; cross-fading the old locomotion pose into the move over 0.18 s
+                // (11 ticks) only showed the start of the move late and slid the pose against the
+                // already-moved root. The sync clip starts on its first frame, un-faded.
+                let fade = if matches!(dead, Some((_, ONESHOT_SYNC))) { None } else { Some(crate::reach_actor::BLEND_SECONDS) };
                 for c in &cands {
-                    if actors.set_anim(native, cache, slot, Some(c)).is_ok() {
+                    if actors.set_anim_with(native, cache, slot, Some(c), fade).is_ok() {
                         self.anim_of.insert(slot, cands[0].clone());
                         break;
                     }
@@ -4047,8 +4223,20 @@ impl ActorDriver {
                 // The lane only accepts a type-3 REPLACEMENT clip, so a graph whose melee is
                 // authored some other way is reported rather than posed wrongly.
                 if let Some((anim, n)) = a.replacement_clip(native, cache, c) {
-                    // 60 Hz film ticks -> 30 fps frames, played once and then held, exactly like
-                    // a death clip: scrub back and the swing un-swings.
+                    // 60 Hz film ticks -> 30 fps frames. The swing lasts exactly its AUTHORED
+                    // length (the shipped strikes are 24-33 frames = 48-66 ticks), fading in over
+                    // its first ticks and out over its last so the pose never snaps on or off the
+                    // locomotion clip it is laid over; scrub back and the swing un-swings.
+                    let len = n * 2.0;
+                    if age as f32 >= len {
+                        got = true; // finished: nothing to draw, and not a failure
+                        break;
+                    }
+                    let sm = |x: f32| {
+                        let x = x.clamp(0.0, 1.0);
+                        x * x * (3.0 - 2.0 * x)
+                    };
+                    a.replacement_weight = sm(age as f32 / MELEE_FADE_IN_TICKS).min(sm((len - age as f32) / MELEE_FADE_OUT_TICKS));
                     a.replacement = Some((anim, (age as f32 / 2.0).min(n - 0.001).max(0.0)));
                     a.replacement_name = c.clone();
                     // How much of the skeleton the swing actually carries -- the number the bug
@@ -5107,7 +5295,8 @@ impl ActorDriver {
     /// #wclass The animation class of the weapon a body is carrying at `tick`, from the map's
     /// own `weap` tags — `None` when the recording never named one for this body.
     fn class_at(&self, tr: Option<&crate::film_decode::EntityTrack>, tick: u32) -> Option<&str> {
-        let w = tr?.weapon_at(tick)? as usize;
+        let tr = tr?;
+        let w = tr.weapon_at(tick).or_else(|| self.carry_hand.get(&tr.net_id).copied())? as usize;
         self.weap_class.get(w)?.as_deref()
     }
 
@@ -5816,7 +6005,20 @@ pub fn solve_plain_camera_at(pb: &Playback, eye_height: f32) -> Option<CameraPos
         }
         FilmCamera::Free => return None,
     };
-    let feet = tr.sample(tick)?;
+    // #cam-jitter  A SEATED rider stops reporting a position of its own (it keeps the boarding spot
+    // for the whole ride), so following the body followed a point that did not move while the
+    // vehicle drove away -- 12.7 wu from the hull on the race clip. A rider's place IS its
+    // vehicle's: use the vehicle's own track at the fractional clock the vehicle is drawn with.
+    let ride_vehicle = pb
+        .index
+        .derived_valid()
+        .and_then(|d| d.rides.iter().find(|r| r.biped_net_id == tr.net_id && r.seat.is_some() && r.from_tick <= tick && tick <= r.to_tick))
+        .and_then(|r| pb.index.tracks.iter().find(|t| t.net_id == r.vehicle_net_id));
+    let ft = pb.tick.max(0.0);
+    let feet = match ride_vehicle {
+        Some(v) => crate::film_vehicle::position_at(v, ft).map(|p| p.to_array()).or_else(|| tr.sample(tick))?,
+        None => crate::film_vehicle::position_at(tr, ft).map(|p| p.to_array()).or_else(|| tr.sample(tick))?,
+    };
     // The AIM angles are the player's own look direction, recorded once per tick. They are what
     // makes first person genuinely first person rather than "wherever the body happened to point".
     // A body with no named slot has no aim record, so it falls back to its own decoded facing --
@@ -5824,11 +6026,18 @@ pub fn solve_plain_camera_at(pb: &Playback, eye_height: f32) -> Option<CameraPos
     // Only a slot whose aim actually moves is worth using; see `Playback::aim_live`. For
     // everyone else the body's own decoded yaw IS the recorded look direction (it tracks the aim
     // to 5.7-7.3 degrees where both exist), just without pitch.
-    let aim = slot.filter(|&s| pb.aim_live.get(s as usize).copied().unwrap_or(false)).and_then(|s| pb.index.aim_at(s, tick));
+    // #fp-jitter  Everything here is sampled at the FRACTIONAL clock (`ft`), the clock the bodies are
+    // drawn with: at a display rate that is not 60 Hz the rounded tick made the view step, and the
+    // recorded look direction (reported at the network rate) turned in hard steps.
+    let aim = slot.filter(|&s| pb.aim_live.get(s as usize).copied().unwrap_or(false)).and_then(|s| pb.index.aim_at_f(s, ft));
     let (yaw, pitch) = match aim {
-        Some(a) => (a.yaw(), a.pitch()),
+        Some((y, p)) => (y, p),
         None => (
-            tr.facing_at(tick)
+            // a rider faces the way its vehicle does
+            ride_vehicle
+                .and_then(|v| crate::film_vehicle::orientation_at(v, ft))
+                .map(|(f, _)| f[1].atan2(f[0]))
+                .or_else(|| tr.facing_at_f(ft))
                 .or_else(|| tr.sample_orientation(tick).map(|(f, _)| f[1].atan2(f[0])))
                 .unwrap_or(0.0),
             0.0,

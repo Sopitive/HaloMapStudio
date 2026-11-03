@@ -202,10 +202,15 @@ impl Voice {
 
 /// One source frame folded to (left, right).
 ///
-/// Mono feeds both sides equally. Stereo passes through. Four- and
-/// six-channel samples (Reach has 464 and 84 of them, all ambience) are
-/// folded: channels 0/2/4 to the left, 1/3/5 to the right, averaged, which
-/// keeps a quad ambience bed at the same loudness as a stereo one.
+/// Mono feeds both sides equally. Stereo passes through. Four-channel samples (464 in Reach, all
+/// ambience) are Vorbis quad order FL FR RL RR: even channels left, odd right, averaged, which
+/// keeps a quad bed at the loudness of a stereo one. Six-channel samples (84) are **Vorbis 5.1
+/// order, FL C FR RL RR LFE** (MEASURED on all 84: channel 1 is the quiet centre and channel 2 the
+/// loud right front, see `tests/full_sweep.rs::six_channel_order`), NOT the "even left, odd
+/// right" interleave a stereo pair would suggest: that put the right front and a rear channel on
+/// the left and the centre on the right. The fold is L = FL + 0.7071 C + RL, R = FR + 0.7071 C +
+/// RR, normalised by the weight sum; the LFE is dropped (a stereo device has no sub). The
+/// coefficients are OUR choice (the engine's own downmix lives in the mastering tag, undecoded).
 #[inline]
 fn sample_lr(p: &Pcm, frame: usize) -> (f32, f32) {
     let c = p.channels as usize;
@@ -215,6 +220,11 @@ fn sample_lr(p: &Pcm, frame: usize) -> (f32, f32) {
     match c {
         1 => (f[0], f[0]),
         2 => (f[0], f[1]),
+        6 => {
+            const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+            let n = 2.0 + K;
+            ((f[0] + K * f[1] + f[3]) / n, (f[2] + K * f[1] + f[4]) / n)
+        }
         _ => {
             let mut l = 0.0;
             let mut r = 0.0;
@@ -619,6 +629,36 @@ mod tests {
             channels: ch,
             sample_rate: 48_000,
         })
+    }
+
+    /// **SIX-CHANNEL ORDER.** A Reach 5.1 sample is Vorbis order FL C FR RL RR LFE. Each channel
+    /// alone must land where its name says: the right front on the RIGHT, the centre on both,
+    /// the rear left on the left, the LFE nowhere (a stereo device has no sub).
+    #[test]
+    fn a_six_channel_sample_is_folded_in_vorbis_5_1_order() {
+        let one = |ch: usize| {
+            let mut f = [0.0f32; 6];
+            f[ch] = 1.0;
+            let p = Pcm { samples: f.to_vec(), channels: 6, sample_rate: 48_000 };
+            sample_lr(&p, 0)
+        };
+        let (l, r) = one(0); // FL
+        assert!(l > 0.3 && r == 0.0, "FL -> ({l}, {r})");
+        let (l, r) = one(1); // C
+        assert!(l > 0.1 && (l - r).abs() < 1e-6, "C -> ({l}, {r})");
+        let (l, r) = one(2); // FR
+        assert!(r > 0.3 && l == 0.0, "FR -> ({l}, {r})");
+        let (l, r) = one(3); // RL
+        assert!(l > 0.3 && r == 0.0, "RL -> ({l}, {r})");
+        let (l, r) = one(4); // RR
+        assert!(r > 0.3 && l == 0.0, "RR -> ({l}, {r})");
+        let (l, r) = one(5); // LFE
+        assert!(l == 0.0 && r == 0.0, "LFE -> ({l}, {r})");
+        // The same level as a stereo bed for decorrelated content: all five full-range channels
+        // at 0.5 give a side no louder than 0.5 * (1 + 0.7071 + 1) / (2 + 0.7071) = 0.5.
+        let p = Pcm { samples: vec![0.5, 0.5, 0.5, 0.5, 0.5, 0.0], channels: 6, sample_rate: 48_000 };
+        let (l, r) = sample_lr(&p, 0);
+        assert!((l - 0.5).abs() < 1e-5 && (r - 0.5).abs() < 1e-5, "({l}, {r})");
     }
 
     #[test]

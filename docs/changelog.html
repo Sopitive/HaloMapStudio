@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
 <li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html" class="cur" aria-current="page">Changelog</a></li>
 </ul>
@@ -41,7 +44,79 @@
 <h1>Changelog</h1>
 <p class="lead">Release notes are published alongside each build on <a href="https://github.com/Sopitive/HaloMapStudio/releases">GitHub Releases</a>. This page summarises them.</p>
 
-<h2>v1.7.0 — 2026-10-29 <span class="tag">current</span></h2>
+<h2>v1.8.0 — 2026-11-03 <span class="tag">current</span></h2>
+<p><strong>Saving now shows what the game will load, and there is a map variant viewer for the web. Theater feels right: first-person and follow cameras are smooth at any refresh rate, vehicles no longer flip 90 degrees for a frame, riders, held weapons, the knife on the hip and melee swings look right, and spoken lines are finally audible. Test mode's first-person arms match your colours and keep their size at wide fields of view. HMS can now be built from source on Windows with one command, and there is a new diagnostic panel for finding why objects look washed out.</strong></p>
+<p class="note"><strong>Test mode and Theater remain labelled EXPERIMENTAL.</strong> See Known limitations at the end: the Windows build script and the Windows live-film fix have not been run on a real Windows machine, and Theater sound is only partly hooked up.</p>
+
+<h3>Added</h3>
+<ul>
+  <li><strong>Build from source on Windows.</strong> <code>build-windows.ps1</code> (with a <code>build-windows.cmd</code> wrapper) checks for Rust, the Visual Studio C++ tools and the Windows SDK, builds the native library and <code>hms-app.exe</code>, and fills <code>dist\windows-x64\</code>; <code>-Package</code> also writes a release-style zip. <code>BUILDING.md</code> and the new <a href="building.html">Building from source</a> page give the ordered steps for Windows and Linux.</li>
+  <li><strong>Object lighting terms (diagnostic).</strong> A new section in Settings &gt; Lighting Lab for finding why Reach objects can look washed out: live on/off switches for the scene grade, environment, area and analytic specular (0 to 1.5), a neutral specular tint, the detail colour, bounce fill, sRGB versus 2.2 decoding, a view that shows one lighting term on its own, and the two object-lane switches that used to be environment variables. A <em>Dump object radiance to log</em> button writes the per-term light under the screen centre to <code>object_terms.log</code> in the settings folder. Defaults are the current look; nothing changes unless you touch it. It is a diagnostic, not a finished feature.</li>
+</ul>
+
+<h3>Theater</h3>
+<ul>
+  <li><strong>Smooth cameras at any refresh rate.</strong> The first-person and follow camera of an on-foot player no longer step or jitter at display rates other than 60 Hz (position, look direction and body facing are sampled at the exact playback time), and the camera following a fast vehicle no longer jitters either. On the race clip at 144 fps the camera's frame-to-frame roughness dropped from 0.087 wu to 0.011 wu. The assassination and dead cameras still use the rounded tick, and a look direction the film reports only once in several seconds still turns in steps (that is what the data holds).</li>
+  <li><strong>Vehicles no longer flip 90 degrees for a frame or two,</strong> and the follow camera no longer flashes with them. Mongooses and other near-level vehicles were decoded 90 degrees off on thousands of single keys; across the race clip's Mongoose tracks 6,732 of them are now continuous.</li>
+  <li><strong>Following a seated rider follows the vehicle,</strong> not the rider's stale boarding position (context cameras off, or first person from a vehicle seat).</li>
+  <li><strong>Riders in seats that do not allow weapons no longer hold their weapon.</strong> Every driver and gunner seat, the Falcon's side seats and others stow it, as the game does; passenger seats that allow weapons keep it. Test mode follows the same seat flag.</li>
+  <li><strong>Held weapons are drawn in the hand.</strong> A weapon a Spartan carries (the energy swords on Castle Wars, for example) is no longer also drawn hovering beside them. Because films seldom say what a body holds, "carrying" is worked out from the weapon staying with the same body for half a second; dropped or thrown weapons and weapons of a dead carrier go back to loose objects.</li>
+  <li><strong>The knife and sheath on a Spartan's hip ride the hip.</strong> They used to stay where the Spartan was first drawn and drift away whenever the body moved or fell.</li>
+  <li><strong>Melee swings blend instead of snapping.</strong> A swing now lasts the clip's own length, fades in over 4 ticks and out over its last 6, and its strike frame lines up with the recorded hit. Still open: films state the weapon class for only 59 of 5,496 swings, so almost every swing still plays the rifle bash; which of the game's random strikes was played, and lunges, are not reproduced.</li>
+  <li><strong>Assassination timing.</strong> Assassination moves start on their first frame at the incident tick with no cross-fade, a second kill inside the first move's window starts its own move, and the camera blend follows the game's rule (0.55 s in, 0.5 s back to first person). The authored assassination camera track is still not played.</li>
+  <li><strong>Following a recording MCC is still writing is safer on Windows.</strong> The file is opened read-only with a share mode that never blocks MCC (including when it renames the <code>.temp</code> to the finished <code>.mov</code>), the length is read from the open file, reads do not use memory mapping, and a sharing violation is retried and then explained in the panel, on stderr and in <code>film_open.log</code>. When MCC finishes the film the follower carries on with the finished file. This applies to Theater and to <code>--film-follow</code>. It has not been run on a real Windows machine.</li>
+</ul>
+
+<h3>Sound</h3>
+<ul>
+  <li><strong>Spoken lines are audible.</strong> The dialogue bank was never opened, so every sound that lives only there (Spartan and Elite combat voice, the multiplayer announcer, Firefight and Invasion lines: 331 of Forge World's 2,353 sounds) played nothing.</li>
+  <li><strong>Shots, melee swings and reloads are no longer dropped on slow frames.</strong> On frames longer than 3 ticks (under 20 fps, a hitch, or 2x playback and faster) earlier events in the frame were silently lost; now every event in a smooth step is heard. A scrub still stops everything.</li>
+  <li><strong>Test mode: the game's take selection and randomisation.</strong> Takes now play as a shuffle (each once per cycle, never the same twice in a row), skip fractions are honoured, and each start gets its authored gain variance and random pitch.</li>
+  <li><strong>5.1 samples (84, mostly cinematic foley) were folded to stereo in the wrong channel order,</strong> putting the right front on the left and the centre on the right. Fixed.</li>
+</ul>
+
+<h3>Test mode and first person</h3>
+<ul>
+  <li><strong>The first-person arms and legs wear your colours.</strong> The body, arms and legs are separate models with their own default colours, and test mode never coloured them, so the arms disagreed with the body. The colour is currently the armoury's first entry for both channels (no player profile is read).</li>
+  <li><strong>The arms and gun keep their size at wide fields of view.</strong> The viewmodel now has its own fixed projection (the authored 78 degrees horizontal) instead of following the world field of view, in test mode and in Theater first person.</li>
+  <li><strong>Looking down no longer shows the inside of your own hips.</strong> The legs slide forward as you look down (none above 20 degrees, 0.30 wu at 80 degrees). The amount is an estimate; the game's own rule was not found.</li>
+  <li><strong>Leaving test mode clears the run's HUD state</strong> and leaves no test-mode actor behind, while a Theater film's actors are kept.</li>
+</ul>
+
+<h3>Lighting</h3>
+<ul>
+  <li><strong>Glossy-area and environment reflections on objects sample the game's table the way its shader does.</strong> The traffic cone, for example, had a reflection peak of 2.49 instead of the game's 1.56. The shadow mask and the dominant colour are also applied as in the shader. This does not by itself explain every "washed-out object" report, which is what the new diagnostic panel is for.</li>
+  <li><strong>Developer tool:</strong> <code>--dump-parts &lt;map&gt; x</code> with <code>HMS_FIND_TAG=&lt;substring&gt;</code> lists matching tags with no GPU, and prints base and detail alpha statistics.</li>
+</ul>
+
+<h3>Map variants: saving and Halo 3 editing</h3>
+<ul>
+  <li><strong>Saving now shows what the game will load.</strong> After Save, Save As or the script verb <code>save</code>, the file just written is read back with the game's own decoder and every object whose position or rotation differs is moved onto exactly the decoded values, as one undo step ("Save quantisation applied"). It applies to Reach, Halo 4, Halo 2 Anniversary and Halo 3, never touches an object the file already holds exactly, and a second save changes nothing. A <em>Save precision</em> window and the status bar report how many objects moved, the largest and median change and the ten worst. <em>Settings &gt; Lighting &amp; rendering &gt; Saving &gt; Save precision</em> (on by default) turns the adjustment off; the scene then stays as authored and the report is still produced. Script: <code>precision on|off|report</code>.</li>
+  <li><strong>The encoders pick the best codes.</strong> Orientation is chosen by searching the codes near the intended rotation and scoring each by what the game decodes, instead of rounding the parts independently; positions choose the nearest decoded value. Never worse than before on any sample, and strictly better on about 3% (Reach), 6% (Halo 4) and 20% (Halo 3) of mixed poses. The rest is the file format's own precision limit. The on-disk format is unchanged and untouched objects keep their original bits.</li>
+  <li><strong>The save-precision ghost is now optional.</strong> It is renamed <em>Show in-game pose (ghost)</em>, still off by default; Save now does the adjusting.</li>
+  <li><strong>Halo 3 objects have the full set of per-object properties.</strong> The Object panel now edits <em>placed at start</em>, <em>unique</em> and a <em>game types</em> mask beside team, respawn time, spare clips / teleporter channel / spawn order, symmetry and boundary. Rows that have no Halo 3 field (colour, "none" team, the quota and variant boxes, the scaled flag) are hidden instead of editing nothing. The script <code>set</code> and <code>get</code> verbs understand the Halo 3 fields. Prefabs carry the mask and translate the placement flags between games, and the cross-game converter keeps Halo 3 spawn order, spare clips, channel, symmetry, unique and placed-at-start instead of resetting them. A multi-selection edit now changes only the bits you changed. The names of a few of the game-type mask bits are inferred, and none of this has been loaded in MCC.</li>
+</ul>
+
+<h3>Web variant viewer and JavaScript reader</h3>
+<ul>
+  <li><strong>Read map variants from JavaScript.</strong> <code>docs/js/hms-mvar.js</code> is one dependency-free file that decodes Reach, Halo 3, Halo 4 and Halo 2 Anniversary <code>.mvar</code> files: header, map, bounds, budget, quotas, labels and every placed object (position, rotation, team, label, physics), with filter, count, CSV and JSON helpers and names from a palette table you supply. A plain-script build lets the viewer work from GitHub Pages and from a double-clicked file. It matches the Rust decoders field by field (floats bit for bit) on 2,514 variants. New pages: <a href="mvar-viewer.html">Variant viewer</a> (drop a file; it runs locally and nothing is uploaded) and <a href="mvar-js.html">JavaScript API</a>. New script field <code>variant get palette-json</code> prints the palette-name table.</li>
+  <li><strong>A map view in the variant viewer.</strong> Top-down (pan, zoom) or an orbit 3D view, objects as markers or oriented boxes, filtered objects highlighted and the rest dimmed, click an object to select its table row. Without anything else it uses only the variant's bounds, positions and rotations. A locally generated <em>render pack</em> (<code>variant get render-pack &lt;out.json&gt;</code> in a headless script, Reach and Halo 4) adds each object type's shape and a coarse height grid of the level. It is derived from your own game, is never shipped with HMS or the site, and must not be redistributed.</li>
+  <li><strong>3D map view upgrade.</strong> Editor-style navigation (orbit about the object under the cursor, pan, zoom toward the cursor, right-drag look with WASD fly, <kbd>F</kbd> to focus, double-click to frame, <kbd>Home</kbd>, front / side / top / isometric presets, touch orbit / pan / pinch, an axis gizmo and a <kbd>?</kbd> cheat sheet) and a WebGL renderer with a Canvas fallback (instanced meshes, lighting, depth, outlines, lit terrain). The render pack is now version 2 (a simplified mesh and a minimal material per part), so glass, shields and force fields draw see-through, with Transparency and Shields / glass checkboxes. Shield doors, laser walls and hangar shield pieces are recognised from their tag data, never from a name. Packs stay local, under 2.5 MB; version 1 packs still load.</li>
+</ul>
+
+<h3>Known limitations</h3>
+<ul>
+  <li>The Windows build script (build-windows.ps1 / .cmd) and the Windows fix for following a recording MCC is still writing have not been tested on a real Windows machine; only the Linux-hosted cross-build and the code paths were checked.</li>
+  <li>Theater sound is only partly hooked up: shots, melee, reloads and spoken lines play, but footsteps, engines and impacts are not yet played in films.</li>
+  <li>In test mode the first-person arm and leg colour is a default (the armoury's first entry), not your player profile's colour.</li>
+  <li>The Object lighting terms panel is a diagnostic for investigating washed-out objects; it is not a fix, and its defaults are the existing look.</li>
+  <li>Theater melee still plays the rifle bash for almost every swing (films rarely state the weapon), and the authored assassination camera is not played.</li>
+  <li>Test mode and Theater are still experimental.</li>
+  <li>The variant viewer's map view (WebGL and Canvas) has not been tested on real GPUs, Firefox or Safari. The render pack must be generated locally from your own game and is never redistributed; Halo 4 render pack generation has not been run.</li>
+  <li>Save precision and the Halo 3 Object panel have not been exercised in the real GUI, and nothing here has been loaded in MCC.</li>
+</ul>
+
+<h2>v1.7.0 — 2026-10-29</h2>
 <p><strong>Theater grows up: it now shows the objects a gametype's script cares about, draws a clip's Forge scene straight from the film, and can export the game variant as a real .bin file. Test mode gets loose objects and vehicles that collide properly, working vehicle weapons, and projectiles and explosions that finally draw and sound right. Real-time lighting is better in narrow spots and next to lamps.</strong></p>
 <p class="note"><strong>Test mode and Theater remain labelled EXPERIMENTAL.</strong> Vehicle weapons fire from the rider's eye rather than the gun's muzzle, and secondary weapons (bombs, missiles) have no key yet. The extracted game variant file has not been loaded in the MCC window itself.</p>
 
@@ -281,7 +356,7 @@
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

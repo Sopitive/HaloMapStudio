@@ -1217,6 +1217,23 @@ pub struct AnimGraph {
     pub blend_screen_labels: Vec<String>,
 }
 
+/// #melee-strike  One animation's FRAME EVENTS: `(type, frame)` pairs, from the clip's
+/// `shared animation data` (`c_shared_model_animation` +0x38, 4-byte `s_frame_event`s).
+///
+/// The engine reads the melee clip's `primary (damage) keyframe` (type 0) with
+/// `c_model_animation::find_first_key_of_type` (halo3_tag_test.xex 0x82DE9660) in
+/// `unit_action_melee_player_next_animation` (0x829BF118) and turns `frame / 30 s` into the tick the
+/// blow lands on with `game_seconds_to_ticks_round`.
+pub fn animation_frame_events(native: &NativeDll, cache: CacheHandle, jmad: u32, anim_index: usize) -> Vec<(u16, u16)> {
+    use reach_jmad::*;
+    let anims_b = tag_block(native, cache, jmad, OFF_ANIMATIONS, ANIMATION_ELEM, 2048);
+    let Some(e) = anims_b.get(anim_index * ANIMATION_ELEM..(anim_index + 1) * ANIMATION_ELEM) else { return Vec::new() };
+    let shared = block_at(native, cache, e, ANIM_SHARED_BLOCK, SHARED_ELEM, 1);
+    if shared.len() < SHARED_ELEM { return Vec::new(); }
+    let ev = block_at(native, cache, &shared[..SHARED_ELEM], 0x38, 4, 512);
+    ev.chunks_exact(4).map(|c| (u16::from_le_bytes([c[0], c[1]]), u16::from_le_bytes([c[2], c[3]]))).collect()
+}
+
 impl AnimGraph {
     pub fn read(native: &NativeDll, cache: CacheHandle, tag: u32) -> Option<AnimGraph> {
         use reach_jmad::*;
@@ -2206,6 +2223,34 @@ impl HeldWeapon {
     }
 }
 
+/// #knife  Palette entries a child object is given. A child's own skin indices address ITS model's
+/// nodes (a knife has 3), so every one of the first few entries carries the same parent-marker matrix.
+pub const CHILD_PALETTE_ENTRIES: usize = 16;
+
+/// #knife  The matrix every vertex of an hlmt child object is skinned by: the PARENT MARKER's node,
+/// `delta * posed[node] * inverse_bind[node]` -- the formula the body's own rigid pieces use, so a
+/// child baked at the marker's bind frame follows that node exactly as the node moves. The ONE
+/// definition: the GPU upload and the CPU gate both call it.
+pub fn child_palette_matrix(delta: Mat4, pose: &Pose, inverse_bind: &[Mat4], node: i32) -> Mat4 {
+    let n = node.max(0) as usize;
+    delta * pose.model.get(n).copied().unwrap_or(Mat4::IDENTITY) * inverse_bind.get(n).copied().unwrap_or(Mat4::IDENTITY)
+}
+
+/// #knife  The skeleton node of the marker the actor's hlmt child objects hang from, or -1.
+pub fn child_parent_node(scene: &mut crate::scene::SceneController, obj_tag: u32, variant_sid: u32, model: &ReachModel) -> i32 {
+    // Bipeds only: a vehicle's turret children have their own attach path (play_vehicle / the
+    // film driver's `follow_parents`) and are left exactly as they were.
+    if scene.raw_tag_class(obj_tag).as_deref() != Some("bipd") { return -1 }
+    let Some((marker_sid, _)) = scene.actor_child_marker(obj_tag, variant_sid) else { return -1 };
+    model
+        .markers
+        .iter()
+        .find(|g| g.name == marker_sid)
+        .and_then(|g| reach_skel::pick_marker(&g.markers, -1, -1))
+        .map(|m| m.node)
+        .unwrap_or(-1)
+}
+
 /// #ride-weapon  The bone palette of a HELD weapon: every entry the attach matrix, or -- when the
 /// weapon is hidden -- the zero matrix, which collapses every vertex to a point and draws nothing
 /// without rebuilding a single mesh.
@@ -2733,6 +2778,19 @@ pub fn apply_replacement(
     channels: &[reach_jmad::NodeChannel],
     node_map: Option<&[i16]>,
 ) {
+    apply_replacement_weighted(trs, channels, node_map, 1.0)
+}
+
+/// #melee  [`apply_replacement`] at a weight: `1` writes the clip's channels, `0` leaves the base
+/// untouched, between is a nlerp/lerp toward the clip. The swing fades in over its first ticks and
+/// out over its last so the pose does not snap on or off the locomotion clip underneath.
+pub fn apply_replacement_weighted(
+    trs: &mut [(glam::Quat, Vec3, f32)],
+    channels: &[reach_jmad::NodeChannel],
+    node_map: Option<&[i16]>,
+    w: f32,
+) {
+    let w = w.clamp(0.0, 1.0);
     for (ci, c) in channels.iter().enumerate() {
         let i = match node_map {
             Some(m) => match m.get(ci) {
@@ -2745,13 +2803,13 @@ pub fn apply_replacement(
             continue;
         }
         if let Some(q) = c.rot {
-            trs[i].0 = q;
+            trs[i].0 = if w >= 1.0 { q } else { trs[i].0.slerp(q, w) };
         }
         if let Some(t) = c.trans {
-            trs[i].1 = t;
+            trs[i].1 = if w >= 1.0 { t } else { trs[i].1.lerp(t, w) };
         }
         if let Some(sc) = c.scale {
-            trs[i].2 = sc;
+            trs[i].2 = if w >= 1.0 { sc } else { trs[i].2 + (sc - trs[i].2) * w };
         }
     }
 }
@@ -2984,6 +3042,8 @@ pub struct Actor {
     pub replacement: Option<(usize, f32)>,
     /// #melee  The replacement clip's name, for the status line and the gates.
     pub replacement_name: String,
+    /// #melee  How much of the replacement clip is applied (fade in / out), 0..1.
+    pub replacement_weight: f32,
     /// #aim  Loaded overlay blobs, keyed by graph animation index, plus each one's frame LABELS
     /// (see [`AimGrid`]). At most a couple per body and loaded once.
     overlay_cache: HashMap<usize, (AnimData, Option<AimGrid>)>,
@@ -3006,6 +3066,11 @@ pub struct Actor {
     pub weapon_bake: Mat4,
     pub palette: Option<Arc<hms_render::SkinPalette>>,
     pub weapon_palette: Option<Arc<hms_render::SkinPalette>>,
+    /// #knife  The palette the hlmt CHILD objects (a Spartan's knife and sheath) are skinned by: every
+    /// entry is the PARENT MARKER's node matrix, so the children ride that node exactly as the
+    /// engine's `object_attach_to_marker` does. `child_node` is that node (-1 = no children).
+    pub child_palette: Option<Arc<hms_render::SkinPalette>>,
+    pub child_node: i32,
     /// The `hlmt` model variant to draw with. 0 = none, which makes the render model show EVERY
     /// permutation of every region at once (a Spartan wearing all the armour in the game);
     /// resolved lazily in `build_actor_meshes` from the model's own variant list.
@@ -3483,6 +3548,10 @@ impl Actor {
             let mats: Vec<Mat4> = (0..skel.len()).map(|i| delta * self.pose.model[i] * inv[i]).collect();
             p.update(queue, &mats);
         }
+        if let (Some(cp), true) = (&self.child_palette, self.child_node >= 0) {
+            let m = child_palette_matrix(delta, &self.pose, &self.def.inverse_bind, self.child_node);
+            cp.update(queue, &vec![m; CHILD_PALETTE_ENTRIES]);
+        }
         if let (Some(wp), Some(w)) = (&self.weapon_palette, &self.weapon) {
             // A held weapon's sections are RIGID with their vertices in the weapon's model
             // space, so every palette entry is the same matrix: the engine's attach
@@ -3581,7 +3650,7 @@ impl Actor {
         let Some((data, _)) = self.overlay_cache.get(&anim) else { return };
         let ty = self.def.graph.as_ref().and_then(|g| g.anims.get(anim)).map(|a| a.anim_type).unwrap_or(AnimType::Replacement);
         let ch = reach_jmad::sample(data, ty, frame);
-        apply_replacement(trs, &ch, self.def.anim_node_map.as_deref());
+        apply_replacement_weighted(trs, &ch, self.def.anim_node_map.as_deref(), self.replacement_weight);
     }
 
     /// #melee  Which NODES a loaded clip animates (true = it carries a rotation channel for that
@@ -3940,12 +4009,15 @@ impl ActorScene {
             pose_override: None,
             replacement: None,
             replacement_name: String::new(),
+            replacement_weight: 1.0,
             overlay_cache: HashMap::new(),
             pose: Pose::default(),
             anchor: Mat4::IDENTITY,
             weapon_bake: Mat4::IDENTITY,
             palette: None,
             weapon_palette: None,
+            child_palette: None,
+            child_node: -1,
             variant_sid: 0,
             variant_name: String::new(),
             skin: None,
@@ -4032,12 +4104,15 @@ impl ActorScene {
             pose_override: None,
             replacement: None,
             replacement_name: String::new(),
+            replacement_weight: 1.0,
             overlay_cache: HashMap::new(),
             pose: Pose::default(),
             anchor: Mat4::IDENTITY,
             weapon_bake: Mat4::IDENTITY,
             palette: None,
             weapon_palette: None,
+            child_palette: None,
+            child_node: -1,
             variant_sid: 0,
             variant_name: String::new(),
             skin: None,
@@ -4695,9 +4770,16 @@ pub fn build_actor_meshes(
         let (origin, bfwd, bup) = actor_mesh_frame(a.anchor);
         // The actor's own mesh, built at its placement (so the object-lighting probe samples
         // where the actor really stands) and bound to its bone palette.
+        // #knife  The hlmt child objects (a Spartan's knife and sheath) ride the PARENT MARKER's node,
+        // not whichever body bones their own node indices happen to equal.
+        a.child_node = child_parent_node(scene, a.def.obj_tag, a.variant_sid, &a.def.model);
+        if a.child_node >= 0 && a.child_palette.is_none() {
+            a.child_palette = Some(mesh.new_skin_palette(device));
+        }
+        let child_pal = if a.child_node >= 0 { a.child_palette.clone() } else { None };
         match scene.build_actor_meshes(
             a.def.obj_tag, a.variant_sid, origin, bfwd, bup,
-            a.skin, a.damage, a.palette.as_ref(), mesh, device, queue,
+            a.skin, a.damage, a.palette.as_ref(), child_pal.as_ref(), mesh, device, queue,
         ) {
             Ok((mut l, bmn, bmx)) => {
                 // #fp-wave  Lighting was sampled where the rig really is (above); the matrix the GPU
@@ -4772,7 +4854,7 @@ pub fn build_actor_meshes(
             // wherever the body's own recorded origin is.
             match scene.build_actor_meshes(
                 w.obj_tag, wvar, origin, bfwd, bup,
-                None, 0, a.weapon_palette.as_ref(), mesh, device, queue,
+                None, 0, a.weapon_palette.as_ref(), None, mesh, device, queue,
             ) {
                 Ok((mut l, wmn, wmx)) => {
                     if a.first_person {

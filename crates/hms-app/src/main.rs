@@ -43,6 +43,7 @@ mod film_riders; // #film-riders  a film's RIDERS: seat membership from the reco
 mod film_roster; // #film-roster  who was in the room and when: the time-aware player roster of a film
 mod film_follow; // #film-follow  headless JSON-lines follower for a growing .temp (no GPU, no window)
 mod film_highlight; // #film-highlight  Theater: highlight script-relevant objects + placeholders for invisible ones
+mod film_reader; // #film-reader  Windows-safe reading of a film MCC is still writing
 mod film_objects; // #film-objects  object identity/lifetime/labels/zones of a film
 mod film_data; // #film-data  script/CLI read access to decoded film data (megalo variables, events, seats, score)
 mod film_megalo; // #film-megalo  the MEGALO VARIABLES a film records: declarations + value time series
@@ -92,7 +93,11 @@ mod hard_floor; // View > Hard floor (playable BSP world bounds)
 mod wire_xray; // View > Selection wireframe through objects (#wire-visible)
 mod color_hover; // team/colour dropdown hover preview (pure predicate)
 mod mvar;
+mod render_pack; // #mvar-js  the tiny local "render pack" the web viewer draws a variant with
+#[cfg(test)]
+mod mvar_json_dump; // #mvar-js  ground-truth JSON dump the JavaScript .mvar reader is tested against
 mod numfield; // signed numeric text entry (a '-' anywhere = sign flip)
+mod quant_opt; // #save-precision  search the .mvar codes for the best DECODED pose
 mod quant_error; // #quant-error  predict the pose a .mvar will actually hold (save-precision ghost + numbers)
 mod quant_error_ui; // #quant-error  the ghost overlay, the Object-panel numbers, snap-to-representable, `precision`
 mod man_cannon_preview; // #cannon-preview  editor: where a Spartan dropped into the selected man cannon lands
@@ -1030,6 +1035,8 @@ fn main() -> eframe::Result<()> {
             let key = args.get(pos + 2).cloned().unwrap_or_default();
             if let Some(mut scene) = cli_scene_controller() {
                 if scene.open_cache(&map).is_ok() {
+                    // print-only: HMS_FIND_TAG=<substring> lists matching tags (bitmap type + curve) with no GPU
+                    if let Ok(v) = std::env::var("HMS_FIND_TAG") { scene.find_tags_diag(&v); std::process::exit(0); }
                     if let Ok(obj) = u32::from_str_radix(key.trim_start_matches("0x"), 16) {
                         scene.dump_object_parts(obj);
                     } else {
@@ -2440,6 +2447,8 @@ struct ObjMeta {
     /// is "scale" the object's spawn_seq encodes an X330 visual scale multiplier.
     label: String,
     placement: u8,
+    /// Halo 3 only: the record's 10-bit game-engine mask (0x3FF = every gametype engine); 0 elsewhere.
+    h3_engine: u16,
     boundary_shape: u8,
     boundary: [u16; 4],
     weapon_clips: u8,
@@ -2478,7 +2487,9 @@ impl ObjMeta {
         if after.respawn != before.respawn { self.respawn = after.respawn; }
         if after.label_idx != before.label_idx { self.label_idx = after.label_idx; }
         if after.label != before.label { self.label = after.label.clone(); }
-        if after.placement != before.placement { self.placement = after.placement; }
+        // bit-wise: toggling ONE flag in a multi-selection must not stamp the primary's other flag bits onto the rest
+        if after.placement != before.placement { let d = after.placement ^ before.placement; self.placement = (self.placement & !d) | (after.placement & d); }
+        if after.h3_engine != before.h3_engine { self.h3_engine = after.h3_engine; }
         if after.boundary_shape != before.boundary_shape { self.boundary_shape = after.boundary_shape; }
         if after.boundary != before.boundary { self.boundary = after.boundary; }
         if after.weapon_clips != before.weapon_clips { self.weapon_clips = after.weapon_clips; }
@@ -2620,6 +2631,13 @@ struct FileEntry {
     hint: String,
 }
 
+/// State of the Lighting Lab "Dump object radiance to log" one-shot: one single-term view per frame.
+struct ObjDump {
+    step: usize,
+    rows: Vec<(String, [f32; 3])>,
+    saved: hms_render::ObjectTerms,
+}
+
 struct App {
     render_state: egui_wgpu::RenderState,
     renderer: SceneRenderer,
@@ -2646,6 +2664,10 @@ struct App {
     ll_ambient: f32,       // ambient/sky multiplier
     ll_lightmap: f32,      // baked lightmap/PVL multiplier
     ll_fog: f32,           // atmosphere fog density (FOG_WU); 0 = default
+    obj_terms: hms_render::ObjectTerms, // Lighting Lab "Object lighting terms (diagnostic)" switches
+    obj_legacy_lane: bool, // same panel: legacy object material lane (was HMS_LEGACY_OBJMAT)
+    obj_no_probe: bool,    // same panel: no per-object probe lighting (was HMS_NO_OBJ_PROBE)
+    objdump: Option<ObjDump>, // one-shot "Dump object radiance to log" state machine
     ll_seeded: bool,       // seeded slider defaults from the loaded scene's cfxs band
     ae_smoothed: f32,      // temporally-smoothed auto-exposure gain (0 = uninit); avoids flicker
     ae_target: f32,        // last read-back target gain (held between throttled meter reads)
@@ -3101,6 +3123,8 @@ struct App {
     /// #film-live  The length the open film had when it was last decoded. A `.temp` is written in
     /// 512 KiB blocks, so growth is the only reliable signal that there is more to read.
     film_follow_len: u64,
+    /// #film-reader  The open read-only handle the follow polls the size of (kept across polls).
+    film_follow_handle: Option<(std::path::PathBuf, std::fs::File)>,
     /// #film-live  When to next look at the file's length. Checking costs one `stat`, but
     /// re-decoding does not, so it is rate-limited rather than done per frame.
     film_follow_next: Option<std::time::Instant>,
@@ -3272,6 +3296,12 @@ struct App {
     /// #quant-error  Signature of everything the ghost's geometry depends on, so the shared
     /// overlay lanes are only rebuilt when the ghost would change (it must follow a live drag).
     quant_ghost_sig: u64,
+    /// #save-precision  Settings > Saving > "Save precision" (default ON, persisted
+    /// `save_precision.txt`): after a save the scene adopts the poses the game will load.
+    save_precision_on: bool,
+    /// The report of the last save (numbers computed even when the toggle is off) and whether its panel is showing.
+    last_save_report: Option<quant_error::SaveReport>,
+    save_report_open: bool,
     /// #cannon-preview  View > Man cannon trajectory (persisted `man_cannon_trajectory.txt`) and its cache.
     cannon_preview: man_cannon_preview::State,
     /// Draw the structure-design soft ceilings (kill floor / acceleration /
@@ -3840,6 +3870,10 @@ impl App {
             // panel SEEDS this from the renderer per map; the old 0.0025 default was pushed on
             // the panel's first draw and re-bridged every map's fog density 4x.
             ll_fog: hms_render::FOG_WU_DEFAULT,
+            obj_terms: hms_render::ObjectTerms::default(),
+            obj_legacy_lane: false,
+            obj_no_probe: false,
+            objdump: None,
             ll_seeded: false,
             ae_smoothed: 0.0,
             ae_target: 0.0,
@@ -3983,6 +4017,7 @@ impl App {
             film_follow_live: crate::film::load_follow_live_setting(),
             film_hl: film_highlight::State::load(),
             film_follow_len: 0,
+            film_follow_handle: None,
             film_follow_next: None,
             film_follow_rx: None,
             film_follow_note: String::new(),
@@ -4054,6 +4089,9 @@ impl App {
             wire_xray: wire_xray::load_setting(),
             quant_ghost: quant_error_ui::env_setting().unwrap_or_else(quant_error_ui::load_setting),
             quant_ghost_sig: 0,
+            save_precision_on: quant_error_ui::load_save_precision(),
+            last_save_report: None,
+            save_report_open: false,
             cannon_preview: man_cannon_preview::State::for_app(),
             show_soft_ceilings: soft_ceilings::load_setting(),
             show_hard_floor: hard_floor::load_setting(),
@@ -6261,6 +6299,7 @@ impl App {
                 // #fp-fov Two lane sets: the world's and the first-person rig's, which is drawn
                 // through the engine's narrower first-person projection.
                 self.renderer.set_first_person_fov_scale(film_play::first_person_fov_scale());
+                self.renderer.set_first_person_fov_y(Some(film_play::reach_first_person_model_fov()));
                 let (l, f) = (b.world, b.first_person);
                 self.renderer.set_actor_meshes(l.opaque, l.cutout, l.holo, l.holo_solid, l.blend);
                 self.renderer.set_first_person_meshes(f.opaque, f.cutout, f.holo, f.holo_solid, f.blend);
@@ -9109,6 +9148,7 @@ impl App {
             // new_placed_object's default, and a 0 here would save an object the game reads
             // but never spawns.
             placement: mvar::PLACEMENT_DEFAULT_SPAWNABLE,
+            h3_engine: 0,
             boundary_shape: 0,
             boundary: [0; 4],
             weapon_clips: 0,
@@ -9440,6 +9480,16 @@ impl App {
                 // shared names (team / color / label ...) fall through to the match below.
                 // An unknown label NAME is appended to the variant's table (like the
                 // panel's "+ name"), so `set <d> label scale` works on a variant without that label.
+                // A Halo 3 record takes its own field names (h3/app.rs `h3_set_field`); a Reach-only field is refused
+                // with the reason, never written to a record that cannot store it.
+                if self.h3_active && m.h4.is_none() && h3::app::h3_set_field(m, field.as_str(), &value)? {
+                    let (team, color) = (m.team, m.color);
+                    self.mvar_colors.insert(datum, (team, if color < 0 { 0xFFu8 } else { color as u8 }));
+                    if matches!(field.as_str(), "shape" | "boundary" | "radius" | "width" | "length" | "top" | "bottom" | "b0" | "b1" | "b2" | "b3") {
+                        self.rebuild_overlays();
+                    }
+                    return Ok(format!("set 0x{datum:08X} {field}={value}"));
+                }
                 let h4_handled = Self::h4_set_field(m, field.as_str(), &value, &mut labels)?;
                 if labels.len() != self.mvar_labels.len() {
                     self.mvar_labels = labels;
@@ -9606,8 +9656,9 @@ impl App {
                         let dst = std::path::PathBuf::from(p.trim());
                         let (n, failed) = self.save_variant_to(&dst)?;
                         let note = self.save_failure_note();
+                        let prec = self.apply_save_precision(&dst); // #save-precision
                         mapcat::save_last_variant(&dst.to_string_lossy()); // #dialogs: last-saved folder
-                        Ok(format!("saved {n} objects -> {}{note}{}{bsp_note}", dst.display(),
+                        Ok(format!("saved {n} objects -> {}{note}{}{bsp_note}\n{prec}", dst.display(),
                             if failed > 0 && note.is_empty() { format!(" ({failed} not saved)") } else { String::new() }))
                     }
                     None => {
@@ -9616,8 +9667,9 @@ impl App {
                         let (n, failed) = self.save_variant_to(&dst)?;
                         let note = self.save_failure_note();
                         self.resync_variant_globals(&dst);
+                        let prec = self.apply_save_precision(&dst); // #save-precision
                         mapcat::save_last_variant(&dst.to_string_lossy()); // #dialogs: last-saved folder
-                        Ok(format!("saved {n} objects -> {}{note}{}{bsp_note}", dst.display(),
+                        Ok(format!("saved {n} objects -> {}{note}{}{bsp_note}\n{prec}", dst.display(),
                             if failed > 0 && note.is_empty() { format!(" ({failed} not saved)") } else { String::new() }))
                     }
                 }
@@ -11456,7 +11508,9 @@ impl App {
                 mn[0], mn[1], mn[2], mx[0], mx[1], mx[2], mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]
             ));
         }
-        if let Some(m) = self.mvar_meta.get(&datum) {
+        if let (true, Some(m)) = (self.h3_active, self.mvar_meta.get(&datum)) {
+            s.push_str(&h3::app::h3_dump_lines(m));
+        } else if let Some(m) = self.mvar_meta.get(&datum) {
             let team_i = if m.team == 0xFF { -1 } else { m.team as i32 };
             let shapes = ["none", "sphere", "cylinder", "box"];
             s.push_str(&format!(
@@ -11564,6 +11618,7 @@ impl App {
             label_idx: 0xFFFF,
             label: String::new(),
             placement: mvar::PLACEMENT_DEFAULT_SPAWNABLE,
+            h3_engine: 0,
             boundary_shape: 0,
             boundary: [0; 4],
             weapon_clips: 0,
@@ -12604,6 +12659,131 @@ impl App {
             }
     }
 
+    /// Lighting Lab > "Object lighting terms (diagnostic)": live A/B switches over the terms of the
+    /// object composite (see `hms_render::ObjectTerms` for the shader mapping). Every default is the
+    /// shipped behaviour; nothing changes unless a control is touched. Not persisted.
+    fn object_terms_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new(egui::RichText::new("Object lighting terms (diagnostic)").small().strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                let mut t = self.obj_terms;
+                ui.small(egui::RichText::new("A/B the terms of the Reach object shading (mesh_shade). Defaults = current look. Affects BSP meshes using the same shader too.").weak());
+                ui.checkbox(&mut t.scene_grade, "Scene grade (non-engine sceg tint)")
+                    .on_hover_text("scene_grade(): luma-preserving tint from the sceg ambient tint, strength 0.68 squared. NOT an engine stage. Also affects terrain / Halo 4 lit surfaces.");
+                ui.add(egui::Slider::new(&mut t.env, 0.0..=1.5).text("environment reflection x"))
+                    .on_hover_text("Multiplies env_d (dynamic/authored environment-map term).");
+                ui.add(egui::Slider::new(&mut t.area, 0.0..=1.5).text("area specular x"))
+                    .on_hover_text("Multiplies spec_area_d (probe glossy lobe x area_specular_contribution).");
+                ui.add(egui::Slider::new(&mut t.analytic, 0.0..=1.5).text("analytic specular x"))
+                    .on_hover_text("Multiplies spec_d (Cook-Torrance dominant-light highlight).");
+                ui.checkbox(&mut t.tint_neutral, "Neutral specular tint (grey)")
+                    .on_hover_text("Replaces the authored specular tint and fresnel colour by their own luminance. Drives the Fresnel term Fv, which scales analytic, area AND env specular.");
+                ui.checkbox(&mut t.detail, "Detail-map colour contributes");
+                ui.checkbox(&mut t.bounce, "Object bounce fill (runtime ambient fill)")
+                    .on_hover_text("The object-lane global bounce light added inside the albedo group. (There is no ENV floor in the Reach object lane: sky_vis has none.)");
+                ui.checkbox(&mut t.srgb_decode, "Texture decode: piecewise sRGB (default = power 2.2)")
+                    .on_hover_text("Base/detail/fine albedo decode. Shader-side only: maps already decoded to linear on the CPU are unaffected.");
+                let mut view = t.view as usize;
+                egui::ComboBox::from_label("show only")
+                    .selected_text(hms_render::ObjectTerms::VIEW_NAMES[view.min(9)])
+                    .show_ui(ui, |ui| {
+                        for (k, n) in hms_render::ObjectTerms::VIEW_NAMES.iter().enumerate() {
+                            ui.selectable_value(&mut view, k, *n);
+                        }
+                    });
+                t.view = view as u32;
+                let mut lane_changed = false;
+                lane_changed |= ui.checkbox(&mut self.obj_legacy_lane, "Legacy object material lane (HMS_LEGACY_OBJMAT)")
+                    .on_hover_text("Forge classes go back to shader 0's constants with no object environment reflection. Re-uploads the objects.").changed();
+                lane_changed |= ui.checkbox(&mut self.obj_no_probe, "No per-object probe lighting (HMS_NO_OBJ_PROBE)")
+                    .on_hover_text("Objects use the plain tint instead of the engine dual-vMF probe. Re-uploads the objects.").changed();
+                if lane_changed {
+                    let bits = (self.obj_legacy_lane as u32 * scene::OBJ_DIAG_LEGACY_OBJMAT) | (self.obj_no_probe as u32 * scene::OBJ_DIAG_NO_OBJ_PROBE);
+                    scene::OBJ_DIAG_FLAGS.store(bits, std::sync::atomic::Ordering::Relaxed);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Reset").clicked() {
+                        t = hms_render::ObjectTerms::default();
+                        if self.obj_legacy_lane || self.obj_no_probe {
+                            self.obj_legacy_lane = false; self.obj_no_probe = false;
+                            scene::OBJ_DIAG_FLAGS.store(0, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    if ui.add_enabled(self.objdump.is_none(), egui::Button::new("Dump object radiance to log"))
+                        .on_hover_text("Put the crosshair / screen centre on the object first. Reads the linear HDR pixel under the screen centre for each term (10 quick frames) and appends it to object_terms.log in the settings folder.")
+                        .clicked()
+                    {
+                        self.objdump = Some(ObjDump { step: 0, rows: Vec::new(), saved: t });
+                    }
+                });
+                if t != self.obj_terms && self.objdump.is_none() {
+                    self.obj_terms = t;
+                    self.renderer.set_object_terms(t);
+                }
+            });
+    }
+
+    /// Before `render`: while a radiance dump is running, force this frame's single-term view.
+    fn objdump_pre(&mut self) {
+        if let Some(d) = &self.objdump {
+            let mut t = d.saved;
+            t.view = d.step as u32;
+            self.renderer.set_object_terms(t);
+        }
+    }
+
+    /// After `render`: read the HDR pixel block under the screen centre for the term just drawn, advance,
+    /// and on the last step write the log and restore the user's switches.
+    fn objdump_post(&mut self) {
+        let Some(mut d) = self.objdump.take() else { return };
+        let (px, w, h) = self.renderer.dump_hdr(&self.render_state.device, &self.render_state.queue);
+        let (cx, cy) = ((w / 2) as i64, (h / 2) as i64);
+        let mut acc = [0.0f64; 3];
+        let mut n = 0.0f64;
+        for dy in -1i64..=1 {
+            for dx in -1i64..=1 {
+                let (x, y) = (cx + dx, cy + dy);
+                if x < 0 || y < 0 || x >= w as i64 || y >= h as i64 { continue; }
+                let o = ((y as usize) * (w as usize) + x as usize) * 4;
+                for c in 0..3 { acc[c] += px[o + c] as f64; }
+                n += 1.0;
+            }
+        }
+        let v = [(acc[0] / n.max(1.0)) as f32, (acc[1] / n.max(1.0)) as f32, (acc[2] / n.max(1.0)) as f32];
+        d.rows.push((hms_render::ObjectTerms::VIEW_NAMES[d.step.min(9)].to_string(), v));
+        d.step += 1;
+        if d.step < hms_render::ObjectTerms::VIEW_NAMES.len() {
+            self.objdump = Some(d);
+            return;
+        }
+        // done: restore the user's switches and write the report
+        self.renderer.set_object_terms(self.obj_terms);
+        let r = |k: usize| d.rows[k].1;
+        let fmt = |a: [f32; 3]| format!("{:.5} {:.5} {:.5}", a[0], a[1], a[2]);
+        let lum = |a: [f32; 3]| 0.2126 * a[0] + 0.7152 * a[1] + 0.0722 * a[2];
+        let parts_sum = [0, 1, 2].map(|c| r(1)[c] + r(2)[c] + r(3)[c] + r(4)[c] + r(7)[c]);
+        let mut out = String::new();
+        out.push_str(&format!("=== object radiance dump (linear HDR, pre-exposure, 3x3 at screen centre {}x{}) ===\n", w, h));
+        out.push_str(&format!("switches: {:?} legacy_lane={} no_probe={}\n", d.saved, self.obj_legacy_lane, self.obj_no_probe));
+        for (name, a) in &d.rows { out.push_str(&format!("{:<34} rgb {}   lum {:.5}\n", name, fmt(*a), lum(*a))); }
+        out.push_str(&format!("sum(diffuse+env+area+analytic+illum) rgb {}  (the final composite is this x scene_grade x fog)\n", fmt(parts_sum)));
+        out.push_str(&format!("final / sum rgb {:.4} {:.4} {:.4}\n", r(0)[0] / parts_sum[0].max(1e-9), r(0)[1] / parts_sum[1].max(1e-9), r(0)[2] / parts_sum[2].max(1e-9)));
+        out.push_str(&format!("specular+env share of (diffuse+spec+env) lum: {:.1}%\n",
+            100.0 * (lum(r(2)) + lum(r(3)) + lum(r(4))) / (lum(r(1)) + lum(r(2)) + lum(r(3)) + lum(r(4))).max(1e-9)));
+        eprintln!("{out}");
+        let path = project::settings_dir().map(|dir| { let _ = std::fs::create_dir_all(&dir); dir.join("object_terms.log") });
+        match path {
+            Some(p) => {
+                use std::io::Write;
+                match std::fs::OpenOptions::new().create(true).append(true).open(&p).and_then(|mut f| f.write_all(out.as_bytes())) {
+                    Ok(()) => self.status = format!("Object radiance dump written to {}", p.display()),
+                    Err(e) => self.status = format!("Object radiance dump: could not write {}: {e}", p.display()),
+                }
+            }
+            None => self.status = "Object radiance dump: no settings folder; printed to stderr only".into(),
+        }
+    }
+
     /// Lighting Lab: live sliders for every lighting term, plus real-time probe GI and the
     /// path-traced bake. Lives in Settings ▸ Lighting & rendering.
     fn lighting_lab_ui(&mut self, ui: &mut egui::Ui) {
@@ -12673,6 +12853,8 @@ impl App {
             lm |= ui.add(egui::Slider::new(&mut self.ll_ambient, 0.0..=4.0).text("ambient")).changed();
             lm |= ui.add(egui::Slider::new(&mut self.ll_lightmap, 0.0..=4.0).text("lightmap")).changed();
             if lm { self.renderer.set_lighting_mults(self.ll_sun, self.ll_ambient, self.ll_lightmap); }
+            ui.separator();
+            self.object_terms_ui(ui);
             ui.separator();
             ui.label(egui::RichText::new("POST").small().strong());
             if ui.add(egui::Slider::new(&mut self.bloom_scale, 0.0..=2.0).text("bloom")).changed() {
@@ -13023,8 +13205,9 @@ impl App {
             Ok((n, _)) => {
                 let extra = self.save_failure_note();
                 self.resync_variant_globals(&dst);
+                let prec = self.apply_save_precision(&dst); // #save-precision
                 mapcat::save_last_variant(&dst.to_string_lossy()); // #dialogs: last-saved folder
-                format!("Saved {n} objects -> {}{extra}", dst.file_name().unwrap_or_default().to_string_lossy())
+                format!("Saved {n} objects -> {}{extra}. {prec}", dst.file_name().unwrap_or_default().to_string_lossy())
             }
             Err(e) => { self.save_error = Some(format!("Save failed:\n{e}\n\nTarget: {}", dst.display())); format!("Save failed: {e}") }
         };
@@ -13166,9 +13349,10 @@ impl App {
                 self.current_variant_path = Some(dst.to_path_buf());
                 self.new_variant_template = None;
                 self.resync_variant_globals(dst);
+                let prec = self.apply_save_precision(dst); // #save-precision
                 // Remember where the user saved so the next Open/Save browser starts here.
                 mapcat::save_last_variant(&dst.to_string_lossy());
-                format!("Saved {n} objects -> {}{extra}", dst.file_name().unwrap_or_default().to_string_lossy())
+                format!("Saved {n} objects -> {}{extra}. {prec}", dst.file_name().unwrap_or_default().to_string_lossy())
             }
             Err(e) => { self.save_error = Some(format!("Save As failed:\n{e}\n\nTarget: {}", dst.display())); format!("Save As failed: {e}") }
         };
@@ -13311,12 +13495,8 @@ impl App {
                 self.film_path = Some(path);
                 // #film-live  Start following from the length it has NOW, so opening a clip does
                 // not immediately re-decode what was just decoded.
-                self.film_follow_len = self
-                    .film_path
-                    .as_ref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.len())
-                    .unwrap_or(0);
+                self.film_follow_len = self.film_path.as_ref().and_then(|p| film_reader::len_of(p).ok()).unwrap_or(0);
+                self.film_follow_handle = None;
                 self.film_follow_next = None;
                 self.film_follow_rx = None;
                 self.film_follow_note = String::new();
@@ -13647,6 +13827,50 @@ impl App {
         self.film_spawn_weapon = Some(applied);
     }
 
+    /// #film-reader  The current length of the followed `.temp`, asked of an open handle that is
+    /// kept between polls. Handles the Windows cases: a sharing violation is reported (with the OS
+    /// error) in the Theater panel and the log instead of silently doing nothing, and MCC's
+    /// finalise rename `.temp -> .mov` switches the followed path to the finished file.
+    fn film_follow_poll_len(&mut self, path: &std::path::Path) -> Option<u64> {
+        if self.film_follow_handle.as_ref().map_or(true, |(p, _)| p != path) {
+            match film_reader::open_with_retry(path, &film_reader::Retry::QUICK) {
+                Ok(f) => {
+                    self.film_follow_handle = Some((path.to_path_buf(), f));
+                    self.film_follow_note = String::new();
+                }
+                Err(e) => {
+                    e.log(path);
+                    self.film_follow_note = e.to_string();
+                    self.film_follow_handle = None;
+                    return None;
+                }
+            }
+        }
+        let (_, f) = self.film_follow_handle.as_ref()?;
+        let len = film_reader::handle_len(f).ok()?;
+        if !path.exists() {
+            // the path is gone but our handle still reads the renamed file: find its successor
+            let head = film_reader::read_range(f, 0, film_reader::VERIFY_PREFIX).unwrap_or_default();
+            match film_reader::find_finalised(path, &head, film::same_recording, &film::film_search_dirs()) {
+                Some(mov) => {
+                    let name = mov.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    film_reader::log_diag(&format!("handover name={} -> {name} final_len={len}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+                    self.film_follow_note = format!("the recording was finalised as {name}; showing the finished film");
+                    self.film_path = Some(mov);
+                    self.film_follow_handle = None;
+                }
+                None => {
+                    film_reader::log_diag("vanished: the followed .temp disappeared and no finished film was found");
+                    self.film_follow_note = "the live recording file disappeared (MCC moved or deleted it); showing what was read".into();
+                    self.film_follow_handle = None;
+                    self.film_follow_len = u64::MAX; // stop following
+                    return None;
+                }
+            }
+        }
+        Some(len)
+    }
+
     /// #film-live  Re-decode an in-progress recording as it grows, keeping the view where it is.
     ///
     /// MCC writes the match being played to a `.temp` in its autosave folder. That file is the
@@ -13717,7 +13941,11 @@ impl App {
             return;
         }
         self.film_follow_next = Some(now + std::time::Duration::from_secs(2));
-        let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        // #film-reader  The length comes from an open HANDLE that is kept across polls (a path stat
+        // of a file MCC is appending to can be stale on NTFS), and a `.temp` that vanishes is the
+        // finalise rename: carry on with the finished file.
+        let Some(len) = self.film_follow_poll_len(&path) else { return };
+        let path = self.film_path.clone().unwrap_or(path);
         if len <= self.film_follow_len {
             return; // nothing new has been written
         }
@@ -15970,8 +16198,8 @@ impl App {
                 // SHOUTS when the drift is being exaggerated.
                 let qg_status = self.quant_ghost_status();
                 let mut qg = self.quant_ghost;
-                if ui.checkbox(&mut qg.on, "Save-precision ghost")
-                    .on_hover_text(format!("Draw the SELECTED object(s) a second time, in violet, at the pose the .mvar will actually hold once the game's quantisers have had their way with it -- so you can see the drift a save costs before you save. The error is usually tiny, so the factor below exaggerates it; at x1 the ghost is the real thing. Off by default. Script: precision ghost on|off|<factor>.\n{qg_status}"))
+                if ui.checkbox(&mut qg.on, "Show in-game pose (ghost)")
+                    .on_hover_text(format!("Optional (off by default). Draw the SELECTED object(s) a second time, in violet, at the pose the .mvar will hold once the game's quantisers have had their way with it -- a preview of what Save will adjust the object to (Settings > Saving > Save precision does the adjusting). The error is usually tiny, so the factor below exaggerates it; at x1 the ghost is the real thing. Off by default. Script: precision ghost on|off|<factor>.\n{qg_status}"))
                     .changed()
                 {
                     self.quant_ghost = qg;
@@ -16446,6 +16674,7 @@ impl App {
                     String::new()
                 },
                 placement: o.placement,
+                h3_engine: 0,
                 boundary_shape: o.boundary_shape,
                 boundary: o.boundary,
                 weapon_clips: o.weapon_clips,
@@ -19344,6 +19573,18 @@ impl eframe::App for App {
                         self.view_settings_ui(ui);
                     });
                     ui.add_space(6.0);
+                    egui::CollapsingHeader::new("Saving").default_open(true).show(ui, |ui| {
+                        if ui.checkbox(&mut self.save_precision_on, "Save precision")
+                            .on_hover_text("A .mvar stores each object's position and rotation in a fixed number of bits, so the game loads every object a hair off what the editor shows. With this on (the default), saving then updates the objects in the editor to EXACTLY what the game will load, as one undo step, and tells you how much moved. Off: the scene keeps your authored values and the save still reports the difference. Script: precision on|off.")
+                            .changed()
+                        {
+                            quant_error_ui::save_save_precision(self.save_precision_on);
+                        }
+                        if self.last_save_report.is_some() && ui.small_button("show the last save's report").clicked() {
+                            self.save_report_open = true;
+                        }
+                    });
+                    ui.add_space(6.0);
                     egui::CollapsingHeader::new("Updates").default_open(false).show(ui, |ui| {
                         self.updater.ui_settings(ui);
                     });
@@ -19394,6 +19635,7 @@ impl eframe::App for App {
         self.convert_variant_ui(ctx);
         self.bsp_warn_window_ui(ctx); // save-time "outside playable space" window
         self.save_error_window_ui(ctx);
+        self.save_report_ui(ctx); // #save-precision
         self.prefab_panel_ui(ctx); // #prefab Tools > Prefabs
         self.h4_save_window_ui(ctx); // the Halo 4 save check (bounds / quota / budget)
         self.h3_save_window_ui(ctx); // #h3-save-check the Halo 3 one (bounds / quota / budget / slots)
@@ -20234,12 +20476,20 @@ impl eframe::App for App {
                         .and_then(|o| self.objscene().map(|s| s.damage_states_of(o)))
                         .unwrap_or_default();
                     egui::Grid::new("mvar-edit").num_columns(2).spacing([8.0, 3.0]).show(ui, |ui| {
+                        let h3 = self.h3_active;
+                        if h3 {
+                            // a Halo 3 record names its quota row; the palette picks it, so it is shown, not edited
+                            ui.label("quota");
+                            ui.label(format!("#{}", m.folder)).on_hover_text("The record's quota-table row (read-only: the palette row decides it)");
+                            ui.end_row();
+                        } else {
                         ui.label("quota/variant");
                         ui.horizontal(|ui| {
                             ui.add(egui::DragValue::new(&mut m.folder).range(0..=255));
                             ui.add(egui::DragValue::new(&mut m.item).range(0..=31));
                         });
                         ui.end_row();
+                        }
 
                         // team: i32 proxy — -1 none, 0..7 team colour, 8 neutral. Shown with the
                         // actual change-colour swatch + name (not a bare index).
@@ -20267,7 +20517,8 @@ impl eframe::App for App {
                                 for t in 0..=7 {
                                     entry(t, ui.selectable_value(&mut team_i, t, egui::RichText::new(format!("⬛ {}", team_label(t))).color(forge_swatch32(t))));
                                 }
-                                entry(-1, ui.selectable_value(&mut team_i, -1, egui::RichText::new(format!("⬛ {}", team_label(-1))).color(forge_swatch32(-1))));
+                                // Halo 3 has no "none": its team byte is 0..7 or 8 (halo3.dll folds anything past 8 to team 0)
+                                if !h3 { entry(-1, ui.selectable_value(&mut team_i, -1, egui::RichText::new(format!("⬛ {}", team_label(-1))).color(forge_swatch32(-1)))); }
                                 let (inside, rect) = popup_ui_contains_pointer(ui);
                                 if inside { hovered_popup = Some(color_hover::Popup::Team); }
                                 self.hover_debug_rects.team_popup = Some(rect);
@@ -20277,6 +20528,8 @@ impl eframe::App for App {
                         m.team = if team_i < 0 { 0xFF } else { team_i as u8 };
                         ui.end_row();
 
+                        // Halo 3 has no colour field (the record stores a team and nothing else): the row is Reach / Halo 4 only
+                        if !h3 {
                         // color: -1 inherit-team, 0..7 change-colour. Swatch + name; "inherit" shows
                         // the colour it resolves to (the team's colour).
                         ui.label("color");
@@ -20300,6 +20553,7 @@ impl eframe::App for App {
                         if color_ir.inner.is_none() { self.hover_debug_rects.color_popup = None; }
                         m.color = col_i;
                         ui.end_row();
+                        }
 
                         // A Halo 4 object shows its own block (object type read-only,
                         // spawn order 0..255, spawn time) instead of the four Reach-only rows below.
@@ -20388,11 +20642,14 @@ impl eframe::App for App {
                             let mixed_scaled = sel_metas.iter().any(|t| t.scaled_on() != m0.scaled_on());
                             let mixed_shadow = sel_metas.iter().any(|t| t.shadow_on() != m0.shadow_on());
                             let tag = |explicit: bool| if explicit { "(set)" } else { "(auto)" };
+                            // Halo 3 records have no spawn-sequence size (the SCALED rule needs one), so the box is Reach / Halo 4 only
+                            if !h3 {
                             let mut scaled = m.scaled_on();
                             let r = ui.add(egui::Checkbox::new(&mut scaled, format!("SCALED {}", tag(m.flags.scaled.is_some()))).indeterminate(mixed_scaled))
                                 .on_hover_text("Pseudo-flag (not saved in the .mvar): read this object's spawn sequence as an X330 size, like the forge \"scale\" label does. Default ON when the label is \"scale\". Right-click: back to automatic.");
                             if r.clicked() { m.flags.scaled = Some(if mixed_scaled { true } else { scaled }); }
                             if r.secondary_clicked() { m.flags.scaled = None; }
+                            }
                             let mut shadow = m.shadow_on();
                             let r = ui.add(egui::Checkbox::new(&mut shadow, format!("SHADOW {}", tag(m.flags.shadow.is_some()))).indeterminate(mixed_shadow))
                                 .on_hover_text("Pseudo-flag (not saved in the .mvar): draw this object into the sun shadow map so it casts a shadow over the ground and other objects. Default ON for the gametype rule GREEN team + \"scale\" label. Vehicles and other engine-default casters always cast. Right-click: back to automatic.");
@@ -20527,7 +20784,7 @@ impl eframe::App for App {
                         // `asymmetric_placement`/`symmetric_placement` pair), placed-at-start (bit4
                         // `not_initially_placed`, INVERTED), hide-unless-required (bit0), unique (bit5).
                         if self.h3_active {
-                            self.h3_row_symmetry(ui, &mut m);
+                            self.h3_rows_placement(ui, &mut m);
                         } else {
                         ui.label("placement");
                         ui.vertical(|ui| {
@@ -21180,12 +21437,14 @@ impl eframe::App for App {
             self.frame_prof_lap(2);
             self.fprof.lap(13);
             if draw_scene {
+                self.objdump_pre();
                 self.renderer.render(
                     &self.render_state.device,
                     &self.render_state.queue,
                     &self.camera,
                     time,
                 );
+                self.objdump_post();
             }
             self.frame_prof_lap(3);
             self.fprof.lap(14);
@@ -21697,9 +21956,14 @@ impl App {
         let rows = sc.first_person_models();
         let elite_of = |t: u32| sc.model_is_elite(t);
         pm.mount_first_person(native, cache, &rows, &elite_of, &mut self.actor_scene);
+        // #fp-colour  The player's armour colours: the profile's default (Steel / Steel, index 0 of the
+        // armoury table -- INFERRED, no profile is read), on the body AND the arms AND the legs.
+        pm.skin = sc.armour_colors(0, 0);
+        pm.dress(&mut self.actor_scene);
         // #fp-fov  The first-person lane is drawn through the engine's own narrower projection,
         // exactly as Theater's rig is.
         self.renderer.set_first_person_fov_scale(film_play::first_person_fov_scale());
+                self.renderer.set_first_person_fov_y(Some(film_play::reach_first_person_model_fov()));
         let report = pm.report();
         let (pos, yaw, pitch) = pm.camera();
         self.play = Some(Box::new(pm));
@@ -21740,6 +22004,9 @@ impl App {
         // carrying it into the editor would silently change how the editor looks.
         self.camera.fov_y = pm.restore_fov;
         self.actor_scene.rebuild = true;
+        // #play-exit  Nothing of the run's HUD survives into the editor (or into the next run).
+        self.play_hud = play_hud::PlayHud::default();
+        self.play_hud_lines.clear();
         self.flying = false;
         "left test mode (the camera stayed where you were standing)".into()
     }
@@ -22991,7 +23258,16 @@ mod mass_edit_tests {
         after.location_name = 22;
 
         let mut other = ObjMeta::default();
+        other.placement = before.placement; // a placement edit is a per-BIT diff, so the other object starts from the same byte
         other.apply_changed_fields(&before, &after);
+
+        // ...and a bit the edit did not touch stays the other object's own
+        let mut third = ObjMeta::default();
+        third.placement = before.placement | 0x80;
+        third.apply_changed_fields(&before, &after);
+        let d = before.placement ^ 5;
+        assert_eq!(third.placement, ((before.placement | 0x80) & !d) | (5 & d), "only the bits the edit changed are copied");
+        assert_eq!(third.placement & 0x80, 0x80, "an untouched bit survives");
 
         assert_eq!(other.folder, 9);
         assert_eq!(other.item, 11);

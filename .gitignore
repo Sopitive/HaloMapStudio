@@ -65,3 +65,7 @@ Cargo.lock.orig
 
 # JetBrains (RustRover) project state
 /.idea/
+
+# Render packs are derived from a locally installed game and must never be committed or published
+*.pack.json
+render-pack*.json

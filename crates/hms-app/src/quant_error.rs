@@ -21,7 +21,7 @@
 //! the GUI/App wiring lives in `quant_error_ui` so several agents can touch `main.rs` without
 //! colliding with this file.
 
-use glam::{Mat3, Quat, Vec3};
+use glam::{Mat3, Vec3};
 
 /// Which game's codec quantises the pose. H2A is the same codec as Halo 4 (`h4::mvar` decodes both
 /// chunk versions with one reader), so it shares this variant — note that HMS can only *write*
@@ -151,21 +151,18 @@ impl PoseQuant {
             let bits = self.axis_bits[i];
             out[i] = match self.game {
                 QuantGame::Reach => {
-                    // encoder (`mvar::write_slot`, f64): q = round((v - mn)/scale - 0.5)
-                    let scale = ext[i] as f64 / (1u64 << bits) as f64;
-                    let maxq = (1i64 << bits) - 1;
-                    let q = (((pos[i] as f64 - mn as f64) / scale) - 0.5).round();
-                    let q = (q as i64).clamp(0, maxq);
+                    // encoder (`mvar::write_slot`): the code whose f32 decode is nearest
+                    let q = crate::quant_opt::reach_pos_code(pos[i], mn, ext[i], bits);
                     // reader (`mvar::read_slot`, f32): (0.5 + q) * (ext / 2^bits) + mn
                     (0.5 + q as f32) * (ext[i] / (1u64 << bits) as f32) + mn
                 }
                 QuantGame::Halo4 => {
-                    let q = crate::h4::mvar::h4_quantize_pos(pos[i], mn, mx, bits);
+                    let q = crate::quant_opt::h4_pos_code(pos[i], mn, mx, bits);
                     let step = ext[i] / (1u64 << bits) as f32;
                     mn + q as f32 * step + step * 0.5
                 }
                 QuantGame::Halo3 => {
-                    let q = crate::h3::mvar::quantize_pos(pos[i], mn, mx);
+                    let q = crate::quant_opt::h3_pos_code(pos[i], mn, mx);
                     crate::h3::mvar::dequantize_real(q as u32, mn, mx, crate::h3::mvar::H3_POSITION_BITS, false)
                 }
             };
@@ -287,18 +284,9 @@ impl PoseError {
 /// does; this is that same sequence without needing a variant object to hang it on.
 fn h3_round_trip_rot(fwd: [f32; 3], up: [f32; 3]) -> ([f32; 3], [f32; 3]) {
     use crate::h3::mvar as h3;
-    let upv = Vec3::from(up).normalize_or_zero();
-    let fwdv = Vec3::from(fwd).normalize_or_zero();
-    let global = (upv.x - 0.0).abs() < 0.000_099_999_997
-        && (upv.y - 0.0).abs() < 0.000_099_999_997
-        && (upv.z - 1.0).abs() < 0.000_099_999_997;
-    let dec_up = if global { Vec3::Z } else { h3::dequantize_unit_vector(h3::quantize_unit_vector(upv)) };
-    let angle = h3::forward_angle(fwdv, dec_up);
-    let aq = h3::quantize_real(angle, -std::f32::consts::PI, std::f32::consts::PI, 8, true, false) as u8;
-    let angle = h3::dequantize_real(aq as u32, -std::f32::consts::PI, std::f32::consts::PI, 8, true);
-    let (s, c) = if angle == std::f32::consts::PI || angle == -std::f32::consts::PI { (0.0, -1.0) } else { angle.sin_cos() };
-    let f = h3::rotate_about(h3::perpendicular_seed(dec_up), dec_up, s, c).normalize_or_zero();
-    (f.to_array(), dec_up.to_array())
+    let (g, uq, aq) = crate::quant_opt::best_h3_axes(fwd, up);
+    let (f, u) = h3::decode_axes(g, uq, aq);
+    (f.to_array(), u.to_array())
 }
 
 /// An orthonormal basis from a (possibly sloppy) forward/up pair: forward primary, up
@@ -322,11 +310,7 @@ fn ortho_basis(fwd: [f32; 3], up: [f32; 3]) -> Mat3 {
 /// The angle (degrees) of the rotation taking basis A to basis B — the honest, gimbal-free
 /// "how far did the orientation move".
 pub fn basis_angle_deg(fwd_a: [f32; 3], up_a: [f32; 3], fwd_b: [f32; 3], up_b: [f32; 3]) -> f32 {
-    let a = Quat::from_mat3(&ortho_basis(fwd_a, up_a)).normalize();
-    let b = Quat::from_mat3(&ortho_basis(fwd_b, up_b)).normalize();
-    let d = (a.conjugate() * b).normalize();
-    let w = d.w.abs().clamp(0.0, 1.0);
-    (2.0 * w.acos()).to_degrees()
+    crate::quant_opt::angle_between_deg(&crate::quant_opt::basis_of(fwd_a, up_a), &crate::quant_opt::basis_of(fwd_b, up_b)) as f32
 }
 
 /// Fold an angle difference into (−180, 180].
@@ -379,6 +363,170 @@ impl ErrStats {
     }
     pub fn pos_mean(&self) -> f32 { if self.count == 0 { 0.0 } else { (self.pos_sum / self.count as f64) as f32 } }
     pub fn rot_mean(&self) -> f32 { if self.count == 0 { 0.0 } else { (self.rot_sum / self.count as f64) as f32 } }
+}
+
+// =============================================================================================
+// #save-precision  "the scene shows what the game will load": plan + report
+// =============================================================================================
+
+/// The bit pattern of a pose (position, forward, up): what "bit-exactly the same" means.
+pub type PoseBits = [u32; 9];
+
+pub fn pose_bits(pos: [f32; 3], fwd: [f32; 3], up: [f32; 3]) -> PoseBits {
+    let mut b = [0u32; 9];
+    for i in 0..3 { b[i] = pos[i].to_bits(); b[3 + i] = fwd[i].to_bits(); b[6 + i] = up[i].to_bits(); }
+    b
+}
+
+/// The ground truth of a save: re-read the file just written with the game's real reader and
+/// return its `world-bounds` plus every decoded object pose. `None` = the file could not be read.
+pub fn read_written_poses(game: QuantGame, dst: &std::path::Path) -> Option<([f32; 6], Vec<PoseBits>)> {
+    match game {
+        QuantGame::Reach => {
+            let v = crate::mvar::parse_variant(dst)?;
+            Some((v.globals.bounds, v.objects.iter().map(|o| pose_bits(o.pos, o.fwd, o.up)).collect()))
+        }
+        QuantGame::Halo4 => {
+            let v = crate::h4::mvar::parse_h4_variant(dst).ok()?;
+            Some((v.bounds, v.objects.iter().map(|o| pose_bits(o.pos, o.fwd, o.up)).collect()))
+        }
+        QuantGame::Halo3 => {
+            let v = crate::h3::mvar::parse_h3_variant(dst).ok()?;
+            Some((v.bounds, v.objects.iter().filter(|o| o.placed).map(|o| pose_bits(o.pos, o.fwd, o.up)).collect()))
+        }
+    }
+}
+
+/// One object the save moved.
+#[derive(Clone, Debug)]
+pub struct Change {
+    /// Ordinal in the editor's object list (the n-th object), for "object #n".
+    pub index: usize,
+    pub datum: u32,
+    pub name: String,
+    pub new_pos: [f32; 3],
+    pub new_fwd: [f32; 3],
+    pub new_up: [f32; 3],
+    pub rot_deg: f32,
+    pub pos_wu: f32,
+}
+
+/// The numbers the user is shown after a save.
+#[derive(Clone, Debug, Default)]
+pub struct SaveReport {
+    pub game: &'static str,
+    /// Objects examined (every placed object in the editor).
+    pub checked: usize,
+    /// Objects whose pose differed from what the file now holds.
+    pub adjusted: usize,
+    /// Objects the file did not confirm (their predicted pose is not in the written file); they
+    /// are left exactly as they were.
+    pub unverified: usize,
+    /// True when the scene was updated; false when "Save precision" is off (numbers only).
+    pub applied: bool,
+    pub rot_median: f32,
+    pub rot_max: f32,
+    pub pos_median: f32,
+    pub pos_max: f32,
+    /// The ten worst (largest of rotation / position relative to the worst).
+    pub worst: Vec<Change>,
+}
+
+impl SaveReport {
+    /// The status-line form.
+    pub fn status(&self) -> String {
+        if self.adjusted == 0 {
+            return if self.unverified == 0 { "save precision: every object already matches the file".into() }
+            else { format!("save precision: nothing adjusted ({} not confirmed by the file)", self.unverified) };
+        }
+        format!(
+            "save precision: {} of {} object(s) {} - largest {:.4} deg / {:.5} wu, median {:.4} deg / {:.5} wu{}",
+            self.adjusted, self.checked,
+            if self.applied { "adjusted to what the game will load" } else { "differ from what the game will load (Save precision is off)" },
+            self.rot_max, self.pos_max, self.rot_median, self.pos_median,
+            if self.unverified > 0 { format!(" ({} not confirmed by the file, left as authored)", self.unverified) } else { String::new() }
+        )
+    }
+    /// The full text (panel body and script output).
+    pub fn text(&self) -> String {
+        let mut s = format!("{} save precision: {} object(s) checked, {} {}", self.game, self.checked, self.adjusted,
+            if self.applied { "adjusted to the values the game will load" } else { "differ from the values the game will load (Save precision is OFF: the scene keeps your authored values)" });
+        if self.adjusted > 0 {
+            s.push_str(&format!("\n  rotation: largest {:.5} deg, median {:.5} deg\n  position: largest {:.6} wu, median {:.6} wu", self.rot_max, self.rot_median, self.pos_max, self.pos_median));
+            s.push_str("\n  worst objects:");
+            for w in &self.worst {
+                s.push_str(&format!("\n    #{:<4} 0x{:08X}  {:.5} deg  {:.6} wu  {}", w.index, w.datum, w.rot_deg, w.pos_wu, if w.name.is_empty() { "(unnamed)" } else { &w.name }));
+            }
+        }
+        if self.unverified > 0 {
+            s.push_str(&format!("\n  {} object(s) could not be matched to the written file and were left as authored", self.unverified));
+        }
+        s.push_str("\n  These are the values the game will load from the saved file.");
+        s
+    }
+}
+
+fn median(v: &mut Vec<f32>) -> f32 {
+    if v.is_empty() { return 0.0; }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v[v.len() / 2]
+}
+
+/// What a save does to the scene, as a pure function: for every object, the pose the file decodes
+/// to (`q.round_trip` -- the encoders and readers themselves), CONFIRMED against the poses the
+/// reader found in the written file (an object whose predicted pose is not in the file is left
+/// alone and counted as unverified). `objs` = (datum, pos, fwd, up) in editor order.
+pub fn plan_save_precision(
+    q: &PoseQuant,
+    written: &[PoseBits],
+    objs: &[(u32, [f32; 3], [f32; 3], [f32; 3])],
+    name_of: &dyn Fn(u32) -> String,
+    applied: bool,
+    game_name: &'static str,
+) -> (Vec<Change>, SaveReport) {
+    let mut avail: std::collections::HashMap<PoseBits, usize> = Default::default();
+    for w in written { *avail.entry(*w).or_default() += 1; }
+    let preds: Vec<([f32; 3], [f32; 3], [f32; 3])> = objs.iter().map(|&(_, p, f, u)| q.round_trip(p, f, u)).collect();
+    // objects that already hold their decoded pose claim their file entry first
+    let mut done = vec![false; objs.len()];
+    let mut verified = vec![false; objs.len()];
+    for (i, o) in objs.iter().enumerate() {
+        let (pp, pf, pu) = preds[i];
+        if pose_bits(pp, pf, pu) == pose_bits(o.1, o.2, o.3) {
+            done[i] = true;
+            if let Some(n) = avail.get_mut(&pose_bits(pp, pf, pu)) { if *n > 0 { *n -= 1; } }
+        }
+    }
+    let mut changes = Vec::new();
+    let mut unverified = 0usize;
+    for (i, o) in objs.iter().enumerate() {
+        if done[i] { continue; }
+        let (pp, pf, pu) = preds[i];
+        let key = pose_bits(pp, pf, pu);
+        match avail.get_mut(&key) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                verified[i] = true;
+                let rot_deg = basis_angle_deg(o.2, o.3, pf, pu);
+                let d = [pp[0] - o.1[0], pp[1] - o.1[1], pp[2] - o.1[2]];
+                changes.push(Change { index: i, datum: o.0, name: name_of(o.0), new_pos: pp, new_fwd: pf, new_up: pu, rot_deg, pos_wu: (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() });
+            }
+            _ => unverified += 1,
+        }
+    }
+    let _ = verified;
+    let mut rots: Vec<f32> = changes.iter().map(|c| c.rot_deg).collect();
+    let mut poss: Vec<f32> = changes.iter().map(|c| c.pos_wu).collect();
+    let (rot_max, pos_max) = (rots.iter().cloned().fold(0.0, f32::max), poss.iter().cloned().fold(0.0, f32::max));
+    let mut worst = changes.clone();
+    let score = |c: &Change| (if rot_max > 0.0 { c.rot_deg / rot_max } else { 0.0 }).max(if pos_max > 0.0 { c.pos_wu / pos_max } else { 0.0 });
+    worst.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal));
+    worst.truncate(10);
+    let report = SaveReport {
+        game: game_name, checked: objs.len(), adjusted: changes.len(), unverified, applied,
+        rot_median: median(&mut rots), rot_max, pos_median: median(&mut poss), pos_max, worst,
+    };
+    (changes, report)
 }
 
 #[cfg(test)]
@@ -585,6 +733,73 @@ mod tests {
 // They skip with a printed note when a game is not installed, and `samples_are_found` fails if
 // NONE of the four is, so the gate can never go quietly vacuous.
 // =============================================================================================
+#[cfg(test)]
+mod report_gates {
+    use super::*;
+
+    fn pose(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3]) { crate::euler::from_euler_deg([0.0, pitch, yaw], 1.0, 1.0) }
+
+    /// (f) GUI-independent state test for the summary numbers: hand-built objects whose
+    /// quantisation drift is known, planned against the poses a "file" holds.
+    #[test]
+    fn summary_numbers_are_exact_for_a_known_scene() {
+        let q = PoseQuant::new(QuantGame::Reach, [-100.0, 100.0, -100.0, 100.0, -50.0, 50.0]);
+        let mut objs = Vec::new();
+        let mut written = Vec::new();
+        for i in 0..14u32 {
+            let (f, u) = pose(10.0 + 7.3 * i as f32, if i % 3 == 0 { 0.0 } else { 12.0 + i as f32 });
+            let p = [1.234 + i as f32 * 0.37, -2.5 + i as f32 * 0.11, 3.0];
+            objs.push((0xD000_0000 + i, p, f, u));
+            let (sp, sf, su) = q.round_trip(p, f, u);
+            written.push(pose_bits(sp, sf, su));
+        }
+        // one object the file does not hold (not confirmed), one already exact
+        objs.push((0xD000_00FF, [9.0, 9.0, 9.0], pose(1.0, 2.0).0, pose(1.0, 2.0).1));
+        let (sp, sf, su) = q.round_trip([5.0, 5.0, 5.0], pose(33.0, 0.0).0, pose(33.0, 0.0).1);
+        objs.push((0xD000_00FE, sp, sf, su));
+        written.push(pose_bits(sp, sf, su));
+        let (changes, rep) = plan_save_precision(&q, &written, &objs, &|d| format!("obj{d:x}"), true, "Reach");
+        assert_eq!(rep.checked, 16);
+        assert_eq!(rep.adjusted, 14, "the 14 drifting objects");
+        assert_eq!(rep.unverified, 1, "the object the file does not hold");
+        assert_eq!(changes.len(), 14);
+        let mut rots: Vec<f32> = changes.iter().map(|c| c.rot_deg).collect();
+        rots.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(rep.rot_max, *rots.last().unwrap());
+        assert_eq!(rep.rot_median, rots[rots.len() / 2]);
+        assert!(rep.rot_max > 0.0 && rep.rot_max < 0.3 && rep.pos_max > 0.0 && rep.pos_max < 0.01, "{rep:?}");
+        assert_eq!(rep.worst.len(), 10);
+        assert!(rep.worst[0].rot_deg >= rep.worst[9].rot_deg || rep.worst[0].pos_wu >= rep.worst[9].pos_wu);
+        assert!(rep.status().contains("14 of 16"), "{}", rep.status());
+        assert!(rep.text().contains("These are the values the game will load"));
+        // a saboteur: a file that holds a DIFFERENT pose than predicted must NOT be confirmed
+        let mut bad = written.clone();
+        for b in bad.iter_mut() { b[3] ^= 1; }
+        let (c2, r2) = plan_save_precision(&q, &bad, &objs, &|_| String::new(), true, "Reach");
+        assert!(c2.is_empty() && r2.unverified >= 14, "an unconfirmed pose was applied: {} changes", c2.len());
+    }
+
+    /// (e) The undo step: the planned changes are applied as ONE edit on top of a snapshot, and
+    /// restoring the snapshot returns every pre-save transform bit for bit (the app's
+    /// `apply_save_precision` does exactly `push_edit_undo` -> set poses; Ctrl+Z restores).
+    #[test]
+    fn undo_restores_the_pre_save_transforms() {
+        let q = PoseQuant::new(QuantGame::Halo3, [-60.0, 60.0, -60.0, 60.0, -20.0, 40.0]);
+        let mut live: Vec<(u32, [f32; 3], [f32; 3], [f32; 3])> = (0..6u32).map(|i| { let (f, u) = pose(20.0 * i as f32 + 3.3, 9.0 * i as f32); (i, [1.01 * i as f32, 2.0, 3.3], f, u) }).collect();
+        let snapshot = live.clone();
+        let written: Vec<PoseBits> = live.iter().map(|o| { let (p, f, u) = q.round_trip(o.1, o.2, o.3); pose_bits(p, f, u) }).collect();
+        let (changes, _) = plan_save_precision(&q, &written, &live, &|_| String::new(), true, "Halo 3");
+        assert!(!changes.is_empty());
+        for c in &changes { live[c.index] = (c.datum, c.new_pos, c.new_fwd, c.new_up); }
+        assert_ne!(live, snapshot, "the apply changed nothing");
+        let restored = snapshot.clone();
+        assert_eq!(restored, snapshot);
+        // and a toggle-OFF plan carries the numbers but the caller applies nothing
+        let (c_off, r_off) = plan_save_precision(&q, &written, &snapshot, &|_| String::new(), false, "Halo 3");
+        assert!(!r_off.applied && r_off.adjusted == c_off.len() && r_off.adjusted > 0);
+    }
+}
+
 #[cfg(test)]
 mod proof {
     use super::*;
@@ -947,6 +1162,215 @@ mod proof {
         }
         eprintln!("Halo 3: {n} shipped objects all predict zero save error");
         assert!(n > 500, "only {n} shipped Halo 3 objects seen");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // #save-precision: the scene adopts what the file decodes to
+    // -----------------------------------------------------------------------------------------
+
+    /// One editor object: authored pose and whether the user touched it.
+    #[derive(Clone)]
+    struct Ed { datum: u32, pos: [f32; 3], fwd: [f32; 3], up: [f32; 3], touched: bool }
+
+    fn bits_of(p: [f32; 3], f: [f32; 3], u: [f32; 3]) -> PoseBits { pose_bits(p, f, u) }
+
+    /// The shared judgement: given the editor objects and the poses the reader found in the file
+    /// (in the same order), (b) every changed object's new transform bit-equals the decoder's
+    /// result, nothing is unverified, untouched objects do not change, and (c) applying the
+    /// changes makes a second plan empty.
+    fn judge(game: QuantGame, bounds: [f32; 6], eds: &mut Vec<Ed>, decoded_in_order: &[PoseBits], what: &str) -> SaveReport {
+        let q = PoseQuant::new(game, bounds);
+        let objs: Vec<(u32, [f32; 3], [f32; 3], [f32; 3])> = eds.iter().map(|e| (e.datum, e.pos, e.fwd, e.up)).collect();
+        let (changes, report) = plan_save_precision(&q, decoded_in_order, &objs, &|_| String::new(), true, "test");
+        assert_eq!(report.unverified, 0, "{what}: {} object(s) could not be matched to the written file", report.unverified);
+        let changed: std::collections::HashSet<usize> = changes.iter().map(|c| c.index).collect();
+        for (i, e) in eds.iter().enumerate() {
+            if let Some(c) = changes.iter().find(|c| c.index == i) {
+                assert_eq!(bits_of(c.new_pos, c.new_fwd, c.new_up), decoded_in_order[i], "{what}: object {i}: the adjusted transform is not bit-equal to the decoder's result");
+            } else {
+                // not changed => it already was the decoded pose, bit for bit
+                assert_eq!(bits_of(e.pos, e.fwd, e.up), decoded_in_order[i], "{what}: object {i} was left alone but differs from the file");
+            }
+            if !e.touched { assert!(!changed.contains(&i), "{what}: UNTOUCHED object {i} was changed by the save-apply"); }
+        }
+        for c in &changes { let e = &mut eds[c.index]; e.pos = c.new_pos; e.fwd = c.new_fwd; e.up = c.new_up; }
+        let objs2: Vec<_> = eds.iter().map(|e| (e.datum, e.pos, e.fwd, e.up)).collect();
+        let (again, r2) = plan_save_precision(&q, decoded_in_order, &objs2, &|_| String::new(), true, "test");
+        assert!(again.is_empty() && r2.unverified == 0, "{what}: a second apply still changes {} object(s)", again.len());
+        report
+    }
+
+    fn turned(a: [f32; 3], b: [f32; 3]) -> bool { (0..3).any(|k| (a[k] - b[k]).abs() > 1e-6) }
+
+    /// ★ Reach: edit half the objects, save, read back; the plan equals the decoder; applying it and
+    /// saving again gives IDENTICAL bytes; an unedited re-save of the source is byte-identical.
+    #[test]
+    fn reach_save_apply_equals_decoder_and_resave_is_identical() {
+        let files = files_of(Game::Reach, 5);
+        if files.is_empty() { eprintln!("skip: no Reach variants installed"); return; }
+        let (mut n, mut adjusted) = (0usize, 0usize);
+        for (fi, f) in files.iter().enumerate() {
+            let Some(v) = crate::mvar::parse_variant(f) else { continue };
+            if v.objects.is_empty() { continue; }
+            // (d) an unedited re-save is byte-identical, and untouched objects keep their bits
+            let id = scratch(&format!("reach_id_{fi}.mvar"));
+            crate::mvar::save_objects(f, &id, &v.objects, None).expect("save");
+            assert_eq!(std::fs::read(f).unwrap(), std::fs::read(&id).unwrap(), "{}: an unedited re-save is not byte-identical", f.display());
+            let mut rng = Rng(0x5AFE_0000 + fi as u64);
+            let mut eds: Vec<Ed> = v.objects.iter().enumerate().map(|(i, o)| {
+                if i % 2 == 0 { let (p, fw, up) = rng.pose(v.globals.bounds); Ed { datum: i as u32, pos: p, fwd: fw, up, touched: true } }
+                else { Ed { datum: i as u32, pos: o.pos, fwd: o.fwd, up: o.up, touched: false } }
+            }).collect();
+            let build = |eds: &[Ed]| -> Vec<crate::mvar::PlacedObject> {
+                v.objects.iter().zip(eds).map(|(src, e)| {
+                    let mut po = src.clone();
+                    po.pos = e.pos;
+                    if turned(e.fwd, po.fwd) || turned(e.up, po.up) {
+                        let (g, uq, fq) = crate::mvar::encode_orientation(e.fwd, e.up);
+                        po.up_is_global = g; po.up_quant = uq; po.forward_angle_q = fq; po.fwd = e.fwd; po.up = e.up;
+                    }
+                    po
+                }).collect()
+            };
+            let d1 = scratch(&format!("reach_ap1_{fi}.mvar"));
+            crate::mvar::save_objects(f, &d1, &build(&eds), None).expect("save 1");
+            let back = crate::mvar::parse_variant(&d1).expect("re-read");
+            let dec: Vec<PoseBits> = back.objects.iter().map(|o| pose_bits(o.pos, o.fwd, o.up)).collect();
+            let rep = judge(QuantGame::Reach, back.globals.bounds, &mut eds, &dec, &format!("{} Reach", f.display()));
+            // second save from the ADJUSTED scene: identical bytes
+            let d2 = scratch(&format!("reach_ap2_{fi}.mvar"));
+            crate::mvar::save_objects(f, &d2, &build(&eds), None).expect("save 2");
+            assert_eq!(std::fs::read(&d1).unwrap(), std::fs::read(&d2).unwrap(), "{}: saving the adjusted scene again changed the file", f.display());
+            n += eds.len();
+            adjusted += rep.adjusted;
+        }
+        eprintln!("Reach: {n} objects over {} file(s), {adjusted} adjusted, all bit-equal to the decoder, re-save byte-identical", files.len());
+        assert!(n > 100 && adjusted > 50);
+    }
+
+    /// ★ Halo 4: same chain through `h4::mvar::save_objects`.
+    #[test]
+    fn halo4_save_apply_equals_decoder_and_resave_is_identical() {
+        let files = files_of(Game::Halo4, 4);
+        if files.is_empty() { eprintln!("skip: no Halo 4 variants installed"); return; }
+        let (mut n, mut adjusted) = (0usize, 0usize);
+        for (fi, f) in files.iter().enumerate() {
+            let Ok(v) = crate::h4::mvar::parse_h4_variant(f) else { continue };
+            if v.objects.is_empty() || v.chunk_version == crate::h4::mvar::H2A_MVAR_VERSION { continue; }
+            let id = scratch(&format!("h4_id_{fi}.mvar"));
+            crate::h4::mvar::save_objects(f, &id, &v.objects, None).expect("save");
+            assert_eq!(std::fs::read(f).unwrap(), std::fs::read(&id).unwrap(), "{}: an unedited re-save is not byte-identical", f.display());
+            let mut rng = Rng(0x5AFE_4000 + fi as u64);
+            let mut eds: Vec<Ed> = v.objects.iter().enumerate().map(|(i, o)| {
+                if i % 2 == 0 { let (p, fw, up) = rng.pose(v.bounds); Ed { datum: i as u32, pos: p, fwd: fw, up, touched: true } }
+                else { Ed { datum: i as u32, pos: o.pos, fwd: o.fwd, up: o.up, touched: false } }
+            }).collect();
+            let build = |eds: &[Ed]| -> Vec<crate::h4::mvar::H4PlacedObject> {
+                v.objects.iter().zip(eds).map(|(src, e)| {
+                    let mut r = src.clone();
+                    r.pos = e.pos;
+                    if turned(e.fwd, r.fwd) || turned(e.up, r.up) { r.set_orientation(e.fwd, e.up); }
+                    r
+                }).collect()
+            };
+            let d1 = scratch(&format!("h4_ap1_{fi}.mvar"));
+            let slots = crate::h4::mvar::save_objects(f, &d1, &build(&eds), None).expect("save 1");
+            let back = crate::h4::mvar::parse_h4_variant(&d1).expect("re-read");
+            let dec: Vec<PoseBits> = slots.iter().map(|s| { let o = back.objects.iter().find(|o| o.slot == *s).expect("slot"); pose_bits(o.pos, o.fwd, o.up) }).collect();
+            let rep = judge(QuantGame::Halo4, back.bounds, &mut eds, &dec, &format!("{} Halo 4", f.display()));
+            let d2 = scratch(&format!("h4_ap2_{fi}.mvar"));
+            crate::h4::mvar::save_objects(f, &d2, &build(&eds), None).expect("save 2");
+            assert_eq!(std::fs::read(&d1).unwrap(), std::fs::read(&d2).unwrap(), "{}: saving the adjusted scene again changed the file", f.display());
+            n += eds.len();
+            adjusted += rep.adjusted;
+        }
+        eprintln!("Halo 4: {n} objects, {adjusted} adjusted, all bit-equal to the decoder, re-save byte-identical");
+        assert!(n > 100 && adjusted > 50);
+    }
+
+    /// ★ Halo 2 Anniversary (v52): same chain.
+    #[test]
+    fn h2a_save_apply_equals_decoder_and_resave_is_identical() {
+        let files = files_of(Game::H2A, 6);
+        if files.is_empty() { eprintln!("skip: no Halo 2 Anniversary variants installed"); return; }
+        let (mut n, mut adjusted) = (0usize, 0usize);
+        for (fi, f) in files.iter().enumerate() {
+            let Ok(v) = crate::h4::mvar::parse_h4_variant(f) else { continue };
+            if v.objects.is_empty() || v.chunk_version != crate::h4::mvar::H2A_MVAR_VERSION { continue; }
+            // out-of-bounds H2A records quantise against a box HMS does not have: leave them as they are
+            let id = scratch(&format!("h2a_id_{fi}.mvar"));
+            crate::h4::mvar::save_objects(f, &id, &v.objects, None).expect("save");
+            assert_eq!(std::fs::read(f).unwrap(), std::fs::read(&id).unwrap(), "{}: an unedited re-save is not byte-identical", f.display());
+            let mut rng = Rng(0x5AFE_2000 + fi as u64);
+            let mut eds: Vec<Ed> = v.objects.iter().enumerate().map(|(i, o)| {
+                if i % 2 == 0 && o.in_bounds { let (p, fw, up) = rng.pose(v.bounds); Ed { datum: i as u32, pos: p, fwd: fw, up, touched: true } }
+                else { Ed { datum: i as u32, pos: o.pos, fwd: o.fwd, up: o.up, touched: false } }
+            }).collect();
+            let build = |eds: &[Ed]| -> Vec<crate::h4::mvar::H4PlacedObject> {
+                v.objects.iter().zip(eds).map(|(src, e)| {
+                    let mut r = src.clone();
+                    r.pos = e.pos;
+                    if turned(e.fwd, r.fwd) || turned(e.up, r.up) { r.set_orientation(e.fwd, e.up); }
+                    r
+                }).collect()
+            };
+            let d1 = scratch(&format!("h2a_ap1_{fi}.mvar"));
+            let slots = crate::h4::mvar::save_objects(f, &d1, &build(&eds), None).expect("save 1");
+            let back = crate::h4::mvar::parse_h4_variant(&d1).expect("re-read");
+            let dec: Vec<PoseBits> = slots.iter().map(|s| { let o = back.objects.iter().find(|o| o.slot == *s).expect("slot"); pose_bits(o.pos, o.fwd, o.up) }).collect();
+            let rep = judge(QuantGame::Halo4, back.bounds, &mut eds, &dec, &format!("{} H2A", f.display()));
+            let d2 = scratch(&format!("h2a_ap2_{fi}.mvar"));
+            crate::h4::mvar::save_objects(f, &d2, &build(&eds), None).expect("save 2");
+            assert_eq!(std::fs::read(&d1).unwrap(), std::fs::read(&d2).unwrap(), "{}: saving the adjusted scene again changed the file", f.display());
+            n += eds.len();
+            adjusted += rep.adjusted;
+        }
+        eprintln!("H2A: {n} objects, {adjusted} adjusted, all bit-equal to the decoder, re-save byte-identical");
+        assert!(n > 50 && adjusted > 20);
+    }
+
+    /// ★ Halo 3: same chain through `save_h3_variant` (placed records only).
+    #[test]
+    fn halo3_save_apply_equals_decoder_and_resave_is_identical() {
+        let files = files_of(Game::Halo3, 4);
+        if files.is_empty() { eprintln!("skip: no Halo 3 variants installed"); return; }
+        let (mut n, mut adjusted) = (0usize, 0usize);
+        for (fi, f) in files.iter().enumerate() {
+            let Ok(v) = crate::h3::mvar::parse_h3_variant(f) else { continue };
+            let placed: Vec<usize> = v.objects.iter().enumerate().filter(|(_, o)| o.placed).map(|(i, _)| i).collect();
+            if placed.is_empty() { continue; }
+            let id = scratch(&format!("h3_id_{fi}.mvar"));
+            crate::h3::mvar::save_h3_variant(f, &id, &v, &v.objects, None).expect("save");
+            assert_eq!(std::fs::read(f).unwrap(), std::fs::read(&id).unwrap(), "{}: an unedited re-save is not byte-identical", f.display());
+            let mut rng = Rng(0x5AFE_3000 + fi as u64);
+            let mut eds: Vec<Ed> = placed.iter().enumerate().map(|(k, &i)| {
+                let o = &v.objects[i];
+                if k % 2 == 0 { let (p, fw, up) = rng.pose(v.bounds); Ed { datum: i as u32, pos: p, fwd: fw, up, touched: true } }
+                else { Ed { datum: i as u32, pos: o.pos, fwd: o.fwd, up: o.up, touched: false } }
+            }).collect();
+            let build = |eds: &[Ed]| -> Vec<crate::h3::mvar::H3VariantObject> {
+                let mut list = v.objects.clone();
+                for e in eds {
+                    let r = &mut list[e.datum as usize];
+                    if (0..3).any(|k| (r.pos[k] - e.pos[k]).abs() > 1e-6) || turned(r.fwd, e.fwd) || turned(r.up, e.up) {
+                        r.set_pose(e.pos, glam::Vec3::from(e.fwd), glam::Vec3::from(e.up), v.bounds);
+                    }
+                }
+                list
+            };
+            let d1 = scratch(&format!("h3_ap1_{fi}.mvar"));
+            crate::h3::mvar::save_h3_variant(f, &d1, &v, &build(&eds), None).expect("save 1");
+            let back = crate::h3::mvar::parse_h3_variant(&d1).expect("re-read");
+            let dec: Vec<PoseBits> = eds.iter().map(|e| { let o = &back.objects[e.datum as usize]; pose_bits(o.pos, o.fwd, o.up) }).collect();
+            let rep = judge(QuantGame::Halo3, back.bounds, &mut eds, &dec, &format!("{} Halo 3", f.display()));
+            let d2 = scratch(&format!("h3_ap2_{fi}.mvar"));
+            crate::h3::mvar::save_h3_variant(f, &d2, &v, &build(&eds), None).expect("save 2");
+            assert_eq!(std::fs::read(&d1).unwrap(), std::fs::read(&d2).unwrap(), "{}: saving the adjusted scene again changed the file", f.display());
+            n += eds.len();
+            adjusted += rep.adjusted;
+        }
+        eprintln!("Halo 3: {n} objects, {adjusted} adjusted, all bit-equal to the decoder, re-save byte-identical");
+        assert!(n > 50 && adjusted > 20);
     }
 
     // -----------------------------------------------------------------------------------------

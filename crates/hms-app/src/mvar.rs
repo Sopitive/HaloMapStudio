@@ -364,12 +364,42 @@ pub(crate) fn dequantize_unit_vector3d(value: i64, bit_count: u32) -> [f64; 3] {
     v
 }
 
+/// #save-precision: every dequantised component value a cube-face unit vector of `bit_count` bits
+/// can hold, in code order (code `q` -> `values[q]`; the engine's quantisers only ever emit codes
+/// `0..values.len()`), plus the packing constants `(apamc, qvc)`: the packed code is
+/// `face * apamc + qu * qvc + qw`. The values come from the decoder's own `dequantize_real_f`.
+pub(crate) fn unit_vector_cells(bit_count: u32) -> (Vec<f64>, i64, i64) {
+    let (apamc, qvc) = unit_vector_encoding_constants(bit_count);
+    let n = (qvc - 1).max(0);
+    let vals = (0..n).map(|q| dequantize_real_f(q, -1.0, 1.0, qvc, true, false)).collect();
+    (vals, apamc, qvc)
+}
+
+/// #save-precision: the decoder's reference tangent for a (dequantised, unit) `up` and its cross
+/// with up: the forward at angle `a` is `ref * cos a + cr * sin a`. Same branch rule and same
+/// normalisation as `angle_to_axes_branch` -- it IS that function evaluated at angle 0.
+pub(crate) fn reference_frame(up: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let r = angle_to_axes_internal(up, 0.0);
+    (r, cross3(up, r))
+}
+
 /// Reconstruct the forward vector (blf frame) from up + a yaw angle (Rodrigues
 /// rotation of a deterministic reference tangent about `up`).
 fn angle_to_axes_internal(up: [f64; 3], angle: f64) -> [f64; 3] {
+    angle_to_axes_branch(up, angle, None)
+}
+
+/// How close `|up.x|` and `|up.y|` must be for the reference-tangent branch to be ambiguous.
+/// `up` travels as a 19-bit cube-face vector, so a component is known to about 2^-9.5; anything
+/// inside two of those steps could have sat on the other side of the tie before it was quantised.
+pub const REFERENCE_TIE: f64 = 0.0045;
+
+/// `angle_to_axes_internal` with the branch of the reference tangent chosen by the caller
+/// (`Some(true)` = `left x up`, `Some(false)` = `up x forward`), or by the engine's own rule.
+fn angle_to_axes_branch(up: [f64; 3], angle: f64, left_branch: Option<bool>) -> [f64; 3] {
     let v10 = dot3(up, GLOBAL_FORWARD).abs();
     let v9 = dot3(up, GLOBAL_LEFT).abs();
-    let mut forward = if v10 >= v9 {
+    let mut forward = if left_branch.unwrap_or(v10 >= v9) {
         cross3(GLOBAL_LEFT, up)
     } else {
         cross3(up, GLOBAL_FORWARD)
@@ -390,6 +420,30 @@ fn angle_to_axes_internal(up: [f64; 3], angle: f64) -> [f64; 3] {
     ];
     normalize3(&mut f);
     f
+}
+
+/// #vehicle-flip  [`decode_orientation_bits`] and, when `|up.x|` and `|up.y|` are too close to say
+/// which side of the reference tangent's tie the SENDER stood on, the forward the OTHER branch
+/// gives (always 90 degrees about `up` from the first).
+pub fn decode_orientation_bits_alt(
+    up_is_global: bool,
+    up_quant: u32,
+    up_bits: u32,
+    angle_q: u32,
+    angle_bits: u32,
+) -> Option<[f32; 3]> {
+    if up_is_global {
+        return None;
+    }
+    let up = dequantize_unit_vector3d(up_quant as i64, up_bits);
+    let v10 = dot3(up, GLOBAL_FORWARD).abs();
+    let v9 = dot3(up, GLOBAL_LEFT).abs();
+    if (v10 - v9).abs() > REFERENCE_TIE {
+        return None;
+    }
+    let angle = dequantize_real_f(angle_q as i64, -K_PI, K_PI, 1i64 << angle_bits, false, false);
+    let f = angle_to_axes_branch(up, angle, Some(v10 < v9));
+    Some([f[0] as f32, f[1] as f32, f[2] as f32])
 }
 
 /// Decode world (forward, up) in engine/HMS space (Z-up) from the captured raw fields.
@@ -476,6 +530,13 @@ fn quantize_unit_vector3d(v: [f64; 3], bit_count: u32) -> i64 {
 /// DEQUANTISED up (what the decoder will actually use) so the round-trip is tight, then quantise θ
 /// over [-π, π] with 14 bits exactly like `quantize_forward_angle`.
 pub fn encode_orientation(fwd: [f32; 3], up: [f32; 3]) -> (bool, u32, u32) {
+    crate::quant_opt::best_reach_axes(fwd, up)
+}
+
+/// The ORIGINAL encoder (#save-precision): each field rounded to its own nearest code, the yaw
+/// measured from the dequantised up. Kept as the baseline `quant_opt` is measured against and
+/// as the optimiser's never-worse fallback candidate; the app saves through `encode_orientation`.
+pub fn encode_orientation_nearest(fwd: [f32; 3], up: [f32; 3]) -> (bool, u32, u32) {
     let mut upn = [up[0] as f64, up[1] as f64, up[2] as f64];
     normalize3(&mut upn);
     if dot3(upn, GLOBAL_UP) > 1.0 - 1e-6 {
@@ -987,6 +1048,13 @@ pub fn globals_report(g: &VariantGlobals, e: &GlobalEdits, names: &[String], fie
     if is("mcc-map-id") || is("guid") { put("mcc-map-id", g.mcc_map_id.map_or("- (version < 32 / 51)".to_string(), |x| x.iter().map(|b| format!("{b:02x}")).collect())); }
     if is("labels") { put("labels", format!("{} {:?}", labels.len(), labels)); }
     if is("chunk") || is("length") { put("mvar chunk", format!("length {} (bits {}), sha1 {}, _fsm {}", g.chunk_length, g.end_bit, if g.hash_ok { "ok" } else { "STALE" }, if g.has_fsm { "present" } else { "absent" })); }
+    // `variant get palette-json`: the quota-index -> palette-name table as one JSON object, the
+    // format `HmsMvar.withPalette` (docs/js/hms-mvar.js) reads. Print-only; only asked for by name.
+    if want.as_deref() == Some("palette-json") {
+        let game = match g.game { "Halo 4" => "halo4", "Reach" => "reach", other => other };
+        let j = serde_json::json!({ "game": game, "mapId": g.map_id, "names": (0..g.quotas.len()).map(|i| names.get(i).cloned().unwrap_or_default()).collect::<Vec<_>>() });
+        return Ok(j.to_string());
+    }
     if is("quota") || is("quota-table") { lines.push(format!("quota table ({} entries; min/max editable, * = edited):\n{}", g.quotas.len(), quota_rows())); }
     if lines.is_empty() { return Err(format!("variant get: unknown field '{}'", field.unwrap_or(""))); }
     Ok(lines.join("\n"))
@@ -1719,12 +1787,9 @@ fn write_slot(w: &mut BitWriter, slot: Option<&PlacedObject>, axis: [u32; 3], bb
     // f32 position keeps decode -> encode a fixed point (the byte-identical gates prove the
     // original files still re-encode to the same bits).
     let enc = |w: &mut BitWriter, i: usize, v: f32| {
-        let range = ext[i] as f64;
-        let mn = [bb[0], bb[2], bb[4]][i] as f64;
-        let scale = range / (1u64 << axis[i]) as f64;
-        let maxq = (1i64 << axis[i]) - 1;
-        let q = (((v as f64 - mn) / scale) - 0.5).round() as i64;
-        w.bits(axis[i], q.clamp(0, maxq) as u64);
+        let mn = [bb[0], bb[2], bb[4]][i];
+        // #save-precision: nearest code by the reader's own f32 decode (see `quant_opt`)
+        w.bits(axis[i], crate::quant_opt::reach_pos_code(v, mn, ext[i], axis[i]));
     };
     enc(w, 0, o.pos[0]);
     enc(w, 1, o.pos[1]);

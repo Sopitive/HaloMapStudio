@@ -1291,6 +1291,12 @@ pub fn h4_quantize_unit_vector(v: [f32; 3]) -> u32 {
 /// (up_is_global, up_quant, forward_angle_q). The yaw is measured in the reference frame the
 /// decoder rebuilds from the DEQUANTISED up (so decode(encode(x)) is a fixed point).
 pub fn h4_encode_axes(fwd: [f32; 3], up: [f32; 3]) -> (bool, u32, u32) {
+    crate::quant_opt::best_h4_axes(fwd, up)
+}
+
+/// The engine-exact (truncating, field-by-field) encoder: the baseline `quant_opt` is measured
+/// against and its never-worse fallback candidate. #save-precision
+pub fn h4_encode_axes_nearest(fwd: [f32; 3], up: [f32; 3]) -> (bool, u32, u32) {
     const EPS: f32 = 0.000_099_999_997;
     let (global, up_quant, up_used) = if (up[0] - 0.0).abs() < EPS && (up[1] - 0.0).abs() < EPS && (up[2] - 1.0).abs() < EPS {
         (true, 0u32, [0.0f64, 0.0, 1.0])
@@ -1399,7 +1405,7 @@ impl H4PlacedObject {
         let (bounds, ext, axis) = variant_axes(v);
         let mut p = [0f32; 3];
         for i in 0..3 {
-            let q = h4_quantize_pos(self.pos[i], bounds[2 * i], bounds[2 * i + 1], axis[i]) as f32;
+            let q = crate::quant_opt::h4_pos_code(self.pos[i], bounds[2 * i], bounds[2 * i + 1], axis[i]) as f32;
             let step = ext[i] / (1u64 << axis[i]) as f32;
             p[i] = bounds[2 * i] + q * step + step * 0.5;
         }
@@ -1447,7 +1453,7 @@ fn write_slot(w: &mut BitWriter, o: &H4PlacedObject, parent: i16, bounds: [f32; 
         w.index(o.h2a_bsp_ref.map(|x| x as u32), 2);
         for i in 0..3 { w.bits(axis[i], o.pos_q[i] as u64); }
     } else {
-        for i in 0..3 { w.bits(axis[i], h4_quantize_pos(o.pos[i], bounds[2 * i], bounds[2 * i + 1], axis[i]) as u64); }
+        for i in 0..3 { w.bits(axis[i], crate::quant_opt::h4_pos_code(o.pos[i], bounds[2 * i], bounds[2 * i + 1], axis[i]) as u64); }
     }
     w.flag(o.up_is_global);
     if !o.up_is_global { w.bits(20, o.up_quant as u64); }

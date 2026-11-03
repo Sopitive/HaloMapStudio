@@ -1,0 +1,455 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map variant viewer — Halo Map Studio</title>
+<meta name="description" content="Open a Halo map variant (.mvar) in your browser: header, quotas, bounds and a sortable, filterable table of every placed object, with CSV and JSON export. Runs entirely locally; nothing is uploaded.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html" class="cur" aria-current="page">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Map variant viewer -->
+<!-- desc: Open a Halo map variant (.mvar) in your browser: header, quotas, bounds and a sortable, filterable table of every placed object, with CSV and JSON export. Runs entirely locally; nothing is uploaded. -->
+<h1>Map variant viewer</h1>
+<p class="lead">Open a Halo map variant (<code>.mvar</code>) and read what is in it: who made it, which map it is for, its bounds and budget, and every placed object with its position, rotation, team, label and physics. Reach, Halo 3, Halo 4 and Halo 2 Anniversary variants are supported. <strong>Everything runs in your browser. The file is never uploaded</strong>, and this page loads no external script, font or service.</p>
+
+<style>
+.mv-drop { display: block; border: 2px dashed var(--line); border-radius: 10px; padding: 1.2rem; text-align: center; background: var(--panel); cursor: pointer; }
+.mv-drop.over, .mv-drop:focus-within { border-color: var(--accent); background: var(--accent-2); }
+.mv-drop input { max-width: 100%; }
+.mv-err { background: var(--danger-bg); border-left: 4px solid var(--danger-line); padding: .6rem 1rem; border-radius: 6px; margin: 1rem 0; }
+.mv-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: .9rem; margin: 1rem 0; }
+.mv-meta dl { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: .7rem 1rem; }
+.mv-meta dt { font-size: .8rem; color: var(--muted); margin-top: .35rem; }
+.mv-meta dd { margin: 0; overflow-wrap: anywhere; }
+.mv-meta h3 { margin: 0 0 .2rem; font-size: 1rem; }
+.mv-filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .6rem; margin: .6rem 0; align-items: end; }
+.mv-filters label { display: block; font-size: .8rem; color: var(--muted); }
+.mv-filters input, .mv-filters select { width: 100%; font: inherit; padding: .3rem .4rem; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.mv-box { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .4rem; margin: .4rem 0; }
+.mv-box input { width: 100%; font: inherit; padding: .3rem .4rem; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.mv-btn { font: inherit; padding: .4rem .9rem; border-radius: 8px; border: 1px solid var(--line); background: var(--accent-2); color: var(--accent); cursor: pointer; font-weight: 600; margin: 0 .4rem .4rem 0; }
+.mv-btn:hover, .mv-btn:focus-visible { border-color: var(--accent); }
+.mv-btn[disabled] { opacity: .5; cursor: default; }
+#mv-objs th button { all: unset; cursor: pointer; font-weight: 600; display: block; width: 100%; }
+#mv-objs th button:focus-visible { outline: 2px solid var(--accent); }
+#mv-objs th[aria-sort="ascending"] button::after { content: " \25B2"; font-size: .7em; }
+#mv-objs th[aria-sort="descending"] button::after { content: " \25BC"; font-size: .7em; }
+#mv-objs td.num, #mv-objs th.num { text-align: right; font-variant-numeric: tabular-nums; }
+#mv-objs { font-size: .88rem; }
+.mv-scroll { max-height: 70vh; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+.mv-scroll table { margin: 0; }
+.mv-scroll thead th { position: sticky; top: 0; z-index: 1; }
+.mv-types td button { all: unset; cursor: pointer; color: var(--accent); text-decoration: underline; }
+.mv-types td button:focus-visible { outline: 2px solid var(--accent); }
+/* selecting a row must never move the page under the cursor (it broke double-click on narrow screens) */
+body { overflow-anchor: none; }
+#mv-stage { position: relative; width: 100%; height: 480px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); overflow: hidden; --mvr-grid: rgba(128,128,128,.28); --mvr-edge: rgba(128,128,128,.85); --mvr-bg2: rgba(128,128,128,.10); --mvr-select: #ffb400; --mvr-hover: #ffffff; --mvr-dim: #808080; }
+#mv-stage canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: block; }
+#mv-gl { visibility: hidden; }
+#mv-map { cursor: grab; touch-action: none; outline: none; }
+#mv-map:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+@media (prefers-color-scheme: light) { #mv-stage { --mvr-hover: #111111; --mvr-select: #d97700; } }
+.mv-bar { display: flex; flex-wrap: wrap; gap: .4rem .8rem; align-items: center; margin: .3rem 0 .6rem; }
+.mv-bar label { font-size: .85rem; color: var(--muted); }
+.mv-bar select { font: inherit; padding: .25rem .4rem; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.mv-btn[aria-pressed="true"] { background: var(--accent); color: #fff; }
+.mv-mapdrop.over { outline: 2px dashed var(--accent); outline-offset: 4px; }
+#mv-objs tbody tr { cursor: pointer; }
+#mv-objs tbody tr.mv-sel td { background: var(--accent-2); box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); font-weight: 600; }
+@media (max-width: 600px) { #mv-stage { height: 340px; } }
+@media (max-width: 600px) { .mv-box { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+</style>
+
+<label class="mv-drop" id="mv-drop" for="mv-file">
+  <strong>Choose a .mvar file</strong> or drop one here<br>
+  <input type="file" id="mv-file" accept=".mvar,application/octet-stream">
+</label>
+<p class="small" id="mv-hint">Nothing is uploaded: the file is read by this page in your browser only. This page works from the project site and when you open the saved <code>mvar-viewer.html</code> from disk (keep it next to its <code>js</code> folder).</p>
+<div id="mv-err" class="mv-err" role="alert" hidden></div>
+
+<div id="mv-out" hidden>
+  <div class="mv-meta" id="mv-meta"></div>
+  <div id="mv-warn" class="warn" hidden></div>
+
+  <h2 id="palette">Names (optional)</h2>
+  <p>Objects are stored by palette <em>index</em>; the names belong to the game, so this page does not contain them. Load a palette JSON made by Halo Map Studio (<code>variant get palette-json</code>, see <a href="mvar-js.html#palette">the API page</a>) to see names.</p>
+  <p><label>Palette JSON: <input type="file" id="mv-pal" accept=".json,application/json"></label> <span id="mv-palstate" class="small" role="status"></span></p>
+
+  <h2 id="types">Objects by type</h2>
+  <div class="tablewrap"><table class="mv-types" id="mv-types"><thead><tr><th>Palette index</th><th>Name</th><th>Count</th><th>Quota min / max / placed</th></tr></thead><tbody></tbody></table></div>
+
+  <h2 id="map">Map</h2>
+  <div class="mv-mapdrop" id="mv-mapdrop">
+    <div class="mv-bar">
+      <button class="mv-btn" id="mv-m-top" type="button" aria-pressed="true">Top view</button>
+      <button class="mv-btn" id="mv-m-3d" type="button" aria-pressed="false">3D view</button>
+      <button class="mv-btn" id="mv-p-front" type="button">Front</button><button class="mv-btn" id="mv-p-side" type="button">Side</button><button class="mv-btn" id="mv-p-iso" type="button">Isometric</button>
+      <label>Colour by <select id="mv-colorby"><option value="auto">automatic</option><option value="material">material colour / texture (pack)</option><option value="category">category (pack)</option><option value="team">team</option><option value="physics">physics</option></select></label>
+      <button class="mv-btn" id="mv-reset" type="button">Whole map</button>
+      <button class="mv-btn" id="mv-fit" type="button">Zoom to objects</button>
+      <button class="mv-btn" id="mv-focus" type="button" title="F">Focus selection</button>
+      <label><input type="checkbox" id="mv-trans" checked> Transparency</label>
+      <label><input type="checkbox" id="mv-shields" checked> Shields / glass</label>
+      <label title="Show objects the filters hide as faded grey silhouettes"><input type="checkbox" id="mv-ghost" checked> Faded filtered-out</label>
+      <label>Fly speed <input id="mv-speed" type="range" min="-2" max="2" step="0.05" value="0" style="width:90px;vertical-align:middle"></label>
+      <button class="mv-btn" id="mv-help" type="button" aria-pressed="false" title="?">? Controls</button>
+      <span class="small" id="mv-maphint">Drag to pan or orbit, wheel to zoom at the cursor, click to select, double-click to frame. Click the map and press ? for every control.</span>
+    </div>
+    <div id="mv-stage"><canvas id="mv-gl" aria-hidden="true"></canvas><canvas id="mv-map" role="img" tabindex="0" aria-label="Map view of the variant's objects. Press ? for the controls."></canvas></div>
+    <p class="small" id="mv-mapstat" role="status"></p>
+    <p><label>Render pack (optional): <input type="file" id="mv-pack" accept=".json,application/json"></label> <span id="mv-packstate" class="small" role="status"></span></p>
+    <details><summary>What is a render pack, and how do I make one?</summary>
+      <p>Without a pack this view draws the map bounds, a grid and one marker per object at its real position and rotation, coloured by team or physics. A <strong>render pack</strong> adds, per object type, a simplified mesh (400 triangles at most) with a basic colour, transparency mode and a tiny texture per part, so glass and shield doors are see-through, plus a coarse 128&times;128 height shading of the level. It stays under 2.5 MB and holds no level triangles, no full models and no full-size textures.</p>
+      <p>The pack is generated <strong>on your own computer from your own installed game</strong> with Halo Map Studio, and loaded here from disk (the page never uploads it). It is derived from game data, so keep it for yourself and do not redistribute it or put it on a web site. For a Reach or Halo 4 variant:</p>
+      <pre><code>hms-app --exec $'loadvariant /path/to/my_map.mvar\nvariant get render-pack my_map.pack.json'</code></pre>
+      <p>A pack is per base map: one pack serves every variant on that map. This page refuses a pack for a different map and says which ids differ.</p>
+    </details>
+  </div>
+
+  <h2 id="objects">Objects</h2>
+  <div class="mv-filters">
+    <div><label for="f-type">Palette index or name contains</label><input id="f-type" type="text" placeholder="e.g. 12 or block"></div>
+    <div><label for="f-label">Label contains</label><input id="f-label" type="text"></div>
+    <div><label for="f-team">Team</label><select id="f-team"><option value="">any</option></select></div>
+    <div><label for="f-phys">Physics</label><select id="f-phys"><option value="">any</option></select></div>
+  </div>
+  <fieldset style="border:1px solid var(--line);border-radius:8px;margin:.4rem 0;padding:.4rem .7rem"><legend class="small">Box filter (world units; leave blank for no limit)</legend>
+    <div class="mv-box">
+      <input id="f-xmin" aria-label="x min" placeholder="x min" inputmode="decimal"><input id="f-xmax" aria-label="x max" placeholder="x max" inputmode="decimal">
+      <input id="f-ymin" aria-label="y min" placeholder="y min" inputmode="decimal"><input id="f-ymax" aria-label="y max" placeholder="y max" inputmode="decimal">
+      <input id="f-zmin" aria-label="z min" placeholder="z min" inputmode="decimal"><input id="f-zmax" aria-label="z max" placeholder="z max" inputmode="decimal">
+    </div>
+  </fieldset>
+  <p><button class="mv-btn" id="mv-clear" type="button">Clear filters</button>
+     <button class="mv-btn" id="mv-csv" type="button">Download CSV (shown rows)</button>
+     <button class="mv-btn" id="mv-json" type="button">Download JSON (whole variant)</button>
+     <span id="mv-count" class="small" role="status"></span></p>
+  <div class="mv-scroll"><table id="mv-objs"><thead><tr id="mv-head"></tr></thead><tbody></tbody></table></div>
+
+  <details style="margin-top:1rem"><summary>Quota table</summary>
+    <div class="tablewrap"><table id="mv-quotas"><thead><tr><th>Index</th><th>Name</th><th>Min</th><th>Max</th><th>Placed</th></tr></thead><tbody></tbody></table></div>
+  </details>
+  <details style="margin-top:.6rem"><summary>Forge labels</summary><ul id="mv-labels"></ul></details>
+</div>
+
+<h2>Notes</h2>
+<ul>
+  <li>This page is read-only: it decodes, it never writes or edits a variant. To edit, use Halo Map Studio.</li>
+  <li>Rotations are shown as yaw / pitch / roll in degrees, derived from the stored forward and up vectors (<a href="mvar-js.html#rotation">how</a>). Halo 3 variants have no spawn-sequence or physics field that HMS decodes, so those columns stay empty for Halo 3.</li>
+  <li>The decoder is <a href="mvar-js.html"><code>hms-mvar.js</code></a> (this page loads its generated plain-script build, <code>hms-mvar.classic.js</code>, and the map renderer <a href="mvar-js.html#render"><code>hms-render.js</code></a>, <code>hms-camera.js</code> and <code>hms-gl.js</code>), a port of Halo Map Studio&rsquo;s own Rust decoders, tested field by field against them. Same licence as Halo Map Studio (PolyForm Noncommercial 1.0.0; <a href="license.html">commercial licence</a> for commercial use).</li>
+</ul>
+
+<script src="js/hms-mvar.classic.js"></script>
+<script src="js/hms-camera.js"></script>
+<script src="js/hms-gl.js"></script>
+<script src="js/hms-render.js"></script>
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var Mvar = null, parsed = null, rows = [], sortKey = 'index', sortDir = 1, palette = null;
+  var view = null, pack = null, selectedIndex = null;
+  var COLS = [
+    ['index', '#', true], ['paletteIndex', 'Palette', true], ['name', 'Name'], ['variantIndex', 'Var', true],
+    ['x', 'x', true], ['y', 'y', true], ['z', 'z', true], ['yaw', 'yaw', true], ['pitch', 'pitch', true], ['roll', 'roll', true],
+    ['team', 'Team', true], ['label', 'Label'], ['physics', 'Physics'], ['spawnSequence', 'Seq', true], ['respawnTime', 'Respawn', true], ['objectType', 'Type', true]
+  ];
+  function val(o, k) {
+    if (k === 'physics') return o.placement ? o.placement.physics : null;
+    if (k === 'label') return o.labels && o.labels.length ? o.labels.join(', ') : o.label;
+    return o[k];
+  }
+  function fmt(v, k) {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'number') return (k === 'x' || k === 'y' || k === 'z') ? v.toFixed(3) : (k === 'yaw' || k === 'pitch' || k === 'roll') ? v.toFixed(1) : String(v);
+    return String(v);
+  }
+  function show(msg) { var e = $('mv-err'); e.textContent = msg; e.hidden = !msg; }
+  function el(tag, text, cls) { var e = document.createElement(tag); if (text !== undefined && text !== null) e.textContent = text; if (cls) e.className = cls; return e; }
+
+  function meta(title, pairs) {
+    var d = el('dl'); d.appendChild(el('h3', title));
+    pairs.forEach(function (p) { if (p[1] === null || p[1] === undefined || p[1] === '') return; d.appendChild(el('dt', p[0])); d.appendChild(el('dd', String(p[1]))); });
+    return d;
+  }
+  function stamp(s) { return s ? (s.date || s.timestamp) + (s.xuid && s.xuid !== '0000000000000000' ? '  (xuid ' + s.xuid + ')' : '') : null; }
+
+  function renderMeta() {
+    var p = parsed, h = p.header, m = p.map, b = p.bounds, box = $('mv-meta');
+    box.textContent = '';
+    box.appendChild(meta('Variant', [
+      ['Game', ({ reach: 'Halo: Reach', halo3: 'Halo 3', halo4: 'Halo 4', h2a: 'Halo 2 Anniversary' })[p.game]],
+      ['Title', h.title + (h.titleIsKey ? '  (localisation key)' : '')], ['Description', h.description], ['Created by', h.author], ['Created', stamp(h.created)],
+      ['Modified by', h.editor], ['Modified', stamp(h.modified)], ['Category index', h.category]
+    ]));
+    box.appendChild(meta('Map', [
+      ['Map id', m.mapId + (m.unassignedMapId ? '  (no numeric id: a custom/workshop map)' : '')], ['MCC map GUID', m.mccMapId],
+      ['Palette CRC', m.paletteCrc], ['Body version', m.version], ['Placed objects', p.objects.length],
+      ['Budget', p.budget.spent + ' of ' + p.budget.max + ' spent'],
+      ['Bounds', 'x ' + b.xMin.toFixed(2) + '..' + b.xMax.toFixed(2) + '  y ' + b.yMin.toFixed(2) + '..' + b.yMax.toFixed(2) + '  z ' + b.zMin.toFixed(2) + '..' + b.zMax.toFixed(2)]
+    ]));
+    box.appendChild(meta('File', [
+      ['BLF mvar chunk version', p.blf.mvarMajor], ['Stored chunk size', p.blf.chunkLength], ['SHA-1', p.blf.hashKind === null ? (p.blf.hashOk === null ? null : 'does not match') : 'matches (' + p.blf.hashKind + ')'],
+      ['Signature chunk', p.blf.hasFsm ? 'present' : 'absent'], ['Uncompressed from _cmp', p.blf.compressed ? 'yes' : null]
+    ]));
+    var w = $('mv-warn'); w.textContent = '';
+    if (p.warnings.length) { p.warnings.forEach(function (t) { w.appendChild(el('p', t)); }); w.hidden = false; } else w.hidden = true;
+  }
+
+  function nameOf(i) { var o = parsed.quotas[i]; return o && o.name ? o.name : ''; }
+  function renderTypes() {
+    var counts = Mvar.countBy(parsed.objects, 'paletteIndex'), tb = $('mv-types').tBodies[0];
+    tb.textContent = '';
+    Object.keys(counts).sort(function (a, b) { return counts[b] - counts[a] || (+a) - (+b); }).forEach(function (k) {
+      var q = parsed.quotas[+k], tr = el('tr'), td = el('td'), b = el('button', k);
+      b.type = 'button'; b.addEventListener('click', function () { $('f-type').value = k; applyFilters(); $('objects').scrollIntoView(); });
+      td.appendChild(b); tr.appendChild(td);
+      tr.appendChild(el('td', q && q.name ? q.name : (k === 'null' ? '(none)' : '')));
+      tr.appendChild(el('td', counts[k])); tr.appendChild(el('td', q ? q.min + ' / ' + q.max + ' / ' + q.placed : ''));
+      tb.appendChild(tr);
+    });
+    var qt = $('mv-quotas').tBodies[0]; qt.textContent = '';
+    parsed.quotas.forEach(function (q) { var tr = el('tr'); [q.index, q.name || '', q.min, q.max, q.placed].forEach(function (v) { tr.appendChild(el('td', v)); }); qt.appendChild(tr); });
+    var ul = $('mv-labels'); ul.textContent = '';
+    parsed.labels.forEach(function (l, i) { ul.appendChild(el('li', i + ': ' + l)); });
+    if (!parsed.labels.length) ul.appendChild(el('li', '(none)'));
+  }
+  function fillSelect(id, values) {
+    var s = $(id), keep = s.value; while (s.options.length > 1) s.remove(1);
+    values.forEach(function (v) { var o = el('option', v === null ? '(none)' : String(v)); o.value = v === null ? '__null' : String(v); s.appendChild(o); });
+    s.value = keep && Array.prototype.some.call(s.options, function (o) { return o.value === keep; }) ? keep : '';
+  }
+  function num(id) { var v = $(id).value.trim(); return v === '' ? null : Number(v); }
+
+  function applyFilters() {
+    if (!parsed) return;
+    var f = {}, t = $('f-type').value.trim(), l = $('f-label').value.trim(), tm = $('f-team').value, ph = $('f-phys').value;
+    var mn = [num('f-xmin'), num('f-ymin'), num('f-zmin')], mx = [num('f-xmax'), num('f-ymax'), num('f-zmax')];
+    var any = mn.concat(mx).some(function (v) { return v !== null; });
+    if (any) f.box = { min: mn.map(function (v) { return v === null ? -Infinity : v; }), max: mx.map(function (v) { return v === null ? Infinity : v; }) };
+    if (l) f.label = l;
+    if (tm) f.team = tm === '__null' ? null : Number(tm);
+    if (ph) f.physics = ph;
+    var res = Mvar.filterObjects(parsed, f);
+    if (t) {
+      var tl = t.toLowerCase(), isNum = /^\d+$/.test(t);
+      res = res.filter(function (o) { return (isNum && String(o.paletteIndex) === t) || (o.name && o.name.toLowerCase().indexOf(tl) >= 0); });
+    }
+    rows = res;
+    renderRows();
+  }
+  function renderRows() {
+    var k = sortKey, d = sortDir;
+    var sorted = rows.slice().sort(function (a, b) {
+      var x = val(a, k), y = val(b, k);
+      if (x === null || x === undefined || x === '') return (y === null || y === undefined || y === '') ? 0 : 1;
+      if (y === null || y === undefined || y === '') return -1;
+      return (typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y))) * d;
+    });
+    var tb = $('mv-objs').tBodies[0]; tb.textContent = '';
+    var frag = document.createDocumentFragment();
+    sorted.forEach(function (o) {
+      var tr = el('tr');
+      tr.setAttribute('data-index', String(o.index));
+      if (o.index === selectedIndex) tr.className = 'mv-sel';
+      COLS.forEach(function (c) { tr.appendChild(el('td', fmt(val(o, c[0]), c[0]), c[2] ? 'num' : '')); });
+      frag.appendChild(tr);
+    });
+    tb.appendChild(frag);
+    $('mv-count').textContent = 'Showing ' + rows.length + ' of ' + parsed.objects.length + ' objects';
+    if (view) view.setVisible(rows.map(function (o) { return o.index; }));
+    var ths = $('mv-head').children;
+    for (var i = 0; i < COLS.length; i++) ths[i].setAttribute('aria-sort', COLS[i][0] === k ? (d > 0 ? 'ascending' : 'descending') : 'none');
+  }
+  function buildHead() {
+    var tr = $('mv-head'); tr.textContent = '';
+    COLS.forEach(function (c) {
+      var th = el('th', null, c[2] ? 'num' : ''), b = el('button', c[1]);
+      b.type = 'button'; th.setAttribute('aria-sort', 'none'); th.setAttribute('data-key', c[0]);
+      b.addEventListener('click', function () { if (sortKey === c[0]) sortDir = -sortDir; else { sortKey = c[0]; sortDir = 1; } renderRows(); });
+      th.appendChild(b); tr.appendChild(th);
+    });
+  }
+
+  function load(parsedNew) {
+    parsed = parsedNew; palette = null;
+    $('mv-palstate').textContent = '';
+    $('mv-out').hidden = false;
+    var teams = [], phys = [];
+    parsed.objects.forEach(function (o) { if (teams.indexOf(o.team) < 0) teams.push(o.team); var p = o.placement && o.placement.physics; if (p && phys.indexOf(p) < 0) phys.push(p); });
+    teams.sort(function (a, b) { return (a === null) - (b === null) || a - b; });
+    fillSelect('f-team', teams); fillSelect('f-phys', phys.sort());
+    selectedIndex = null;
+    if (view) { view.setVariant(parsed); }
+    if (pack) { var chk = HmsRender.math.checkPack(pack, parsed); if (chk.ok) view.setPack(pack); else { view.setPack(null); packMsg(chk.message + ' The pack was removed.', true); pack = null; } }
+    renderMeta(); renderTypes(); applyFilters();
+    showStat();
+  }
+  function handleFile(file) {
+    show('');
+    if (!file) return;
+    Mvar.parseFile(file).then(load, function (e) {
+      $('mv-out').hidden = true; parsed = null;
+      show((e && e.code ? '[' + e.code + '] ' : '') + (e && e.message ? e.message : String(e)));
+    });
+  }
+  function packMsg(t, bad) { var e = $('mv-packstate'); e.textContent = t; e.style.color = bad ? 'var(--danger-line)' : ''; }
+  function showStat() {
+    if (!view) return;
+    var s = view.state();
+    $('mv-mapstat').textContent = (s.hasPack ? 'Render pack loaded: objects are drawn as boxes over the height shading.' : 'No render pack: markers at real positions and rotations over the map bounds.') + '  ' + (parsed ? parsed.objects.length + ' objects.' : '');
+  }
+  function describe(index) {
+    var o = parsed && parsed.objects[index]; if (!o) return '';
+    var bits = ['#' + o.index, o.name || ('palette ' + o.paletteIndex)];
+    if (o.labels && o.labels.length) bits.push(o.labels.join(', ')); else if (o.label) bits.push(o.label);
+    if (o.team !== null && o.team !== undefined) bits.push('team ' + o.team);
+    if (o.placement && o.placement.physics) bits.push(o.placement.physics);
+    return bits.join('  \u00B7  ');
+  }
+  function selectRow(index, scroll) {
+    selectedIndex = index;
+    var rowsEl = $('mv-objs').tBodies[0].rows;
+    for (var i = 0; i < rowsEl.length; i++) {
+      var on = index !== null && rowsEl[i].getAttribute('data-index') === String(index);
+      rowsEl[i].className = on ? 'mv-sel' : '';
+      if (on && scroll) {   // scroll the table's own box only: the page (and the map) must not jump
+        var sc = $('mv-objs').parentNode, r = rowsEl[i], hd = $('mv-head').offsetHeight;
+        if (r.offsetTop - hd < sc.scrollTop) sc.scrollTop = Math.max(0, r.offsetTop - hd - 4);
+        else if (r.offsetTop + r.offsetHeight > sc.scrollTop + sc.clientHeight) sc.scrollTop = r.offsetTop + r.offsetHeight - sc.clientHeight + 4;
+      }
+    }
+  }
+  function loadPack(file) {
+    if (!file) return;
+    file.text().then(function (t) {
+      var j; try { j = JSON.parse(t); } catch (x) { packMsg('That file is not valid JSON.', true); return; }
+      var chk = HmsRender.math.checkPack(j, parsed);
+      if (!chk.ok) { packMsg(chk.message, true); return; }
+      try { HmsRender.math.decodeGrid(j.grid); } catch (x) { packMsg(String(x.message || x), true); return; }
+      pack = j;
+      if (view) view.setPack(pack);
+      if (parsed && !parsed.paletteApplied && Array.isArray(pack.palette)) {
+        var names = []; pack.palette.forEach(function (p) { names[p.i] = p.name; });
+        Mvar.withPalette(parsed, { game: pack.game, mapId: pack.mapId, names: names });
+        renderTypes(); applyFilters();
+      }
+      packMsg('Render pack loaded' + (parsed ? '' : ' (open a variant to see it)') + '. ' + chk.message, false);
+      showStat();
+    }, function () { packMsg('Could not read that file.', true); });
+  }
+  function wireMap() {
+    var pressed = function (m) { $('mv-m-top').setAttribute('aria-pressed', String(m === 'top')); $('mv-m-3d').setAttribute('aria-pressed', String(m === '3d')); };
+    view = HmsRender.create($('mv-map'), { glCanvas: /[?&]nogl\b/.test(location.search) ? null : $('mv-gl'), describe: describe, onSelect: function (i) { selectRow(i, true); }, onMode: pressed });
+    window.__mvarView = view;
+    var setMode = function (m) { view.setMode(m); pressed(m); };
+    $('mv-m-top').addEventListener('click', function () { setMode('top'); });
+    $('mv-m-3d').addEventListener('click', function () { setMode('3d'); });
+    ['front', 'side', 'iso'].forEach(function (n) { $('mv-p-' + n).addEventListener('click', function () { view.preset(n); pressed('3d'); }); });
+    $('mv-trans').addEventListener('change', function (e) { view.setTransparency(e.target.checked); });
+    $('mv-ghost').addEventListener('change', function (e) { view.setGhost(e.target.checked); });
+    $('mv-shields').addEventListener('change', function (e) { view.setHideCats(e.target.checked ? [] : ['shield', 'glass', 'glow']); });
+    $('mv-focus').addEventListener('click', function () { view.focus(); });
+    $('mv-help').addEventListener('click', function () { var on = !view.state().help; view.setHelp(on); $('mv-help').setAttribute('aria-pressed', String(on)); });
+    var sp = $('mv-speed'); sp.value = String(Math.log(view.getSpeed()) / Math.LN10);
+    sp.addEventListener('input', function () { view.setSpeed(Math.pow(10, Number(sp.value))); });
+    $('mv-reset').addEventListener('click', function () { view.reset(); });
+    $('mv-fit').addEventListener('click', function () { view.fitObjects(); });
+    $('mv-colorby').addEventListener('change', function (e) { view.setColorBy(e.target.value); });
+    $('mv-pack').addEventListener('change', function (e) { loadPack(e.target.files[0]); });
+    var md = $('mv-mapdrop');
+    ['dragenter', 'dragover'].forEach(function (n) { md.addEventListener(n, function (e) { e.preventDefault(); md.classList.add('over'); }); });
+    ['dragleave', 'drop'].forEach(function (n) { md.addEventListener(n, function (e) { e.preventDefault(); md.classList.remove('over'); }); });
+    md.addEventListener('drop', function (e) { var f = e.dataTransfer && e.dataTransfer.files[0]; if (f) loadPack(f); });
+    $('mv-objs').tBodies[0].addEventListener('click', function (e) {
+      var tr = e.target.closest ? e.target.closest('tr') : null; if (!tr) return;
+      var idx = Number(tr.getAttribute('data-index'));
+      selectRow(idx, false); view.setSelection(idx);
+    });
+  }
+  function download(name, text, type) {
+    var blob = new Blob([text], { type: type }), a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+  }
+  function base() { var f = $('mv-file').files[0]; return f ? f.name.replace(/\.mvar$/i, '') : 'variant'; }
+
+  function wire() {
+    $('mv-file').addEventListener('change', function (e) { handleFile(e.target.files[0]); });
+    var drop = $('mv-drop');
+    ['dragenter', 'dragover'].forEach(function (n) { drop.addEventListener(n, function (e) { e.preventDefault(); drop.classList.add('over'); }); });
+    ['dragleave', 'drop'].forEach(function (n) { drop.addEventListener(n, function (e) { e.preventDefault(); drop.classList.remove('over'); }); });
+    drop.addEventListener('drop', function (e) { var f = e.dataTransfer && e.dataTransfer.files[0]; if (f) handleFile(f); });
+    ['f-type', 'f-label', 'f-xmin', 'f-xmax', 'f-ymin', 'f-ymax', 'f-zmin', 'f-zmax'].forEach(function (id) { $(id).addEventListener('input', applyFilters); });
+    ['f-team', 'f-phys'].forEach(function (id) { $(id).addEventListener('change', applyFilters); });
+    $('mv-clear').addEventListener('click', function () {
+      ['f-type', 'f-label', 'f-xmin', 'f-xmax', 'f-ymin', 'f-ymax', 'f-zmin', 'f-zmax'].forEach(function (id) { $(id).value = ''; });
+      $('f-team').value = ''; $('f-phys').value = ''; applyFilters();
+    });
+    $('mv-csv').addEventListener('click', function () { if (parsed) download(base() + '-objects.csv', Mvar.toCSV(rows), 'text/csv'); });
+    $('mv-json').addEventListener('click', function () { if (parsed) download(base() + '.json', Mvar.toJSON(parsed, 2), 'application/json'); });
+    $('mv-pal').addEventListener('change', function (e) {
+      var f = e.target.files[0]; if (!f || !parsed) { $('mv-palstate').textContent = f ? 'Open a variant first.' : ''; return; }
+      f.text().then(function (t) {
+        var before = parsed.warnings.length, j;
+        try { j = JSON.parse(t); } catch (x) { $('mv-palstate').textContent = 'That is not valid JSON.'; return; }
+        parsed.paletteApplied = false;
+        Mvar.withPalette(parsed, j);
+        $('mv-palstate').textContent = parsed.paletteApplied ? 'Names applied.' : (parsed.warnings[parsed.warnings.length - 1] || 'No names applied.');
+        renderMeta(); renderTypes(); applyFilters();
+      });
+    });
+    buildHead();
+    if (window.HmsRender) wireMap();
+  }
+
+  if (window.HmsMvar && window.HmsRender && window.HmsCamera) {
+    Mvar = window.HmsMvar; wire(); $('mv-file').disabled = false;
+    window.__mvarViewerReady = true;
+  } else {
+    $('mv-file').disabled = true;
+    show('The decoder scripts js/hms-mvar.classic.js, js/hms-camera.js, js/hms-gl.js and js/hms-render.js did not all load. It has to sit in the js folder next to this page (keep the docs folder together if you saved it), and a browser extension or content blocker must not block it.');
+  }
+})();
+</script>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

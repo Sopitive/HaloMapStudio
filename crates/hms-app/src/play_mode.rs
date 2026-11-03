@@ -448,6 +448,28 @@ pub struct VehicleFire {
     pub held: bool,
 }
 
+/// #fp-legs-down  How far the first-person legs slide FORWARD as the player looks down, world units
+/// (so the eye ends up behind the hips).
+///
+/// The first-person body is legs and hips with an OPEN top that ends 0.14 wu below the eye
+/// (`the_first_person_body_never_reaches_the_eye_it_is_seen_from`). Looking straight down the eye
+/// sits above that opening, so the viewer saw into the inside of the hips ("I can see into my
+/// torso when I look down"). Sliding the body forward puts the
+/// opening ahead of and below the eye, outside the downward view, which is what a player looking
+/// at their own feet sees. Nothing happens above 20 degrees of downward pitch, and the full
+/// `LEGS_BACK_WU` is reached at 80 degrees. INFERRED, not RE'd: the engine's own rule for this
+/// (a pitch-driven offset in the first-person graph, a near clip, or a hidden region) was not
+/// found; the amount is the body's authored hip radius order of magnitude, chosen by measurement.
+pub const LEGS_BACK_WU: f32 = 0.30;
+
+pub fn fp_legs_look_down_shift(facing: f32, pitch: f32) -> Vec3 {
+    let down = (-pitch).to_degrees();
+    let k = ((down - 20.0) / 60.0).clamp(0.0, 1.0);
+    let back = k * k * (3.0 - 2.0 * k) * LEGS_BACK_WU;
+    // The LEGS move forward, which puts the eye behind the hips.
+    Vec3::new(facing.cos() * back, facing.sin() * back, 0.0)
+}
+
 /// A live test-mode session.
 pub struct PlayMode {
     pub phys: PlayerPhysics,
@@ -475,6 +497,11 @@ pub struct PlayMode {
     /// reaches 0%. So it poses off the body's locomotion clip, at the player's feet, and the
     /// third-person biped is parked while it is drawn.
     pub fp_body: Option<u32>,
+    /// #fp-colour  The player's armour colours (primary, secondary), linear RGB, or `None` for the models'
+    /// own authored defaults. ONE value for every actor that is the player: the third-person body,
+    /// the first-person arms and the first-person legs, so they cannot disagree
+    /// (see [`PlayMode::dress`]).
+    pub skin: Option<[[f32; 3]; 2]>,
     /// `(hands render model, first-person graph)` for the arms rig, when one resolved.
     fp_rig: Option<(u32, Option<u32>)>,
     /// #play-rate  The locomotion cycle's phase, in CYCLES, wrapped to `[0, 1)`.
@@ -853,6 +880,7 @@ impl PlayMode {
             body: None,
             fp: Vec::new(),
             fp_body: None,
+            skin: None,
             fp_rig: None,
             cycle: 0.0,
             cycle_distance: 0.0,
@@ -2151,6 +2179,7 @@ impl PlayMode {
         self.frames += 1;
         self.clock += dt.clamp(0.0, 0.1);
         self.last_input = *input;
+        self.dress(actors);
         // #vehicle-dup  While riding, count the copies of the ridden vehicle in the set the
         // renderer was actually given. One pass over the objects, and only while riding.
         self.dup_report = match &self.riding {
@@ -2909,7 +2938,7 @@ impl PlayMode {
                     a.base_blend = mix;
                     a.yaw = yaw;
                     a.pitch = 0.0;
-                    a.pos = if fp_body_drawn { self.st.pos } else { PARK };
+                    a.pos = if fp_body_drawn { self.st.pos + fp_legs_look_down_shift(self.st.facing, self.st.pitch) } else { PARK };
                 }
             }
         }
@@ -3127,6 +3156,23 @@ impl PlayMode {
         }
         let p = self.foot_pose();
         (p.eye, p.yaw, p.pitch)
+    }
+
+    /// #fp-colour  Put the player's colours on every actor that is the player. The arms, the legs and
+    /// the third-person body are three different render models, each with its own authored default
+    /// colours (a black glove under a grey body), so leaving the colour to the models made the arms
+    /// disagree with the unit they belong to. One `skin` goes through the same `four_change_color`
+    /// masks on all three. Cheap when nothing changed; marks the scene for rebuild when it did.
+    pub fn dress(&self, actors: &mut ActorScene) {
+        let ids: Vec<u32> = self.body.into_iter().chain(self.fp.iter().copied()).chain(self.fp_body).collect();
+        for id in ids {
+            if let Some(a) = actors.get_mut(id) {
+                if a.skin != self.skin {
+                    a.skin = self.skin;
+                    actors.rebuild = true;
+                }
+            }
+        }
     }
 
     /// Take every actor test mode created out of the scene. Leaving must not leave a Spartan
@@ -4591,6 +4637,223 @@ mod map_gates {
             "both species jump at {:.4} wu/s: the impulse is not being read per biped",
             vels[0].1
         );
+    }
+
+    /// #melee-strike  **THE SWING'S AUTHORED STRIKE FRAME LANDS WHERE THE RECORDED HITS DO.** The
+    /// engine takes the blow's tick from the melee clip's own damage keyframe
+    /// (`unit_action_melee_player_next_animation`, halo3_tag_test.xex 0x829BF118:
+    /// `find_first_key_of_type` then `game_seconds_to_ticks_round(frame / 30 s)`, i.e. 2 ticks a
+    /// frame). The recordings' melee damage lands 8-10 ticks after the swing event in 11 of 14
+    /// cases. Every melee clip in both shipped graphs that states a keyframe must put it inside
+    /// 6..=12 ticks (frame 3..=6) -- so a swing started on the recorded event and played from its
+    /// first frame strikes when the recording says it did, with nothing to shift. (Reach's enum
+    /// numbers the damage key 1, not the prototype's 0: every one of the 47 clips that state one
+    /// states exactly this type, which is the evidence for the identification.)
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn every_melee_clips_strike_frame_is_where_the_recorded_hits_land() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("play_mode map_gates SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let bipeds = ActorScene::list_bipeds(native, cache);
+        let (mut judged, mut early, mut late) = (0usize, Vec::new(), Vec::new());
+        for species in [Species::Spartan, Species::Elite] {
+            let Ok((bipd, _, _, _)) = resolve_species(native, cache, &bipeds, species) else { continue };
+            let Some(jmad) = crate::reach_actor::resolve_jmad(native, cache, bipd) else { continue };
+            let Some(g) = crate::reach_actor::AnimGraph::read(native, cache, jmad) else { continue };
+            for a in g.anims.iter().filter(|a| crate::film_anim::is_melee_clip(&a.name) && !a.name.contains("lunge") && !a.name.contains("dash")) {
+                let ev = crate::reach_actor::animation_frame_events(native, cache, jmad, a.index);
+                let Some(&(_, frame)) = ev.iter().find(|e| e.0 == 1) else { continue };
+                judged += 1;
+                let tick = frame as u32 * 2;
+                if tick < 6 { early.push((a.name.clone(), tick)); }
+                if tick > 12 { late.push((a.name.clone(), tick)); }
+            }
+        }
+        println!("{judged} strike clip(s) state a damage keyframe; early {early:?} late {late:?}");
+        assert!(judged >= 20, "only {judged} clips state a keyframe: the gate proves nothing");
+        assert!(early.is_empty() && late.is_empty(), "strike ticks outside 6..=12: early {early:?} late {late:?}");
+    }
+
+    /// #fp-colour  **THE ARMS AND LEGS WEAR THE COLOURS OF THE UNIT THEY BELONG TO.** Reported: the
+    /// first-person arms do not carry the colour of the player's third-person unit. They are
+    /// separate render models, each with its own authored default, and test mode never gave any of
+    /// them a colour. Gate: with a player colour set, after a few frames the third-person body, every
+    /// first-person arm/gun actor and the first-person legs all hold exactly that colour; changing
+    /// it changes all of them on the next frame (a respawn or armour change); and a weapon swap that
+    /// rebuilds the rig keeps it. Saboteur: drop the `dress` call from `tick`.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn the_arms_and_legs_wear_the_colour_of_the_third_person_unit() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("play_mode map_gates SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let mut checked = 0;
+        for species in [Species::Spartan, Species::Elite] {
+            let mut actors = ActorScene::default();
+            let Some((mut pm, scene)) = start(native, cache, &mut actors, species) else { continue };
+            let red = Some([[0.8, 0.05, 0.05], [0.6, 0.0, 0.0]]);
+            let blue = Some([[0.05, 0.05, 0.8], [0.0, 0.0, 0.6]]);
+            for want in [red, blue] {
+                pm.skin = want;
+                for _ in 0..3 {
+                    pm.tick(&hold(0.0, false), 1.0 / 60.0, native, cache, &scene, &[], &mut actors);
+                }
+                let body = pm.body.expect("a body");
+                assert_eq!(actors.get(body).unwrap().skin, want, "{}: body", species.label());
+                assert!(!pm.fp.is_empty(), "{}: no first-person arms mounted: the gate proves nothing", species.label());
+                for &id in &pm.fp {
+                    assert_eq!(actors.get(id).unwrap().skin, want, "{}: a first-person arm/gun actor", species.label());
+                }
+                if let Some(l) = pm.fp_body {
+                    assert_eq!(actors.get(l).unwrap().skin, want, "{}: first-person legs", species.label());
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 2, "only {checked} cases ran");
+    }
+
+    /// #fp-legs-down  **LOOKING DOWN, THE EYE LEAVES THE OPENING OF THE HIPS.** The first-person
+    /// body is legs and hips with an open top; with the eye above its middle, looking straight down
+    /// shows its inside. Measured here from the model's own `compression info` bounds (bind pose,
+    /// model space, +X forward): the body extends back to `x_min` behind its origin. At 85 degrees
+    /// of downward pitch the eye must sit BEHIND that (the opening is then in front of the eye), and
+    /// at level pitch the legs must not have moved at all.
+    /// Saboteur: `LEGS_BACK_WU = 0` -> the eye is still inside the hips at 85 degrees.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn looking_down_puts_the_eye_behind_the_first_person_hips() {
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("play_mode map_gates SKIPPED: no forge_halo cache");
+            return;
+        };
+        let native = &*native;
+        let bounds = |mode_tag: u32| -> Option<[f32; 4]> {
+            let h = native.tag_meta(cache, mode_tag, 0x64 + 0x10, 8)?;
+            let c = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+            let ptr = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+            if c == 0 || c >= 64 {
+                return None;
+            }
+            let b = native.tag_ptr_bytes(cache, ptr, c * 56)?;
+            let f = |o: usize| f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let mut r = [f32::MAX, f32::MIN, f32::MAX, f32::MIN];
+            for k in 0..c as usize {
+                r[0] = r[0].min(f(k * 56 + 4));
+                r[1] = r[1].max(f(k * 56 + 8));
+                r[2] = r[2].min(f(k * 56 + 12));
+                r[3] = r[3].max(f(k * 56 + 16));
+            }
+            Some(r)
+        };
+        let bounds_z = |mode_tag: u32| -> Option<f32> {
+            let h = native.tag_meta(cache, mode_tag, 0x64 + 0x10, 8)?;
+            let c = u32::from_le_bytes([h[0], h[1], h[2], h[3]]);
+            let ptr = u32::from_le_bytes([h[4], h[5], h[6], h[7]]);
+            let b = native.tag_ptr_bytes(cache, ptr, c * 56)?;
+            (0..c as usize).map(|k| f32::from_le_bytes([b[k * 56 + 24], b[k * 56 + 25], b[k * 56 + 26], b[k * 56 + 27]])).reduce(f32::max)
+        };
+        let bipeds = ActorScene::list_bipeds(native, cache);
+        let mut checked = 0;
+        for species in [Species::Spartan, Species::Elite] {
+            let Ok((unit, _, _, _)) = resolve_species(native, cache, &bipeds, species) else { continue };
+            let Some(rep) = crate::play_phys::PlayerPhysics::player_representations(native, cache).into_iter().find(|r| r.unit == unit) else { continue };
+            let Some(b) = bounds(rep.body) else { continue };
+            let Some(zb) = bounds_z(rep.body) else { continue };
+            let level = fp_legs_look_down_shift(0.0, 0.0);
+            let down = fp_legs_look_down_shift(0.0, -85f32.to_radians());
+            println!("   {}: body x {:+.3}..{:+.3}, y {:+.3}..{:+.3}, z top {:+.3} | shift at 85 deg down {:+.3} wu", species.label(), b[0], b[1], b[2], b[3], zb, down.x);
+            assert_eq!(level, Vec3::ZERO, "{}: the legs moved at level pitch", species.label());
+            // The eye is at x = -shift in the legs' frame. The nearest point of the body's top
+            // rim is its rearmost one (x_min); the eye is `headroom` above it.
+            let (phys_eye, _) = (player_physics_for(native, cache, &bipeds, species).map(|(_, p)| p.eye_standing).unwrap_or(0.6), 0);
+            let headroom = phys_eye - zb;
+            let eye_x = -down.x;
+            let reach = (b[0] - eye_x).max(0.0); // horizontal distance from eye to the rim, 0 when over it
+            let depression = headroom.atan2(reach).to_degrees(); // how far below the horizon the rim lies
+            let top_edge = 85.0 - 43.2 / 2.0; // the steepest-down view's upper edge, degrees below horizon
+            println!("      rim lies {depression:.1} deg below the horizon; the 85 deg view's upper edge is {top_edge:.1}");
+            assert!(depression < top_edge, "{}: the hips' opening ({depression:.1} deg down) is inside the view looking 85 deg down (edge {top_edge:.1})", species.label());
+            checked += 1;
+        }
+        assert!(checked >= 1, "no species resolved");
+    }
+
+    /// #play-exit  **LEAVING TEST MODE LEAVES NOTHING OF IT BEHIND.** A bystander actor (standing
+    /// in for an open Theater film, which must survive) is in the scene before test mode starts;
+    /// after `leave` the scene holds EXACTLY that actor, whatever the player was doing: standing,
+    /// swinging, in third person, mid-jump, seated in a vehicle, or having just stepped out of one
+    /// (the parked copy).
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn leaving_test_mode_leaves_no_actor_of_it_behind() {
+        use crate::play_mode::ride_harness::Ride;
+        let Some((_g, native, cache)) = open() else {
+            eprintln!("play_mode map_gates SKIPPED: no forge_halo cache");
+            return;
+        };
+        let ids = |a: &ActorScene| -> Vec<u32> {
+            let mut v: Vec<u32> = a.actors.iter().map(|x| x.id).collect();
+            v.sort();
+            v
+        };
+        let bipeds = ActorScene::list_bipeds(&native, cache);
+        let by_tag = bipeds.first().expect("a biped").0;
+        let mut checked = 0;
+        // --- on foot ------------------------------------------------------------------------
+        for scenario in ["standing", "swinging", "third person", "jumping"] {
+            let mut actors = ActorScene::default();
+            let by = actors.add_object(&native, cache, by_tag, Vec3::new(40.0, 40.0, 0.0), 0.0).expect("bystander");
+            let before = ids(&actors);
+            let Some((mut pm, scene)) = start(&native, cache, &mut actors, Species::Spartan) else { return };
+            let dt = 1.0 / 60.0;
+            for i in 0..90 {
+                let mut inp = hold(if scenario == "standing" { 0.0 } else { 1.0 }, false);
+                inp.jump = scenario == "jumping" && i % 30 == 5;
+                if scenario == "third person" && i == 10 {
+                    pm.view = PlayView::ThirdPerson;
+                }
+                if scenario == "swinging" && i == 20 {
+                    pm.melee(&scene, None);
+                }
+                pm.tick(&inp, dt, &native, cache, &scene, &[], &mut actors);
+            }
+            let during = ids(&actors);
+            assert!(during.len() > before.len() + 1, "{scenario}: test mode added nothing ({during:?})");
+            pm.leave(&mut actors);
+            assert_eq!(ids(&actors), before, "{scenario}: actors left behind");
+            assert!(actors.get(by).is_some(), "{scenario}: the bystander was taken");
+            checked += 1;
+        }
+        // --- seated, then stepped out (the parked vehicle) -----------------------------------
+        for stage in ["seated", "stepped out"] {
+            let Some(mut r) = Ride::with_vehicle(native.clone(), cache, "warthog\\warthog") else { continue };
+            let by = r.actors.add_object(&native, cache, by_tag, Vec3::new(60.0, 60.0, 0.0), 0.0).expect("bystander");
+            let tag = r.objects[0].primary_tag;
+            r.force_seat(tag, 0).unwrap();
+            for _ in 0..45 {
+                let look = r.input();
+                r.tick(&look);
+            }
+            if stage == "stepped out" {
+                let _ = r.pm.exit_vehicle(&native, cache);
+                for _ in 0..45 {
+                    let look = r.input();
+                    r.tick(&look);
+                }
+            }
+            r.pm.leave(&mut r.actors);
+            let left: Vec<u32> = r.actors.actors.iter().map(|x| x.id).collect();
+            assert_eq!(left, vec![by], "{stage}: actors left behind: {left:?}");
+            checked += 1;
+        }
+        println!("exit gate: {checked} scenario(s) left nothing behind");
+        assert!(checked >= 6, "only {checked} scenarios ran");
     }
 }
 
@@ -8279,10 +8542,10 @@ mod scale_probes {
     /// Warthog and the Ghost with their riders, to ONE scale, with a 1 wu ruler; and the same
     /// bodies projected through the world camera at three fields of view. PNGs for a person.
     #[test]
-    #[ignore = "writes PNGs to the scratchpad; run alone with --ignored"]
+    #[ignore = "writes PNGs to the system temp folder; run alone with --ignored"]
     fn render_scale_comparison_pngs() {
         let Some((_g, native, cache)) = open() else { return };
-        let out = std::path::PathBuf::from("/tmp/claude-1000/-home-sopitive/05268b5e-9d50-4b4a-9c35-93b66f9dc5fa/scratchpad/scale");
+        let out = std::env::temp_dir().join("hms_scale");
         let _ = std::fs::create_dir_all(&out);
         // --- gather world points (all facing +x) for each exhibit --------------------------------
         let mut exhibits: Vec<(String, Vec<(Vec<Vec3>, [u8; 3])>)> = Vec::new();

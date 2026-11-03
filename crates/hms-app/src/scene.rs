@@ -46,6 +46,51 @@ const PREDECODE_BATCH: usize = 48;
 /// through `maybe_rebuild` for a POSED ACTOR (a biped, its held weapon, the first-person arms).
 /// `object_scale` keys off it, so it lives here rather than inside that function.
 const ACTOR_DATUM: u32 = 0xF2F1_0000;
+
+/// #knife  Which hlmt variant's child rows apply to a placement: the placement's own variant when
+/// some row names it, else the object's default model variant when some row names that, else 0
+/// (= the default-variant rows, `variant_index == 0`). ONE rule for the scene rebuild and for the
+/// actor's child-palette binding, so the two can never pick different rows.
+pub(crate) fn pick_child_variant(row_sids: &[u32], vsid: u32, dsid: u32) -> u32 {
+    if vsid != 0 && row_sids.contains(&vsid) { vsid } else if dsid != 0 && row_sids.contains(&dsid) { dsid } else { 0 }
+}
+
+/// #knife  Is a row with variant name `sid` (`is_default` = variant index 0) selected under `chosen`?
+pub(crate) fn child_row_selected(sid: u32, is_default: bool, chosen: u32) -> bool {
+    if chosen != 0 { sid == chosen } else { is_default }
+}
+
+/// #knife  The parent MARKER (string id) the hlmt child rows that apply to an object wearing
+/// `variant_sid` hang from, and how many children that is -- `None` when it has no children for
+/// that variant (an Elite, most bipeds) or its rows disagree about the marker (a single child
+/// palette could not serve both, so they keep the old placement).
+pub(crate) fn child_marker_for(native: &NativeDll, cache: CacheHandle, obj_tag: u32, variant_sid: u32, default_variant_sid: u32) -> Option<(u32, usize)> {
+    let rows: Vec<_> = native
+        .enumerate_attachments(cache, obj_tag)
+        .into_iter()
+        .filter(|a| { let cm = a.child_mode; cm != 0 && cm != 0xFFFF_FFFF })
+        .collect();
+    if rows.is_empty() { return None; }
+    let sids: Vec<u32> = rows.iter().map(|a| a.variant_name_sid).collect();
+    let chosen = pick_child_variant(&sids, variant_sid, default_variant_sid);
+    let mut markers = rows.iter().filter(|a| child_row_selected(a.variant_name_sid, a.variant_index == 0, chosen)).map(|a| a.marker_sid);
+    let first = markers.next()?;
+    let n = 1 + markers.clone().count();
+    if markers.any(|m| m != first) { return None; }
+    Some((first, n))
+}
+
+/// #knife  Which half of an actor's mesh set one rebuild pass produces. An actor's hlmt CHILD
+/// objects (a Spartan's knife and sheath) must be skinned by the PARENT MARKER's node, not by
+/// whichever of the body's bones their own node indices happen to equal, so they are built in a
+/// pass of their own and handed a palette of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActorChildPass {
+    /// Body and children together (every non-actor build, and an actor with no child palette).
+    Both,
+    BodyOnly,
+    ChildrenOnly,
+}
 /// BSP texture-prewarm tags uploaded between two queue submits (bounds the staging in flight).
 const PREWARM_CHUNK: usize = 24;
 
@@ -4497,6 +4542,8 @@ pub struct SceneController {
     /// attachments. The child obje tag is what decode_model needs for the child's own
     /// object type (engine material lane), default change colours and resting variant mask.
     attach_cache: HashMap<u32, Vec<(u32, Mat4, u32, bool, u32)>>,
+    /// #knife  See [`ActorChildPass`]; only ever non-`Both` during `build_actor_pass`.
+    actor_child_pass: ActorChildPass,
     /// Per obj tag, the object's DEFAULT MODEL VARIANT sid (obje +0x60; 0 = hlmt variant 0).
     obj_default_variant_cache: HashMap<u32, u32>,
     /// Per obj_tag decoded lift/man-cannon effect chain (obje attachments → effe → ltvl
@@ -5827,6 +5874,7 @@ impl SceneController {
             palette_names: HashMap::new(),
             forge_lights: Vec::new(),
             attach_cache: HashMap::new(),
+            actor_child_pass: ActorChildPass::Both,
             obj_default_variant_cache: HashMap::new(),
             lift_fx_cache: HashMap::new(),
             lens_def_cache: HashMap::new(),
@@ -7334,7 +7382,40 @@ impl SceneController {
         }
     }
 
+    /// #knife  Build an actor's meshes. With `child_palette` set, the object's hlmt CHILD objects
+    /// (the Spartan's knife and sheath) are built in a second pass and skinned by THAT palette,
+    /// not the body's: see [`ActorChildPass`]. Without it the old single pass runs.
     pub fn build_actor_meshes(
+        &mut self,
+        obj_tag: u32,
+        variant_sid: u32,
+        at: Vec3,
+        fwd: Vec3,
+        up: Vec3,
+        skin: Option<[[f32; 3]; 2]>,
+        damage: u8,
+        palette: Option<&std::sync::Arc<hms_render::SkinPalette>>,
+        child_palette: Option<&std::sync::Arc<hms_render::SkinPalette>>,
+        mesh: &MeshRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) -> Result<(crate::objscene::RebuiltLanes, Vec3, Vec3), bool> {
+        let Some(cp) = child_palette else {
+            return self.build_actor_pass(obj_tag, variant_sid, at, fwd, up, skin, damage, palette, mesh, device, queue, ActorChildPass::Both);
+        };
+        let (mut lanes, mn, mx) =
+            self.build_actor_pass(obj_tag, variant_sid, at, fwd, up, skin, damage, palette, mesh, device, queue, ActorChildPass::BodyOnly)?;
+        match self.build_actor_pass(obj_tag, variant_sid, at, fwd, up, skin, damage, Some(cp), mesh, device, queue, ActorChildPass::ChildrenOnly) {
+            Ok((children, _, _)) => lanes.extend(children),
+            // No children for this variant (an Elite, most bipeds): nothing to add.
+            Err(false) => {}
+            // Still decoding: the whole build is retried, as for the body.
+            Err(true) => return Err(true),
+        }
+        Ok((lanes, mn, mx))
+    }
+
+    fn build_actor_pass(
         &mut self,
         obj_tag: u32,
         variant_sid: u32,
@@ -7347,6 +7428,7 @@ impl SceneController {
         mesh: &MeshRenderer,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        pass: ActorChildPass,
     ) -> Result<(crate::objscene::RebuiltLanes, Vec3, Vec3), bool> {
         if self.cache.is_none() { return Err(false); }
         // #fp `obj_tag` may itself BE a render model: Reach's first-person arm models are bare
@@ -7392,12 +7474,14 @@ impl SceneController {
         let empty: HashMap<u32, (u8, u8)> = HashMap::new();
         self.actor_cc = skin;
         self.rebuild_pending = true;
+        self.actor_child_pass = pass;
         let mut out = None;
         for _ in 0..8 {
             out = self.maybe_rebuild(&objects, &empty, mesh, device, queue).or(out);
             if !self.rebuild_pending { break; }
         }
         let complete = !self.rebuild_pending;
+        self.actor_child_pass = ActorChildPass::Both;
         self.actor_cc = None;
         let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
         for p in &self.picks { mn = mn.min(p.min); mx = mx.max(p.max); }
@@ -7439,6 +7523,13 @@ impl SceneController {
         }
         if mn.x > mx.x { mn = at; mx = at; }
         Ok((lanes, mn, mx))
+    }
+
+    /// #knife  See [`child_marker_for`].
+    pub(crate) fn actor_child_marker(&mut self, obj_tag: u32, variant_sid: u32) -> Option<(u32, usize)> {
+        let cache = self.cache?;
+        let dsid = self.object_default_variant(obj_tag);
+        child_marker_for(&self.native, cache, obj_tag, variant_sid, dsid)
     }
 
     pub fn build_preview_meshes(
@@ -8102,6 +8193,15 @@ impl SceneController {
                                 let curve = self.native.find_bitmap(cache, t, 0).map(|b| b.curve);
                                 let mean = self.bitmap_mean(t, true).map(|m| format!("({:.3},{:.3},{:.3})", m[0], m[1], m[2])).unwrap_or_default();
                                 println!("        bitmap {u} = {t:#x} '{}' curve={curve:?} linear_mean={mean}", nm(t));
+                                // alpha statistics (the engine specular mask = base.a x detail.a x albedo_color.a)
+                                if u == "base_map" || u == "detail_map" {
+                                    if let Some((px, _, _)) = self.native.decode_bitmap_keep_alpha(cache, t, 0, 0) {
+                                        let (mut lo, mut hi, mut sum) = (255u8, 0u8, 0u64);
+                                        for p in px.chunks_exact(4) { lo = lo.min(p[3]); hi = hi.max(p[3]); sum += p[3] as u64; }
+                                        let n = (px.len() / 4).max(1) as f64;
+                                        println!("          alpha min={lo} max={hi} mean={:.1} ({:.3})", sum as f64 / n, sum as f64 / n / 255.0);
+                                    }
+                                }
                             }
                         }
                     }
@@ -12340,6 +12440,69 @@ impl SceneController {
     /// already-cached + skip null). Used to pre-warm object models OFF the frame-budgeted
     /// main-thread decode so they render immediately (scenario objects on the worker;
     /// .mvar forge objects when a variant is rendered). Returns how many were decoded.
+    /// #mvar-js  What the render pack needs to know about an object's RENDER model: its parts
+    /// (triangles + UVs, the material lane the scene itself routes each part to, a base colour
+    /// = the diffuse map's average, an opacity, and the diffuse map), and whether the object
+    /// attaches an effect. Decodes the model fresh (textures included, then dropped) instead of
+    /// filling the scene's cache. The lane comes from `PartLaneIn::lane` with the TAG-authored
+    /// inputs only (blend type, alpha test, rmgl glass, halogram, forcefield); no name hint.
+    pub fn render_info_for_pack(&self, obj_tag: u32) -> crate::render_pack::RenderInfo {
+        use crate::render_pack::{Part, RenderInfo, Tri};
+        let mut info = RenderInfo { parts: Vec::new(), model_tris: 0, effects: !self.object_effects(obj_tag).is_empty() };
+        let Some(cache) = self.cache else { return info };
+        let mode = self.resolve_object_mode(obj_tag);
+        if mode == 0 || mode == 0xFFFF_FFFF { return info; }
+        let bmp = BitmapCache::default();
+        let Some(d) = decode_model_cached(&self.native, cache, mode, obj_tag, Some(&bmp)) else { return info };
+        let single = d.obj_parts.is_empty();
+        let n_units = if single { 1 } else { d.obj_parts.len() };
+        let avg = |t: &SharedTex| -> ([f32; 3], f32) {
+            let (px, w, h) = (&t.0, t.1 as usize, t.2 as usize);
+            let (mut r, mut g, mut b, mut a, mut wsum) = (0f64, 0f64, 0f64, 0f64, 0f64);
+            for c in px.chunks_exact(4).take(w * h) { let al = c[3] as f64 / 255.0; r += c[0] as f64 * al; g += c[1] as f64 * al; b += c[2] as f64 * al; a += al; wsum += al; }
+            let n = (w * h).max(1) as f64;
+            if wsum < 1e-6 { ([0.5; 3], (a / n) as f32) } else { ([(r / wsum / 255.0) as f32, (g / wsum / 255.0) as f32, (b / wsum / 255.0) as f32], (a / n) as f32) }
+        };
+        for ui in 0..n_units {
+            let (idx, tex, blend, alpha_test, is_glass, is_halo, is_ff, ff_color, ff_extra, has_emis, glass_a): (&[u32], &Option<SharedTex>, u32, bool, bool, bool, bool, [f32; 3], bool, bool, f32) = if single {
+                (&d.indices, &d.tex, d.blend, d.alpha_test, false, d.is_halo, d.is_forcefield, d.ff_color, d.ff_extra.is_some(), d.emissive.is_some(), 1.0)
+            } else {
+                let p = &d.obj_parts[ui];
+                (&p.indices, &p.tex, p.blend, p.alpha_test, p.is_glass, p.is_halo, p.is_forcefield, p.ff_color, p.ff_extra.is_some(), p.emissive.is_some(), p.glass_albedo_a)
+            };
+            let lane_in = PartLaneIn { blend, alpha_test, has_emissive: has_emis, emis_cc: false, is_halo, is_ff, is_glass, ff_extra, si_mode: 0, name_holo: false, marker_forced: false, shield_name_blend: false };
+            let lane = lane_in.lane(false, false);
+            let at = |i: u32| d.verts.get(i as usize);
+            let tris: Vec<Tri> = idx.chunks_exact(3).filter_map(|t| { let (a, b, c) = (at(t[0])?, at(t[1])?, at(t[2])?); Some(Tri { p: [Vec3::from(a.pos), Vec3::from(b.pos), Vec3::from(c.pos)], uv: [a.uv, b.uv, c.uv] }) }).filter(|t| t.p.iter().all(|v| v.is_finite())).collect();
+            if tris.is_empty() { continue; }
+            let (mut color, mut a_avg) = tex.as_ref().map_or(([0.6; 3], 1.0), |t| avg(t));
+            let mut opacity = 1.0f32;
+            let lane_name = match lane {
+                PartLane::Opaque => "opaque",
+                PartLane::Cutout => "cutout",
+                PartLane::Additive => "additive",
+                PartLane::HoloSolid => "blend",
+                PartLane::Blend => "blend",
+            };
+            match lane {
+                PartLane::Blend | PartLane::HoloSolid => { opacity = if is_glass { (glass_a * a_avg.max(0.05)).clamp(0.05, 1.0) } else { a_avg.clamp(0.05, 1.0) }; }
+                PartLane::Additive => { if is_ff { let m = ff_color[0].max(ff_color[1]).max(ff_color[2]).max(1e-3); color = [ff_color[0] / m, ff_color[1] / m, ff_color[2] / m]; } opacity = 0.6; a_avg = 1.0; }
+                _ => {}
+            }
+            let _ = a_avg;
+            info.parts.push(Part { tris, lane: lane_name, color: Some(color), opacity, tex: tex.clone(), halogram: is_ff });
+        }
+        info.model_tris = info.parts.iter().map(|p| p.tris.len()).sum();
+        info
+    }
+
+    /// Gates: the decoded render model's local bounds (after `predecode_tags`), the box the pick
+    /// table is built from.
+    #[cfg(test)]
+    pub(crate) fn model_bounds_for_test(&self, mode_tag: u32) -> Option<(Vec3, Vec3)> {
+        match self.geom_cache.get(&mode_tag) { Some(Some(d)) if !d.indices.is_empty() => Some((d.min, d.max)), _ => None }
+    }
+
     pub fn predecode_tags(&mut self, tags: &[u32]) -> usize {
         use rayon::prelude::*;
         let Some(cache) = self.cache else { return 0 };
@@ -14860,7 +15023,8 @@ impl SceneController {
             }
             acc ^ h
         });
-        let sig = signature(objects, forge_colors) ^ scale_sig ^ caster_sig ^ damage_sig ^ transform_sig;
+        let diag_sig = (OBJ_DIAG_FLAGS.load(std::sync::atomic::Ordering::Relaxed) as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        let sig = signature(objects, forge_colors) ^ scale_sig ^ caster_sig ^ damage_sig ^ transform_sig ^ diag_sig;
         // Take delivery of any background-decoded variant models first; while a burst is in
         // flight the rebuild keeps re-running (like the budgeted decode) so arrivals pop in.
         if self.poll_background_predecode() {
@@ -14935,7 +15099,7 @@ impl SceneController {
         // closer than the hit override; HMS_OBJ_LIGHT_LEGACY=1 = the old 4-nearest airprobe blend).
         // The FILL lobe rides in the tint lane; [dom_dir, bandwidth, dom_rgb, mask] in the probe lane;
         // fill dir / bounce in the packed obj_light lane (probe_lanes).
-        let obj_probe_on = ev("HMS_NO_OBJ_PROBE").is_err();
+        let obj_probe_on = ev("HMS_NO_OBJ_PROBE").is_err() && !obj_diag(OBJ_DIAG_NO_OBJ_PROBE);
         // Placed objects are ray targets for each other's lighting samples
         if obj_probe_on { self.refresh_obj_ray_targets(objects); }
         self.picks.clear();
@@ -15063,7 +15227,7 @@ impl SceneController {
             if let Some(d) = rmodel.filter(|d| !d.indices.is_empty()) {
                 let (wmin, wmax) = transform_aabb(d.min, d.max, &m);
                 self.picks.push(PickEntry { datum: o.datum, min: wmin, max: wmax, mode_tag: o.mode_tag, xform: m, hull: None, att: false });
-                if !hide_boundary_shell {
+                if !hide_boundary_shell && !(o.datum == ACTOR_DATUM && self.actor_child_pass == ActorChildPass::ChildrenOnly) {
                     // Engine default (obje lightmap_shadow_mode) OR the
                     // per-object forced caster flag decides this instance's shadow batch.
                     let cs = self.object_is_caster(o);
@@ -15252,6 +15416,9 @@ impl SceneController {
                 if ot == 0 || ot == 0xFFFF_FFFF {
                     continue;
                 }
+                if o.datum == ACTOR_DATUM && self.actor_child_pass == ActorChildPass::BodyOnly {
+                    continue;
+                }
                 if !self.attach_cache.contains_key(&ot) {
                     // Keep EVERY variant's attachments (tagged by hlmt-variant Name sid), so a
                     // placement's variant selects the right child (rocket warthog → rocket turret).
@@ -15289,12 +15456,11 @@ impl SceneController {
                 // Select this placement's variant. vsid!=0 → attachments whose variant Name sid
                 // matches; else the object's own default model variant (obje +0x60) when
                 // it names one; if none match, fall back to the hlmt DEFAULT variant (index 0).
-                let vsid = o.variant_name_sid;
-                let vsid = if vsid != 0 && all.iter().any(|(_, _, s, _, _)| *s == vsid) { vsid } else if dsid != 0 && all.iter().any(|(_, _, s, _, _)| *s == dsid) { dsid } else { 0 };
-                let has_match = vsid != 0;
+                let row_sids: Vec<u32> = all.iter().map(|(_, _, s, _, _)| *s).collect();
+                let vsid = pick_child_variant(&row_sids, o.variant_name_sid, dsid);
                 let list: Vec<(u32, Mat4, u32)> = all
                     .iter()
-                    .filter(|(_, _, s, is_def, _)| if has_match { *s == vsid } else { *is_def })
+                    .filter(|(_, _, s, is_def, _)| child_row_selected(*s, *is_def, vsid))
                     .map(|(cm, m, _, _, co)| (*cm, *m, *co))
                     .collect();
                 if list.is_empty() {
@@ -15865,7 +16031,7 @@ impl SceneController {
                 // classes go back to shader 0's constants with no object environment reflection, while
                 // the unit/item lane stays exactly as it was), in the same idiom as HMS_NO_ENV_DYNAMIC /
                 // HMS_NO_RMGL_ENV / HMS_LEGACY_FF. The DEFAULT needs no env var.
-                let mat_lane = if ev("HMS_LEGACY_OBJMAT").is_ok() { veh_lane } else { opaque_route && umat.mat };
+                let mat_lane = if ev("HMS_LEGACY_OBJMAT").is_ok() || obj_diag(OBJ_DIAG_LEGACY_OBJMAT) { veh_lane } else { opaque_route && umat.mat };
                 // #objshine print-only: the shading lanes EVERY opaque object part is uploaded with
                 // (not just the unit/item `veh_lane` ones), so "does this Forge piece get a specular
                 // or an environment term, and which authored value turned it on" can be answered for
@@ -24010,7 +24176,7 @@ fn push_state_entries(out: &mut HlmtVariants, sid: u32, choice: &[Option<i32>], 
 /// the palette entry names no variant (sid 0), and every eqip but Evade authors 0x2c65 = the SPARTAN
 /// drop variant (Evade, the Elite ability, authors 0x2c6b = the Elite drop, which is also the hlmt
 /// default that HMS used to draw for all of them).
-fn object_default_variant_sid(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> u32 {
+pub(crate) fn object_default_variant_sid(native: &NativeDll, cache: CacheHandle, obj_tag: u32) -> u32 {
     if obj_tag == 0 || obj_tag == 0xFFFF_FFFF { return 0; }
     match native.tag_meta(cache, obj_tag, 0x60, 4) {
         Some(b) if b.len() >= 4 => {
@@ -26064,6 +26230,15 @@ static GEOM_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// several finalize spots; routing every `ev(` → `ev(` fixes them all at once. These flags
 /// never change mid-run, so a first-access snapshot is behaviour-identical. Returns Result<String,()>
 /// so every existing `.ok()/.is_ok()/.is_err()/.and_then()` call site works UNCHANGED.
+/// Lighting Lab "Object lighting terms (diagnostic)": the two object-lane switches that used to be
+/// env-only (`HMS_LEGACY_OBJMAT`, `HMS_NO_OBJ_PROBE`) as live UI checkboxes. Bit 0 = legacy object
+/// material lane, bit 1 = no per-object probe lighting. Folded into the object rebuild signature so
+/// toggling one re-uploads the objects on the next frame. The env vars still work (OR'd in).
+pub static OBJ_DIAG_FLAGS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub const OBJ_DIAG_LEGACY_OBJMAT: u32 = 1;
+pub const OBJ_DIAG_NO_OBJ_PROBE: u32 = 2;
+fn obj_diag(bit: u32) -> bool { OBJ_DIAG_FLAGS.load(std::sync::atomic::Ordering::Relaxed) & bit != 0 }
+
 fn ev(key: &str) -> Result<String, ()> {
     static SNAP: std::sync::OnceLock<std::collections::HashMap<String, String>> = std::sync::OnceLock::new();
     let m = SNAP.get_or_init(|| std::env::vars().collect());
@@ -29650,5 +29825,23 @@ mod contrail_gates {
         let oldest = v[0].tangent[3].abs() * 2.0;
         assert!(head < 0.05, "the newest profile is a point, got width {head}");
         assert!(oldest > 0.9, "the oldest profile is a lifespan old: width {oldest}");
+    }
+}
+
+#[cfg(test)]
+mod obj_diag_tests {
+    use super::*;
+
+    /// The Lighting Lab object-lane switches must be live bits that (a) are distinct, (b) default to OFF
+    /// (so nothing changes unless touched) and (c) are consulted at BOTH former env-only sites and folded
+    /// into the rebuild signature (otherwise ticking the box would do nothing until the next edit).
+    #[test]
+    fn object_lane_switches_default_off_and_are_wired() {
+        assert_eq!(OBJ_DIAG_LEGACY_OBJMAT & OBJ_DIAG_NO_OBJ_PROBE, 0);
+        assert!(!obj_diag(OBJ_DIAG_LEGACY_OBJMAT) && !obj_diag(OBJ_DIAG_NO_OBJ_PROBE));
+        let src = include_str!("scene.rs");
+        assert!(src.contains("|| obj_diag(OBJ_DIAG_LEGACY_OBJMAT) { veh_lane }"), "legacy-lane switch not consulted");
+        assert!(src.contains("&& !obj_diag(OBJ_DIAG_NO_OBJ_PROBE)"), "no-probe switch not consulted");
+        assert!(src.contains("^ transform_sig ^ diag_sig;"), "switches not part of the object rebuild signature");
     }
 }

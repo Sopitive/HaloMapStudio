@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
 <li><a href="film-data.html" class="cur" aria-current="page">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
 </ul>
@@ -365,8 +368,9 @@ jq '[.objects[] | select(.label != null) | {id, label, position}]' match.json</c
   <li>The follower reads only complete records, decodes <em>only the ones it has not seen</em>, and keeps all state between refreshes, so the cost of a refresh depends on what is new.</li>
   <li>Nothing is printed until the file holds <strong>256 records</strong> (about four seconds of play); at that point everything from the start is reported in one burst.</li>
   <li>If the file is replaced by a different match, or becomes shorter, a <code>reset</code> event is printed and following starts over (a consumer should discard its state).</li>
-  <li>When the match ends MCC finalises the recording and renames the <code>.temp</code>. The follower does not chase the new name: it keeps polling the old path and prints nothing. Stop it, and run it once more with <code>--once</code> on the finished file if you want the tail (use <code>--since</code> to skip what you have).</li>
+  <li>When the match ends MCC finalises the recording and renames the <code>.temp</code> to a finished <code>.mov</code>. The follower keeps its file open (so the rename is never blocked), notices the old name is gone, reads the final bytes, finds the finished film in the same folder (or the film folders) by name and by comparing the first records, prints one <code>{"type":"finalised","file":"&lt;name&gt;"}</code> event, and carries on from there. Nothing needs restarting.</li>
   <li>If the file cannot be opened or parsed at the moment of a poll (the game is mid-write), the follower prints <code>waiting: ...</code> on stderr and tries again on the next poll; nothing is lost.</li>
+  <li><strong>Windows.</strong> The file is opened read-only with an explicit share mode of read | write | delete, the length is always asked of the open handle (never of the path, whose size NTFS can report late while another program is appending), and reads are positional, never a memory map. If MCC holds the file in a way that forbids readers (Windows error 32), the follower retries for a few seconds, then says so on stderr with the OS error and the fix: let the match finish and open the <code>.mov</code>, or copy the film after MCC closes it. Every such failure is appended to <code>film_open.log</code> in <code>%LOCALAPPDATA%\HaloMapStudio</code> (file names only, never folders). If following does not work for you on Windows, send that file.</li>
 </ul>
 
 <h3 id="f-bg">Running it in the background and piping it</h3>
@@ -449,7 +453,7 @@ for line in sys.stdin:
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

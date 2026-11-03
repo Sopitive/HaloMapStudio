@@ -1749,6 +1749,66 @@ pub fn orientation_world(raw: (Option<u32>, u32)) -> ([f32; 3], [f32; 3]) {
     }
 }
 
+/// #fp-jitter  Two recorded look keys further apart than this are two separate statements, not one
+/// motion: the view holds the earlier until the later arrives. Within it the view turns smoothly
+/// between them. A player's aim is reported at the network rate (a few ticks), so this only has to
+/// cover that gap; a body reporting its facing once in several seconds keeps the old hold.
+pub const AIM_SMOOTH_TICKS: u32 = 12;
+
+/// #fp-jitter  A recorded angle series sampled at a fractional tick: the shortest-arc interpolation of
+/// the two bracketing keys when they are at most [`AIM_SMOOTH_TICKS`] apart, else the earlier key
+/// held (and the first key before the series begins). `key` gives a record's tick, `val` its angle.
+pub fn lerp_angle_keys<T>(v: &[T], t: f32, key: impl Fn(&T) -> u32, val: impl Fn(&T) -> f32) -> Option<f32> {
+    if v.is_empty() {
+        return None;
+    }
+    let i = v.partition_point(|r| (key(r) as f32) <= t);
+    if i == 0 {
+        return Some(val(&v[0]));
+    }
+    let (t0, a0) = (key(&v[i - 1]), val(&v[i - 1]));
+    match v.get(i) {
+        Some(n) if key(n) > t0 && key(n) - t0 <= AIM_SMOOTH_TICKS => {
+            let a1 = val(n);
+            let d = (a1 - a0 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            let w = ((t - t0 as f32) / (key(n) - t0) as f32).clamp(0.0, 1.0);
+            Some(a0 + d * w)
+        }
+        _ => Some(a0),
+    }
+}
+
+/// #vehicle-flip  How many keys have taken the other reference branch (liveness for the gate).
+pub static TIE_BRANCH_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// #vehicle-flip  [`orientation_world`], resolved against the track's PREVIOUS orientation.
+///
+/// The forward angle is measured from a reference tangent that the engine picks by comparing
+/// `|up.x|` with `|up.y|`. A near-level vehicle has both about zero, so the comparison is a
+/// coin toss at the precision `up` travels in. The engine's sender quantises `up`, DEQUANTISES it
+/// and measures the angle from the dequantised vector (`write_axes<8,19>` calls
+/// `dequantize_unit_vector3d` then `axes_to_angle_internal`, both reaching
+/// `axes_compute_reference_internal`, halo3_tag_test.xex 0x82CC08A8), so sender and receiver agree
+/// in principle -- but on an exact tie of the two quantised components the winner is decided by
+/// the last bit of single-precision arithmetic, which this f64 decoder does not reproduce. The
+/// decoded forward is then exactly 90 degrees about `up` away for that one key. A real
+/// vehicle cannot turn 90 degrees in a tick and back again, so inside that tie band the branch
+/// that continues the previous orientation is the one taken. Outside the band, or with nothing
+/// before it, the engine's own rule stands.
+pub fn orientation_world_after(raw: (Option<u32>, u32), prev: Option<([f32; 3], [f32; 3])>) -> ([f32; 3], [f32; 3]) {
+    // (a pure function; the counter below only lets a gate prove the situation occurs)
+    let (f, u) = orientation_world(raw);
+    let (Some(axis), Some((pf, _))) = (raw.0, prev) else { return (f, u) };
+    let Some(alt) = crate::mvar::decode_orientation_bits_alt(false, axis, 19, raw.1, 8) else { return (f, u) };
+    let d = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    if d(alt, pf) > d(f, pf) {
+        TIE_BRANCH_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (alt, u)
+    } else {
+        (f, u)
+    }
+}
+
 /// `ceil(log2(v))` the way the engine computes it (`sub_180015B78`: the highest set bit, plus one
 /// when `v` is not a power of two).
 pub fn ceil_log2(v: u32) -> u32 {
@@ -2137,6 +2197,11 @@ impl EntityTrack {
             Err(i) => i - 1,
         };
         Some(self.facings[i].1)
+    }
+
+    /// #fp-jitter  [`EntityTrack::facing_at`] at a **fractional** tick. See [`lerp_angle_keys`].
+    pub fn facing_at_f(&self, t: f32) -> Option<f32> {
+        lerp_angle_keys(&self.facings, t, |&(k, _)| k, |&(_, y)| y)
     }
 
     /// The last reported orientation at or before `tick`, HELD (no interpolation).
@@ -2555,6 +2620,29 @@ impl FilmIndex {
     /// the map and its Forge objects are there and the players are not. Seeking to tick 0 and
     /// concluding that nothing is drawn is therefore wrong, and this is what says so.
     /// The aim this slot recorded at (or just before) `tick`, if the slot has any samples.
+    /// #fp-jitter  A slot's recorded look direction `(yaw, pitch)` radians at a **fractional** tick.
+    /// Yaw is interpolated along the shortest arc between the bracketing samples when they are
+    /// within [`AIM_SMOOTH_TICKS`] of each other, else the earlier one is held. Pitch is a plain lerp
+    /// under the same rule.
+    pub fn aim_at_f(&self, slot: u8, t: f32) -> Option<(f32, f32)> {
+        let v = self.player_aims.get(slot as usize)?;
+        let yaw = lerp_angle_keys(v, t, |&(k, _)| k, |&(_, a)| a.yaw())?;
+        let i = v.partition_point(|&(k, _)| (k as f32) <= t);
+        let pitch = if i == 0 {
+            v[0].1.pitch()
+        } else {
+            let (t0, a0) = v[i - 1];
+            match v.get(i) {
+                Some(&(t1, a1)) if t1 > t0 && t1 - t0 <= AIM_SMOOTH_TICKS => {
+                    let w = ((t - t0 as f32) / (t1 - t0) as f32).clamp(0.0, 1.0);
+                    a0.pitch() + (a1.pitch() - a0.pitch()) * w
+                }
+                _ => a0.pitch(),
+            }
+        };
+        Some((yaw, pitch))
+    }
+
     pub fn aim_at(&self, slot: u8, tick: u32) -> Option<PlayerAim> {
         let v = self.player_aims.get(slot as usize)?;
         if v.is_empty() {
@@ -4122,7 +4210,7 @@ pub fn build_index_full(
                 }
             }
             if let Some(or) = st.orientation_raw {
-                let (f, u) = orientation_world(or);
+                let (f, u) = orientation_world_after(or, tr.orientations.last().map(|o| (o.1, o.2)));
                 tr.orientations.push((tick, f, u));
             }
             // #film-attach  Base field 12, when the message stated it. Recorded on CHANGE, so a

@@ -923,7 +923,7 @@ pub fn parse_line(line: &str) -> Result<Option<EditorCommand>, String> {
         "redo" => EditorCommand::Redo,
         "newvariant" | "new_variant" => EditorCommand::NewVariant,
         "variant" | "mvar" => match t.get(1).map(|s| s.to_lowercase()).as_deref() {
-            None | Some("get") | Some("info") | Some("show") => EditorCommand::VariantGet(t.get(2).map(|s| s.to_string())),
+            None | Some("get") | Some("info") | Some("show") => EditorCommand::VariantGet(if t.get(2).is_some_and(|f| f.eq_ignore_ascii_case("render-pack")) { t.get(2..).map(|v| v.join(" ")) } else { t.get(2).map(|s| s.to_string()) }),
             Some("set") => {
                 let field = t.get(2).ok_or("variant set <field> <value...>  (name, description, author, editor, category, budget, bounds, quotamin, quotamax, quota)")?.to_string();
                 let value = t.get(3..).map(|v| v.join(" ")).unwrap_or_default();

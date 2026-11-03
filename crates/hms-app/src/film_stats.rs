@@ -2130,10 +2130,10 @@ pub fn cli(paths: &[String], json: bool, names: &dyn NameSource) -> i32 {
     let mut ok = 0usize;
     let mut out: Vec<FilmStats> = Vec::new();
     for p in &files {
-        match std::fs::metadata(p) {
+        match crate::film_reader::listing_len(p) {
             // A zero-byte autosave stub is the common case in the autosave folder (87 of 110 in
             // one directory), so it is reported as what it is rather than as a parse failure.
-            Ok(m) if m.len() == 0 => {
+            Ok(0) => {
                 eprintln!("{}: empty file (MCC leaves zero-byte autosave stubs)", p.display());
                 continue;
             }

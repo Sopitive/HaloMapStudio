@@ -90,6 +90,27 @@ pub fn env_setting() -> Option<GhostSetting> {
     Some(GhostSetting { on, exaggerate: fac.filter(|f| f.is_finite() && *f >= 1.0 && *f <= EXAGGERATE_MAX).unwrap_or(1.0) })
 }
 
+/// Settings file of the "Save precision" toggle (`1` / `0`).
+const SAVE_PRECISION_FILE: &str = "save_precision.txt";
+
+/// "Save precision": after a save, the scene adopts the poses the game will load. DEFAULT ON --
+/// an absent or unreadable file means on. Persisted.
+pub fn load_save_precision() -> bool {
+    crate::project::settings_dir().map_or(true, |d| load_save_precision_from(&d))
+}
+pub fn load_save_precision_from(dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(dir.join(SAVE_PRECISION_FILE)).ok()
+        .and_then(|s| crate::map_spawns::parse_flag(s.trim()))
+        .unwrap_or(true)
+}
+pub fn save_save_precision(on: bool) {
+    if let Some(d) = crate::project::settings_dir() { save_save_precision_to(&d, on); }
+}
+pub fn save_save_precision_to(dir: &std::path::Path, on: bool) {
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(SAVE_PRECISION_FILE), if on { "1" } else { "0" });
+}
+
 // ---------------------------------------------------------------------------------------------
 // pose math for the ghost
 // ---------------------------------------------------------------------------------------------
@@ -334,6 +355,85 @@ impl crate::App {
     }
 
     // -----------------------------------------------------------------------------------------
+    // #save-precision: the scene becomes what the game will load
+    // -----------------------------------------------------------------------------------------
+
+    fn save_precision_game(&self) -> QuantGame {
+        if self.h3_active { QuantGame::Halo3 } else if self.h4_active { QuantGame::Halo4 } else { QuantGame::Reach }
+    }
+
+    /// Called right after a successful save of `dst`. Re-reads the written file with the game's
+    /// real reader, works out which objects the file holds at a different pose than the editor
+    /// does, and (with "Save precision" on) moves those objects onto exactly the decoded values as
+    /// ONE undo step. Idempotent: a second save changes nothing. Returns the one-line summary for
+    /// the status bar / script output ("" when nothing could be examined).
+    pub(crate) fn apply_save_precision(&mut self, dst: &std::path::Path) -> String {
+        let game = self.save_precision_game();
+        let Some((bounds, written)) = crate::quant_error::read_written_poses(game, dst) else { return String::new() };
+        let q = PoseQuant::new(game, bounds);
+        let objs: Vec<(u32, [f32; 3], [f32; 3], [f32; 3])> = self.mvar_objects.iter().chain(self.local_objects.iter())
+            .filter(|o| self.mvar_meta.contains_key(&o.datum))
+            .map(|o| (o.datum, o.pos, o.fwd, o.up)).collect();
+        let name_of = |d: u32| self.mvar_meta.get(&d).map(|m| m.name.clone()).unwrap_or_default();
+        let (changes, report) = crate::quant_error::plan_save_precision(&q, &written, &objs, &name_of, self.save_precision_on, self.pose_quant_game_name());
+        if self.save_precision_on && !changes.is_empty() {
+            self.push_edit_undo();
+            self.prop_snapshotted_for = None;
+            for c in &changes {
+                let Some((p0, f0, u0)) = self.live_pose(c.datum) else { continue };
+                self.set_movable_pose(c.datum, Vec3::from(c.new_pos), Vec3::from(c.new_fwd), Vec3::from(c.new_up));
+                let q_rel = Quat::from_mat3(&ortho(c.new_fwd, c.new_up)).normalize() * Quat::from_mat3(&ortho(f0, u0)).normalize().conjugate();
+                if let Some(sc) = self.objscene_mut() {
+                    sc.rotate_pick(c.datum, q_rel, Vec3::from(p0));
+                    sc.translate_pick(c.datum, Vec3::from(c.new_pos) - Vec3::from(p0));
+                }
+            }
+            if let Some(s) = self.objscene_mut() { s.invalidate(); }
+            self.highlight_dirty = true;
+            self.overlays_dirty = true;
+        }
+        let line = report.status();
+        self.save_report_open = report.adjusted > 0;
+        self.last_save_report = Some(report);
+        line
+    }
+
+    /// The post-save panel: a one-line headline and, expandable, the worst ten objects. Closed
+    /// with its X; reopened by `precision report` / the Settings checkbox's report button.
+    pub(crate) fn save_report_ui(&mut self, ctx: &egui::Context) {
+        if !self.save_report_open { return; }
+        let Some(r) = self.last_save_report.clone() else { self.save_report_open = false; return };
+        let mut open = true;
+        egui::Window::new("Save precision")
+            .open(&mut open)
+            .default_width(420.0)
+            .default_pos(ctx.screen_rect().right_bottom() + egui::vec2(-450.0, -260.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(r.status()).strong());
+                ui.small("These are the values the game will load from the saved file. Ctrl+Z undoes the adjustment in the editor (the file keeps what it holds).");
+                egui::CollapsingHeader::new(format!("worst {} object(s)", r.worst.len())).default_open(false).show(ui, |ui| {
+                    egui::Grid::new("save-precision-worst").num_columns(5).spacing([10.0, 3.0]).striped(true).show(ui, |ui| {
+                        ui.strong("#"); ui.strong("object"); ui.strong("deg"); ui.strong("wu"); ui.strong("");
+                        ui.end_row();
+                        for w in &r.worst {
+                            ui.monospace(format!("{}", w.index));
+                            ui.label(if w.name.is_empty() { format!("0x{:08X}", w.datum) } else { w.name.clone() });
+                            ui.monospace(format!("{:.5}", w.rot_deg));
+                            ui.monospace(format!("{:.6}", w.pos_wu));
+                            if ui.small_button("select").clicked() {
+                                self.selected_set = vec![w.datum];
+                                self.selected_datum = Some(w.datum);
+                                self.highlight_dirty = true;
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+            });
+        if !open { self.save_report_open = false; }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // snap to representable
     // -----------------------------------------------------------------------------------------
 
@@ -534,6 +634,21 @@ impl crate::App {
                     }
                 };
                 self.snap_datums_to_representable(&targets)
+            }
+            "report" => match &self.last_save_report {
+                Some(r) => { self.save_report_open = r.adjusted > 0; Ok(r.text()) }
+                None => Err("no save has happened yet in this session".into()),
+            },
+            "mode" | "on" | "off" => {
+                let want = match (sub, args.first().map(|s| s.to_lowercase()).as_deref()) {
+                    ("on", _) => Some(true),
+                    ("off", _) => Some(false),
+                    (_, Some(a)) => crate::map_spawns::parse_flag(a),
+                    _ => None,
+                };
+                if let Some(on) = want { self.save_precision_on = on; save_save_precision(on); }
+                Ok(format!("save precision: {} -- {}", if self.save_precision_on { "ON" } else { "off" },
+                    if self.save_precision_on { "after a save the scene adopts the poses the game will load (one undo step)" } else { "saving leaves the scene as authored; `precision report` still shows the differences" }))
             }
             "ghost" => {
                 let mut g = self.quant_ghost;

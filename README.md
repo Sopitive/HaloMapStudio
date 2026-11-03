@@ -5,7 +5,7 @@
 
 # Halo Map Studio
 
-**Current release: v1.7.0** — [downloads](https://github.com/Sopitive/HaloMapStudio/releases/latest) · [changelog](https://sopitive.github.io/HaloMapStudio/changelog.html). The app can check for new releases itself (Help ▸ Software update…; opt-in, see the [user guide](https://sopitive.github.io/HaloMapStudio/getting-started.html#updating)). Release archives are named `HaloMapStudio-<version>-linux-x64.zip` / `HaloMapStudio-<version>-windows-x64.zip` (see `RELEASING.md`).
+**Current release: v1.8.0** — [downloads](https://github.com/Sopitive/HaloMapStudio/releases/latest) · [changelog](https://sopitive.github.io/HaloMapStudio/changelog.html). The app can check for new releases itself (Help ▸ Software update…; opt-in, see the [user guide](https://sopitive.github.io/HaloMapStudio/getting-started.html#updating)). Release archives are named `HaloMapStudio-<version>-linux-x64.zip` / `HaloMapStudio-<version>-windows-x64.zip` (see `RELEASING.md`).
 
 A standalone map viewer and Forge editor for **Halo: Reach**, **Halo 3**,
 **Halo 4** and **Halo 2 Anniversary** from *Halo: The Master Chief Collection*
@@ -45,33 +45,21 @@ Halo 4 Ravine / Haven).
 
 ## Building
 
-Prerequisites: stable Rust (`rust-toolchain.toml` pins the channel and adds the
-`x86_64-pc-windows-msvc` target), a C++20 compiler and `libdeflate` for the
-native parser on Linux.
+Full, ordered instructions for **Windows (native, one command)** and Linux are in
+[BUILDING.md](BUILDING.md). In short:
 
-```sh
-./build-all.sh linux     # native/build-linux.sh + cargo build --release -p hms-app
-./build-all.sh windows   # cross-build the Windows release from Linux (see below)
-./build-all.sh           # both
+```powershell
+.\build-windows.ps1 [-Package]   # Windows: VS Build Tools "Desktop development with C++" + rustup (MSVC)
 ```
 
-Output: `target/release/hms-app` next to `libhalomapstudio.so`, and
-`target/x86_64-pc-windows-msvc/release/hms-app.exe` next to
-`HaloMapStudioDLL.dll`. `build-all.sh --debug ...` builds the debug profile.
+```sh
+./build-all.sh linux             # Linux: native/build-linux.sh + cargo build --release -p hms-app
+```
 
-**Windows cross-build from Linux** needs [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)
-(`cargo install cargo-xwin`; it downloads the MSVC CRT / Windows SDK into
-`~/.cache/cargo-xwin/xwin`) plus `clang-cl` and `lld-link` from LLVM for the
-native DLL (`native/build-windows.sh`).
-
-**Building on Windows:** `cargo build --release -p hms-app` and
-`pwsh native\build.ps1` (MSBuild, `native/HaloMapStudioNative.sln`), which
-stages `HaloMapStudioDLL.dll` into `target\release\`.
-
-The native library is loaded at runtime from the executable's directory, so
-keep the two files together. After rebuilding only the native library on Linux
-use `native/install-linux.sh` (it swaps the file atomically; a running app has
-it mapped).
+Output: `dist\windows-x64\hms-app.exe` next to `HaloMapStudioDLL.dll` (Windows) or
+`target/release/hms-app` next to `libhalomapstudio.so` (Linux). The native library is loaded at
+runtime from the executable's directory, so keep the two files together. No game content is
+built or downloaded; HMS reads your own MCC install.
 
 ## Running
 

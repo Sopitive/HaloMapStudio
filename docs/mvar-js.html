@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Map variant JavaScript API — Halo Map Studio</title>
+<meta name="description" content="Read Halo map variants (.mvar) from JavaScript in a browser or in Node: hms-mvar.js, one dependency-free file for Reach, Halo 3, Halo 4 and Halo 2 Anniversary, with filtering, CSV/JSON export and palette names.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231f6f8b'/%3E%3Ctext x='16' y='22' font-size='18' text-anchor='middle' fill='white' font-family='sans-serif' font-weight='bold'%3EH%3C/text%3E%3C/svg%3E">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<header class="top">
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
+  <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
+</header>
+<div class="wrap">
+<nav class="side" aria-label="Site">
+<ul>
+<li><a href="index.html">Home</a></li>
+<li><a href="getting-started.html">Getting started</a></li>
+<li><a href="maps-and-variants.html">Maps &amp; variants</a></li>
+<li><a href="editing.html">Editing</a></li>
+<li><a href="camera.html">Camera &amp; navigation</a></li>
+<li><a href="shortcuts.html">Keyboard shortcuts</a></li>
+<li><a href="rendering.html">Rendering &amp; settings</a></li>
+<li><a href="scripting.html">Scripting reference</a></li>
+<li><a href="headless.html">Headless / CLI</a></li>
+<li><a href="theater.html">Theater</a></li>
+<li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html" class="cur" aria-current="page">Variant JavaScript API</a></li>
+<li><a href="halo4.html">Halo 4</a></li>
+<li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
+<li><a href="license.html">Licence &amp; commercial use</a></li>
+<li><a href="changelog.html">Changelog</a></li>
+</ul>
+<p class="sidefoot"><a href="https://github.com/Sopitive/HaloMapStudio/releases">Releases</a> · <a href="https://github.com/Sopitive/HaloMapStudio">Source</a></p>
+</nav>
+<main id="content">
+<!-- title: Map variant JavaScript API -->
+<!-- desc: Read Halo map variants (.mvar) from JavaScript in a browser or in Node: hms-mvar.js, one dependency-free file for Reach, Halo 3, Halo 4 and Halo 2 Anniversary, with filtering, CSV/JSON export and palette names. -->
+<h1>Map variant JavaScript API</h1>
+<p class="lead"><code>hms-mvar.js</code> reads Halo map variants (<code>.mvar</code>) in a web page or in Node: the header and metadata, the map, bounds, budget, quotas, Forge labels and every placed object with its position, rotation, team, label and physics, for <strong>Halo: Reach, Halo 3, Halo 4 and Halo 2 Anniversary</strong>. It is one file with no dependencies, no network access and no build step. Try it in the <a href="mvar-viewer.html">web viewer</a>.</p>
+
+<div class="toc"><strong>On this page</strong><ul>
+<li><a href="#start">Quick start (double-click, web site, Node)</a></li>
+<li><a href="#api">API</a></li>
+<li><a href="#object">The object record</a></li>
+<li><a href="#rotation">Rotation</a></li>
+<li><a href="#palette">Names and the palette table</a></li>
+<li><a href="#games">What each game provides</a></li>
+<li><a href="#errors">Bad input</a></li>
+<li><a href="#tests">How it is tested</a></li>
+<li><a href="#render">The map renderer and render packs</a></li>
+<li><a href="#limits">Limits</a></li>
+<li><a href="#licence">Licence</a></li>
+</ul></div>
+
+<div class="note"><p><strong>Decode only.</strong> The library reads variants; it does not write or edit them (use Halo Map Studio for that). It contains no game data, so object <em>names</em> need a palette table you supply (<a href="#palette">below</a>).</p></div>
+
+<h2 id="start">Quick start</h2>
+<p>There are two files in this site&rsquo;s <code>js/</code> folder, with identical code and API:</p>
+<ul>
+<li><a href="js/hms-mvar.js"><code>js/hms-mvar.js</code></a> &mdash; an ES module (for <code>import</code>, Node ESM, bundlers).</li>
+<li><a href="js/hms-mvar.classic.js"><code>js/hms-mvar.classic.js</code></a> &mdash; the same code as a plain script: no <code>import</code>, no <code>type="module"</code>. It works when a page is opened from disk (<code>file://</code>) and from a web server. It is <em>generated</em> from the module by <code>js/build-classic.mjs</code> (<code>node docs/js/build-classic.mjs</code>), and a test fails if the two ever differ.</li>
+</ul>
+<h3 id="mode-file">Mode 1: double-click (a page opened from disk)</h3>
+<p>Save the page and the <code>js</code> folder together. A plain script tag is all it takes; the global <code>HmsMvar</code> appears:</p>
+<pre><code>&lt;input type="file" id="f"&gt;
+&lt;script src="js/hms-mvar.classic.js"&gt;&lt;/script&gt;
+&lt;script&gt;
+  document.getElementById('f').onchange = async (e) =&gt; {
+    try {
+      const v = await HmsMvar.parseFile(e.target.files[0]);   // File or Blob
+      console.log(v.game, v.header.title, v.objects.length, 'objects');
+      console.log(HmsMvar.toCSV(HmsMvar.filterObjects(v, { paletteIndex: 12 })));
+    } catch (err) {
+      if (err instanceof HmsMvar.Error) alert(err.code + ': ' + err.message);
+      else throw err;
+    }
+  };
+&lt;/script&gt;</code></pre>
+<p>The <a href="mvar-viewer.html">viewer</a> is built exactly this way. (A browser will not load an <code>import</code>ed module from a <code>file://</code> page, which is why this build exists.)</p>
+<h3 id="mode-pages">Mode 2: on a web site or GitHub Pages</h3>
+<p>The same <code>&lt;script src="js/hms-mvar.classic.js"&gt;</code> works on a site served from a sub-path such as <code>https://sopitive.github.io/HaloMapStudio/</code>, because every URL is <em>relative</em> (no leading <code>/</code>). If you prefer modules there: <code>&lt;script type="module"&gt; import HmsMvar from './js/hms-mvar.js'; &lt;/script&gt;</code> (this needs http(s), not <code>file://</code>).</p>
+<h3 id="mode-node">Mode 3: Node and bundlers</h3>
+<pre><code>// ESM
+import fs from 'node:fs';
+import HmsMvar from './hms-mvar.js';
+const v = HmsMvar.parse(fs.readFileSync('my_map.mvar'));   // Buffer / Uint8Array / ArrayBuffer
+console.log(v.game, v.map.mapId, v.objects.length);
+console.log(HmsMvar.countBy(v.objects, 'paletteIndex'));
+fs.writeFileSync('objects.csv', HmsMvar.toCSV(v.objects));
+
+// CommonJS
+const HmsMvar2 = require('./hms-mvar.classic.js');</code></pre>
+
+<h2 id="api">API</h2>
+<div class="tablewrap"><table>
+<tr><th>Call</th><th>Returns</th></tr>
+<tr><td><code>HmsMvar.parse(bytes)</code></td><td>The parsed variant (below). <code>bytes</code> is an <code>ArrayBuffer</code>, <code>Uint8Array</code> or Node <code>Buffer</code>. Synchronous.</td></tr>
+<tr><td><code>HmsMvar.parseFile(blobOrFile)</code></td><td>A promise of the same, for a <code>File</code> / <code>Blob</code>.</td></tr>
+<tr><td><code>HmsMvar.Error</code></td><td>The error class every refusal uses. <code>.code</code> is <code>bad-input</code>, <code>not-mvar</code>, <code>truncated</code>, <code>unsupported</code>, <code>corrupt</code> or <code>too-large</code>.</td></tr>
+<tr><td><code>HmsMvar.filterObjects(parsed, filter)</code></td><td>The matching objects. Filter keys (all optional, all must match): <code>paletteIndex</code> (number or list), <code>name</code> (substring or RegExp; needs a palette), <code>label</code> (substring or RegExp), <code>team</code> (number, list, or <code>null</code> for none), <code>physics</code> (<code>'normal'</code>, <code>'fixed'</code>, <code>'phased'</code>), <code>objectType</code>, <code>box</code> (<code>{min:[x,y,z], max:[x,y,z]}</code>), <code>near</code> (<code>{x,y,z,radius}</code>), <code>predicate</code> (<code>o =&gt; boolean</code>).</td></tr>
+<tr><td><code>HmsMvar.countBy(objects, key)</code></td><td>An object of counts, <code>{"12": 41, ...}</code>. <code>key</code> is a property path (<code>'paletteIndex'</code>, <code>'placement.physics'</code>) or a function.</td></tr>
+<tr><td><code>HmsMvar.toCSV(objects, opts)</code></td><td>RFC 4180 text (CRLF). Text cells that start with <code>= + - @</code> get a leading apostrophe so a spreadsheet does not run them as formulas; pass <code>{safe:false}</code> to switch that off. <code>{columns:[...]}</code> picks columns.</td></tr>
+<tr><td><code>HmsMvar.toJSON(parsed, space)</code></td><td>A JSON string of the whole result.</td></tr>
+<tr><td><code>HmsMvar.withPalette(parsed, table, opts)</code></td><td>The same <code>parsed</code> with <code>.name</code> on every object and quota. See <a href="#palette">names</a>.</td></tr>
+</table></div>
+<p>The parsed variant is plain data: <code>game</code> (<code>'reach'</code>, <code>'halo3'</code>, <code>'halo4'</code>, <code>'h2a'</code>), <code>blf</code> (chunk list, mvar chunk version, stored length and SHA-1 check), <code>header</code> (title, description, author, editor, created and modified stamps, category, ids), <code>map</code> (<code>mapId</code>, <code>mccMapId</code>, <code>paletteCrc</code>, version, ...), <code>bounds</code> (<code>xMin..zMax</code>, plus <code>min</code> / <code>max</code> arrays), <code>budget</code> (<code>max</code>, <code>spent</code>), <code>quotas</code>, <code>labels</code>, <code>objects</code>, <code>extra</code> and <code>warnings</code>. 64-bit ids (<code>uid</code>, <code>xuid</code>, ...) are 16-digit hexadecimal <em>strings</em>, never <code>BigInt</code>. Timestamps are Unix seconds with an ISO <code>date</code> beside them.</p>
+
+<h2 id="object">The object record</h2>
+<div class="tablewrap"><table>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td><code>index</code>, <code>slot</code></td><td>Position in <code>objects</code>; the slot in the file (<code>parentSlot</code> of another object refers to it).</td></tr>
+<tr><td><code>paletteIndex</code></td><td>Which palette entry (Reach / Halo 4: the quota index; Halo 3: the quota index, <code>null</code> for a base-map object). <code>variantIndex</code> is the variant inside the entry (Reach, Halo 4).</td></tr>
+<tr><td><code>x</code>, <code>y</code>, <code>z</code></td><td>World position. Stored quantised to the variant&rsquo;s bounds, so these are the exact values the game would read.</td></tr>
+<tr><td><code>forward</code>, <code>up</code>, <code>yaw</code>, <code>pitch</code>, <code>roll</code></td><td>Orientation; see <a href="#rotation">Rotation</a>.</td></tr>
+<tr><td><code>team</code></td><td><code>0</code>..<code>7</code> the team colours, <code>8</code> neutral, <code>null</code> none (Halo 3: the stored byte).</td></tr>
+<tr><td><code>label</code>, <code>labelIndex</code></td><td>The Forge label text (Reach: one; Halo 4 / H2A: <code>labels</code> lists up to four).</td></tr>
+<tr><td><code>placement</code></td><td><code>{raw, physics, symmetry, placedAtStart, uniqueSpawn, ...}</code>. <code>physics</code> is <code>'normal'</code>, <code>'fixed'</code> or <code>'phased'</code> (Reach, Halo 4, H2A; <code>null</code> for Halo 3).</td></tr>
+<tr><td><code>spawnSequence</code>, <code>respawnTime</code></td><td>The Forge spawn sequence and the respawn time in seconds (Halo 3 has only the respawn time).</td></tr>
+<tr><td><code>objectType</code></td><td>The multiplayer object type number (a position in the game&rsquo;s own list).</td></tr>
+<tr><td><code>shape</code></td><td><code>{type: 'none'|'sphere'|'cylinder'|'box', raw, values}</code>. <code>raw</code> are the stored quanta; <code>values</code> are world units for Halo 3 and Halo 4 / H2A and <code>null</code> for Reach, where HMS does not decode a unit.</td></tr>
+<tr><td><code>color</code>, <code>extra</code></td><td>Colour override; type-specific fields (weapon clips, teleporter channel, scale and lock for Halo 4, ...).</td></tr>
+<tr><td><code>raw</code></td><td>The exact stored fields (quanta, flags) for anyone who wants the bits.</td></tr>
+</table></div>
+
+<h2 id="rotation">Rotation</h2>
+<p>The file stores the <em>up</em> vector (a flag for &ldquo;straight up&rdquo;, otherwise a quantised unit vector) and a forward angle about it. <code>forward</code> and <code>up</code> are decoded exactly as Halo Map Studio decodes them. <code>yaw</code>, <code>pitch</code> and <code>roll</code> (degrees) are <strong>derived</strong> by this library from those two vectors: yaw is <code>atan2(forward.y, forward.x)</code>, pitch is the elevation of <code>forward</code>, and roll is the turn of <code>up</code> about <code>forward</code> relative to the up that a zero-roll object with that forward would have. Use <code>forward</code> / <code>up</code> if you need the stored orientation itself.</p>
+
+<h2 id="palette">Names and the palette table</h2>
+<p>A variant stores palette <em>indices</em>. The names belong to the game&rsquo;s map, so they are not embedded in this library. Supply a table with <code>withPalette</code>:</p>
+<pre><code>{ "game": "reach", "mapId": 3006, "names": ["Walls / Wall, double", "Blocks / Block 2x2", "..."] }   // one map
+{ "maps": { "3006": { "game": "reach", "names": ["..."] } } }                                          // several maps
+[ "name0", "name1" ]                                                                                  // bare array (no checks)</code></pre>
+<p><code>names[i]</code> is the name of palette index <code>i</code>, which is also quota <code>i</code>. If the table says it is for another game or map id, nothing is applied and a warning is added (override with <code>{force:true}</code>).</p>
+<h3>Making the table with Halo Map Studio</h3>
+<p>Reach and Halo 4 are supported. The script verb <code>variant get palette-json</code> prints the table as one JSON object. Headless (needs the game installed so HMS can read the map):</p>
+<pre><code>hms-app --exec $'loadvariant /path/to/my_map.mvar\nvariant get palette-json'</code></pre>
+<p><code>loadvariant</code> loads the variant&rsquo;s base map automatically; the log goes to stderr, so redirect it (<code>2&gt;table.log</code>) and copy the single JSON line into a <code>.json</code> file. In the app&rsquo;s console the same command prints it on screen. The names are the same ones the Quota table in <code>variant get</code> shows (<em>category / name</em>). A table is per map, so make it once per base map and reuse it for every variant on that map. The verb itself is covered by a unit test; the end-to-end headless run is described here as the intended route and has not been exercised by an automated test. Halo 3 and H2A names are not produced by HMS yet (their index is still listed by <code>variant get</code>); you can write the table by hand.</p>
+
+<h2 id="games">What each game provides</h2>
+<div class="tablewrap"><table>
+<tr><th></th><th>Reach</th><th>Halo 3</th><th>Halo 4</th><th>H2A</th></tr>
+<tr><td><code>mvar</code> chunk version</td><td>31</td><td>12</td><td>50</td><td>52</td></tr>
+<tr><td>Header strings</td><td>yes</td><td>yes (no editor)</td><td>stored text; may be a <code>$key</code></td><td>same as Halo 4</td></tr>
+<tr><td>Forge labels</td><td>yes</td><td>none in the format</td><td>yes (up to 4 per object)</td><td>yes</td></tr>
+<tr><td>Physics, spawn sequence</td><td>yes</td><td>no</td><td>yes</td><td>yes</td></tr>
+<tr><td>Flag byte</td><td>placement byte (physics, symmetry, placed-at-start, unique)</td><td>bit 0 unique (<code>uniqueSpawn</code>), bit 1 NOT placed at start (<code>placedAtStart</code>, stored inverted), bits 2-3 symmetry (0x00 is ambiguous in the engine), bits 4-7 never read by the engine (kept in <code>extra.mpUnreadBits</code>, meaning unresolved)</td><td>10-bit placement</td><td>11-bit placement</td></tr>
+<tr><td>Game-engine mask</td><td>-</td><td><code>placement.engineMask</code>: the real 10-bit field, bit n = game engine n, 0 reads as all; <code>engineGamesInferred</code> names bits 0 ctf, 3 oddball, 5 koth, 6 assault, 7 territories (INFERRED from stock variants, not proven)</td><td>-</td><td>-</td></tr>
+<tr><td>Team</td><td>0-7 colours, 8 neutral, <code>null</code> none</td><td>0-8 (the engine folds larger values to 0, so <code>team</code> is folded and <code>extra.teamRaw</code> keeps the stored byte; no &ldquo;none&rdquo;)</td><td>same as Reach</td><td>same as Reach</td></tr>
+<tr><td>Colour, label, scale, parent, physics</td><td>yes</td><td>none of these exist in a Halo 3 record</td><td>yes</td><td>yes</td></tr>
+<tr><td>Objects listed</td><td>every placed object</td><td>Forge-placed objects; base-map slots in <code>extra.unplacedSlots</code></td><td>every placed object</td><td>every placed object</td></tr>
+<tr><td>Quota count fields</td><td>8-bit</td><td>8-bit + price + max allowed</td><td>8-bit</td><td>read as 10-bit, shown 0..255</td></tr>
+</table></div>
+<p>A Halo 4 or H2A title that is a localisation key (<code>$h4_mvar_..._name</code>) is returned as the key, with <code>header.titleIsKey</code> set; the text lives in the game&rsquo;s own string tables. A Reach or Halo 4 file stored inside a compressed <code>_cmp</code> chunk is expanded automatically.</p>
+
+<h2 id="errors">Bad input</h2>
+<p>Anything that is not a readable variant throws an <code>HmsMvar.Error</code> with a <code>code</code> and a plain-language message; the library never lets a raw <code>RangeError</code> or <code>TypeError</code> escape from a damaged file and never loops on one. A file with flipped bits can still be a valid variant with different values; check <code>warnings</code> (for example a stale SHA-1) if the source is untrusted. Strings from a file (titles, labels) are untrusted text: put them in the page with <code>textContent</code>, not <code>innerHTML</code>.</p>
+
+<h2 id="tests">How it is tested</h2>
+<p>The JavaScript is a port of Halo Map Studio&rsquo;s own Rust decoders and is tested against them. A Rust test (<code>crates/hms-app/src/mvar_json_dump.rs</code>, ignored by default) decodes a list of folders with the real parsers and writes every field of every file as JSON, with each 32-bit float as its raw bits. <code>docs/js/test/hms-mvar.test.mjs</code> (plain <code>node</code>, no dependencies) parses the same files with <code>hms-mvar.js</code> and compares field by field. On the author&rsquo;s machine that covered 2514 variants (895 Reach, 666 Halo 3, 778 Halo 4, 175 H2A; the shipped sets of three installs plus game-saved files) with <strong>every field identical in all of them</strong>; the one remaining file has no variant chunk at all and both decoders refuse it. Positions and all stored values are bit-identical; the Halo 3 forward vector differs in the last bit of one component for some objects (a difference between the platform&rsquo;s and JavaScript&rsquo;s single-precision sine and cosine, at most 1.2e-7), and the test states that tolerance for the orientation vectors only. The same test cuts files short at many points and flips thousands of bits, and requires a clean <code>HmsMvar.Error</code> or a normal result every time. The classic and module builds are additionally checked against each other (<code>docs/js/test/classic.test.mjs</code>: the committed classic file must equal what the build script makes, and both decode sample files of every game identically), and the same equivalence run passes on the classic build. The test files themselves are never copied into the repository.</p>
+
+<h2 id="render">The map renderer (<code>hms-render.js</code>, <code>hms-camera.js</code>, <code>hms-gl.js</code>)</h2>
+<p>Three small plain scripts (they work from <code>file://</code> and from a web site, with no library and no network) draw a parsed variant: <a href="js/hms-render.js"><code>hms-render.js</code></a> is the view (top-down Canvas 2D, overlay, picking, the Canvas fallback for 3D), <a href="js/hms-camera.js"><code>hms-camera.js</code></a> is the camera maths and input controller, <a href="js/hms-gl.js"><code>hms-gl.js</code></a> is the WebGL renderer. The <a href="mvar-viewer.html">viewer</a> uses all three. It is meant to show <em>roughly what the map looks like</em>, not to be a game renderer: no PBR, no lightmaps, no specular or environment maps, no bump maps.</p>
+<pre><code>&lt;canvas id="gl"&gt;&lt;/canvas&gt;&lt;canvas id="map" tabindex="0"&gt;&lt;/canvas&gt;   // stack them: the 2D canvas on top, transparent
+&lt;script src="js/hms-mvar.classic.js"&gt;&lt;/script&gt;
+&lt;script src="js/hms-camera.js"&gt;&lt;/script&gt;&lt;script src="js/hms-gl.js"&gt;&lt;/script&gt;&lt;script src="js/hms-render.js"&gt;&lt;/script&gt;
+&lt;script&gt;
+  const view = HmsRender.create(document.getElementById('map'), {
+    glCanvas: document.getElementById('gl'),   // optional; without WebGL the Canvas painter is used
+    describe: (i) =&gt; 'object ' + i,            // text for the hover label
+    onSelect: (i) =&gt; console.log('clicked', i) // i = the object's .index, or null
+  });
+  view.setVariant(HmsMvar.parse(bytes));      // markers over the map bounds: needs nothing else
+  view.setPack(pack);                         // optional render pack: meshes, materials, height shading
+  view.setVisible(filtered.map(o =&gt; o.index)); // draw only these; the rest are faded
+  view.setTransparency(true); view.setHideCats(['shield', 'glass', 'glow']); view.setGhost(true);
+&lt;/script&gt;</code></pre>
+<h3 id="nav">Navigation (cheat sheet; press <kbd>?</kbd> in the map)</h3>
+<div class="tablewrap"><table>
+<tr><th>Input</th><th>3D view</th><th>Top view</th></tr>
+<tr><td>Left-drag</td><td>Orbit about the object under the cursor (else the current target); smooth inertia, no flips (pitch is clamped)</td><td>Pan</td></tr>
+<tr><td>Middle-drag, <kbd>Shift</kbd>+left-drag</td><td>Pan</td><td>Pan</td></tr>
+<tr><td>Wheel</td><td>Smooth exponential zoom toward the cursor (clamped)</td><td>Zoom toward the cursor</td></tr>
+<tr><td>Right-drag, then <kbd>W</kbd> <kbd>A</kbd> <kbd>S</kbd> <kbd>D</kbd> <kbd>Q</kbd> <kbd>E</kbd></td><td>Look around and fly; <kbd>Shift</kbd> fast, <kbd>Ctrl</kbd> slow; <kbd>Alt</kbd>+wheel or the slider changes the speed (remembered)</td><td>WASD pans</td></tr>
+<tr><td>Double-click an object, <kbd>F</kbd></td><td colspan="2">Frame the object / the selection, animated</td></tr>
+<tr><td><kbd>Home</kbd>, <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd></td><td colspan="2">Whole map; front, side, top, isometric (animated). <kbd>Esc</kbd> deselects</td></tr>
+<tr><td>Touch</td><td>One finger orbits; two fingers pan and pinch-zoom</td><td>One finger pans; pinch zooms</td></tr>
+</table></div>
+<p>3D picking is by ray against each object&rsquo;s oriented box with depth, hover highlights, and a click selects (the viewer highlights the matching table row and a row click selects the object). A small axis gizmo shows the orientation. Near and far planes follow the zoom, so nothing clips when you are very close or very far.</p>
+<h3 id="gl">Drawing</h3>
+<ul>
+<li><strong>3D, WebGL (1 or 2):</strong> instanced meshes with a depth buffer, hemisphere plus directional light, flat shading, a lit terrain from the pack&rsquo;s height grid, a ground grid and bounds, frustum culling, an outline for the selected and hovered object (also through glass). If WebGL (or instancing) is not available, a Canvas painter draws oriented boxes instead (the page works the same, only plainer).</li>
+<li><strong>Materials (pack v2):</strong> opaque parts and alpha-test cutouts (foliage, fences, texture holes) draw first with depth writes; <em>blend</em> parts (glass, windows) and <em>additive</em> parts (force fields, glows) draw afterwards, sorted far to near per object, with depth test on and depth write off, premultiplied alpha / additive blending, and no back-face culling. A part shows its diffuse colour (the diffuse map&rsquo;s average) and, when the pack has it, a tiny texture, lit only by the hemisphere and sun term. <strong>Colour by</strong> &ldquo;material&rdquo; shows that; &ldquo;category&rdquo;, &ldquo;team&rdquo; and &ldquo;physics&rdquo; recolour the instance but keep the transparency.</li>
+<li><strong>Transparency</strong> checkbox: off draws every part as an opaque surface. <strong>Shields / glass</strong> checkbox: hides the translucent categories (<code>shield</code>, <code>glass</code>, <code>glow</code>) entirely.</li>
+<li><strong>Filtered-out objects</strong> (they do not match the table filters) are drawn as a flat, desaturated, faded silhouette so they cannot be mistaken for real transparency; the <em>Faded filtered-out</em> checkbox hides them instead.</li>
+<li>Performance: it culls to the view frustum and batches by mesh; on a real GPU thousands of instances are not a concern. Software GL in headless Chromium takes about 200 ms for 5000 instances of 160 triangles each (800 000 triangles); it is much faster for plain boxes. The pure maths (box corners, projection, picking, camera, pack and mesh decoding) is unit-tested in plain Node (<code>docs/js/test/render.test.mjs</code>, <code>camera.test.mjs</code>).</li>
+</ul>
+
+<h3 id="pack">The render pack</h3>
+<div class="warn"><p><strong>A render pack is derived from your own installed game. Keep it for yourself; do not redistribute it, commit it, or put it on a web site.</strong> The Halo Map Studio repository and this site ship no pack and no game data. The viewer reads a pack from your disk, keeps it in memory only, and never uploads it.</p></div>
+<p>A pack is deliberately small and abstract: per object type a simplified mesh (at most 400 triangles) with one minimal material per part, a coarse height grid, and no triangle soup of the level, no full-size model, no full-size texture, no shader. Format version 2 (JSON; version 1 packs, which hold boxes and the grid only, still load). Forge World: 145 palette entries, about 2.4 MB (limit 2.5 MB; the generator shrinks triangle budgets and drops textures to fit, never the alpha modes):</p>
+<pre><code>{
+  "format": "hms-render-pack", "version": 2, "game": "reach", "mapId": 3006,
+  "bounds": [xmin, xmax, ymin, ymax, zmin, zmax],
+  "palette": [ {                       // one entry per palette (quota) index
+      "i": 79, "name": "structure_blocks", "cat": "block",   // cat: block scenery weapon vehicle equipment device spawn zone shield glass glow other
+      "box": [minx, miny, minz, maxx, maxy, maxz],          // local axis-aligned box, +x forward, +z up
+      "mesh": { "box": [...], "n": 24, "tris": 12, "ib": 8,  // n vertices, int16 x,y,z inside "box"; indices u8 (ib 8) or u16 (16)
+                "v": "&lt;base64&gt;", "i": "&lt;base64&gt;",
+                "uv": "&lt;base64 u16 pairs&gt;", "uvb": [u0, v0, u1, v1],   // only when a part has a texture
+                "parts": [ { "lane": "opaque", "c": [r, g, b], "o": 1.0, "t": 0, "s": 0, "n": 12 } ] },
+      "variants": [ { "v": 0, "name": "block_1x1", "cat": "...", "box": [...], "mesh": {...} } ]   // only when an entry has several sizes
+  } ],
+  "textures": [ { "w": 16, "h": 16, "rgba": "&lt;base64 RGBA8&gt;" } ],   // tiny diffuse maps shared by parts; optional
+  "grid": { "w": 128, "h": 128, "zmin": -25.0, "zmax": 117.8, "min": "&lt;base64&gt;", "max": "&lt;base64&gt;" }
+}</code></pre>
+<p>A <strong>part</strong> is a triangle range <code>[s, s+n)</code> of the mesh with <code>lane</code> = <code>opaque</code>, <code>cutout</code> (alpha test), <code>blend</code> (glass, windows) or <code>additive</code> (force fields, glows), a base colour <code>c</code> (the diffuse map&rsquo;s average, 0 to 255), an opacity <code>o</code> and an optional texture index <code>t</code>. The lane is the one Halo Map Studio&rsquo;s own scene routes the shader to, from the shader tag&rsquo;s authored blend type, alpha test, glass, halogram and forcefield class. It is never guessed from a name.</p>
+<p><code>cat</code> is a guess from the tag class and palette name for the colour, except these: <code>shield</code> is a model that is mostly a forcefield (the Forge one-way and two-way shield doors, the laser walls, the hangar shield pieces), or an effect-drawn volume (a render model of 4 triangles or fewer, with a physics hull and an effect attachment: a translucent cool-tinted hull panel is emitted for it); <code>glass</code> is a model that is mostly alpha-blended; <code>glow</code> is mostly additive. A weapon with one translucent scope lens stays a weapon. The mesh is the object&rsquo;s render model where its box agrees with the physics hull&rsquo;s box (weapons, vehicles, scenery), else the physics hull itself (blocks, walls, ramps and the hidden blockers, where convex hulls are essentially exact). The height grid holds, per cell of the world bounds, the lowest and highest Z of the level&rsquo;s collision triangles that touch the cell, quantised to 8 bits over <code>[zmin, zmax]</code>.</p>
+<h3 id="pack-make">Making a pack with Halo Map Studio</h3>
+<p>Reach and Halo 4 variants; the game must be installed so HMS can read the map:</p>
+<pre><code>hms-app --exec $'loadvariant /path/to/my_map.mvar\nvariant get render-pack my_map.pack.json'</code></pre>
+<p>It writes the file and prints a one-line summary (entries, boxes, size). Make it once per base map; it serves every variant on that map. Halo 3 and H2A packs are not produced (HMS has no palette-to-geometry route for them), but a variant of those games still draws as markers, and the pack format simply omits what it does not have.</p>
+<p>The viewer also lists which entries a pack classified as shield or glass (the generator prints the list: <code>translucent entries (n): ...</code>). How the generator is checked: an ignored, map-backed Rust test (<code>render_pack::tests::render_pack_gate_forge_world</code>) builds the pack for Forge World with the same function the verb calls and asserts the size (&le; 200 KB; measured 75 KB), that nearly every palette entry has a box, known proportions (<code>block_1x1</code> is a 1.016 &times; 1.016 &times; 1.0 cube, <code>block_4x4</code> is 4 &times; 4 &times; 1, the Forge grid object is 30 wide), that every entry has a mesh within the 400-triangle and 2.5 MB budgets, that the one-way and two-way shield doors are classified <code>shield</code> with only translucent parts while a solid block and the heavy barricade (whose tag path contains &ldquo;shield&rdquo;) stay opaque, and that the height grid cell under each of a real variant&rsquo;s objects equals a direct query of that cell (a transposed grid fails it). The verb itself has not been run end to end in this environment.</p>
+
+<h2 id="limits">Limits</h2>
+<ul>
+<li>Decode only. No encoder, no editing. The map view is a rough overview (boxes and a coarse height grid), not a faithful render; objects with no box in the pack are shown at a default size.</li>
+<li>No game data: names need your palette table; Halo 4 localisation keys stay keys.</li>
+<li>Reach boundary-shape sizes are not converted to world units (HMS does not do it either); the stored values are in <code>shape.raw</code>.</li>
+<li>Halo 3 records have no physics, spawn-sequence, colour, label or scale field; the flag byte is decoded as described in the table above and the raw bytes stay in <code>placement.raw</code> and <code>raw</code>.</li>
+<li>Browsers: tested in headless Chromium only (from <code>file://</code> and from a sub-path web server); Firefox and Safari are untested. Needs ES2020 (BigInt, <code>TextDecoder</code>).</li>
+<li>Files over 64 MiB are refused.</li>
+</ul>
+
+<h2 id="licence">Licence</h2>
+<p><code>hms-mvar.js</code> and <code>hms-render.js</code> are part of Halo Map Studio and are covered by the same licence (the decoder is a port of its own Rust source): Copyright &copy; 2026 Sopitive, all rights reserved, under the <strong>PolyForm Noncommercial License 1.0.0</strong>, with a separate commercial licence for commercial use. See <a href="license.html">Licence &amp; commercial use</a>. Each file carries the notice in its header.</p>
+
+<footer class="foot">
+<p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+</footer>
+</main>
+</div>
+</body>
+</html>

@@ -13,7 +13,7 @@ use std::path::Path;
 use eframe::egui;
 use hms_ipc::ObjectInfo;
 
-use super::edit::{build_h3_save_list, H3EditorSet, H3SaveReport, h3_tag, variant_to_editor, H3LiveMeta, ScnEntry, StorageRole, H3_MARKER_TAG, MP_SYMMETRY_MASK, NEW_SLOT};
+use super::edit::{build_h3_save_list, H3EditorSet, H3SaveReport, h3_tag, variant_to_editor, H3LiveMeta, ScnEntry, StorageRole, H3_MARKER_TAG, MP_EDIT_MASK, MP_SYMMETRY_MASK, MP_NOT_AT_START, MP_UNIQUE, NEW_SLOT};
 use super::scenario::{is_scenario_datum, SLOT_SCENARIO};
 use super::edit_scene::{H3EditorAssets, H3ObjectScene};
 use super::mvar::{parse_h3_variant, save_h3_variant, H3HeaderEdits, H3Variant, H3VariantObject};
@@ -77,7 +77,7 @@ pub fn live_meta_of(om: &ObjMeta, team: u8, palette_item: Option<usize>) -> H3Li
     };
     H3LiveMeta {
         team, spawn_time: om.respawn, boundary_shape: om.boundary_shape, boundary_q: om.boundary, palette_item,
-        shared_storage: shared, symmetry: Some(om.placement & MP_SYMMETRY_MASK),
+        shared_storage: shared, mp_bits: Some(om.placement & MP_EDIT_MASK), engine: Some(om.h3_engine),
     }
 }
 
@@ -120,6 +120,7 @@ pub fn obj_meta_from_h3(m: &super::edit::H3ObjMeta, pos: [f32; 3]) -> ObjMeta {
         label_idx: 0xFFFF,
         label: String::new(),
         placement: m.mp_flags,
+        h3_engine: m.game_engine_flags,
         boundary_shape: m.boundary_shape,
         boundary: m.boundary_q,
         // the record's shared byte lands in the field that names its role for this object type
@@ -439,20 +440,59 @@ impl App {
         ui.end_row();
     }
 
-    /// The Forge menu's `symmetry` property: which gametype symmetry the object appears in. The two
-    /// bits are the pair a gametype needs one object of each for (halo3.dll sub_1800BC2BC); "both"
-    /// (`0x0C`) is what a fresh drop gets.
-    pub(crate) fn h3_row_symmetry(&self, ui: &mut egui::Ui, m: &mut ObjMeta) {
+    /// The Forge menu's placement properties for a Halo 3 object, in the menu's own words
+    /// (halo3.dll .rdata keys `symmetry`, `on_map_at_start`, `unique_object`): which gametype symmetry the
+    /// object is used in, whether it exists when the match starts, whether it is a unique object. The
+    /// flags byte's other bits ride through a save as read (edit.rs `MP_EDIT_MASK`).
+    pub(crate) fn h3_rows_placement(&self, ui: &mut egui::Ui, m: &mut ObjMeta) {
         ui.label("symmetry").on_hover_text("Which gametype symmetry the object is used in. Bit 0x04 is called symmetric and 0x08 asymmetric (the order the Forge menu lists them -- the engine only needs one object of each, so the naming is inferred). 'both' is what a fresh drop gets.");
         let mut sym = m.placement & MP_SYMMETRY_MASK;
-        let txt = match sym { 0x0C => "both", 0x04 => "symmetric", 0x08 => "asymmetric", _ => "never" };
+        let txt = match sym { 0x0C => "both", 0x04 => "symmetric", 0x08 => "asymmetric", _ => "neither (engine reads as both)" };
         egui::ComboBox::from_id_salt("h3-sym").selected_text(txt).show_ui(ui, |ui| {
-            ui.selectable_value(&mut sym, 0u8, "never");
+            ui.selectable_value(&mut sym, 0x0Cu8, "both");
             ui.selectable_value(&mut sym, 0x04u8, "symmetric");
             ui.selectable_value(&mut sym, 0x08u8, "asymmetric");
-            ui.selectable_value(&mut sym, 0x0Cu8, "both");
+            if sym == 0 { ui.selectable_value(&mut sym, 0u8, "neither (engine reads as both)"); }
         });
         m.placement = (m.placement & !MP_SYMMETRY_MASK) | sym;
+        ui.end_row();
+        ui.label("placement");
+        ui.vertical(|ui| {
+            // stored inverted: the bit is "not initially placed"
+            let mut at_start = m.placement & MP_NOT_AT_START == 0;
+            if ui.checkbox(&mut at_start, "placed at start").on_hover_text("The Forge menu's 'on map at start'. Off = the object is not on the map when a match begins (stored inverted, flag bit 0x02).").changed() {
+                if at_start { m.placement &= !MP_NOT_AT_START; } else { m.placement |= MP_NOT_AT_START; }
+            }
+            let mut unique = m.placement & MP_UNIQUE != 0;
+            if ui.checkbox(&mut unique, "unique").on_hover_text("The Forge menu's 'unique object' (flag bit 0x01). No shipped variant sets it.").changed() {
+                if unique { m.placement |= MP_UNIQUE; } else { m.placement &= !MP_UNIQUE; }
+            }
+            let rest = m.placement & !MP_EDIT_MASK;
+            if rest != 0 {
+                ui.small(egui::RichText::new(format!("other flag bits 0x{rest:02X} kept")).weak())
+                    .on_hover_text("Bits 4-7 of the flags byte: the engine's load path never reads them, so they are saved exactly as found.");
+            }
+        });
+        ui.end_row();
+        ui.label("game types").on_hover_text("Which gametype engines the object appears in: a 10-bit mask (0x3FF = every one). The Forge menu does not offer it; stock maps use it to hide a gametype's spawns from the others.");
+        ui.vertical(|ui| {
+            let mut mask = if m.h3_engine & 0x3FF == 0 { 0x3FF } else { m.h3_engine & 0x3FF };
+            ui.horizontal_wrapped(|ui| {
+                for bit in 0..10u16 {
+                    let mut on = mask >> bit & 1 == 1;
+                    if ui.checkbox(&mut on, match H3_ENGINE_BIT_NAMES[bit as usize] { Some(n) => format!("{bit} {n}"), None => format!("{bit}") })
+                        .on_hover_text(match H3_ENGINE_BIT_NAMES[bit as usize] {
+                            Some(n) => format!("engine bit {bit}: {n} (INFERRED from which objective objects carry only this bit on the stock variants; halo3.dll tests `mask & (1 << engine_type)`)"),
+                            None => format!("engine bit {bit} (halo3.dll tests `mask & (1 << engine_type)`; no name proven)"),
+                        }).changed() {
+                        if on { mask |= 1 << bit; } else { mask &= !(1 << bit); }
+                    }
+                }
+            });
+            if mask == 0 { mask = 0x3FF; ui.small("a mask of none reads as every gametype"); }
+            if mask != m.h3_engine & 0x3FF || (m.h3_engine & !0x3FF) != 0 { m.h3_engine = mask; }
+            ui.small(egui::RichText::new(format!("mask 0x{:03X}", m.h3_engine)).weak());
+        });
         ui.end_row();
     }
 
@@ -739,6 +779,125 @@ impl App {
 fn dist2(a: [f32; 3], b: [f32; 3]) -> f32 { (0..3).map(|k| (a[k] - b[k]) * (a[k] - b[k])).sum() }
 
 /// The multiplayer object type's name (the tag enum; confirmed against the palette names).
+/// The `get <datum>` lines of a Halo 3 object: every property its record stores, by the names `set` takes.
+pub fn h3_dump_lines(m: &ObjMeta) -> String {
+    let shapes = ["none", "sphere", "cylinder", "box"];
+    let role = StorageRole::of(m.cached_type);
+    let sym = match m.placement & MP_SYMMETRY_MASK { 0x0C => "both", 0x04 => "symmetric", 0x08 => "asymmetric", _ => "neither" };
+    let mut s = format!("  name={}\n  object type={} ({})  team={}  respawn={}\n  symmetry={sym} unique={} placed_at_start={} flags=0x{:02X}\n  engine=0x{:03X}\n  quota={}\n",
+        m.name, m.cached_type, h3_type_name(m.cached_type), crate::forge_team_name(m.team as i32), m.respawn,
+        if m.placement & MP_UNIQUE != 0 { "on" } else { "off" }, if m.placement & MP_NOT_AT_START == 0 { "on" } else { "off" },
+        m.placement, m.h3_engine, m.folder);
+    match role {
+        StorageRole::SpareClips => s.push_str(&format!("  spare_clips={}\n", m.weapon_clips)),
+        StorageRole::TeleporterChannel => s.push_str(&format!("  teleporter_channel={}\n", m.tele_channel)),
+        StorageRole::SpawnOrder => s.push_str(&format!("  spawn_order={}\n", m.spawn_seq)),
+        StorageRole::None => {}
+    }
+    let sh = (m.boundary_shape as usize).min(3);
+    let names: &[&str] = match sh { 1 => &["radius"], 2 => &["radius", "top", "bottom"], 3 => &["width", "length", "top", "bottom"], _ => &[] };
+    s.push_str(&format!("  shape={}", shapes[sh]));
+    for (k, n) in names.iter().enumerate() { s.push_str(&format!(" {n}={:.3}wu(q{})", super::edit::boundary_wu(m.boundary[k]), m.boundary[k])); }
+    s.push('\n');
+    s
+}
+
+/// The per-object properties the Halo 3 panel exposes, with the `set <datum> <field>` name that edits each one.
+/// Reach / Halo 4 rows that are absent here are absent from the Halo 3 panel on purpose (see
+/// `H3_HIDDEN_REACH_PROPERTIES`). The script-verb test below drives every entry, so a property added to the
+/// panel without a verb (or the reverse) is caught.
+pub const H3_PANEL_PROPERTIES: &[(&str, &str)] = &[
+    ("team", "team"), ("spawn time (respawn rate)", "respawn"), ("spare clips (weapons, grenades)", "clips"),
+    ("teleporter channel (teleporters)", "channel"), ("spawn order (spawns, objectives)", "spawn_order"),
+    ("symmetry", "symmetry"), ("unique", "unique"), ("placed at start", "atstart"), ("game types (engine mask)", "engine"),
+    ("boundary shape", "shape"), ("boundary size (radius / width / length / top / bottom)", "radius"),
+];
+/// Reach / Halo 4 properties a Halo 3 record has no field for (hidden from the panel, refused by `set`).
+pub const H3_HIDDEN_REACH_PROPERTIES: &[&str] = &["color", "label", "scale", "scaled", "cached_type", "tele_passability"];
+
+/// Slot of a named boundary size in a Halo 3 record's four quanta, by shape (mvar.rs: sphere radius; cylinder
+/// radius / top / bottom; box width / length / top / bottom).
+pub fn h3_boundary_slot(shape: u8, name: &str) -> Option<usize> {
+    match (shape, name) {
+        (1, "radius") | (2, "radius") | (3, "width") => Some(0),
+        (2, "top") | (3, "length") => Some(1),
+        (2, "bottom") | (3, "top") => Some(2),
+        (3, "bottom") => Some(3),
+        _ => None,
+    }
+}
+
+fn h3_flag_value(value: &str) -> Result<bool, String> {
+    match value.trim().to_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        v => Err(format!("expected on|off, got '{v}'")),
+    }
+}
+
+/// `set <datum> <field> <value>` for a Halo 3 object: the properties the Halo 3 record stores, under the Forge
+/// menu's names (and the Reach script's names where the property is the same one). Returns Ok(true) when the
+/// field was handled, Ok(false) to let the shared pseudo-flag fields (shadow, damage) fall through, and Err
+/// with the reason for a Reach-only field.
+pub fn h3_set_field(m: &mut ObjMeta, field: &str, value: &str) -> Result<bool, String> {
+    let int = |lo: i64, hi: i64| -> Result<i64, String> {
+        let v: i64 = value.trim().parse().map_err(|_| format!("{field} needs a whole number ({lo}..{hi})"))?;
+        if v < lo || v > hi { return Err(format!("{field} must be {lo}..{hi}, got {v}")); }
+        Ok(v)
+    };
+    let role = StorageRole::of(m.cached_type);
+    let need = |want: StorageRole| -> Result<(), String> {
+        if role == want { Ok(()) } else { Err(format!("{field}: a {} (type {}) has no '{}' in Halo 3{}", h3_type_name(m.cached_type), m.cached_type, want.label(),
+            if role == StorageRole::None { String::new() } else { format!(" (it has '{}')", role.label()) })) }
+    };
+    match field {
+        "team" => {
+            let t = crate::script::parse_team(value)?;
+            if t == 0xFF { return Err("a Halo 3 object has no 'none' team: use red..pink (0..7) or neutral (8)".into()); }
+            m.team = t;
+        }
+        "respawn" | "spawntime" | "spawn_time" | "respawn_rate" => m.respawn = int(0, 255)? as u8,
+        "spawnseq" | "spawn_seq" | "spawnsequence" | "spawn_sequence" | "spawnorder" | "spawn_order" => { need(StorageRole::SpawnOrder)?; m.spawn_seq = int(0, 255)? as i32; }
+        "clips" | "spare_clips" | "weapon_clips" => { need(StorageRole::SpareClips)?; m.weapon_clips = int(0, 255)? as u8; }
+        "channel" | "tele_channel" | "teleporter_channel" => { need(StorageRole::TeleporterChannel)?; m.tele_channel = int(0, 255)? as u8; }
+        "symmetry" => {
+            let sym = match value.trim().to_lowercase().as_str() {
+                "both" => 0x0C, "symmetric" => 0x04, "asymmetric" => 0x08,
+                v => return Err(format!("symmetry must be both|symmetric|asymmetric, got '{v}'")),
+            };
+            m.placement = (m.placement & !MP_SYMMETRY_MASK) | sym;
+        }
+        "unique" | "unique_object" => { if h3_flag_value(value)? { m.placement |= MP_UNIQUE } else { m.placement &= !MP_UNIQUE } }
+        "atstart" | "at_start" | "placed_at_start" | "on_map_at_start" => { if h3_flag_value(value)? { m.placement &= !MP_NOT_AT_START } else { m.placement |= MP_NOT_AT_START } }
+        "engine" | "engines" | "gametypes" | "engine_flags" => {
+            let v = value.trim().to_lowercase();
+            m.h3_engine = if v == "all" { 0x3FF } else {
+                let n = match v.strip_prefix("0x") { Some(h) => i64::from_str_radix(h, 16).ok(), None => v.parse::<i64>().ok() };
+                match n { Some(n) if (1..=0x3FF).contains(&n) => n as u16, _ => return Err("engine takes all or a mask 1..0x3FF (bit n = gametype engine n)".into()) }
+            };
+        }
+        "shape" | "boundary" => {
+            m.boundary_shape = match value.trim().to_lowercase().as_str() { "none" => 0, "sphere" => 1, "cylinder" => 2, "box" => 3, _ => return Err("shape must be none/sphere/cylinder/box".into()) };
+        }
+        "radius" | "width" | "length" | "top" | "bottom" => {
+            let wu: f32 = value.trim().parse().map_err(|_| format!("{field} needs a number in world units (0..{})", super::mvar::H3_BOUNDARY_MAX))?;
+            let k = h3_boundary_slot(m.boundary_shape, field).ok_or_else(|| format!("a {} boundary has no '{field}'", ["empty", "sphere", "cylinder", "box"][(m.boundary_shape as usize).min(3)]))?;
+            m.boundary[k] = super::edit::boundary_q_of(wu);
+        }
+        "b0" | "b1" | "b2" | "b3" => { let k = (field.as_bytes()[1] - b'0') as usize; m.boundary[k] = int(0, 65535)? as u16; }
+        "color" | "colour" | "label" | "scale" | "scaled" | "cached_type" | "cachedtype" | "tele_passability" | "passability" => {
+            return Err(format!("'{field}' is a Reach / Halo 4 property: a Halo 3 record has no such field"));
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// Names of the 10 game-engine mask bits where the stock variants make them clear (INFERRED, not read from a
+/// table): a flag spawn / return area carries bits 0 and 6 only, a hill bit 5, a territory bit 7, an oddball spawn
+/// bit 3. The rest are unnamed rather than guessed.
+pub const H3_ENGINE_BIT_NAMES: [Option<&str>; 10] = [Some("CTF"), None, None, Some("Oddball"), None, Some("KOTH"), Some("Assault"), Some("Territories"), None, None];
+
 pub fn h3_type_name(t: u8) -> &'static str {
     const N: [&str; 24] = ["ordinary", "weapon", "grenade", "projectile", "powerup", "equipment", "light land vehicle", "heavy land vehicle",
         "flying vehicle", "teleporter (2-way)", "teleporter sender", "teleporter receiver", "player spawn", "respawn zone", "oddball spawn",
@@ -768,16 +927,16 @@ mod tests {
             let live = live_meta_of(&om, 8, None);
             let want = match t { 1 | 2 => Some(11), 9..=11 => Some(22), 12..=23 => Some(33), _ => None };
             assert_eq!(live.shared_storage, want, "object type {t}");
-            assert_eq!(live.symmetry, Some(0x0C), "object type {t}");
+            assert_eq!(live.mp_bits, Some(0x0C), "object type {t}");
         }
         // the panel's spawn order is a signed int: out of byte range clamps instead of wrapping
         let big = ObjMeta { cached_type: 18, spawn_seq: 300, placement: 0x04, ..Default::default() };
         assert_eq!(live_meta_of(&big, 8, None).shared_storage, Some(255));
         let neg = ObjMeta { cached_type: 18, spawn_seq: -4, placement: 0x04, ..Default::default() };
         assert_eq!(live_meta_of(&neg, 8, None).shared_storage, Some(0));
-        // only the symmetry bits leave the placement byte
+        // only the four bits the engine reads leave the placement byte
         let sym = ObjMeta { cached_type: 0, placement: 0xFF, ..Default::default() };
-        assert_eq!(live_meta_of(&sym, 8, None).symmetry, Some(0x0C));
+        assert_eq!(live_meta_of(&sym, 8, None).mp_bits, Some(0x0F));
     }
 
     /// The record's bytes land in the same fields `live_meta_of` reads them back from: load ->
@@ -786,16 +945,78 @@ mod tests {
     fn loading_then_saving_a_record_is_the_identity_for_every_role() {
         for t in [0u8, 1, 2, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15, 17, 18, 20, 22, 23] {
             let m = crate::h3::edit::H3ObjMeta { name: "x".into(), quota: 3, team: 8, object_type: t, spawn_time: 30, boundary_shape: 2,
-                boundary_q: [1, 2, 3, 4], slot: 5, shared_storage: 7, mp_flags: 0x8C };
+                boundary_q: [1, 2, 3, 4], slot: 5, shared_storage: 7, mp_flags: 0x8C, game_engine_flags: 0x0A2 };
             let om = obj_meta_from_h3(&m, [0.0; 3]);
             let live = live_meta_of(&om, m.team, None);
             match StorageRole::of(t) {
                 StorageRole::None => assert_eq!(live.shared_storage, None, "type {t}"),
                 _ => assert_eq!(live.shared_storage, Some(7), "type {t}: the shared byte did not survive load -> save"),
             }
-            assert_eq!(live.symmetry, Some(0x8C & MP_SYMMETRY_MASK));
+            assert_eq!(live.mp_bits, Some(0x8C & MP_EDIT_MASK));
+            assert_eq!(live.engine, Some(0x0A2));
             assert_eq!((live.boundary_shape, live.boundary_q, live.spawn_time), (2, [1, 2, 3, 4], 30));
         }
+    }
+
+    /// Every panel property has a `set` verb that reaches the ObjMeta field the save reads, and a Reach-only
+    /// property is refused with a reason instead of being written to a record that cannot store it.
+    #[test]
+    fn every_panel_property_has_a_script_verb_that_reaches_the_save() {
+        let mk = |t: u8| ObjMeta { cached_type: t, placement: 0x0C, h3_engine: 0x3FF, boundary_shape: 3, team: 8, ..Default::default() };
+        let live = |m: &ObjMeta| live_meta_of(m, m.team, None);
+        let mut m = mk(12); // a player spawn: spawn order
+        assert_eq!(h3_set_field(&mut m, "team", "red"), Ok(true)); assert_eq!(m.team, 0);
+        assert_eq!(h3_set_field(&mut m, "team", "7"), Ok(true)); assert_eq!(m.team, 7);
+        assert!(h3_set_field(&mut m, "team", "none").is_err() && h3_set_field(&mut m, "team", "9").is_err(), "H3 has no 'none' team and no team past 8");
+        assert_eq!(h3_set_field(&mut m, "respawn", "255"), Ok(true)); assert_eq!(live(&m).spawn_time, 255);
+        assert!(h3_set_field(&mut m, "respawn", "256").is_err());
+        assert_eq!(h3_set_field(&mut m, "spawn_order", "3"), Ok(true)); assert_eq!(live(&m).shared_storage, Some(3));
+        assert!(h3_set_field(&mut m, "clips", "1").is_err() && h3_set_field(&mut m, "channel", "1").is_err(), "a spawn has neither clips nor a channel");
+        for (v, bits) in [("both", 0x0C), ("symmetric", 0x04), ("asymmetric", 0x08)] {
+            assert_eq!(h3_set_field(&mut m, "symmetry", v), Ok(true)); assert_eq!(live(&m).mp_bits.unwrap() & MP_SYMMETRY_MASK, bits);
+        }
+        assert!(h3_set_field(&mut m, "symmetry", "never").is_err());
+        assert_eq!(h3_set_field(&mut m, "unique", "on"), Ok(true)); assert_eq!(live(&m).mp_bits.unwrap() & MP_UNIQUE, MP_UNIQUE);
+        assert_eq!(h3_set_field(&mut m, "unique", "off"), Ok(true)); assert_eq!(live(&m).mp_bits.unwrap() & MP_UNIQUE, 0);
+        assert_eq!(h3_set_field(&mut m, "atstart", "off"), Ok(true)); assert_eq!(live(&m).mp_bits.unwrap() & MP_NOT_AT_START, MP_NOT_AT_START);
+        assert_eq!(h3_set_field(&mut m, "atstart", "on"), Ok(true)); assert_eq!(live(&m).mp_bits.unwrap() & MP_NOT_AT_START, 0);
+        assert!(h3_set_field(&mut m, "atstart", "maybe").is_err());
+        assert_eq!(h3_set_field(&mut m, "engine", "0x021"), Ok(true)); assert_eq!(live(&m).engine, Some(0x021));
+        assert_eq!(h3_set_field(&mut m, "engine", "all"), Ok(true)); assert_eq!(live(&m).engine, Some(0x3FF));
+        assert!(h3_set_field(&mut m, "engine", "0").is_err() && h3_set_field(&mut m, "engine", "0x400").is_err());
+        // the box: width / length / top / bottom land in quanta 0..3 in world units, clamped to the 60 wu range
+        assert_eq!(h3_set_field(&mut m, "shape", "box"), Ok(true));
+        for (f, k) in [("width", 0), ("length", 1), ("top", 2), ("bottom", 3)] {
+            assert_eq!(h3_set_field(&mut m, f, "12.5"), Ok(true));
+            assert!((super::super::edit::boundary_wu(live(&m).boundary_q[k]) - 12.5).abs() < 0.001, "{f}");
+        }
+        assert_eq!(h3_set_field(&mut m, "width", "90"), Ok(true)); assert_eq!(live(&m).boundary_q[0], 65535, "sizes clamp at 60 wu");
+        assert!(h3_set_field(&mut m, "radius", "1").is_err(), "a box has no radius");
+        assert_eq!(h3_set_field(&mut m, "shape", "cylinder"), Ok(true));
+        for (f, k) in [("radius", 0), ("top", 1), ("bottom", 2)] { assert_eq!(h3_set_field(&mut m, f, "3"), Ok(true)); assert!((super::super::edit::boundary_wu(live(&m).boundary_q[k]) - 3.0).abs() < 0.001, "{f}"); }
+        assert!(h3_set_field(&mut m, "width", "1").is_err());
+        assert_eq!(h3_set_field(&mut m, "b3", "65535"), Ok(true)); assert_eq!(live(&m).boundary_q[3], 65535);
+        assert!(h3_set_field(&mut m, "b0", "65536").is_err());
+        // the storage roles
+        let mut w = mk(1); assert_eq!(h3_set_field(&mut w, "clips", "4"), Ok(true)); assert_eq!(live(&w).shared_storage, Some(4));
+        assert!(h3_set_field(&mut w, "spawn_order", "1").is_err());
+        let mut t = mk(9); assert_eq!(h3_set_field(&mut t, "channel", "25"), Ok(true)); assert_eq!(live(&t).shared_storage, Some(25));
+        // every Reach-only name is refused, and every panel property's verb exists
+        for f in H3_HIDDEN_REACH_PROPERTIES { assert!(h3_set_field(&mut mk(0), f, "1").is_err(), "{f} must be refused on Halo 3"); }
+        assert_eq!(h3_set_field(&mut mk(0), "shadow", "on"), Ok(false), "the display pseudo-flags fall through to the shared handler");
+        for (name, verb) in H3_PANEL_PROPERTIES {
+            let ok = ["team", "respawn", "clips", "channel", "spawn_order", "symmetry", "unique", "atstart", "engine", "shape", "radius"].contains(verb);
+            assert!(ok, "{name}: verb '{verb}' is not one the test drives");
+        }
+    }
+
+    /// The object dump names every stored property, and only those.
+    #[test]
+    fn the_object_dump_lists_the_halo_3_properties() {
+        let m = ObjMeta { name: "weapons\\br".into(), cached_type: 1, weapon_clips: 4, respawn: 30, team: 8, placement: 0x0E, h3_engine: 0x3FF, boundary_shape: 1, boundary: [32768, 0, 0, 0], ..Default::default() };
+        let d = h3_dump_lines(&m);
+        for want in ["spare_clips=4", "symmetry=both", "placed_at_start=off", "unique=off", "engine=0x3FF", "shape=sphere radius=30.0"] { assert!(d.contains(want), "{want} missing from:\n{d}"); }
+        assert!(!d.contains("color") && !d.contains("label"), "{d}");
     }
 
     /// Scaling a selection cannot resize anything on Halo 3 (the record has no size field) and

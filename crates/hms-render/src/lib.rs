@@ -48,7 +48,63 @@ pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub const COLOR_FORMAT_SRGB: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Light uniform size: 11 Reach vec4s + 9 Halo 4 shadow vec4s (see `render`'s light block).
-pub(crate) const LIGHT_UNIFORM_BYTES: u64 = 320;
+pub(crate) const LIGHT_UNIFORM_BYTES: u64 = 352;
+/// Float index (in the light uniform) where the Lighting Lab "object lighting terms" tail starts:
+/// right after the 76 floats of the mesh module's `Light` struct up to `casc1`. Three vec4
+/// (`objdbg0..2`) = 12 floats = bytes 304..352. See `ObjectTerms::lanes`.
+pub(crate) const OBJ_TERMS_FLOAT_OFFSET: usize = 76;
+/// Number of floats in the object-terms tail (3 x vec4).
+pub(crate) const OBJ_TERMS_LANES: usize = 12;
+
+/// Lighting Lab "Object lighting terms (diagnostic)": live A/B switches over the terms of the
+/// mesh shader's object composite. EVERY field's default reproduces the shipped shader maths
+/// exactly, and `lanes()` encodes them so an all-zero uniform tail IS the default (a buffer that
+/// was never written, or a shader permutation that ignores the tail, cannot change the picture).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ObjectTerms {
+    /// Apply `scene_grade()` (the sceg-ambient luma-preserving tint; NOT an engine stage). Default true.
+    pub scene_grade: bool,
+    /// Environment reflection (`env_d`) multiplier. Default 1.
+    pub env: f32,
+    /// Area specular (`spec_area_d`) multiplier. Default 1.
+    pub area: f32,
+    /// Analytical (dominant-light) specular (`spec_d`) multiplier. Default 1.
+    pub analytic: f32,
+    /// Replace the authored specular tint / fresnel colour by their own luminance (neutral grey). Default false.
+    pub tint_neutral: bool,
+    /// The detail-map COLOUR contributes to the albedo. Default true.
+    pub detail: bool,
+    /// The runtime object bounce fill is added to the diffuse group. Default true.
+    pub bounce: bool,
+    /// Decode base/detail textures with the piecewise sRGB curve instead of `pow(c, 2.2)`. Default false.
+    pub srgb_decode: bool,
+    /// Which term the object pixel shows: 0 = the final composite (default), else `ObjectTerms::VIEW_NAMES`.
+    pub view: u32,
+}
+impl Default for ObjectTerms {
+    fn default() -> Self {
+        Self { scene_grade: true, env: 1.0, area: 1.0, analytic: 1.0, tint_neutral: false, detail: true,
+               bounce: true, srgb_decode: false, view: 0 }
+    }
+}
+impl ObjectTerms {
+    /// Names of the single-term views (index = `view`; 0 is the normal composite).
+    pub const VIEW_NAMES: [&'static str; 10] = [
+        "final composite", "diffuse total (albedo x light)", "environment reflection", "area specular",
+        "analytic specular", "baked probe diffuse", "object bounce fill", "self-illum", "sun diffuse", "albedo",
+    ];
+    pub fn is_default(&self) -> bool { *self == Self::default() }
+    /// The uniform tail. ZERO = default for every lane: objdbg0 = (grade off, env - 1, area - 1, analytic - 1),
+    /// objdbg1 = (tint neutral, detail off, bounce off, sRGB decode), objdbg2 = (view, 0, 0, 0).
+    pub fn lanes(&self) -> [f32; OBJ_TERMS_LANES] {
+        let b = |x: bool| if x { 1.0 } else { 0.0 };
+        [
+            b(!self.scene_grade), self.env.clamp(0.0, 4.0) - 1.0, self.area.clamp(0.0, 4.0) - 1.0, self.analytic.clamp(0.0, 4.0) - 1.0,
+            b(self.tint_neutral), b(!self.detail), b(!self.bounce), b(self.srgb_decode),
+            self.view as f32, 0.0, 0.0, 0.0,
+        ]
+    }
+}
 /// Sun shadow depth map side (Reach camera-centred box AND the Halo 4 object burn map).
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 /// Halo 4 cascade depth texture side (the engine's largest resolution option).
@@ -197,6 +253,17 @@ impl Camera {
         let proj = Mat4::perspective_rh(self.fov_y, aspect.max(0.01), self.near, self.far);
         proj * view
     }
+}
+
+/// #fp-fov / #fp-wave  The first-person rig's view-projection: camera-relative (the eye sits at
+/// `camera.pos - origin`, ~0 when the rig is mounted on it) and with the rig's OWN vertical field of
+/// view when `fp_fov_y` is given, else the world camera's times `fp_fov_scale`. A free function so the
+/// gates run exactly what the renderer writes to the GPU.
+pub fn first_person_view_proj(camera: &Camera, aspect: f32, fp_fov_y: Option<f32>, fp_fov_scale: f32, origin: Vec3) -> Mat4 {
+    let mut c = *camera;
+    c.fov_y = fp_fov_y.unwrap_or(c.fov_y * fp_fov_scale).clamp(0.01, 3.0);
+    c.pos = camera.pos - origin;
+    c.view_proj(aspect)
 }
 
 #[repr(C)]
@@ -373,6 +440,9 @@ pub struct SceneRenderer {
     /// The factor above, as the app measured it off the engine. 1.0 = draw the rig through the
     /// world camera (what HMS did before).
     fp_fov_scale: f32,
+    /// #fp-fov  The first-person rig's OWN vertical field of view, radians, independent of the world
+    /// camera's. `None` = the old behaviour (world FOV x `fp_fov_scale`).
+    fp_fov_y: Option<f32>,
     /// #fp-wave  World position the first-person rig's matrices are RELATIVE to (the eye). See
     /// [`SceneRenderer::set_first_person_origin`].
     fp_origin: Vec3,
@@ -575,6 +645,8 @@ pub struct SceneRenderer {
     pub h4_shadow_diag: std::cell::Cell<[f32; 4]>,
     pub ambient_mult: f32,
     pub lm_mult: f32,
+    /// Lighting Lab "object lighting terms" diagnostic switches (all default = shipped maths).
+    pub obj_terms: ObjectTerms,
     pub fog_wu: f32,
     /// Per-map dynamic-OBJECT directional soft-shade strength (the map's airprobe directional
     /// fraction). Carried to the shader in sun_dir.w; 0 → shader uses its modest default. Set
@@ -1918,6 +1990,7 @@ impl SceneRenderer {
             fp_camera_buf,
             fp_camera_bg,
             fp_fov_scale: 1.0,
+            fp_fov_y: None,
             fp_origin: Vec3::ZERO,
             rtgi,
             vmf_lut_view,
@@ -2034,6 +2107,7 @@ impl SceneRenderer {
             h4_shadow_diag: std::cell::Cell::new([0.0; 4]),
             ambient_mult: 1.0,
             lm_mult: 1.0,
+            obj_terms: ObjectTerms::default(),
             fog_wu: 0.0,
             obj_dir_strength: 0.0, // 0 → shader default (OBJ_DIR_SHADE); set per-map on load
             fixed_exposure: 0.0, // 0 → metered auto-exposure; >0 → fixed engine g_exposure
@@ -2549,6 +2623,10 @@ impl SceneRenderer {
     }
 
     /// Lighting Lab live multipliers (written into the light buffer each frame). 1.0 = no-op.
+    /// Lighting Lab: object lighting-term diagnostic switches (see `ObjectTerms`). Takes effect at
+    /// the next light-uniform upload (every frame).
+    pub fn set_object_terms(&mut self, t: ObjectTerms) { self.obj_terms = t; }
+    pub fn object_terms(&self) -> ObjectTerms { self.obj_terms }
     pub fn set_lighting_mults(&mut self, sun: f32, ambient: f32, lightmap: f32) {
         self.sun_mult = sun.max(0.0);
         self.ambient_mult = ambient.max(0.0);
@@ -3131,6 +3209,14 @@ impl SceneRenderer {
     /// The CPU side (`ActorScene::fp_origin`) must hand the actors the same value.
     pub fn set_first_person_origin(&mut self, origin: Vec3) {
         self.fp_origin = if origin.is_finite() { origin } else { Vec3::ZERO };
+    }
+
+    /// #fp-fov  Give the first-person rig a FIXED vertical field of view, whatever the world camera's
+    /// FOV slider says. The viewmodel is authored for one projection; drawn through a wide world
+    /// projection it stretches toward the screen edges ("the arms protrude outward when I increase
+    /// the FOV"). `None` returns to world FOV x [`SceneRenderer::set_first_person_fov_scale`].
+    pub fn set_first_person_fov_y(&mut self, fov_y: Option<f32>) {
+        self.fp_fov_y = fov_y.filter(|f| f.is_finite()).map(|f| f.clamp(0.01, 3.0));
     }
 
     /// The factor in force, and how many meshes ride it (status line / gates).
@@ -3777,14 +3863,7 @@ impl SceneRenderer {
         // near/far — only the vertical field of view is narrower, which is exactly what the engine
         // does (`render_first_person_view`: copy the world camera, then `vfov *= 0.6908 /
         // vfov_scale`). Written every frame; nothing reads it unless the rig has meshes.
-        let fp_vp = {
-            let mut c = *camera;
-            c.fov_y = (c.fov_y * self.fp_fov_scale).clamp(0.01, 3.0);
-            // #fp-wave  Camera-relative: the eye sits at (camera - origin), which is ~0 when the rig
-            // is mounted on it, so the view matrix carries no large translation.
-            c.pos = camera.pos - self.fp_origin;
-            c.view_proj(aspect)
-        };
+        let fp_vp = first_person_view_proj(camera, aspect, self.fp_fov_y, self.fp_fov_scale, self.fp_origin);
         // `time.w = 1` tells the vertex shader that `world` is relative to `cam_pos`; `cam_pos` is the
         // ORIGIN (a world position), which the shader adds back for lighting / shadow / fog.
         let fp_origin = [self.fp_origin.x, self.fp_origin.y, self.fp_origin.z, cam.cam_pos[3]];
@@ -3894,7 +3973,7 @@ impl SceneRenderer {
             // Light uniform (see LIGHT_UNIFORM_BYTES): mat4 light_view_proj, sun_dir, sun_tint,
             // ambient_tint, sky_ambient, dbg (Lighting Lab multipliers), expo, expo2, then the
             // Halo 4 shadow tail (h4s0, h4s1, cascade view_proj, casc0, casc1).
-            let mut lb = [0.0f32; 80];
+            let mut lb = [0.0f32; LIGHT_UNIFORM_BYTES as usize / 4];
             // Halo 4: the sun shadow map is the engine's "forge lightmap burn" map - an
             // orthographic depth map of the OBJECT casters only (halo4.dll sub_180344BE8: the tile
             // bounds are the union of the registered objects' bounding spheres in sun space, 512
@@ -3992,6 +4071,7 @@ impl SceneRenderer {
             let ap = self.illum_params.get();
             lb[36] = ap[0]; lb[37] = ap[1]; lb[38] = ap[2]; lb[39] = ap[3];
             lb[40] = ap[4]; lb[41] = self.fixed_exposure; lb[42] = ap[5]; lb[43] = ap[6];
+            lb[OBJ_TERMS_FLOAT_OFFSET..OBJ_TERMS_FLOAT_OFFSET + OBJ_TERMS_LANES].copy_from_slice(&self.obj_terms.lanes());
             queue.write_buffer(&self.light_buf, 0, bytemuck::cast_slice(&lb));
             // Post grade vec4 (offset 16): the engine has NO whole-frame post grade (final
             // color_matrix ≈ identity for every Reach cfxs); per-scenario warmth is per-domain
@@ -6372,6 +6452,61 @@ mod wgsl_tests {
         assert!(crate::mesh::FOG_WGSL.contains(&want), "FOG_WGSL no longer declares `{want}`");
     }
 
+    /// `// #spec-parity` CPU mirror of the engine's diffuse_power_specular lookup over the REAL LUT bytes.
+    /// The shipped DX11 pixel shader (Sapien capture ps_11197159538964788000, instr 146-161) treats the
+    /// LUT as a 2D ARRAY: slice A = array index frac(roughness)*4 (hardware rounds to nearest), slice B =
+    /// that + 1 (wraps to 0 at the top), result = lerp(A, B, frac) * 3. A filtered 3D fetch lerps the two
+    /// NEAREST slices instead -- for the traffic cone's roughness 0.2 that is slices 0/1 rather than 1/2.
+    fn dps_texel(k: usize, x: f32, y: f32) -> f32 {
+        const LUT: &[u8] = include_bytes!("diffuse_power_lut.bin");
+        let (fx, fy) = (x.clamp(0.0, 1.0) * 63.0, y.clamp(0.0, 1.0) * 63.0);
+        let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
+        let (x1, y1) = ((x0 + 1).min(63), (y0 + 1).min(63));
+        let (ax, ay) = (fx - x0 as f32, fy - y0 as f32);
+        let g = |a: usize, b: usize| LUT[k * 4096 + b * 64 + a] as f32 / 255.0;
+        (g(x0, y0) * (1.0 - ax) + g(x1, y0) * ax) * (1.0 - ay) + (g(x0, y1) * (1.0 - ax) + g(x1, y1) * ax) * ay
+    }
+    fn dps_engine_cpu(x: f32, bw: f32, rough: f32) -> f32 {
+        let zs = rough.fract() * 4.0;
+        let nz = if zs >= 3.0 { 0.0 } else { zs + 1.0 };
+        let ia = ((zs + 0.5).floor().clamp(0.0, 3.0)) as usize;
+        let ib = ((nz + 0.5).floor().clamp(0.0, 3.0)) as usize;
+        let f = zs.fract();
+        (dps_texel(ia, x, bw) * (1.0 - f) + dps_texel(ib, x, bw) * f) * 3.0
+    }
+    /// What the shader did before: a filtered 3D fetch (z texel centres at (k + .5) / 4).
+    fn dps_3d_cpu(x: f32, bw: f32, rough: f32) -> f32 {
+        let zc = rough * 4.0 - 0.5;
+        let k0 = zc.floor().clamp(0.0, 3.0) as usize;
+        let k1 = (k0 + 1).min(3);
+        let f = (zc - k0 as f32).clamp(0.0, 1.0);
+        (dps_texel(k0, x, bw) * (1.0 - f) + dps_texel(k1, x, bw) * f) * 3.0
+    }
+
+    /// Traffic-cone material (forge_halo `street_cone`, rmsh `_0_1_0_1_1_2_0_0_0_0_0_0`): roughness 0.2,
+    /// specular_tint (1,.467,.31), albedo_blend .5, area_specular_contribution .159, env contribution 1.
+    /// The area-specular term is `mask * coef * area_contribution * F * (lut*3*dom + .25*fill)`; with the
+    /// engine-literal slice indexing its lobe PEAK (bandwidth 1, R == dominant) drops from 2.49 to 1.56 and
+    /// the shader must route BOTH Reach consumers (object lane, BSP glass) through `dps_engine`.
+    #[test]
+    fn spec_parity_dps_array_slices() {
+        // engine value at roughness 0.2 = lerp(slice1, slice2, 0.8)
+        let e = dps_engine_cpu(1.0, 1.0, 0.2);
+        let o = dps_3d_cpu(1.0, 1.0, 0.2);
+        assert!((e - (dps_texel(1, 1.0, 1.0) * 0.2 + dps_texel(2, 1.0, 1.0) * 0.8) * 3.0).abs() < 1e-5);
+        assert!(o / e > 1.4, "the filtered-3D fetch overstated the lobe peak: {o} vs engine {e}");
+        // zero roughness is slice 0 exactly in both (the quirk only bites for r > 0)
+        assert!((dps_engine_cpu(0.7, 0.4, 0.0) - dps_3d_cpu(0.7, 0.4, 0.0)).abs() < 0.35);
+        // the shader: helper present, the two Reach call sites use it, no other raw Reach fetch remains
+        let src = crate::mesh::MESH_WGSL;
+        assert!(src.contains("fn dps_engine("), "dps_engine helper missing");
+        assert!(src.contains("dps_engine(rdotd_o * 0.5 + 0.5, bw_o, rough_lut_o)"), "object lane must use dps_engine");
+        assert!(src.contains("dps_engine(rdotd * 0.5 + 0.5, bw_g, clamp(rough_lut_g, 0.0, 1.0))"), "BSP glass must use dps_engine");
+        // raw fetches left: the two slice reads inside dps_engine + the Halo 3 object path (halo3's own table)
+        assert_eq!(src.matches("textureSampleLevel(dps_lut").count(), 3, "a Reach site went back to the filtered 3D fetch");
+        assert!(src.contains("let seed_o = raised_o * sun_col * obj_b * 0.25 * Fv * shadow;"), "the engine seed carries the shadow mask");
+    }
+
     /// `// #objmask` The object material lane's specular mask is the engine's COMPOSED albedo
     /// alpha (`albedo.hlsl_include:121` `albedo.w = base.w*detail.w*albedo_color.w`, saturated by
     /// `entry_points.hlsl_include:102`), which `calc_specular_mask_from_diffuse_ps` hands to BOTH
@@ -6411,6 +6546,77 @@ mod wgsl_tests {
         let slights = *sizes.get(&(0, 6)).expect("simple lights uniform");
         assert!(super::LIGHT_UNIFORM_BYTES >= light, "Light buffer {} B < shader {light} B", super::LIGHT_UNIFORM_BYTES);
         assert!(16 + 8 * 80 >= slights, "SimpleLights buffer {} B < shader {slights} B", 16 + 8 * 80);
+    }
+
+    // ---- Lighting Lab "Object lighting terms (diagnostic)" gates -------------------------------
+
+    /// SUN_DUMMY_BYTES-style named-constant gate: the shader's `Light` struct ends EXACTLY where the
+    /// Rust-side tail does (offset + lanes), and the buffer is exactly that big. A mismatch is the
+    /// wgpu "buffer smaller than binding" startup crash, so it is caught here instead of at the draw.
+    #[test]
+    fn object_terms_tail_matches_the_shader_light_struct() {
+        let sizes = crate::rtgi::tests::min_binding_sizes(&subst(&format!("{}{}{}{}{}", crate::mesh::FOG_WGSL, crate::mesh::SHADOW_SAMPLE_WGSL, crate::rtgi::GI_FRAGMENT_WGSL, crate::rtgi::GI_SHARED_WGSL, crate::mesh::TERRAIN_WGSL)));
+        let light = *sizes.get(&(0, 2)).expect("light uniform");
+        assert_eq!(light, ((super::OBJ_TERMS_FLOAT_OFFSET + super::OBJ_TERMS_LANES) * 4) as u64, "shader Light struct size != Rust tail end");
+        assert_eq!(super::LIGHT_UNIFORM_BYTES, light, "Light buffer must be exactly the shader struct");
+        assert_eq!(super::ObjectTerms::default().lanes().len(), super::OBJ_TERMS_LANES);
+    }
+
+    /// Default switches encode to an ALL-ZERO tail (so an unwritten buffer == the shipped maths), and
+    /// every non-default switch moves exactly its own lane.
+    #[test]
+    fn object_terms_default_is_a_zero_tail_and_each_switch_has_its_own_lane() {
+        use super::ObjectTerms as T;
+        assert!(T::default().lanes().iter().all(|v| *v == 0.0), "default tail not zero: {:?}", T::default().lanes());
+        let d = T::default();
+        let cases: [(T, usize, f32); 8] = [
+            (T { scene_grade: false, ..d }, 0, 1.0), (T { env: 0.0, ..d }, 1, -1.0), (T { area: 1.5, ..d }, 2, 0.5),
+            (T { analytic: 0.0, ..d }, 3, -1.0), (T { tint_neutral: true, ..d }, 4, 1.0), (T { detail: false, ..d }, 5, 1.0),
+            (T { bounce: false, ..d }, 6, 1.0), (T { srgb_decode: true, ..d }, 7, 1.0),
+        ];
+        for (t, lane, want) in cases {
+            let l = t.lanes();
+            for (k, v) in l.iter().enumerate() {
+                assert_eq!(*v, if k == lane { want } else { 0.0 }, "{t:?}: lane {k}");
+            }
+        }
+        assert_eq!(T { view: 3, ..d }.lanes()[8], 3.0);
+        assert_eq!(T::VIEW_NAMES.len(), 10);
+    }
+
+    /// CPU mirror of the toggled shader maths: with the DEFAULT tail the composite equals the old sum
+    /// of terms bit-for-bit; the multipliers are (1 + lane); the sRGB decode differs from pow 2.2 only
+    /// when asked for. (A mirror of the WGSL expressions, since the GPU path cannot run here.)
+    #[test]
+    fn object_terms_cpu_mirror_default_is_identity() {
+        fn tex_decode(c: f32, lane_w: f32) -> f32 {
+            if lane_w > 0.5 { if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) } } else { c.powf(2.2) }
+        }
+        let lanes = super::ObjectTerms::default().lanes();
+        let (diffuse, env, area, ana) = (0.31f32, 0.17, 0.09, 0.05);
+        let old = diffuse + env + area + ana;
+        let new = diffuse + env * (1.0 + lanes[1]) + area * (1.0 + lanes[2]) + ana * (1.0 + lanes[3]);
+        assert_eq!(old, new);
+        for c in [0.0f32, 0.02, 0.2, 0.5, 0.9, 1.0] {
+            assert_eq!(tex_decode(c, lanes[7]), c.powf(2.2));
+        }
+        assert!((tex_decode(0.1, 1.0) / tex_decode(0.1, 0.0) - 1.0).abs() > 0.2, "the debug decode must actually differ");
+        let t = super::ObjectTerms { env: 0.0, ..Default::default() }.lanes();
+        assert_eq!(env * (1.0 + t[1]), 0.0);
+    }
+
+    /// The shader source must keep the default-neutral forms: each switch is a multiply/select against a
+    /// uniform lane, and `scene_grade` early-outs only on objdbg0.x > 0.5.
+    #[test]
+    fn object_terms_shader_hooks_present() {
+        let src = format!("{}{}", crate::mesh::SHADOW_SAMPLE_WGSL, crate::mesh::MESH_WGSL);
+        for needle in [
+            "if (light.objdbg0.x > 0.5) { return rgb; }", "* (1.0 + light.objdbg0.w)", "* (1.0 + light.objdbg0.y)", "* (1.0 + light.objdbg0.z)",
+            "light.objdbg1.x > 0.5", "light.objdbg1.y > 0.5", "light.objdbg1.z < 0.5", "light.objdbg1.w > 0.5", "light.objdbg2.x + 0.5",
+            "var albedo = tex_decode(tex.rgb) * detail_c * fine;",
+        ] {
+            assert!(src.contains(needle), "missing shader hook: {needle}");
+        }
     }
 
     #[test]
@@ -6519,5 +6725,49 @@ mod transparent_routing_tests {
         }
         assert_eq!(seen.len(), 12, "expected 6 families x 2 skinning states, got {seen:?}");
         assert_eq!(seen.iter().filter(|p| p.is_skinned()).count(), 6);
+    }
+}
+
+/// #fp-fov  The first-person rig has its own projection: at world FOVs of 60-120 the projected
+/// pixels of a grid of arm-sized points are identical (< 0.1 px) to the authored reference, because
+/// the rig no longer follows the world camera's field of view. The CONTROL: drawn through the world
+/// FOV (the old path) the same points move by tens of pixels at 85 degrees vertical, so this gate
+/// can tell the two apart.
+#[cfg(test)]
+mod fp_fov_gates {
+    use super::*;
+
+    fn pixels(vp: Mat4) -> Vec<(f32, f32)> {
+        let (w, h) = (1920.0f32, 1080.0f32);
+        let mut out = Vec::new();
+        for ix in 0..5 {
+            for iy in 0..5 {
+                for iz in 0..5 {
+                    let p = Vec3::new(0.15 + 0.1 * ix as f32, -0.25 + 0.125 * iy as f32, -0.25 + 0.125 * iz as f32);
+                    let c = vp * p.extend(1.0);
+                    out.push((c.x / c.w * w * 0.5, c.y / c.w * h * 0.5));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_viewmodel_projection_does_not_follow_the_world_fov() {
+        let fp = 43.205f32.to_radians(); // Reach's first-person model vertical FOV
+        let aspect = 16.0 / 9.0;
+        let cam = |fov_deg: f32| Camera { pos: Vec3::new(300.0, -200.0, 40.0), yaw: 0.5, pitch: -0.3, fov_y: fov_deg.to_radians(), near: 0.05, far: 50_000.0 };
+        let origin = Vec3::new(300.0, -200.0, 40.0);
+        let reference = pixels(first_person_view_proj(&cam(49.097), aspect, Some(fp), 0.88, origin));
+        let mut worst_old = 0.0f32;
+        for world in [40.0f32, 49.097, 70.0, 85.0] {
+            let got = pixels(first_person_view_proj(&cam(world), aspect, Some(fp), 0.88, origin));
+            let err = got.iter().zip(&reference).map(|(a, b)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()).fold(0.0f32, f32::max);
+            assert!(err < 0.1, "world vfov {world}: the viewmodel moved {err} px from the reference");
+            let old = pixels(first_person_view_proj(&cam(world), aspect, None, 0.88, origin));
+            worst_old = worst_old.max(old.iter().zip(&reference).map(|(a, b)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()).fold(0.0f32, f32::max));
+        }
+        assert!(worst_old > 20.0, "control: the world-FOV path should move the rig by tens of px, got {worst_old}");
+        println!("fp fov: fixed projection max error 0 px; the old world-FOV path moved the rig {worst_old:.0} px");
     }
 }

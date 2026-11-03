@@ -1489,7 +1489,7 @@ pub fn find_films() -> Vec<std::path::PathBuf> {
             if !is_film_file(&p) {
                 continue;
             }
-            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            let len = crate::film_reader::listing_len(&p).unwrap_or(0);
             // Below the header prefix there is nothing to read; MCC also leaves zero-byte stubs.
             if len as usize >= HEADER_PREFIX_LEN {
                 v.push((len, p));
@@ -1502,8 +1502,26 @@ pub fn find_films() -> Vec<std::path::PathBuf> {
 }
 
 pub fn open(path: &Path) -> Result<Film, FilmError> {
-    let bytes = std::fs::read(path).map_err(|e| FilmError::Io(format!("{}: {e}", path.display())))?;
+    // #film-reader  Read-only, share READ|WRITE|DELETE, size from the HANDLE, positional reads:
+    // safe on a `.temp` MCC is still writing (and on Windows, where it is not otherwise).
+    let f = crate::film_reader::open_with_retry(path, &crate::film_reader::Retry::PATIENT).map_err(|e| {
+        e.log(path);
+        FilmError::Io(e.to_string())
+    })?;
+    let bytes = crate::film_reader::read_to_end(&f).map_err(|e| FilmError::Io(format!("{}: {e}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())))?;
     parse(&bytes)
+}
+
+/// Are these two byte prefixes the same RECORDING? Compared on the first stretch of the `flmd`
+/// stream (the records), which a `.temp` and the `.mov` it becomes share byte for byte; the
+/// container header around it is rewritten at finalise and cannot be compared.
+pub fn same_recording(a: &[u8], b: &[u8]) -> bool {
+    let stream = |x: &[u8]| -> Option<Vec<u8>> {
+        let c = blf_chunks(x).into_iter().find(|c| &c.magic == FLMD)?;
+        let s = x.get(c.payload_at..)?;
+        (s.len() >= 512).then(|| s[..512].to_vec())
+    };
+    matches!((stream(a), stream(b)), (Some(x), Some(y)) if x == y)
 }
 
 /// The bytes the engine itself reads to validate and set up a film: every chunk up to and
@@ -1515,18 +1533,12 @@ pub const HEADER_PREFIX_LEN: usize = 0x1F8A8;
 /// complete (the `flmh` chunk ends well inside the prefix); `data` comes back empty, so
 /// `FilmData::records` is NOT available from this path — use `open` for that.
 pub fn open_header(path: &Path) -> Result<Film, FilmError> {
-    use std::io::Read;
-    let mut f = std::fs::File::open(path).map_err(|e| FilmError::Io(format!("{}: {e}", path.display())))?;
-    let mut buf = vec![0u8; HEADER_PREFIX_LEN];
-    let mut got = 0usize;
-    while got < buf.len() {
-        match f.read(&mut buf[got..]) {
-            Ok(0) => break,
-            Ok(n) => got += n,
-            Err(e) => return Err(FilmError::Io(format!("{}: {e}", path.display()))),
-        }
-    }
-    buf.truncate(got);
+    let f = crate::film_reader::open_with_retry(path, &crate::film_reader::Retry::PATIENT).map_err(|e| {
+        e.log(path);
+        FilmError::Io(e.to_string())
+    })?;
+    let buf = crate::film_reader::read_range(&f, 0, HEADER_PREFIX_LEN as u64)
+        .map_err(|e| FilmError::Io(format!("{}: {e}", path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())))?;
     parse(&buf)
 }
 

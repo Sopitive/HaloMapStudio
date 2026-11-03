@@ -12,7 +12,7 @@ second bullet.
 
 ## not yet released
 
-(nothing yet -- 1.7.0 was released 2026-10-29; its entries are in `docs/changelog.html` and `dist/release/RELEASE-NOTES-1.7.0.md`.)
+(nothing yet -- 1.8.0 is the current release line; its entries are in `docs/changelog.html` and `dist/release/RELEASE-NOTES-1.8.0.md`.)
 
 ---
 

@@ -124,9 +124,14 @@ pub struct PrefabObject {
     /// Forge "user data" byte (Halo 4 only; 0 elsewhere).
     #[serde(default)]
     pub user_data: i32,
-    /// Placement flags byte (symmetry / at-start / unique / physics).
+    /// Placement flags byte (symmetry / at-start / unique / physics), in the SOURCE game's own bits (a Halo 3
+    /// prefab holds the Halo 3 record's byte; every other game the Reach-style byte). `translate_placement`
+    /// re-spells it when the prefab lands on another game.
     #[serde(default)]
     pub placement: u8,
+    /// Halo 3 only: the record's 10-bit game-engine mask (0 = not captured / every engine).
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub engine_flags: u16,
     /// Halo 4 placement bits 8-9.
     #[serde(default)]
     pub placement_hi: u8,
@@ -181,6 +186,27 @@ fn is_false(b: &bool) -> bool {
 }
 fn is_zero_u8(v: &u8) -> bool {
     *v == 0
+}
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+/// Re-spell a placement byte from one game's bits to another's. Symmetry (0x04 | 0x08) is the same pair in
+/// every title; `not initially placed` is Reach / Halo 4 bit 4 (0x10) but Halo 3 bit 1 (0x02); `unique` is Reach /
+/// Halo 4 bit 5 (0x20) but Halo 3 bit 0 (0x01). Reach's physics (0x40 | 0x80), hide-unless-required and shortcut
+/// bits have no Halo 3 home and are dropped; Halo 3's unread bits 4-7 are not Reach's and are dropped too. An
+/// empty symmetry pair becomes "both", as the converter and a fresh drop do.
+pub fn translate_placement(from: Game, to: Game, p: u8) -> u8 {
+    if (from == Game::Halo3) == (to == Game::Halo3) {
+        return p;
+    }
+    let sym = p & 0x0C;
+    let out = if from == Game::Halo3 {
+        sym | if p & 0x02 != 0 { 0x10 } else { 0 } | if p & 0x01 != 0 { 0x20 } else { 0 }
+    } else {
+        sym | if p & 0x10 != 0 { 0x02 } else { 0 } | if p & 0x20 != 0 { 0x01 } else { 0 }
+    };
+    if out & 0x0C == 0 { out | 0x0C } else { out }
 }
 
 impl PrefabObject {
@@ -1356,6 +1382,10 @@ pub fn place(scene: &mut dyn PrefabScene, pf: &Prefab, opt: &PlaceOptions) -> Re
                 }
             }
         }
+        if let Some(from) = pf.game_of().filter(|g| *g != dst_game) {
+            o.placement = translate_placement(from, dst_game, o.placement);
+            o.engine_flags = 0; // another game's engine mask means nothing here: the target gets its default
+        }
         match scene.pf_place(pi, &o) {
             Ok(d) => {
                 out.datum = Some(d);
@@ -1754,6 +1784,40 @@ mod tests {
         for o in &out {
             assert_eq!(o.via, "same object tag on this canvas", "{o:?}");
         }
+    }
+
+    /// The placement byte is re-spelled between Halo 3 and the other games, losslessly for the bits both have
+    /// (symmetry, placed-at-start, unique), and is left alone between games that share a spelling.
+    #[test]
+    fn placement_flags_are_respelled_between_halo_3_and_the_rest() {
+        use Game::*;
+        // Reach: 0x10 not-at-start, 0x20 unique; Halo 3: 0x02, 0x01
+        assert_eq!(translate_placement(Reach, Halo3, 0x0C | 0x10 | 0x20), 0x0C | 0x02 | 0x01);
+        assert_eq!(translate_placement(Halo3, Reach, 0x04 | 0x02), 0x04 | 0x10);
+        assert_eq!(translate_placement(Halo3, Halo4, 0x08 | 0x01), 0x08 | 0x20);
+        // Reach-only bits (physics, hide-unless-required, shortcut) have no Halo 3 home; an empty symmetry pair reads "both"
+        assert_eq!(translate_placement(Reach, Halo3, 0xC0 | 0x03), 0x0C);
+        // Halo 3's unread upper bits are not Reach's physics
+        assert_eq!(translate_placement(Halo3, Reach, 0x8C), 0x0C);
+        // same spelling: untouched
+        assert_eq!(translate_placement(Reach, Halo4, 0xF3), 0xF3);
+        assert_eq!(translate_placement(Halo3, Halo3, 0x8F), 0x8F);
+        // round trip of the shared bits
+        for p in [0x04u8, 0x08, 0x0C, 0x04 | 0x10, 0x0C | 0x20, 0x08 | 0x10 | 0x20] {
+            assert_eq!(translate_placement(Halo3, Reach, translate_placement(Reach, Halo3, p)), p, "{p:#x}");
+        }
+    }
+
+    /// A prefab object saved before the Halo 3 engine mask existed reads back with none, and a mask round-trips.
+    #[test]
+    fn the_engine_mask_is_optional_in_the_file() {
+        let old: PrefabObject = serde_json::from_str(r#"{"pos":[0,0,0],"fwd":[1,0,0],"up":[0,0,1]}"#).unwrap();
+        assert_eq!(old.engine_flags, 0);
+        let mut o = old.clone();
+        assert!(!serde_json::to_string(&o).unwrap().contains("engine_flags"), "an unset mask stays out of the file");
+        o.engine_flags = 0x155;
+        let back: PrefabObject = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+        assert_eq!(back.engine_flags, 0x155);
     }
 
     /// Cross-game placement is a clearly-labelled SECOND step: with it off a foreign prefab is

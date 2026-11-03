@@ -52,10 +52,37 @@ use crate::reach_sound::{self as rs, CacheSound, Distances, GainLaw, Gestalt, Pl
 /// them, and every sound this module plays is a world sound.
 pub const WORLD_BANK: &str = "sfx";
 
-/// How long after a `action_weapon_fire` event a shot may still be started.
-/// Two ticks at 60 Hz: enough that a frame drop does not swallow the shot,
-/// short enough that a scrub cannot replay a burst.
-const FIRE_WINDOW_TICKS: u32 = 2;
+/// The dialogue bank (English). A `snd!` whose subsound is in it is spoken: the Spartan and Elite
+/// combat voice, the multiplayer announcer, the firefight and invasion lines. Measured on
+/// `forge_halo`: 331 of its 2,353 sounds (14%) are in `english.fsb` and in NO other bank, and until
+/// this was opened every one of them resolved to nothing and was silent.
+pub const LANGUAGE_BANK: &str = "english";
+
+/// A sample key is the index into its bank; a language-bank sample carries this bit on top so the
+/// two banks share one key space (the decode cache, the in-flight set, every `Clip::samples`).
+pub const LANGUAGE_SAMPLE_BIT: usize = 1 << 30;
+
+/// `(bank, index within the bank)` of a sample key.
+pub fn split_sample_key(key: usize) -> (&'static str, usize) {
+    if key & LANGUAGE_SAMPLE_BIT != 0 {
+        (LANGUAGE_BANK, key & !LANGUAGE_SAMPLE_BIT)
+    } else {
+        (WORLD_BANK, key)
+    }
+}
+
+/// An event edge `(prev, now]` is one SMOOTH step of the clock, and every event in it is heard
+/// ([`event_is_audible`]). This used to be a 2-tick window behind the newest tick, which threw
+/// away every event older than two ticks in a step: a Theater frame slower than 30 fps (a step of
+/// 3+ ticks), a frame hitch, or 2x playback silently dropped shots, melee swings and reloads
+/// (a third of them at 20 fps, three quarters at 8x). A scrub never reaches this point (a step
+/// over [`SMOOTH_STEP_TICKS`] stops everything instead), so the narrow window protected nothing.
+const AUDIBLE_BACKLOG_TICKS: u32 = SMOOTH_STEP_TICKS as u32;
+
+/// Is an event at `event_tick` still worth starting in the step that ends at `now`?
+pub(crate) fn event_is_audible(now: u32, event_tick: u32) -> bool {
+    now.saturating_sub(event_tick) <= AUDIBLE_BACKLOG_TICKS
+}
 
 /// The largest forward clock step that still counts as smooth playback. Above
 /// this the clock has been scrubbed or seeked and no event edge fires.
@@ -119,9 +146,10 @@ impl Worker {
                         break;
                     }
                 }
-                Job::Decode { bank, sample, .. } => {
+                Job::Decode { sample, .. } => {
                     let t0 = std::time::Instant::now();
-                    let pcm = w.decode(bank, sample);
+                    let (bank, idx) = split_sample_key(sample);
+                    let pcm = w.decode(bank, idx);
                     let ms = t0.elapsed().as_secs_f32() * 1000.0;
                     if tx.send(Done::Decoded { bank, sample, pcm, ms }).is_err() {
                         break;
@@ -147,6 +175,13 @@ impl Worker {
         let setups = hms_sound::SetupTable::from_module(&module)
             .map_err(|e| format!("{}: {e:#}", module.display()))?;
         self.banks.insert(WORLD_BANK, bank);
+        // The dialogue bank is optional: a missing one costs the spoken lines and nothing else.
+        match hms_sound::SoundBank::open(&dir, LANGUAGE_BANK) {
+            Ok(b) => {
+                self.banks.insert(LANGUAGE_BANK, b);
+            }
+            Err(e) => log::warn!("hms-sound: {LANGUAGE_BANK}.fsb: {e:#} (spoken lines will be silent)"),
+        }
         self.setups = Some(setups);
         Ok(n)
     }
@@ -186,6 +221,98 @@ pub struct Clip {
     pub spatial: bool,
     /// `snd!` flag "play permutations in order" (a looping bed steps through its takes).
     pub in_order: bool,
+    /// The authored per-start randomisation (live play only; Theater stays a pure function).
+    pub rand: ClipRandom,
+}
+
+/// What the engine randomises every time it starts a one-shot, read from the tag (xex
+/// `sound_definition_can_start_new_impulse_sound` / `_random_gain_db` / `_random_pitch` /
+/// `sound_definition_next_permutation_deterministic`). All of it is applied only in LIVE play
+/// ([`SoundEngine::begin_frame`] marks the engine live): a Theater frame must be a pure function of
+/// the tick, so there the take is the deterministic hash and nothing is randomised.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ClipRandom {
+    /// Probability that a request to play the sound is ignored: `lerp(scale skip modifier,
+    /// scale 0) * playback skip fraction`.
+    pub skip_fraction: f32,
+    /// `playback.gain variance` (dB, <= 0): a start's gain is `gain base + lerp(0, variance, r)`.
+    pub gain_variance_db: f32,
+    /// `playback.random pitch bounds`, cents: a start's pitch is uniform in it.
+    pub pitch_cents: (i16, i16),
+    /// Per-permutation probability that this take is rejected for another one.
+    pub perm_skip: Vec<f32>,
+}
+
+impl ClipRandom {
+    pub fn read(g: &Gestalt, snd: &CacheSound, perms: &[&rs::Permutation], kept: &[bool]) -> ClipRandom {
+        let pb = g.playback_of(snd);
+        let (slo, _shi) = g.scale_skip.get(snd.scale_index as usize).copied().unwrap_or((1.0, 1.0));
+        ClipRandom {
+            skip_fraction: pb.map(|p| p.skip_fraction).unwrap_or(0.0) * slo.clamp(0.0, 1.0),
+            gain_variance_db: pb.map(|p| p.gain_variance_db).unwrap_or(0.0).min(0.0),
+            pitch_cents: pb.map(|p| p.random_pitch_cents).unwrap_or((0, 0)),
+            perm_skip: perms.iter().zip(kept).filter(|(_, k)| **k).map(|(p, _)| p.skip_fraction).collect(),
+        }
+    }
+}
+
+/// The permutation chooser's persistent state for one sound: which takes have been used since the
+/// last full cycle, and the last one played.
+#[derive(Clone, Copy, Debug)]
+pub struct PermBag {
+    pub mask: u32,
+    pub last: i32,
+}
+
+impl Default for PermBag {
+    fn default() -> Self {
+        PermBag { mask: 0, last: -1 }
+    }
+}
+
+/// The engine's permutation choice (`sound_definition_next_permutation_deterministic`, xex
+/// `0x82DFA5C0`): a SHUFFLE BAG. Every take is played once before any repeats, the take just
+/// played is never the first of the next cycle, a sound flagged "in order" steps `last + 1`, and a
+/// take whose skip fraction exceeds the draw is passed over (at most `2n` rejections, then the
+/// last candidate is taken). `rng` returns uniform `[0, 1)`.
+pub fn next_permutation(n: usize, in_order: bool, perm_skip: &[f32], bag: &mut PermBag, rng: &mut dyn FnMut() -> f32) -> usize {
+    if n <= 1 {
+        bag.last = 0;
+        return 0;
+    }
+    let n = n.min(32);
+    let all = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
+    let last0 = bag.last;
+    let mut rejected = 0usize;
+    let mut cand;
+    loop {
+        if all & !bag.mask == 0 {
+            bag.mask = 0;
+            if last0 >= 0 {
+                bag.mask = 1 << last0;
+            }
+        }
+        cand = if in_order && last0 >= 0 { (last0 as usize + 1) % n } else { ((rng() * n as f32) as usize).min(n - 1) };
+        if in_order && last0 >= 0 {
+            // Stepping in order never rejects and never re-draws (the engine asserts there).
+            bag.mask |= 1 << cand;
+            break;
+        }
+        if bag.mask & (1 << cand) != 0 {
+            continue;
+        }
+        bag.mask |= 1 << cand;
+        let skip = perm_skip.get(cand).copied().unwrap_or(0.0);
+        if skip <= rng() {
+            break;
+        }
+        rejected += 1;
+        if rejected >= 2 * n {
+            break;
+        }
+    }
+    bag.last = cand as i32;
+    cand
 }
 
 impl Clip {
@@ -203,8 +330,12 @@ impl Clip {
         let pb: Option<&PlaybackParams> = gestalt.playback_of(&snd);
         let mut samples = Vec::new();
         let mut perm_gain_db = Vec::new();
-        for p in gestalt.permutations_of(&snd) {
-            if let Some(i) = bank.index_of_subsound(p.fmod_subsound_id) {
+        let all_perms = gestalt.permutations_of(&snd);
+        let mut kept = Vec::new();
+        for p in &all_perms {
+            let hit = bank.index_of_subsound(p.fmod_subsound_id);
+            kept.push(hit.is_some());
+            if let Some(i) = hit {
                 samples.push(i);
                 perm_gain_db.push(p.gain_db);
             }
@@ -228,6 +359,7 @@ impl Clip {
             dist,
             spatial: dist.usable(),
             in_order: snd.flags & rs::SND_FLAG_PERMUTATIONS_IN_ORDER != 0,
+            rand: ClipRandom::read(gestalt, &snd, &all_perms, &kept),
         })
     }
 
@@ -568,6 +700,11 @@ pub struct SoundEngine {
     acoustics_read: bool,
     /// One-shot voices, so a seek can stop them.
     oneshots: Vec<VoiceId>,
+    /// Live play (test mode): the engine's per-start randomisation applies. Theater leaves it off.
+    live: bool,
+    /// Permutation bags per sound tag, and the randomiser's state (live play only).
+    perm_bags: HashMap<u32, PermBag>,
+    rng_state: u32,
     /// User volume, 0..=1. Persisted.
     volume: f32,
     pub muted: bool,
@@ -617,6 +754,9 @@ impl Default for SoundEngine {
             playing_ambience: Vec::new(),
             acoustics_read: false,
             oneshots: Vec::new(),
+            live: false,
+            perm_bags: HashMap::new(),
+            rng_state: 0x9E37_79B9,
             volume: load_volume_setting(),
             muted: false,
             last_tick: None,
@@ -805,7 +945,7 @@ impl SoundEngine {
             return None;
         }
         if let Some((tx, _, _)) = &self.worker {
-            if tx.send(Job::Decode { bank: WORLD_BANK, sample, urgent: false }).is_ok() {
+            if tx.send(Job::Decode { bank: split_sample_key(sample).0, sample, urgent: false }).is_ok() {
                 self.inflight.insert(sample);
             }
         }
@@ -823,7 +963,7 @@ impl SoundEngine {
         }
         // Re-ask as urgent (the warm-up request may be queued behind a hundred others).
         if let Some((tx, _, _)) = &self.worker {
-            let _ = tx.send(Job::Decode { bank: WORLD_BANK, sample, urgent: true });
+            let _ = tx.send(Job::Decode { bank: split_sample_key(sample).0, sample, urgent: true });
             self.inflight.insert(sample);
         }
         let t0 = std::time::Instant::now();
@@ -926,6 +1066,13 @@ impl SoundEngine {
             .iter()
             .map(|r| (r.subsound_id, r.index))
             .collect();
+        // The dialogue bank joins the same map under the language bit. The world bank wins a
+        // collision (none measured on forge_halo: sfx-only 2021, english-only 331, both 0).
+        if let Ok(lang) = hms_sound::BankInfo::open(&bd.join(format!("{LANGUAGE_BANK}.fsb.info"))) {
+            for r in &lang.records {
+                self.subsound.entry(r.subsound_id).or_insert(r.index | LANGUAGE_SAMPLE_BIT);
+            }
+        }
     }
 
     fn resolve_clip(
@@ -939,8 +1086,12 @@ impl SoundEngine {
         let pb = g.playback_of(&snd);
         let mut samples = Vec::new();
         let mut perm_gain_db = Vec::new();
-        for p in g.permutations_of(&snd) {
-            if let Some(i) = self.subsound.get(&p.fmod_subsound_id).copied() {
+        let all_perms = g.permutations_of(&snd);
+        let mut kept = Vec::new();
+        for p in &all_perms {
+            let hit = self.subsound.get(&p.fmod_subsound_id).copied();
+            kept.push(hit.is_some());
+            if let Some(i) = hit {
                 samples.push(i);
                 perm_gain_db.push(p.gain_db);
             }
@@ -961,6 +1112,7 @@ impl SoundEngine {
             dist,
             spatial: dist.usable(),
             in_order: snd.flags & rs::SND_FLAG_PERMUTATIONS_IN_ORDER != 0,
+            rand: ClipRandom::read(g, &snd, &all_perms, &kept),
         })
     }
 
@@ -1202,7 +1354,7 @@ impl SoundEngine {
         let work: Vec<(u8, u32, Option<u32>, Option<u32>)> =
             slice.iter().map(|e| (e.kind, e.tick, e.subject, e.other)).collect();
         for (kind, tick, subject, other) in work {
-            if b.saturating_sub(tick) > FIRE_WINDOW_TICKS {
+            if !event_is_audible(b, tick) {
                 continue;
             }
             let what = match kind {
@@ -1403,6 +1555,7 @@ impl SoundEngine {
     /// started this frame. Non-blocking: `false` while the banks are still opening, and the
     /// caller simply tries again next frame.
     pub fn begin_frame(&mut self, native: &NativeDll, cache: CacheHandle, map_path: &Path) -> bool {
+        self.live = true;
         self.ensure_open(map_path);
         self.pump_worker();
         if !self.ensure_map(native, cache, map_path) {
@@ -1651,12 +1804,15 @@ impl SoundEngine {
     /// mix (`sub_1401F5BC0`) rather than a 3D position, so the driver's gear shift is heard
     /// at the same level wherever the camera is.
     pub fn play_clip_flat(&mut self, clip: &Clip, seed: u32) -> bool {
-        let perm = clip.permutation_for(seed, clip.snd);
+        let Some((perm, gain_f, pitch)) = self.start_choices(clip, seed, clip.snd) else {
+            return false;
+        };
         let Some(&sample) = clip.samples.get(perm) else {
             self.refuse(Refusal::NoClip);
             return false;
         };
         let g = clip.gain_unspatialized(perm);
+        let g = [g[0] * gain_f, g[1] * gain_f];
         // Below the engine's -64 dB floor it would not be started at all.
         if g[0].max(g[1]) <= rs::db_to_linear(rs::MIN_GAIN_DB) {
             self.refuse(Refusal::BelowFloor);
@@ -1666,7 +1822,7 @@ impl SoundEngine {
             self.refuse(Refusal::NotDecoded);
             return false;
         };
-        match self.out.as_ref().and_then(|o| o.play(pcm, g, 1.0, false)) {
+        match self.out.as_ref().and_then(|o| o.play(pcm, g, pitch, false)) {
             Some(v) => {
                 self.tag_voice(v, self.cat_hint);
                 self.oneshots.push(v);
@@ -1766,6 +1922,44 @@ impl SoundEngine {
         self.fire_of.get(&key).cloned().flatten()
     }
 
+    fn rnd(&mut self) -> f32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x;
+        (x >> 8) as f32 / 16_777_216.0
+    }
+
+    /// The per-start choices of one one-shot: `(permutation, gain factor, pitch ratio)`, or `None`
+    /// when the engine would ignore the request (`skip fraction`). LIVE play follows the engine:
+    /// shuffle-bag takes, a random gain in `[gain base + gain variance, gain base]`, a random pitch
+    /// in `random pitch bounds`, and the sound's skip fraction. Theater (`live == false`) keeps the
+    /// pure hash of tick and source, and no randomisation, so a frame stays a function of the tick.
+    fn start_choices(&mut self, clip: &Clip, tick: u32, source: u32) -> Option<(usize, f32, f64)> {
+        if !self.live {
+            return Some((clip.permutation_for(tick, source), 1.0, 1.0));
+        }
+        let r = &clip.rand;
+        if r.skip_fraction > 0.0 && self.rnd() <= r.skip_fraction {
+            return None;
+        }
+        let mut bag = self.perm_bags.get(&clip.snd).copied().unwrap_or_default();
+        let mut state = self.rng_state;
+        let perm = next_permutation(clip.samples.len(), clip.in_order, &r.perm_skip, &mut bag, &mut || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 8) as f32 / 16_777_216.0
+        });
+        self.rng_state = state;
+        self.perm_bags.insert(clip.snd, bag);
+        let gain = if r.gain_variance_db < 0.0 { rs::db_to_linear(r.gain_variance_db * self.rnd()) } else { 1.0 };
+        let (lo, hi) = (r.pitch_cents.0.min(r.pitch_cents.1) as f32, r.pitch_cents.0.max(r.pitch_cents.1) as f32);
+        let cents = if hi > lo { lo + (hi - lo) * self.rnd() } else { lo };
+        Some((perm, gain, 2f64.powf(f64::from(cents) / 1200.0)))
+    }
+
     /// Start one positioned one-shot. The single place a world position
     /// becomes a voice, so the distance law, the pan and the floor test cannot
     /// differ between a gunshot and a melee swing.
@@ -1785,8 +1979,11 @@ impl SoundEngine {
             self.refuse(Refusal::OutOfRange);
             return PlayResult::OutOfRange;
         }
-        let perm = clip.permutation_for(tick, source);
+        let Some((perm, gain_f, pitch)) = self.start_choices(clip, tick, source) else {
+            return PlayResult::NoSample;
+        };
         let g = clip.gains_at(dir, distance, perm);
+        let g = [g[0] * gain_f, g[1] * gain_f];
         // Below the engine's own floor it would not be started at all.
         if g[0].max(g[1]) <= rs::db_to_linear(rs::MIN_GAIN_DB) {
             self.refuse(Refusal::BelowFloor);
@@ -1801,7 +1998,7 @@ impl SoundEngine {
             self.refuse(Refusal::NotDecoded);
             return PlayResult::NotDecoded;
         };
-        if let Some(v) = self.out.as_ref().and_then(|o| o.play(pcm, g, 1.0, false)) {
+        if let Some(v) = self.out.as_ref().and_then(|o| o.play(pcm, g, pitch, false)) {
             self.tag_voice(v, self.cat_hint);
             self.oneshots.push(v);
             if self.oneshots.len() > 128 {
@@ -1913,6 +2110,162 @@ pub fn save_volume_to_dir(dir: &Path, v: f32) {
 mod tests {
     use super::*;
 
+    /// **THE SPOKEN LINES PLAY.** Offline (no device): on `forge_halo` the sounds that live only in
+    /// the dialogue bank (Spartan and Elite combat voice, the multiplayer announcer) must resolve
+    /// to samples carrying the language bit, and those samples must decode to exactly the frame
+    /// count the tag declares for the permutation and to a signal that is not silence. Before the
+    /// language bank was opened 331 of the map's 2,353 sounds resolved to nothing.
+    #[test]
+    #[ignore]
+    fn the_spoken_lines_in_the_language_bank_resolve_and_decode() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let map = crate::mapcat::enumerate()
+            .into_iter()
+            .find(|c| c.game == crate::mapcat::Game::Reach && c.path.file_stem().map_or(false, |s| s.to_string_lossy().eq_ignore_ascii_case("forge_halo")))
+            .unwrap()
+            .path;
+        let mut eng = SoundEngine::offline(48_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(240);
+        while !eng.begin_frame(&native, cache, &map) {
+            assert!(std::time::Instant::now() < deadline, "banks never opened: {:?}", eng.status());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let g = eng.gestalt.clone().unwrap();
+        let (mut spoken, mut checked) = (0usize, 0usize);
+        for t in rs::sound_tags(&native, cache) {
+            let Some(clip) = eng.resolve_clip(&native, cache, t) else { continue };
+            if !clip.samples.iter().any(|s| s & LANGUAGE_SAMPLE_BIT != 0) {
+                continue;
+            }
+            spoken += 1;
+            if checked >= 6 || spoken % 40 != 1 {
+                continue;
+            }
+            let cs = CacheSound::read(&native, cache, t).unwrap();
+            let perms = g.permutations_of(&cs);
+            let key = clip.samples[0];
+            let declared = perms.iter().find(|p| eng.subsound.get(&p.fmod_subsound_id) == Some(&key)).map(|p| p.sample_count).unwrap();
+            let pcm = eng.want_now(key).expect("a spoken line failed to decode");
+            // The tag's count and the bank's agree within one frame (measured: 9,368 of 9,492 exact-or-one).
+            assert!((pcm.frames() as i64 - declared as i64).abs() <= 1, "tag {t:#x}: decoded {} frames vs the permutation's declared {declared}", pcm.frames());
+            assert!(pcm.peak() > 0.01, "tag {t:#x}: a spoken line decoded to silence");
+            checked += 1;
+        }
+        eprintln!("spoken sounds resolved: {spoken}, decode-checked {checked}");
+        assert!(spoken >= 250, "only {spoken} language-bank sounds resolve (331 expected)");
+        assert!(checked >= 5);
+    }
+
+    /// **NO EVENT IS DROPPED BY A SLOW FRAME.** Events at every tick, frames of 1..30 ticks (60 fps
+    /// to 2 fps, or 1x to 30x playback): the events in each smooth step `(prev, now]` are all
+    /// admitted, so the total heard equals the total recorded.
+    #[test]
+    fn a_slow_frame_does_not_swallow_the_events_inside_it() {
+        for step in [1u32, 2, 3, 4, 6, 8, 16, 30] {
+            let (mut now, mut heard, mut recorded) = (0u32, 0u32, 0u32);
+            while now < 900 {
+                let next = now + step;
+                for e in (now + 1)..=next {
+                    recorded += 1;
+                    if event_is_audible(next, e) {
+                        heard += 1;
+                    }
+                }
+                now = next;
+            }
+            assert_eq!(heard, recorded, "frame step {step} ticks lost {} of {recorded} events", recorded - heard);
+        }
+        // ...and a stale event (older than a smooth step) is still refused.
+        assert!(!event_is_audible(1000, 1000 - SMOOTH_STEP_TICKS as u32 - 1));
+    }
+
+    fn lcg(seed: u32) -> impl FnMut() -> f32 {
+        let mut x = seed;
+        move || {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 8) as f32 / 16_777_216.0
+        }
+    }
+
+    /// **THE SHUFFLE BAG** (`sound_definition_next_permutation_deterministic`): the first cycle
+    /// plays every take once; each later cycle starts with the take just played already spent, so
+    /// it holds the other `n - 1` takes once each and never opens with a repeat.
+    #[test]
+    fn permutations_play_as_a_shuffle_bag_with_no_immediate_repeat() {
+        for n in 2..=8usize {
+            let mut bag = PermBag::default();
+            let mut rng = lcg(7 + n as u32);
+            let mut prev = usize::MAX;
+            for cycle in 0..200 {
+                let len = if cycle == 0 { n } else { n - 1 };
+                let mut seen = vec![false; n];
+                for k in 0..len {
+                    let p = next_permutation(n, false, &[], &mut bag, &mut rng);
+                    assert!(p < n);
+                    assert!(!seen[p], "n={n} cycle {cycle}: take {p} repeated inside its cycle (pos {k})");
+                    assert!(p != prev, "n={n} cycle {cycle}: take {p} played twice in a row");
+                    seen[p] = true;
+                    prev = p;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_in_order_sound_steps_through_its_takes() {
+        let mut bag = PermBag::default();
+        let mut rng = lcg(3);
+        let seq: Vec<usize> = (0..9).map(|_| next_permutation(4, true, &[], &mut bag, &mut rng)).collect();
+        // The first is a random start (no `last` yet); then strictly +1 mod 4.
+        for w in seq.windows(2) {
+            assert_eq!(w[1], (w[0] + 1) % 4, "{seq:?}");
+        }
+    }
+
+    #[test]
+    fn a_take_with_a_skip_fraction_is_passed_over_that_often() {
+        let mut bag = PermBag::default();
+        let mut rng = lcg(11);
+        let skip = [0.9f32, 0.0, 0.0, 0.0];
+        let mut count = [0usize; 4];
+        for _ in 0..8000 {
+            count[next_permutation(4, false, &skip, &mut bag, &mut rng)] += 1;
+        }
+        let others = (count[1] + count[2] + count[3]) as f32 / 3.0;
+        assert!((count[0] as f32) < 0.35 * others, "take 0 (skip 0.9) played {} vs the others' mean {others}: {count:?}", count[0]);
+        assert!(count[0] > 0, "a skipped take is rejected, not banned: {count:?}");
+    }
+
+    /// Live play randomises per start; Theater does not.
+    #[test]
+    fn live_play_applies_the_authored_randomisation_and_theater_does_not() {
+        let mut c = clip(1.0, Distances::default(), 3);
+        c.rand = ClipRandom { skip_fraction: 0.5, gain_variance_db: -6.0, pitch_cents: (-100, 100), perm_skip: vec![] };
+        let mut e = SoundEngine::default();
+        // Theater: the pure hash, unit gain, unit pitch, never skipped.
+        for t in 0..50 {
+            let (p, g, pitch) = e.start_choices(&c, t, 9).expect("Theater never skips");
+            assert_eq!((p, g, pitch), (c.permutation_for(t, 9), 1.0, 1.0));
+        }
+        e.live = true;
+        let (mut skipped, mut gmin, mut gmax, mut pmin, mut pmax) = (0, f32::MAX, 0f32, f64::MAX, 0f64);
+        for t in 0..4000 {
+            match e.start_choices(&c, t, 9) {
+                None => skipped += 1,
+                Some((_, g, p)) => {
+                    gmin = gmin.min(g);
+                    gmax = gmax.max(g);
+                    pmin = pmin.min(p);
+                    pmax = pmax.max(p);
+                }
+            }
+        }
+        assert!((1800..2200).contains(&skipped), "skip 0.5 skipped {skipped} of 4000");
+        assert!(gmax <= 1.0 && gmax > 0.97 && gmin >= rs::db_to_linear(-6.0) - 1e-4 && gmin < 0.52, "gain factors {gmin}..{gmax}");
+        let (lo, hi) = (2f64.powf(-100.0 / 1200.0), 2f64.powf(100.0 / 1200.0));
+        assert!(pmin >= lo - 1e-9 && pmin < lo * 1.01 && pmax <= hi + 1e-9 && pmax > hi * 0.99, "pitch {pmin}..{pmax}");
+    }
+
     fn clip(gain: f32, dist: Distances, samples: usize) -> Clip {
         Clip {
             snd: 1,
@@ -1923,6 +2276,7 @@ mod tests {
             dist,
             spatial: dist.usable(),
             in_order: false,
+            rand: ClipRandom::default(),
         }
     }
 

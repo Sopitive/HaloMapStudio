@@ -481,6 +481,11 @@ pub struct Permutation {
     /// permutations of `forge_halo.map`: zero for 9,412 of them, the rest
     /// between -12 and -2. A plain signed dB integer, not a scaled encoding.
     pub gain_db: i8,
+    /// `encoded skip fraction` (u16 at +0x02) read as `raw / 65536`: the fraction of requests for
+    /// THIS take that are rejected in favour of another (`sound_permutation_get_skip_fraction`).
+    /// INFERRED encoding: the non-zero values on forge_halo (16383, 19660, 22936, 24575, 26213,
+    /// 29490, 31128, 32111, 32768..) are 0.25, 0.30, 0.35, 0.375, 0.40, 0.45, 0.475, 0.49, 0.5.
+    pub skip_fraction: f32,
     /// The join key into an `.fsb.info` sidecar: equals its `+0x00 subsound
     /// id`, and the record index is the bank's sample index.
     pub fmod_subsound_id: u32,
@@ -518,6 +523,10 @@ pub struct Gestalt {
     /// looping sound's SCALE (0..1) sweeps. Debug `0x1806538B0`:
     /// `lerp(lower, upper, scale) + pitch_offset`.
     pub scale_pitch_cents: Vec<(i16, i16)>,
+    /// `sound_gestalt_scale_block +0x0C skip fraction modifier` (lower, upper): the engine's
+    /// `sound_definition_skip_fraction` (xex `0x82A810A0`) is `lerp(lower, upper, scale) *
+    /// playback.skip fraction`.
+    pub scale_skip: Vec<(f32, f32)>,
     /// `ugh!.pitch range parameters` (16 B), indexed by `PitchRange::parameters_index`.
     pub pitch_params: Vec<PitchParams>,
     pub pitch_ranges: Vec<PitchRange>,
@@ -564,6 +573,13 @@ impl Gestalt {
             .chunks_exact(SCALE_SIZE)
             .map(|c| (i16::from_le_bytes([c[0x08], c[0x09]]), i16::from_le_bytes([c[0x0A], c[0x0B]])))
             .collect();
+        let scale_skip: Vec<(f32, f32)> = sc
+            .chunks_exact(SCALE_SIZE)
+            .map(|c| {
+                let f = |o: usize| f32::from_le_bytes([c[o], c[o + 1], c[o + 2], c[o + 3]]);
+                (f(0x0C), f(0x10))
+            })
+            .collect();
         let pitch_params: Vec<PitchParams> = pp
             .chunks_exact(PITCH_PARAMS_SIZE)
             .map(|c| {
@@ -593,6 +609,7 @@ impl Gestalt {
                     c[PERM_SAMPLE_COUNT + 3],
                 ]),
                 gain_db: c[PERM_ENCODED_GAIN_DB] as i8,
+                skip_fraction: u16::from_le_bytes([c[PERM_ENCODED_SKIP_FRACTION], c[PERM_ENCODED_SKIP_FRACTION + 1]]) as f32 / 65_536.0,
                 fmod_subsound_id: u32::from_le_bytes([
                     c[PERM_FMOD_SUBSOUND_HASH],
                     c[PERM_FMOD_SUBSOUND_HASH + 1],
@@ -637,6 +654,7 @@ impl Gestalt {
             playbacks,
             scale_gain_db,
             scale_pitch_cents,
+            scale_skip,
             pitch_params,
             pitch_ranges,
             permutations,
@@ -4349,5 +4367,144 @@ mod probes4 {
         );
         assert!(tot_sampled > 200, "only {tot_sampled} footstep rows reach a bank sample");
 
+    }
+}
+
+/// Offline census of the authored randomisation fields the one-shot path has to honour.
+/// Prints numbers; touches no audio device. `--ignored --nocapture`.
+#[cfg(test)]
+mod census {
+    use super::probes_support::*;
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn census_of_randomisation_fields() {
+        let _serial = super::probes_support::PROBE_LOCK.lock();
+        let Some((native, cache, _p)) = open_reach("forge_halo") else { return };
+        let Some(g) = Gestalt::read(&native, cache) else { return };
+        let mut skip_enc = std::collections::BTreeMap::<u16, usize>::new();
+        let pm = crate::reach_actor::tag_block(&native, cache, g.tag, UGH_PERMUTATIONS, PERMUTATION_SIZE, MAX_BLOCK);
+        for c in pm.chunks_exact(PERMUTATION_SIZE) {
+            *skip_enc.entry(u16::from_le_bytes([c[2], c[3]])).or_default() += 1;
+        }
+        eprintln!("perm +2 (encoded skip fraction) histogram: {:?}", skip_enc.iter().take(30).collect::<Vec<_>>());
+        let pr = crate::reach_actor::tag_block(&native, cache, g.tag, UGH_PITCH_RANGES, PITCH_RANGE_SIZE, MAX_BLOCK);
+        let mut enc4 = std::collections::BTreeMap::<u16, usize>::new();
+        for c in pr.chunks_exact(PITCH_RANGE_SIZE) {
+            *enc4.entry(u16::from_le_bytes([c[4], c[5]])).or_default() += 1;
+        }
+        eprintln!("pitch range +4 (encoded permutation data) histogram: {:?}", enc4.iter().take(30).collect::<Vec<_>>());
+        let pbs = &g.playbacks;
+        eprintln!(
+            "playbacks {}: skip_fraction>0 {}, gain_variance!=0 {}, random_pitch!=0 {}, cone {}",
+            pbs.len(),
+            pbs.iter().filter(|p| p.skip_fraction > 0.0).count(),
+            pbs.iter().filter(|p| p.gain_variance_db != 0.0).count(),
+            pbs.iter().filter(|p| p.random_pitch_cents != (0, 0)).count(),
+            pbs.iter().filter(|p| p.outer_cone_deg > 0.0).count(),
+        );
+        let mut ss = std::collections::BTreeMap::<(i32, i32), usize>::new();
+        for (a, b) in &g.scale_skip { *ss.entry(((a * 1000.0) as i32, (b * 1000.0) as i32)).or_default() += 1; }
+        eprintln!("scale skip modifier (lo,hi)*1000 histogram: {:?}", ss.iter().take(12).collect::<Vec<_>>());
+        for (i, p) in pbs.iter().enumerate().filter(|(_, p)| p.skip_fraction > 0.0) { eprintln!("   playback {i} skip {}", p.skip_fraction); }
+        let sk: Vec<f32> = pbs.iter().filter(|p| p.skip_fraction > 0.0).map(|p| p.skip_fraction).take(12).collect();
+        eprintln!("  some skip fractions {sk:?}");
+        // Sounds with several pitch ranges: do their natural pitches differ?
+        let tags = sound_tags(&native, cache);
+        let (mut multi, mut differing, mut perms_multi, mut inorder, mut with_playback) = (0, 0, 0, 0, 0);
+        let mut worst: Vec<(i32, u32)> = vec![];
+        for t in &tags {
+            let Some(s) = CacheSound::read(&native, cache, *t) else { continue };
+            if s.flags & SND_FLAG_PERMUTATIONS_IN_ORDER != 0 { inorder += 1; }
+            if g.playback_of(&s).is_some() { with_playback += 1; }
+            if g.permutations_of(&s).len() > 1 { perms_multi += 1; }
+            if s.pitch_range_count > 1 && s.flags & 0x2000 == 0 {
+                multi += 1;
+                let a = s.first_pitch_range as usize;
+                let nat: Vec<i16> = g.pitch_ranges[a..a + s.pitch_range_count as usize]
+                    .iter()
+                    .filter_map(|pr| g.params_of(pr).map(|p| p.natural_pitch))
+                    .collect();
+                let (lo, hi) = (nat.iter().min().copied().unwrap_or(0) as i32, nat.iter().max().copied().unwrap_or(0) as i32);
+                if hi != lo { differing += 1; worst.push((hi - lo, *t)); }
+            }
+        }
+        // Which sounds live only in the language bank?
+        if let Some(dir) = hms_sound::SoundBank::bank_dir_for_reach(&_p) {
+            let sfx = hms_sound::BankInfo::open(&dir.join("sfx.fsb.info")).ok();
+            let eng = hms_sound::BankInfo::open(&dir.join("english.fsb.info")).ok();
+            if let (Some(sfx), Some(eng)) = (sfx, eng) {
+                let mut by_prefix = std::collections::BTreeMap::<String, usize>::new();
+                let (mut n_eng, mut n_sfx, mut n_both, mut n_none) = (0, 0, 0, 0);
+                for t in &tags {
+                    let Some(s) = CacheSound::read(&native, cache, *t) else { continue };
+                    let ps = g.permutations_of(&s);
+                    let in_s = ps.iter().any(|p| sfx.index_of_subsound(p.fmod_subsound_id).is_some());
+                    let e = ps.iter().find_map(|p| eng.index_of_subsound(p.fmod_subsound_id));
+                    match (in_s, e.is_some()) {
+                        (true, true) => n_both += 1,
+                        (true, false) => n_sfx += 1,
+                        (false, true) => n_eng += 1,
+                        _ => n_none += 1,
+                    }
+                    if !in_s {
+                        if let Some(i) = e {
+                            let path = eng.get(i).map(|r| r.path.clone()).unwrap_or_default();
+                            let k: Vec<&str> = path.split('\\').take(5).collect();
+                            *by_prefix.entry(k.join("/")).or_default() += 1;
+                        }
+                    }
+                }
+                eprintln!("snd! by bank: sfx-only {n_sfx}, english-only {n_eng}, both {n_both}, neither {n_none}");
+                for (k, v) in by_prefix.iter().take(60) { eprintln!("   english {v:>4}  {k}"); }
+            }
+        }
+        worst.sort();
+        eprintln!(
+            "snd! {}: with playback row {with_playback}, >1 permutation {perms_multi}, in-order flag {inorder}, multi-pitch-range (non-0x2000) {multi}, of which natural pitches differ {differing}; widest spreads (cents) {:?}",
+            tags.len(), worst.iter().rev().take(8).collect::<Vec<_>>()
+        );
+    }
+
+    /// What level does the authored gain chain INTEND? For every world sound with a first
+    /// permutation: `peak dBFS of the decoded sample + authored dB` (pre-master). If the chain
+    /// normalises its samples, this sum is nearly constant for the right decode and scattered for
+    /// the wrong one. Computed for the raw decode and for the band-limited playback decode.
+    #[test]
+    #[ignore]
+    fn census_of_authored_gain_vs_decoded_peak() {
+        let _serial = super::probes_support::PROBE_LOCK.lock();
+        let Some((native, cache, path)) = open_reach("forge_halo") else { return };
+        let Some(g) = Gestalt::read(&native, cache) else { return };
+        let law = GainLaw::read(&native, cache);
+        let Some(dir) = hms_sound::SoundBank::bank_dir_for_reach(&path) else { return };
+        let sfx = hms_sound::SoundBank::open(&dir, "sfx").unwrap();
+        let setups = hms_sound::SetupTable::from_module(&dir.parent().unwrap().parent().unwrap().join("haloreach.dll")).unwrap();
+        let (mut raw, mut bl, mut auth) = (vec![], vec![], vec![]);
+        for t in sound_tags(&native, cache) {
+            let Some(s) = CacheSound::read(&native, cache, t) else { continue };
+            let perms = g.permutations_of(&s);
+            let Some(p) = perms.first() else { continue };
+            let Some(i) = sfx.index_of_subsound(p.fmod_subsound_id) else { continue };
+            let Ok(mut pcm) = sfx.decode_sample(i, &setups) else { continue };
+            let a = law.authored_gain_db(&s, g.playback_of(&s), g.scale_gain_of(&s), p.gain_db);
+            let pr = pcm.peak().max(1e-6);
+            raw.push(20.0 * pr.log10() + a);
+            hms_sound::decode::band_limit(&mut pcm);
+            let pb = pcm.peak().max(1e-6);
+            bl.push(20.0 * pb.log10() + a);
+            auth.push(a);
+        }
+        let stat = |v: &Vec<f32>| {
+            let mut w = v.clone();
+            w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let m = w.iter().sum::<f32>() / w.len() as f32;
+            let sd = (w.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / w.len() as f32).sqrt();
+            (w.len(), m, sd, w[w.len() / 10], w[w.len() / 2], w[w.len() * 9 / 10])
+        };
+        eprintln!("authored dB                        (n, mean, sd, p10, median, p90) = {:.2?}", stat(&auth));
+        eprintln!("RAW decode peak dBFS + authored dB                                 = {:.2?}", stat(&raw));
+        eprintln!("BAND-LIMITED peak dBFS + authored dB                               = {:.2?}", stat(&bl));
     }
 }

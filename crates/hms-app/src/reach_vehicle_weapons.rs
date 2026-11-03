@@ -256,4 +256,63 @@ mod gates {
         }
         assert_eq!(after, 0, "released: no shots");
     }
+
+    /// #seat-weapons  Which seats allow the rider's own weapon, per family, LITERAL from the real tags
+    /// (engine rule: `unit_can_use_weapon_in_seat` tests seat flag bit 5; driver and gunner seats
+    /// author it clear, passenger seats set). Also: a recorded rider in a no-weapon seat holds
+    /// nothing in Theater, and in a weapon seat keeps what the recording says.
+    #[test]
+    #[ignore = "opens the native library; run alone with --ignored"]
+    fn seats_allow_the_riders_weapon_exactly_where_the_engine_does() {
+        let Some((_g, native, cache)) = crate::reach_actor::tests::open_reach_for("forge_halo") else { return };
+        let native = &*native;
+        let leaf = |t: u32| native.tag_name(cache, t).unwrap_or_default().rsplit('\\').next().unwrap_or("").to_string();
+        // (vehicle, seat label, allows weapons)
+        let table: [(&str, &str, bool); 28] = [
+            ("warthog", "warthog_d", false),
+            ("warthog", "warthog_p", true),
+            ("warthog", "warthog_b_d", false),
+            ("warthog_chaingun", "warthog_g", false),
+            ("warthog_troop", "warthog_p_l", true),
+            ("mongoose", "mongoose_d", false),
+            ("mongoose", "mongoose_p", true),
+            ("ghost", "ghost_d", false),
+            ("banshee", "banshee_d", false),
+            ("falcon", "falcon_d", false),
+            ("falcon", "falcon_p_l1", false),
+            ("falcon", "falcon_p_l1_wpn", true),
+            ("falcon", "falcon_p_bench_wpn", true),
+            ("scorpion", "scorpion_d", false),
+            ("scorpion", "scorpion_p_lf", true),
+            ("scorpion_anti_infantry", "scorpion_g", false),
+            ("wraith", "wraith_d", false),
+            ("wraith", "wraith_b_l", false),
+            ("wraith_anti_infantry", "wraith_g", false),
+            ("revenant", "revenant_d", false),
+            ("revenant", "revenant_p", true),
+            ("pelican", "pelican_d", false),
+            ("pelican", "pelican_p_l01", true),
+            ("pelican", "pelican_g", false),
+            ("pelican", "pelican_e", true),
+            ("sabre", "sabre_p", false),
+            ("truck_cab_large", "truck_p", false),
+            ("phantom_mp", "phantom_pr_lf", true),
+        ];
+        let mut seen = 0;
+        for (v, label, allows) in table {
+            let Some(vt) = native.tags_by_group(cache, "vehi").into_iter().find(|&t| leaf(t) == v) else { continue };
+            let seats = UnitSeats::read(native, cache, vt).unwrap().seats;
+            let (i, s) = seats.iter().enumerate().find(|(_, s)| s.label == label).unwrap_or_else(|| panic!("{v} has no seat {label}"));
+            assert_eq!(s.allows_weapons(), allows, "{v} seat {label}");
+            // Theater: the held weapon the recording names survives only where the seat allows it
+            let mut memo = std::collections::HashMap::new();
+            let held = crate::film_play::weapon_in_seat(&mut memo, native, cache, Some(vt), Some(i), Some(0x1234));
+            assert_eq!(held, if allows { Some(0x1234) } else { None }, "{v} seat {label}: rider's weapon");
+            seen += 1;
+        }
+        assert!(seen >= 20, "liveness: only {seen} of the table's seats exist in forge_halo");
+        // a ride whose seat the recording does not state keeps its weapon
+        let mut memo = std::collections::HashMap::new();
+        assert_eq!(crate::film_play::weapon_in_seat(&mut memo, native, cache, None, None, Some(7)), Some(7));
+    }
 }

@@ -11,7 +11,7 @@
 <body>
 <a class="skip" href="#content">Skip to content</a>
 <header class="top">
-  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.7.0 docs</span></a>
+  <a class="brand" href="index.html"><span class="logo">H</span> Halo Map Studio <span class="ver">v1.8.0 docs</span></a>
   <button class="navtoggle" aria-label="Toggle navigation" onclick="document.body.classList.toggle('nav-open')">Menu</button>
 </header>
 <div class="wrap">
@@ -28,8 +28,11 @@
 <li><a href="headless.html">Headless / CLI</a></li>
 <li><a href="theater.html">Theater</a></li>
 <li><a href="film-data.html">Film data</a></li>
+<li><a href="mvar-viewer.html">Variant viewer (web)</a></li>
+<li><a href="mvar-js.html">Variant JavaScript API</a></li>
 <li><a href="halo4.html">Halo 4</a></li>
 <li><a href="faq.html">FAQ / troubleshooting</a></li>
+<li><a href="building.html">Building from source</a></li>
 <li><a href="license.html">Licence &amp; commercial use</a></li>
 <li><a href="changelog.html">Changelog</a></li>
 </ul>
@@ -143,7 +146,7 @@
 <p>What a save does:</p>
 <ul>
   <li>Every part of the file that is not the object list (the BLF container chunks, the header, the title/description/author unless you edited them, the label table unless you edited it) is copied byte-for-byte from the original.</li>
-  <li>Objects are written in the editor's order into slots 0…N. Objects you did not touch round-trip bit-exactly; rotations are only re-quantised for objects you actually rotated. Deleted objects free their slots; if a deleted object was the parent of another, the child is left without a parent.</li>
+  <li>Objects are written in the editor's order into slots 0…N. Objects you did not touch round-trip bit-exactly; rotations are only re-quantised for objects you actually rotated. After a save the objects in the editor are updated to exactly the values the game will load (Settings &#9656; Saving &#9656; Save precision; one undo step), so what you see is what the map will look like in game. Deleted objects free their slots; if a deleted object was the parent of another, the child is left without a parent.</li>
   <li>Objects the app could not display are still written back unchanged.</li>
   <li>The per-type quota table is updated (<em>placed on map</em> recounted; <em>max</em> raised if you exceeded it).</li>
   <li>New objects whose palette entry cannot be resolved are dropped, and the status line tells you how many.</li>
@@ -153,6 +156,8 @@
 
 <h2 id="budget">The 651-object budget</h2>
 <p>A Reach variant has exactly 651 object slots. The bottom-right of the window shows <code>Objects: N / 651</code> (yellow at 90 %, red when full). Objects that are in the file but not displayed still count. When the variant is full, newly placed objects cannot be saved: the status line reports how many had no free slot.</p>
+
+<p><strong>Object properties on Halo 3.</strong> The Halo 3 Object panel exposes every per-object property the file stores: team, respawn time, spare clips / teleporter channel / spawn order, symmetry, placed-at-start, unique, the gametype-engine mask, and the boundary shape and sizes in world units (see <a href="editing.html#panel-h3">The Object panel</a>). Properties that only Reach and later have (colour, labels, parent, cached type, passability, scale) are hidden, not stored. Prefabs carry the Halo 3 properties, and a prefab or a converted variant moving between Halo 3 and another game re-spells the placement flags (<em>placed at start</em> and <em>unique</em> live in different bits) instead of dropping them.</p>
 
 <h2 id="crossgame">Converting a variant to another game</h2>
 <p><em>File ▸ Convert variant to another game…</em> takes a Forge variant authored in one Halo title
@@ -221,7 +226,7 @@ single byte.</p>
 
 <footer class="foot">
 <p>Halo Map Studio is free for noncommercial use under the PolyForm Noncommercial License 1.0.0; commercial use needs a <a href="license.html">commercial licence</a>. Copyright © 2026 Sopitive. Halo, Halo: Reach, Halo 4 and The Master Chief Collection are trademarks of Microsoft Corporation; this project is not affiliated with or endorsed by Microsoft or 343 Industries and ships no game content.</p>
-<p class="small">Documentation written against the v1.7.0 source (2026-10-29). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
+<p class="small">Documentation written against the v1.8.0 source (2026-11-03). Pages marked with a notice describe a UI that is being reorganised; labels and screenshots may lag the current build.</p>
 </footer>
 </main>
 </div>

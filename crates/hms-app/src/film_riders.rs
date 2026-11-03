@@ -1580,4 +1580,731 @@ mod e2e {
         }
         eprintln!("corpus: {films} films ({vehicle_films} with vehicles); {with12} biped creations state a parent, {recovered} recovered");
     }
+
+    /// **#cam-jitter  THE GATE for "the camera is jittery when following a fast vehicle".** On the
+    /// race clip, following a rider whose Mongoose is doing ~20 wu/s, through the production camera
+    /// solve (`solve_camera_at`, the vehicle camera the engine switches to) and the production
+    /// vehicle placement (`sync`), at 30 / 60 / 144 fps and irregular frame times: the hull must stay
+    /// put in the view -- high-pass RMS of its projected position under 0.5 px at every rate (the
+    /// lag-free camera measured 0.01 px; the rounded-tick camera 7.1 px at 144 fps, 5.7 px irregular).
+    /// Saboteur: read the rounded tick again in `context_pose`'s vehicle arm.
+    /// #vehicle-flip  **A VEHICLE NEVER TURNS 90 DEGREES IN A TICK.** Reported: Mongooses "randomly
+    /// rotate 90 degrees" and the follow camera flashes. Cause: the forward angle is measured from a
+    /// reference tangent chosen by comparing |up.x| with |up.y|; for a near-level hull that is a
+    /// tie at the precision `up` travels in, so single keys decoded 90 degrees about `up` off
+    /// (6,732 of them in the race clip's 17 Mongoose tracks, up to 586 per hull, every one 87-93
+    /// degrees). Gate: in every recorded clip, no orientation key of any track turns faster than
+    /// 400 deg/s (a Mongoose spins nowhere near that; the broken keys were 5,000 deg/s and up) while
+    /// also turning more than 30 degrees; and the tie really occurs (liveness).
+    /// Saboteur: make `orientation_world_after` return the engine-rule decode (6,732 -> back).
+    #[test]
+    #[ignore = "reads the downloaded clips"]
+    fn no_recorded_track_turns_ninety_degrees_in_one_tick() {
+        let dir = PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads");
+        let mut clips = 0;
+        let mut keys = 0usize;
+        let before = crate::film_decode::TIE_BRANCH_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+        for name in ["Reach(1).mov", "Reach.mov", "asq_mglo-1_ca_forge__A5992DE3_6938D76B.mov"] {
+            let Ok(f) = crate::film::open(&dir.join(name)) else { continue };
+            let idx = crate::film_decode::build_index_film(&f);
+            clips += 1;
+            let mut bad = Vec::new();
+            for tr in &idx.tracks {
+                keys += tr.orientations.len();
+                for w in tr.orientations.windows(2) {
+                    let q = |f: [f32; 3], u: [f32; 3]| glam::Quat::from_mat3(&crate::film_decode::basis_mat3(f, u));
+                    let ang = q(w[0].1, w[0].2).angle_between(q(w[1].1, w[1].2)).to_degrees();
+                    let dt = (w[1].0 - w[0].0).max(1) as f32 / 60.0;
+                    if ang > 30.0 && ang / dt > 400.0 {
+                        bad.push((tr.net_id, w[0].0, ang));
+                    }
+                }
+            }
+            eprintln!("{name}: {} track(s), {} jump(s) {:?}", idx.tracks.len(), bad.len(), &bad[..bad.len().min(5)]);
+            assert!(bad.is_empty(), "{name}: {} orientation key(s) turn >30 deg faster than 400 deg/s", bad.len());
+        }
+        let taken = crate::film_decode::TIE_BRANCH_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - before;
+        eprintln!("{clips} clip(s), {keys} orientation keys, {taken} tie key(s) resolved by continuity");
+        assert!(clips >= 1, "no clip found");
+        assert!(taken >= 1000 || clips < 2, "the tie never occurred ({taken}): the gate proves nothing");
+    }
+
+    /// #vehicle-flip  The follow camera over a long span has no outlier frame: following the
+    /// racer through ticks 600..20000 at 144 fps, no frame turns the camera more than 6 degrees or
+    /// moves it more than 1.5 wu from the previous one (a Mongoose at 25 wu/s moves 0.17 wu a
+    /// frame; the bad keys turned the camera 90 degrees for 1-3 ticks). Reports the count.
+    #[test]
+    #[ignore = "opens a Reach cache and reads a downloaded race clip"]
+    fn the_follow_camera_has_no_outlier_frame_over_a_long_drive() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let p = PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov");
+        let f = crate::film::open(&p).expect("opens");
+        let idx = crate::film_decode::build_index_film(&f);
+        let rider: u32 = 0xec0e029b;
+        let owner = idx.tracks.iter().find(|t| t.net_id == rider).and_then(|t| t.owner_raw).expect("owner");
+        let mut rig = Rig::new(&o, idx);
+        let mut worst = (0usize, String::new());
+        for context in [true, false] {
+            rig.pb.context_cameras = context;
+            rig.pb.camera = crate::film_play::FilmCamera::FollowOwner(owner);
+            let mut prev: Option<(Vec3, f32, f32)> = None;
+            let (mut frames, mut outliers, mut ticks) = (0usize, 0usize, Vec::new());
+            let n = ((20000.0 - 600.0) / 60.0 * 144.0) as usize;
+            for i in 0..n {
+                rig.pb.seek_tick(600.0 + i as f32 * 60.0 / 144.0);
+                rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                let Some(pose) = crate::film_play::solve_camera_at(&rig.pb, rig.driver.eye_height(&rig.pb)) else { prev = None; continue };
+                let cur = (Vec3::from(pose.pos), pose.yaw, pose.pitch);
+                if let Some(pr) = prev {
+                    let mut dy = (cur.1 - pr.1).abs();
+                    if dy > std::f32::consts::PI { dy = 2.0 * std::f32::consts::PI - dy; }
+                    frames += 1;
+                    if dy.to_degrees() > 6.0 || (cur.0 - pr.0).length() > 1.5 || (cur.2 - pr.2).abs().to_degrees() > 6.0 {
+                        outliers += 1;
+                        if ticks.len() < 8 { ticks.push((600.0 + i as f32 * 60.0 / 144.0) as u32); }
+                    }
+                }
+                prev = Some(cur);
+            }
+            eprintln!("context {context}: {frames} frames, {outliers} outlier(s) at {ticks:?}");
+            if outliers > worst.0 { worst = (outliers, format!("context {context}: {ticks:?}")); }
+        }
+        assert_eq!(worst.0, 0, "outlier camera frames: {}", worst.1);
+    }
+
+    /// #fp-jitter  The camera of an ON-FOOT subject, sampled like a display would. Over `secs` seconds
+    /// from `t0` at `fps` (optionally with irregular frame times) returns the 95th percentile of the
+    /// per-frame second difference of the position (wu) and of the yaw (degrees), and the largest
+    /// position second difference. Respawn cuts (a 3 wu jump) are not jitter and are skipped.
+    fn on_foot_camera_series(pb: &mut Playback, t0: f32, secs: f32, fps: f32, irregular: bool) -> Option<(f32, f32, f32)> {
+        let mut t = 0.0f32;
+        let mut rngs = 777u32;
+        let mut poses: Vec<(f32, [f32; 3], f32)> = Vec::new();
+        while t < secs {
+            let dt = if irregular {
+                rngs = rngs.wrapping_mul(1664525).wrapping_add(1013904223);
+                (1.0 / fps) * (0.4 + 1.2 * ((rngs >> 8) as f32 / 16777216.0))
+            } else {
+                1.0 / fps
+            };
+            t += dt;
+            pb.seek_tick(t0 + t * 60.0);
+            let Some(p) = crate::film_play::solve_camera_at(pb, 0.62) else { continue };
+            poses.push((t, p.pos, p.yaw));
+        }
+        if poses.len() < 20 {
+            return None;
+        }
+        let wrap = |d: f32| (d + std::f32::consts::PI).rem_euclid(2.0 * std::f32::consts::PI) - std::f32::consts::PI;
+        let (mut ep, mut ey) = (Vec::new(), Vec::new());
+        for w in poses.windows(3) {
+            if (Vec3::from(w[2].1) - Vec3::from(w[0].1)).length() > 3.0 { continue; }
+            // the deviation of the middle frame from the straight line (in TIME) through its neighbours,
+            // so uneven frame times are not mistaken for roughness
+            let f = (w[1].0 - w[0].0) / (w[2].0 - w[0].0);
+            let line = Vec3::from(w[0].1) + (Vec3::from(w[2].1) - Vec3::from(w[0].1)) * f;
+            ep.push((Vec3::from(w[1].1) - line).length());
+            let (a, c) = (wrap(w[0].2 - w[1].2), wrap(w[2].2 - w[1].2));
+            ey.push((-(a + (c - a) * f)).to_degrees().abs());
+        }
+        let p95 = |v: &mut Vec<f32>| { v.sort_by(|a, b| a.total_cmp(b)); v[((v.len() - 1) as f32 * 0.95) as usize] };
+        let worst = ep.iter().cloned().fold(0.0, f32::max);
+        Some((p95(&mut ep), p95(&mut ey), worst))
+    }
+
+    /// The films the first-person gates can use: the race clip plus the playable corpus.
+    fn jitter_films() -> Vec<crate::film_decode::FilmIndex> {
+        let mut files: Vec<PathBuf> = vec![PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov")];
+        files.extend(crate::film::spec_corpus().into_iter().take(40));
+        let mut out = Vec::new();
+        for p in files {
+            if out.len() >= 5 { break; }
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.data.records.len() < 3000 { continue; }
+            let idx = crate::film_decode::build_index_film(&f);
+            if idx.tracks.iter().any(|t| t.entity_type == 11 && t.positions.len() > 400 && t.owner_raw.is_some()) {
+                out.push(idx);
+            }
+        }
+        eprintln!("{} film(s) for the first-person gates", out.len());
+        out
+    }
+
+    /// #fp-jitter  **THE VIEW OF A WALKING PLAYER DOES NOT DEPEND ON THE DISPLAY RATE.** Reported: weird
+    /// jitter in first person when spectating a player. The camera (and a followed body) were
+    /// placed at the ROUNDED tick and the recorded look direction was held between reports, so at
+    /// 144 Hz or with irregular frames the view stepped. Now position, aim and facing are all
+    /// sampled at the fractional clock, the look turning along the shortest arc between reports a
+    /// network-update apart. Gate: for the busiest 8 s of up to two on-foot subjects in each of five
+    /// films, in first person and in follow, the 95th-percentile second difference of the camera
+    /// at 144 fps / irregular frames stays within 15% / 50% of what 60 fps shows plus a small
+    /// slack (60 fps samples the recorded keys themselves, so it is the data's own roughness).
+    /// Before: 144 fps was 2.2x 60 fps in position on the race clip. Saboteur: read the rounded tick.
+    #[test]
+    #[ignore = "reads downloaded clips"]
+    fn the_view_of_a_walking_player_does_not_depend_on_the_display_rate() {
+        let mut judged = 0usize;
+        let mut report = String::new();
+        for idx in jitter_films() {
+            let mut cands: Vec<(u8, usize)> = idx.tracks.iter().filter(|t| t.entity_type == 11 && t.positions.len() > 400).filter_map(|t| t.owner_raw.map(|o| (o, t.positions.len()))).collect();
+            cands.sort_by_key(|c| std::cmp::Reverse(c.1));
+            cands.dedup_by_key(|c| c.0);
+            report += &format!("film: {} owner candidate(s)\n", cands.len());
+            let mut pb = Playback::new(idx);
+            pb.context_cameras = false;
+            for &(owner, _) in cands.iter().take(2) {
+                let tr = pb.index.tracks.iter().filter(|t| t.owner_raw == Some(owner) && t.entity_type == 11).max_by_key(|t| t.positions.len()).unwrap().clone();
+                let mut best = (0.0f32, tr.first_tick);
+                let mut k = tr.first_tick + 120;
+                while k + 600 < tr.last_tick {
+                    let d = crate::film_vehicle::position_at(&tr, (k + 480) as f32).zip(crate::film_vehicle::position_at(&tr, k as f32)).map(|(a, b)| (a - b).length()).unwrap_or(0.0);
+                    if d > best.0 && d < 200.0 { best = (d, k); }
+                    k += 300;
+                }
+                for fp in [true, false] {
+                    pb.camera = if fp { crate::film_play::FilmCamera::FirstPersonOwner(owner) } else { crate::film_play::FilmCamera::FollowOwner(owner) };
+                    let at = |fps: f32, irr: bool, pb: &mut Playback| on_foot_camera_series(pb, best.1 as f32, 8.0, fps, irr);
+                    let (Some(a), Some(b), Some(c)) = (at(60.0, false, &mut pb), at(144.0, false, &mut pb), at(90.0, true, &mut pb)) else {
+                        eprintln!("owner {owner} fp {fp}: no series (window {best:?})");
+                        continue;
+                    };
+                    judged += 1;
+                    report += &format!("owner {owner} {} 60: pos {:.4} yaw {:.3} | 144: pos {:.4} yaw {:.3} | irr: pos {:.4} yaw {:.3}\n", if fp { "FP" } else { "FOLLOW" }, a.0, a.1, b.0, b.1, c.0, c.1);
+                    assert!(b.0 <= a.0 * 1.15 + 0.004 && c.0 <= a.0 * 1.5 + 0.006, "{report}\nposition step grows with the display rate");
+                    assert!(b.1 <= a.1 * 1.15 + 0.05 && c.1 <= a.1 * 1.5 + 0.08, "{report}\nlook step grows with the display rate");
+                }
+            }
+        }
+        eprintln!("{report}");
+        assert!(judged >= 8, "only {judged} subject views judged: the gate proves nothing");
+    }
+
+    /// #fp-jitter  **A STANDING-STILL PLAYER'S VIEW IS PERFECTLY STABLE.** Wherever the recording holds a
+    /// body at one position with no new look report for 3 s or more, the first-person camera at
+    /// 144 fps does not move: position and yaw second differences are zero (1e-4 wu, 1e-3 deg).
+    #[test]
+    #[ignore = "reads downloaded clips"]
+    fn a_standing_players_first_person_view_is_perfectly_stable() {
+        let (mut windows, mut worst_p, mut worst_y) = (0usize, 0f32, 0f32);
+        for idx in jitter_films() {
+            let mut pb = Playback::new(idx);
+            pb.context_cameras = false;
+            let tracks: Vec<crate::film_decode::EntityTrack> = pb.index.tracks.iter().filter(|t| t.entity_type == 11 && t.owner_raw.is_some() && t.positions.len() > 50).cloned().collect();
+            for tr in tracks.iter().take(40) {
+                for w in tr.positions.windows(2) {
+                    let ((t0, p0), (t1, p1)) = (w[0], w[1]);
+                    if t1 - t0 < 200 || Vec3::from(p1).distance(Vec3::from(p0)) > 0.005 { continue; }
+                    if tr.facings.iter().any(|&(k, _)| k > t0 && k < t1) { continue; }
+                    // some player must still be the subject (the camera resolves) and not be a recorder with a live aim
+                    let owner = tr.owner_raw.unwrap();
+                    pb.camera = crate::film_play::FilmCamera::FirstPersonOwner(owner);
+                    // a seated rider's view is its vehicle's, which moves: not a standing player
+                    if pb.index.derived_valid().is_some_and(|d| d.rides.iter().any(|r| r.biped_net_id == tr.net_id && r.from_tick <= t1 && r.to_tick >= t0)) { continue; }
+                    if pb.index.entity_for_owner(owner, t0 + 20).map(|e| e.net_id) != Some(tr.net_id) { continue; }
+                    if pb.index.slot_of_owner(owner).is_some_and(|s| pb.aim_live.get(s as usize).copied().unwrap_or(false)) { continue; }
+                    // exact: compare every sampled pose with the first, while this body is the subject
+                    let mut first: Option<([f32; 3], f32)> = None;
+                    let mut t = 0.0f32;
+                    let mut seen = 0usize;
+                    while t < (t1 - t0 - 40) as f32 / 60.0 {
+                        t += 1.0 / 144.0;
+                        let k = (t0 + 20) as f32 + t * 60.0;
+                        pb.seek_tick(k);
+                        let tick = k.round() as u32;
+                        if pb.death_at(tr).is_some_and(|d| tick >= d) || pb.index.entity_for_owner(owner, tick).map(|e| e.net_id) != Some(tr.net_id) { continue; }
+                        let Some(c) = crate::film_play::solve_camera_at(&pb, 0.62) else { continue };
+                        let f0 = *first.get_or_insert((c.pos, c.yaw));
+                        let dy = (c.yaw - f0.1 + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+                        worst_p = worst_p.max(Vec3::from(c.pos).distance(Vec3::from(f0.0)));
+                        worst_y = worst_y.max(dy.to_degrees().abs());
+                        seen += 1;
+                    }
+                    if seen < 100 { continue; }
+                    windows += 1;
+                }
+            }
+        }
+        eprintln!("{windows} standing window(s): worst position drift {worst_p:.6} wu, yaw drift {worst_y:.5} deg");
+        assert!(windows >= 3, "only {windows} standing windows found: the gate proves nothing");
+        assert!(worst_p < 1e-4 && worst_y < 1e-3, "a standing player's view moves: {worst_p} wu, {worst_y} deg");
+    }
+
+    #[test]
+    #[ignore = "opens a Reach cache and reads a downloaded race clip"]
+    fn probe_follow_camera_jitter() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let p = PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov");
+        let f = crate::film::open(&p).expect("opens");
+        let idx = crate::film_decode::build_index_film(&f);
+        let rider: u32 = 0xec0e029b;
+        let veh: u32 = 0xebf0027d;
+        let owner = idx.tracks.iter().find(|t| t.net_id == rider).and_then(|t| t.owner_raw).expect("owner");
+        let vt = idx.tracks.iter().find(|t| t.net_id == veh).cloned().expect("vehicle");
+        // a 4 s window where the hull is fast
+        let mut t0 = 3000u32;
+        let mut best = (0.0f32, 3000u32);
+        while t0 + 300 < vt.last_tick {
+            let d = crate::film_vehicle::position_at(&vt, (t0 + 240) as f32).zip(crate::film_vehicle::position_at(&vt, t0 as f32)).map(|(a, b)| a.distance(b)).unwrap_or(0.0);
+            if d > best.0 {
+                best = (d, t0);
+            }
+            t0 += 600;
+        }
+        let t0 = best.1;
+        eprintln!("window t{t0}..{}: hull covers {:.0} wu in 4 s ({:.1} wu/s)", t0 + 240, best.0, best.0 / 4.0);
+        let mut rig = Rig::new(&o, idx);
+        for context in [true, false] {
+            rig.pb.context_cameras = context;
+            rig.pb.camera = crate::film_play::FilmCamera::FollowOwner(owner);
+            for (label, fps, irregular) in [("30 fps", 30.0f32, false), ("60 fps", 60.0, false), ("144 fps", 144.0, false), ("irregular ~90", 90.0, true)] {
+                let mut t = 0.0f32;
+                let mut rngs = 12345u32;
+                let mut screen: Vec<(f32, f32)> = Vec::new();
+                let mut cam_lag: Vec<f32> = Vec::new();
+                let mut label_seen = String::new();
+                let frames = (4.0 * fps) as usize;
+                for _ in 0..frames {
+                    let dt = if irregular {
+                        rngs = rngs.wrapping_mul(1664525).wrapping_add(1013904223);
+                        (1.0 / fps) * (0.4 + 1.2 * ((rngs >> 8) as f32 / 16777216.0))
+                    } else {
+                        1.0 / fps
+                    };
+                    t += dt;
+                    rig.pb.seek_tick(t0 as f32 + t * 60.0);
+                    rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                    let Some(pose) = crate::film_play::solve_camera_at(&rig.pb, rig.driver.eye_height(&rig.pb)) else { continue };
+                    label_seen = pose.label.clone();
+                    let Some(&vid) = rig.driver.vehicle_actor.get(&veh) else { continue };
+                    let Some(a) = rig.actors.get(vid) else { continue };
+                    let vp = a.world_override.map(|m| m.w_axis.truncate()).unwrap_or(a.pos);
+                    let cam = hms_render::Camera { pos: Vec3::from(pose.pos), yaw: pose.yaw, pitch: pose.pitch, fov_y: 60f32.to_radians(), near: 0.05, far: 50_000.0 };
+                    let c = cam.view_proj(16.0 / 9.0) * vp.extend(1.0);
+                    if c.w > 0.1 {
+                        screen.push(((c.x / c.w) * 960.0, (c.y / c.w) * 540.0));
+                    }
+                    cam_lag.push((Vec3::from(pose.pivot.unwrap_or(pose.pos)) - vp).length());
+                }
+                let hp = |v: &[(f32, f32)]| -> f32 {
+                    let d: Vec<f32> = v.windows(3).map(|w| { let (ex, ey) = (w[1].0 - 0.5 * (w[0].0 + w[2].0), w[1].1 - 0.5 * (w[0].1 + w[2].1)); ex * ex + ey * ey }).collect();
+                    (d.iter().sum::<f32>() / d.len().max(1) as f32).sqrt()
+                };
+                let m = cam_lag.iter().sum::<f32>() / cam_lag.len().max(1) as f32;
+                let jit = hp(&screen);
+                eprintln!("CAMJ ctx={context} {label:<14}: vehicle on screen high-pass RMS {jit:.2} px | pivot-to-hull distance mean {m:.2} wu | {label_seen}");
+                if !context {
+                    // the PLAIN follow camera of a seated rider follows the vehicle, not the stale body
+                    assert!(m < 3.0, "{label}: the plain follow camera is {m:.1} wu from the hull it is riding");
+                    assert!(jit < 0.5, "{label}: the plain follow camera wobbles {jit:.2} px on the hull");
+                }
+                if context {
+                    assert!(label_seen.contains("riding"), "liveness: the vehicle camera is not the one in use ({label_seen})");
+                    assert!(screen.len() > 100, "liveness: only {} frames had the hull in view", screen.len());
+                    assert!(jit < 0.5, "{label}: the followed hull wobbles {jit:.2} px in the view");
+                }
+            }
+        }
+    }
+
+    /// #assassination-timing  print-only: the independent timeline of every stated assassination.
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_assassination_timeline() {
+        let mut paths = crate::film::find_finished_films();
+        paths.push(PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov"));
+        let (mut total, mut with_flag) = (0usize, 0usize);
+        let mut lead: Vec<i64> = Vec::new();
+        for p in paths {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let asn = crate::film_anim::assassinations(&idx);
+            if asn.is_empty() {
+                continue;
+            }
+            let who: std::collections::HashSet<u32> = asn.iter().flat_map(|a| [a.attacker, a.victim]).flatten().collect();
+            // every 0x35 statement on those bodies, in tick order
+            let mut flags: std::collections::HashMap<u32, Vec<(u32, bool)>> = Default::default();
+            for (i, rec) in f.data.records.iter().enumerate() {
+                let Ok(t) = crate::film_decode::decode_record(rec.body(&f.bytes), &idx.params) else { continue };
+                for e in &t.entities {
+                    if e.entity_type != 11 || !e.is_update || !who.contains(&e.net_id) {
+                        continue;
+                    }
+                    let Some(u) = crate::film_anim::unit::decode(e, &idx.params, crate::film_decode::WEAPREF_BITS) else { continue };
+                    if !u.trustworthy(e.dirty_mask) {
+                        continue;
+                    }
+                    if e.dirty_mask & (1u64 << 0x35) != 0 {
+                        flags.entry(e.net_id).or_default().push((i as u32, u.assassination.and_then(|a| a.target).is_some()));
+                    }
+                }
+            }
+            eprintln!("ASN {} | {} stated assassinations", p.file_name().unwrap().to_string_lossy(), asn.len());
+            for a in &asn {
+                total += 1;
+                let (Some(k), Some(v)) = (a.attacker, a.victim) else { eprintln!("   t{} incident {} (no pair)", a.tick, a.incident); continue };
+                let kf = flags.get(&k).cloned().unwrap_or_default();
+                let vf = flags.get(&v).cloned().unwrap_or_default();
+                let set = kf.iter().rev().find(|(t, on)| *on && *t <= a.tick + 30).copied();
+                let clear = set.and_then(|(s, _)| kf.iter().find(|(t, on)| !*on && *t > s).copied());
+                if let Some((s, _)) = set {
+                    with_flag += 1;
+                    lead.push(a.tick as i64 - s as i64);
+                }
+                eprintln!(
+                    "   incident t{} ({}) killer {k:#x} victim {v:#x} | killer 0x35 set {:?} cleared {:?} | victim 0x35 msgs {:?} | request(22) move {:?} | victim last tick {:?}",
+                    a.tick, a.incident, set.map(|x| x.0), clear.map(|x| x.0), vf.iter().take(4).collect::<Vec<_>>(), a.action_index,
+                    idx.tracks.iter().find(|t| t.net_id == v).map(|t| t.last_tick)
+                );
+            }
+        }
+        lead.sort();
+        eprintln!("ASN total {total}, killer 0x35 flag found for {with_flag}; incident minus flag-set ticks: {lead:?}");
+    }
+
+    /// #assassination-timing  print-only: when do the two bodies actually lock together, relative to
+    /// the incident? (killer-victim distance and the victim's own movement, tick by tick)
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_assassination_lock_tick() {
+        let mut paths = crate::film::find_finished_films();
+        paths.push(PathBuf::from(std::env::var("HOME").unwrap()).join("Downloads").join("Reach(1).mov"));
+        let mut leads: Vec<i64> = Vec::new();
+        let mut ends: Vec<i64> = Vec::new();
+        for p in paths {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            for a in crate::film_anim::assassinations(&idx) {
+                let (Some(k), Some(v)) = (a.attacker, a.victim) else { continue };
+                let (Some(kt), Some(vt)) = (idx.tracks.iter().find(|t| t.net_id == k), idx.tracks.iter().find(|t| t.net_id == v)) else { continue };
+                // first tick in [I-240, I] after which killer and victim stay within 1.2 wu through the incident
+                let mut lock: Option<u32> = None;
+                let from = a.tick.saturating_sub(240);
+                let mut t = a.tick;
+                while t > from {
+                    match (kt.sample(t), vt.sample(t)) {
+                        (Some(pk), Some(pv)) if glam::Vec3::from(pk).distance(glam::Vec3::from(pv)) < 1.2 => lock = Some(t),
+                        _ => break,
+                    }
+                    t -= 1;
+                }
+                // the victim's last replicated position tick and the killer's, after the incident
+                let end = vt.last_tick as i64 - a.tick as i64;
+                if let Some(l) = lock {
+                    leads.push(a.tick as i64 - l as i64);
+                }
+                ends.push(end);
+            }
+        }
+        leads.sort();
+        ends.sort();
+        eprintln!("LOCK incident minus first tick of continuous <1.2 wu contact ({} cases): {leads:?}", leads.len());
+        eprintln!("LOCK victim last replicated tick minus incident ({} cases): {ends:?}", ends.len());
+    }
+
+    /// **#assassination-timing  THE GATE for "assassinations are a little delayed on the animation".**
+    /// Through the production `ActorDriver::sync` on real clips with stated assassinations:
+    ///
+    /// * the killer's and the victim's move starts on the incident tick, on its FIRST frame, and with
+    ///   NO cross-fade (`blend_left == 0`): the sync action snaps both bodies onto the shared root;
+    /// * a killer who finishes another victim inside the first move's window (kill chains) starts
+    ///   the NEW move at the new incident (frame 0 there), not 70 ticks later when the old window ends.
+    ///
+    /// Liveness: at least 8 plain assassinations and 3 chained ones. Saboteurs: put the 0.18 s
+    /// cross-fade back, or pick the oldest covering action again.
+    #[test]
+    #[ignore = "opens a Reach cache and reads the saved-film corpus"]
+    fn assassination_moves_start_on_their_incident_with_no_fade_and_chains_restart() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let (mut plain, mut chained, mut shown) = (0usize, 0usize, 0usize);
+        for p in crate::film::find_finished_films() {
+            if plain >= 12 && chained >= 3 {
+                break;
+            }
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let asn: Vec<_> = crate::film_anim::assassinations(&idx).into_iter().filter(|a| a.attacker.is_some() && a.victim.is_some()).collect();
+            if asn.len() < 2 {
+                continue;
+            }
+            let mut rig = Rig::new(&o, idx);
+            for (n, a) in asn.iter().enumerate().take(14) {
+                let (k, v) = (a.attacker.unwrap(), a.victim.unwrap());
+                let chain = n > 0 && asn[n - 1].attacker == Some(k) && a.tick - asn[n - 1].tick < crate::film_anim::SYNC_TICKS;
+                // the tick before the incident, then the incident, then a few ticks into the move
+                let mut at_incident: Vec<(u32, bool, f32, f32)> = Vec::new();
+                for t in [a.tick.saturating_sub(1), a.tick, a.tick + 10] {
+                    rig.pb.seek_tick(t as f32);
+                    // let any cross-fade armed by earlier ticks finish (the rig has no frame clock)
+                    rig.actors.update_poses_headless(1.0);
+                    rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                    for id in [k, v] {
+                        let Some(&aid) = rig.driver.body_actor.get(&id) else { continue };
+                        let Some(ac) = rig.actors.get(aid) else { continue };
+                        at_incident.push((t, crate::film_anim::is_sync_clip(&ac.anim_name), ac.frame, ac.blend_left));
+                    }
+                }
+                // entries: (before: killer, victim), (incident: killer, victim), (+10: killer, victim)
+                if at_incident.len() < 6 {
+                    continue;
+                }
+                let (inc_k, plus_k) = (at_incident[2], at_incident[4]);
+                assert!(inc_k.1, "incident t{}: the killer is not in the assassination clip on the incident tick", a.tick);
+                assert!(inc_k.2 <= 1.01, "incident t{}: the move starts on frame {} instead of 0 (chain: {chain})", a.tick, inc_k.2);
+                let restarted = asn.iter().any(|b| b.attacker == Some(k) && b.tick > a.tick && b.tick <= a.tick + 10);
+                assert!(restarted || (plus_k.2 > 3.0 && plus_k.2 < 8.0), "incident t{}: 10 ticks in, the move is at frame {} (want ~5)", a.tick, plus_k.2);
+                assert_eq!(inc_k.3, 0.0, "incident t{}: the killer's move starts through a cross-fade ({} s left)", a.tick, inc_k.3);
+                if chain { chained += 1 } else { plain += 1 }
+                if shown < 3 {
+                    shown += 1;
+                    eprintln!("   incident t{} chain={chain}: killer on the clip at frame {:.1}, no fade; +10 ticks frame {:.1}", a.tick, inc_k.2, plus_k.2);
+                }
+            }
+        }
+        eprintln!("assassination starts: {plain} plain, {chained} chained");
+        assert!(plain >= 8 && chained >= 3, "liveness: {plain} plain / {chained} chained assassinations were exercised");
+    }
+
+    /// #melee-timing  print-only: what Theater draws for each recorded melee, and when the hit lands.
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_melee_inventory() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let mut by_name: std::collections::BTreeMap<String, (usize, u32, u32)> = Default::default();
+        let mut hit_offsets: Vec<i64> = Vec::new();
+        let (mut events, mut no_clip) = (0usize, 0usize);
+        for p in crate::film::find_finished_films().into_iter().take(14) {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let swings: Vec<(u32, u32)> = idx.events.iter().filter(|e| e.kind == crate::film_action::EV_MELEE_INITIATE).filter_map(|e| Some((e.tick, e.subject?))).collect();
+            let hits: Vec<(u32, u32)> = idx.events.iter().filter(|e| e.kind == crate::film_action::EV_MELEE_DAMAGE).filter_map(|e| Some((e.tick, e.subject?))).collect();
+            if swings.is_empty() {
+                continue;
+            }
+            for &(t, who) in &swings {
+                if let Some(&(ht, _)) = hits.iter().find(|&&(ht, hs)| hs == who && ht >= t && ht <= t + 120) {
+                    hit_offsets.push(ht as i64 - t as i64);
+                }
+            }
+            let mut rig = Rig::new(&o, idx);
+            for &(t, who) in swings.iter().take(10) {
+                events += 1;
+                let mut name = String::new();
+                let (mut active_until, mut last_frame) = (0u32, 0.0f32);
+                for dt in 0..90u32 {
+                    rig.pb.seek_tick((t + dt) as f32);
+                    rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                    let Some(&aid) = rig.driver.body_actor.get(&who) else { break };
+                    let Some(ac) = rig.actors.get(aid) else { break };
+                    if let Some((_, fr)) = ac.replacement {
+                        name = ac.replacement_name.clone();
+                        active_until = dt + 1;
+                        last_frame = fr;
+                    }
+                }
+                if name.is_empty() {
+                    no_clip += 1;
+                    continue;
+                }
+                let e = by_name.entry(name).or_insert((0, 0, 0));
+                e.0 += 1;
+                e.1 = e.1.max(active_until);
+                e.2 = e.2.max(last_frame as u32);
+            }
+        }
+        hit_offsets.sort();
+        eprintln!("MELEE {events} swings sampled, {no_clip} with NO replacement clip drawn");
+        for (n, (c, until, lastf)) in &by_name {
+            eprintln!("MELEE clip {n}: {c} swings, replacement active for up to {until} ticks, last frame {lastf}");
+        }
+        eprintln!("MELEE recorded hit lands this many ticks after the swing event ({}): {:?}", hit_offsets.len(), hit_offsets);
+    }
+
+    /// #melee-timing  print-only: how are the recorded melee events spaced, and how long after the
+    /// swing does the damage event land?
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_melee_event_spacing() {
+        let (mut gaps, mut hit): (Vec<u32>, Vec<i64>) = (Vec::new(), Vec::new());
+        let mut per_kind: std::collections::BTreeMap<u8, usize> = Default::default();
+        for p in crate::film::find_finished_films() {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let mut last: std::collections::HashMap<u32, u32> = Default::default();
+            for e in &idx.events {
+                *per_kind.entry(e.kind).or_default() += (e.kind == crate::film_action::EV_MELEE_INITIATE || e.kind == crate::film_action::EV_MELEE_DAMAGE || e.kind == crate::film_action::EV_MELEE_CLANG) as usize;
+                if e.kind == crate::film_action::EV_MELEE_INITIATE {
+                    if let Some(s) = e.subject {
+                        if let Some(&t0) = last.get(&s) {
+                            gaps.push(e.tick - t0);
+                        }
+                        last.insert(s, e.tick);
+                    }
+                }
+                if e.kind == crate::film_action::EV_MELEE_DAMAGE {
+                    if let Some(s) = e.subject.or(e.other) {
+                        if let Some(&t0) = last.get(&s) {
+                            hit.push(e.tick as i64 - t0 as i64);
+                        }
+                    }
+                }
+            }
+        }
+        gaps.sort();
+        hit.sort();
+        let q = |v: &[u32], f: f32| v.get(((v.len() as f32) * f) as usize).copied();
+        eprintln!("MSP kinds {per_kind:?}; consecutive swing gaps n={} p10 {:?} p50 {:?} p90 {:?}; under 60: {}", gaps.len(), q(&gaps, 0.1), q(&gaps, 0.5), q(&gaps, 0.9), gaps.iter().filter(|g| **g < 60).count());
+        eprintln!("MSP damage minus last swing: n={} {:?}", hit.len(), hit.iter().take(40).collect::<Vec<_>>());
+    }
+
+    /// #melee-class  print-only: which weapon/class does Theater resolve for each recorded swing?
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_melee_weapon_classes() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let mut classes: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut tags: std::collections::BTreeMap<String, usize> = Default::default();
+        for p in crate::film::find_finished_films().into_iter().take(20) {
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let swings: Vec<(u32, u32)> = idx.events.iter().filter(|e| e.kind == crate::film_action::EV_MELEE_INITIATE).filter_map(|e| Some((e.tick, e.subject?))).collect();
+            if swings.is_empty() {
+                continue;
+            }
+            let mut rig = Rig::new(&o, idx);
+            rig.pb.seek_tick(swings[0].0 as f32);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            for &(t, who) in &swings {
+                let Some(tr) = rig.pb.index.tracks.iter().find(|x| x.net_id == who) else { continue };
+                let w = tr.weapon_at(t);
+                let n = w.and_then(|w| rig.driver.weap_tags.get(w as usize).copied()).and_then(|tag| o.native.tag_name(o.cache, tag)).map(|n| n.rsplit('\\').next().unwrap_or(&n).to_string()).unwrap_or_else(|| "<none>".into());
+                *tags.entry(n).or_default() += 1;
+                let c = w.and_then(|w| rig.driver.weap_class.get(w as usize).cloned()).flatten().unwrap_or_else(|| "<unresolved>".into());
+                *classes.entry(c).or_default() += 1;
+            }
+        }
+        eprintln!("MCL weapons at the swing tick: {tags:?}");
+        eprintln!("MCL classes: {classes:?}");
+    }
+
+    /// #melee-class  print-only: every melee clip the Spartan graph authors.
+    #[test]
+    #[ignore = "print-only probe"]
+    fn probe_melee_graph_names() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let p = crate::film::find_finished_films().into_iter().next().expect("a film");
+        let f = crate::film::open(&p).expect("opens");
+        let idx = crate::film_decode::build_index_film(&f);
+        let mut rig = Rig::new(&o, idx);
+        rig.pb.seek_tick(2000.0);
+        rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+        let g = rig.actors.actors.iter().find_map(|a| a.def.graph.clone()).expect("a graph");
+        let mut names: Vec<String> = g.anims.iter().filter(|a| a.name.contains("melee") || a.name.contains("lunge")).map(|a| format!("{} [{:?} {}f]", a.name, a.anim_type, a.frame_count)).collect();
+        names.sort();
+        std::fs::write(std::env::temp_dir().join("hms_melee_names.txt"), names.join("\n")).unwrap();
+    }
+
+    /// **#melee  THE GATE for "melee animations look weird in Theater".** On real clips, through the
+    /// production `ActorDriver::sync`: an undisturbed swing lasts exactly its AUTHORED length (the clip's
+    /// own frame count x 2 ticks, not a fixed 60), fades in (first tick's weight under 0.35) and out (the
+    /// last tick's under 0.35) instead of snapping on and off the locomotion clip. A swing cut short by
+    /// the body dying / being locked into another action is counted, not judged.
+    ///
+    /// The weapon CLASS is reported, not fixed: only a few percent of swings have a class the film
+    /// states (see the numbers printed). Saboteur: set the weight to 1 everywhere.
+    #[test]
+    #[ignore = "opens a Reach cache and reads the saved-film corpus"]
+    fn a_swing_uses_the_weapon_in_the_hand_and_fades_in_and_out() {
+        let _serial = crate::reach_sound::probes_support::PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(o) = open_forge() else { return };
+        let (mut swings, mut stated, mut judged, mut interrupted, mut bad) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut classes: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut shown = 0;
+        for p in crate::film::find_finished_films().into_iter().take(30) {
+            if judged >= 40 {
+                break;
+            }
+            let Ok(f) = crate::film::open(&p) else { continue };
+            if f.header.map_variant.is_empty() {
+                continue;
+            }
+            let idx = crate::film_decode::build_index_film(&f);
+            let ev: Vec<(u32, u32)> = idx.events.iter().filter(|e| e.kind == crate::film_action::EV_MELEE_INITIATE).filter_map(|e| Some((e.tick, e.subject?))).collect();
+            if ev.is_empty() {
+                continue;
+            }
+            let mut rig = Rig::new(&o, idx);
+            rig.pb.seek_tick(ev[0].0 as f32);
+            rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+            for &(t, who) in &ev {
+                if let Some(tr) = rig.pb.index.tracks.iter().find(|x| x.net_id == who) {
+                    swings += 1;
+                    stated += tr.weapon_at(t).and_then(|w| rig.driver.weap_class.get(w as usize).cloned().flatten()).is_some() as usize;
+                }
+            }
+            for &(t, who) in ev.iter().take(10) {
+                if ev.iter().any(|&(t2, w2)| w2 == who && t2 > t && t2 < t + 80) {
+                    continue; // a following swing restarts the clip
+                }
+                let mut active: Vec<(u32, f32, String)> = Vec::new();
+                let mut n_frames = 0.0f32;
+                for dt in 0..80u32 {
+                    rig.pb.seek_tick((t + dt) as f32);
+                    rig.driver.sync(&rig.pb, &mut rig.actors, &o.native, o.cache);
+                    let Some(&aid) = rig.driver.body_actor.get(&who) else { break };
+                    let Some(ac) = rig.actors.get_mut(aid) else { break };
+                    if ac.replacement.is_some() {
+                        let name = ac.replacement_name.clone();
+                        if n_frames == 0.0 {
+                            n_frames = ac.replacement_clip(&o.native, o.cache, &name).map_or(0.0, |(_, n)| n);
+                        }
+                        active.push((dt, ac.replacement_weight, name));
+                    }
+                }
+                let (Some(first), Some(last)) = (active.first(), active.last()) else { continue };
+                let len = (last.0 - first.0 + 1) as f32;
+                // the window ends where the clip does, unless something else took the body
+                if (len - n_frames * 2.0).abs() > 1.5 {
+                    interrupted += 1;
+                    continue;
+                }
+                judged += 1;
+                *classes.entry(first.2.split(':').nth(1).unwrap_or("?").to_string()).or_default() += 1;
+                if first.1 > 0.35 || last.1 > 0.35 {
+                    bad += 1;
+                    if shown < 4 {
+                        shown += 1;
+                        eprintln!("   bad swing at t{t}: first weight {:.2}, last weight {:.2}, {len} ticks of {}", first.1, last.1, n_frames * 2.0);
+                    }
+                }
+            }
+        }
+        eprintln!("melee: {swings} swings; film states the weapon class for {stated}; {judged} undisturbed swings judged, {interrupted} cut short, classes {classes:?}, {bad} without a fade");
+        assert!(judged >= 20, "liveness: only {judged} undisturbed swings were judged");
+        assert_eq!(bad, 0, "{bad} swings snap on or off");
+    }
 }
